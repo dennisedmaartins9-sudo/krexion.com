@@ -1,3 +1,153 @@
+# v2.6.28 — 2026-01 — Visual Recorder Popup Work: visibility filter + per-item action selector
+#
+# =================================================================
+# CUSTOMER-REPORTED BUG — POPUP WORK OVER-DETECTS + CLICK-ONLY
+# =================================================================
+#
+# The customer sent 3 screenshots showing the Visual Recorder's
+# "Popup Work" tool on a landing page (ALERT!/BACK TO DEALS style
+# offer popup) with the checklist reading:
+#
+#     🪟 Popup Work — 5 popups · 7 buttons
+#
+# while ONLY ONE popup was visually on screen. The extra 4 "popups"
+# were counted from hidden template modals (`.modal`, `.popup`,
+# `.dialog` at `display:none`) that landing-page frameworks routinely
+# ship in the DOM. Several detected rows also carried useless
+# "Button #1 / Button #2" labels.
+#
+# Customer's second ask (in Urdu):
+#     "agr click form fill wale button b use krein to wo b sab
+#      es pr use hun"
+# → the other recorder tools (Click, Form Fill, Dropdown, Check Box)
+#   must also work on popup items — currently Popup Work only
+#   records Click steps, so form fields / selects / checkboxes
+#   inside a popup can't be recorded from the Popup Work checklist.
+#
+# =================================================================
+# ROOT CAUSE
+# =================================================================
+#
+# 1. VISIBILITY FILTER MISSING ON CLASS-BASED SELECTOR PATH
+#    `_DETECT_POPUP_BUTTONS_JS` had TWO discovery paths:
+#      (a) `document.querySelectorAll('[role="dialog"], .modal, .popup,
+#           .dialog, .overlay, .lightbox, .drawer, .MuiDialog-root,
+#           .ant-modal, .ReactModal__Content, .chakra-modal__content,
+#           .swal2-container, .sweet-alert, .fancybox-container')`
+#      (b) ad-hoc `position:fixed / :absolute + z-index ≥ 100 +
+#           covers ≥ 10 % of viewport` sweep
+#    Only path (b) applied a display/visibility/opacity check. Path
+#    (a) accepted every match — including hidden template popups
+#    sitting at `display:none` — so `popup_count` counted them all.
+#
+# 2. ITEM METADATA TOO THIN FOR "USE OTHER TOOLS ON POPUPS"
+#    Each clickable was returned as `{popup_index, text, tag,
+#    x, y, w, h}` — no element_kind, no input_type. The front-end
+#    couldn't distinguish `<input type="text">` from `<button>` and
+#    could only offer the default Click action for every ticked row.
+#
+# 3. NO PLACEHOLDER / LABEL EXTRACTION FOR FORM FIELDS
+#    `<input>` / `<textarea>` have empty innerText, so they fell
+#    through every heuristic and got the "Button #N" fallback,
+#    hiding what the field actually was.
+#
+# 4. DUPLICATE ROWS FROM WRAPPING <label>
+#    Common `<label><input type=checkbox/> …</label>` pattern
+#    produced two rows for the same visible target — the wrapping
+#    label AND the inner input — because both matched the button
+#    selector.
+#
+# =================================================================
+# THE FIX
+# =================================================================
+#
+# 1. `isVisible(el)` helper (display / visibility / opacity ≥ 0.05 /
+#    size ≥ 20×20 / on-screen) now applied to BOTH the popupSel
+#    candidates AND the ad-hoc overlay pass. Landing pages carrying
+#    3-5 hidden template popups no longer inflate `popup_count`.
+#
+# 2. Widened `BTN_SEL` so `<input type=text>`, `<textarea>`, `<select>`
+#    are also enumerated inside popups (previously only submit /
+#    button / reset / checkbox / radio inputs were caught).
+#
+# 3. New `classifyKind(el)` → returns one of
+#    `text_input | textarea | select | checkbox | radio | button |
+#     link | file | generic`.
+#    Emitted as `element_kind` (plus `input_type` for `<input>`) on
+#    every item so the front-end can pick a sensible default tool.
+#
+# 4. New `formFieldLabelFor(el)` — for form fields, prefer
+#    placeholder → aria-label → title → linked `<label for=id>` →
+#    wrapping `<label>` → name/id BEFORE the "Button #N" fallback.
+#    Result: a text input with placeholder "Email address" now
+#    shows as "Email address" not "Button #3".
+#
+# 5. Skip `<input type=hidden>` (Firebase reCAPTCHA / CSRF ghost
+#    fields no longer pollute the checklist).
+#
+# 6. Skip `<label>` when it already contains a listed input /
+#    textarea / select (kills the checkbox duplicate-row).
+#
+# 7. FRONT-END: new per-item action `<select>` in every popup
+#    checklist row (data-testid `vr-popup-item-action-{i}`) with
+#    options Click / Form Fill / Dropdown / Check Box. Auto-defaults
+#    from `element_kind`: text_input/textarea → form_fill,
+#    select → dropdown, checkbox/radio → check, everything else →
+#    click. Operator can override per row.
+#
+# 8. `addSelectedPopupClicks()` now dispatches each ticked item to
+#    `/api/visual-recorder/{sid}/click` with its selected `mode`.
+#    For the LAST `form_fill` and LAST `dropdown` pick, the existing
+#    `pendingFormFill` / `pendingDropdown` picker opens so the user
+#    can bind an Excel column / option literal without re-clicking
+#    the element on the live preview.
+#
+# =================================================================
+# VERIFICATION
+# =================================================================
+#
+# Backend: 5/5 pytest tests pass (`test_v2_6_28_popup_work.py`)
+#   • version=2.6.28
+#   • empty page → `popup_count=0`, `items=[]`
+#   • hidden `.modal` template only → `popup_count=0` (fix confirmed)
+#   • visible role=dialog with input/select/checkbox/button →
+#     `popup_count=1`, element_kind classification correct for
+#     every item, text-input label = placeholder text
+#   • mixed page (visible dialog + hidden .popup template) →
+#     `popup_count=1` (ghost filtered)
+#
+# Frontend: Playwright E2E — session started on fixture, Popup Work
+#   tool clicked, `vr-popup-checklist-panel` rendered with correct
+#   per-item action defaults, tick-all + `vr-popup-add-clicks-btn`
+#   → 5 steps recorded + both follow-up pickers (form-fill binder
+#   for the email input, dropdown option picker for the country
+#   select) opened as spec'd.
+#
+# =================================================================
+# IMPACT
+# =================================================================
+#
+#   • Popup Work count now matches operator visual reality — no more
+#     ghost popup rows on any landing page framework.
+#   • Operators can build full popup interactions (fill email in
+#     popup, pick country from popup dropdown, tick T&C checkbox,
+#     click Submit) directly from the Popup Work checklist — no
+#     need to switch back to click-live-on-the-preview mode.
+#   • Meaningful labels ("Email address", "Country", "I agree") in
+#     the checklist replace the previous "Button #N" fallback.
+#   • Zero customer-facing regressions — visibility filter is strict
+#     but honours what a real user actually sees on screen.
+#
+# Files:
+#   backend/visual_recorder.py               (_DETECT_POPUP_BUTTONS_JS rewritten)
+#   frontend/src/pages/VisualRecorderPage.js (per-item action selector + dispatch)
+#   backend/VERSION                          (2.6.27 → 2.6.28)
+#   backend/tests/test_v2_6_28_popup_work.py (new — 5 tests)
+#   backend/tests/_popup_fixtures/*.html     (new — 4 fixture pages)
+#   backend/tests/_popup_fixtures_live/*.html(new — UI test fixtures)
+#
+# ---------------------------------------------------------------
+
 # v2.6.27 — 2026-01 — TikTok Android FB_IAB bracket + FB FBAV normalisation + Visual Recorder iframe drill
 #
 # =================================================================

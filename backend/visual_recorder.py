@@ -4763,9 +4763,46 @@ async def add_wait_for_button_at(
 # for each container extracts every clickable inside (buttons, links,
 # inputs, [role=button], onclick, cursor:pointer). Same shape as
 # detect_clickables().items so the front-end can reuse the checklist UI.
+#
+# 2026-01 v2.6.28 — Bug fixes to Popup Work:
+#   1. VISIBILITY FILTER — previously the class-based selector (`.modal`,
+#      `.popup`, etc.) matched hidden containers too. Landing pages
+#      often have 3-5 template popups sitting in the DOM with
+#      display:none; the user only sees 1. We now apply the same
+#      display/visibility/opacity/size gate to ALL candidates (not
+#      just the ad-hoc overlay scan) so `popup_count` matches what the
+#      user actually sees.
+#   2. RICHER ITEM METADATA — each detected clickable now carries
+#      `element_kind` = "text_input" | "textarea" | "select" |
+#      "checkbox" | "radio" | "button" | "link" | "generic". The
+#      front-end uses this to auto-pick the right recorder tool
+#      (Form Fill for text_input, Dropdown for select, Check Box for
+#      checkbox/radio, Click for the rest) so the operator can
+#      Form-Fill / Dropdown / Check-Box INSIDE popups too, not just
+#      Click them. Customer ask: "agr click form fill wale button b
+#      use krein to wo b sab es pr use hun".
+#   3. INPUT-TYPE LABELS — inputs / textareas now get their
+#      placeholder / name / aria-label as the label (instead of the
+#      useless "Button #N" fallback) so the popup checklist row shows
+#      "Email address" not "Button #3".
 _DETECT_POPUP_BUTTONS_JS = r"""
 () => {
   const out = [];
+
+  // ── Helper: is the element visibly on screen right now? ───────────
+  const isVisible = (el) => {
+    try {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity || '1') < 0.05) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 20) return false;
+      // Off-screen (below-fold DOM template popups often live at y=99999)
+      if (r.bottom < 0 || r.top > (window.innerHeight || 10000) + 200) return false;
+      if (r.right < 0 || r.left > (window.innerWidth || 10000) + 200) return false;
+      return true;
+    } catch (e) { return false; }
+  };
 
   // ── Step 1: find popup / modal / dialog containers ────────────────
   const popupSel = [
@@ -4786,7 +4823,11 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     '.sweet-alert',
     '.fancybox-container',
   ].join(', ');
-  const candidates = Array.from(document.querySelectorAll(popupSel));
+  // v2.6.28 fix — apply visibility filter to class/role matches too.
+  // Landing pages often carry 3-5 hidden template popups in the DOM;
+  // without this filter Popup Work over-reports (e.g. "5 popups") when
+  // only 1 is on screen.
+  const candidates = Array.from(document.querySelectorAll(popupSel)).filter(isVisible);
 
   // Also detect ad-hoc overlays: position:fixed / :absolute + high z-index
   // + covers > 25 % of the viewport. Catches hand-rolled popups on lead-
@@ -4819,12 +4860,43 @@ _DETECT_POPUP_BUTTONS_JS = r"""
   );
 
   // ── Step 2: enumerate clickables inside each popup ────────────────
-  const BTN_SEL = 'a, button, input[type=submit], input[type=button], input[type=reset], input[type=checkbox], input[type=radio], [role=button], [role=link], [role=checkbox], [role=radio], [aria-label*="close" i], [aria-label*="dismiss" i], [aria-label*="cancel" i], label, [onclick], [class*="close" i], [class*="dismiss" i], [data-dismiss], [data-close]';
+  // v2.6.28 — Widened selector so form fields (text inputs, textareas,
+  //           <select>) are also detected. The front-end will route
+  //           them to Form Fill / Dropdown / Check Box tools instead
+  //           of the default Click.
+  const BTN_SEL = 'a, button, input, textarea, select, [role=button], [role=link], [role=checkbox], [role=radio], [aria-label*="close" i], [aria-label*="dismiss" i], [aria-label*="cancel" i], label, [onclick], [class*="close" i], [class*="dismiss" i], [data-dismiss], [data-close]';
   const normText = (el) => (
     (el.innerText || el.textContent || el.value ||
      el.getAttribute('aria-label') || el.getAttribute('title') || '')
       .replace(/\s+/g, ' ').trim()
   );
+
+  // v2.6.28 — Classify each element so the UI can auto-pick the right
+  // recorder tool (Form Fill / Dropdown / Check Box / Click).
+  const classifyKind = (el) => {
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag === 'SELECT') return 'select';
+    if (tag === 'TEXTAREA') return 'textarea';
+    if (tag === 'INPUT') {
+      const t = ((el.getAttribute('type') || 'text') + '').toLowerCase();
+      if (t === 'checkbox') return 'checkbox';
+      if (t === 'radio')    return 'radio';
+      if (t === 'submit' || t === 'button' || t === 'reset' || t === 'image')
+        return 'button';
+      if (t === 'file') return 'file';
+      // text / email / password / number / search / tel / url / date / …
+      return 'text_input';
+    }
+    if (tag === 'A') return 'link';
+    if (tag === 'BUTTON') return 'button';
+    // role= fallbacks (custom widgets)
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (role === 'checkbox') return 'checkbox';
+    if (role === 'radio')    return 'radio';
+    if (role === 'link')     return 'link';
+    if (role === 'button')   return 'button';
+    return 'generic';
+  };
 
   // 2026-07 v2.5.4 — Extract a label even when the button has no text.
   // Handles the common close-X patterns:
@@ -4861,6 +4933,37 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     return '';
   };
 
+  // v2.6.28 — For form fields (input / textarea / select) prefer
+  // placeholder / name / aria-label / linked <label> over the "Button
+  // #N" fallback since text-input's innerText is always empty.
+  const formFieldLabelFor = (el) => {
+    const ph = el.getAttribute && (el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.getAttribute('title'));
+    if (ph && ph.trim()) return ph.trim();
+    const nm = el.getAttribute && (el.getAttribute('name') || el.getAttribute('id'));
+    // Try linked <label for=id>
+    if (el.id) {
+      try {
+        const lbl = document.querySelector('label[for="' + el.id.replace(/"/g, '\\"') + '"]');
+        if (lbl) {
+          const t = (lbl.innerText || lbl.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t) return t;
+        }
+      } catch (e) {}
+    }
+    // Wrapping <label> (implicit for)
+    let p = el.parentElement, depth = 0;
+    while (p && depth < 3) {
+      if (p.tagName === 'LABEL') {
+        const t = (p.innerText || p.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t) return t;
+        break;
+      }
+      p = p.parentElement; depth++;
+    }
+    if (nm && nm.trim()) return nm.trim();
+    return '';
+  };
+
   kept.forEach((popup, popupIdx) => {
     const rectP = popup.getBoundingClientRect();
     if (rectP.width < 20 || rectP.height < 20) return;
@@ -4884,6 +4987,20 @@ _DETECT_POPUP_BUTTONS_JS = r"""
         if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05) continue;
         const r = el.getBoundingClientRect();
         if (r.width < 4 || r.height < 4) continue;
+        // v2.6.28 — Skip hidden form inputs like <input type="hidden">
+        // and off-screen fields (Firebase reCAPTCHA hidden inputs, etc)
+        const tagUp = (el.tagName || '').toUpperCase();
+        if (tagUp === 'INPUT' && ((el.getAttribute('type') || '').toLowerCase() === 'hidden')) continue;
+        // v2.6.28 polish — Skip a wrapping <label> if it already contains
+        //   an input/textarea/select that will be enumerated on its own
+        //   row. Otherwise the same visible target shows up twice in the
+        //   checklist (once as the label, once as the input), and ticks
+        //   would record two steps against the same field. Keep bare
+        //   labels (no inner control) since they're used as standalone
+        //   clickable hints in some designs.
+        if (tagUp === 'LABEL' && el.querySelector && el.querySelector('input,textarea,select')) continue;
+
+        const kind = classifyKind(el);
         const rawText = normText(el);
         // Popup close-Xs often have empty text — synthesise a label
         // from aria-label / title / icon class / SVG so the UI still
@@ -4892,6 +5009,11 @@ _DETECT_POPUP_BUTTONS_JS = r"""
         if (!label) {
           const al = el.getAttribute('aria-label') || el.getAttribute('title') || '';
           if (al) label = al.trim();
+        }
+        // v2.6.28 — For form fields prefer placeholder/name/label
+        //           BEFORE the icon/close heuristics.
+        if (!label && (kind === 'text_input' || kind === 'textarea' || kind === 'select' || kind === 'checkbox' || kind === 'radio')) {
+          label = formFieldLabelFor(el);
         }
         if (!label) {
           label = iconLabelFor(el);
@@ -4920,6 +5042,8 @@ _DETECT_POPUP_BUTTONS_JS = r"""
           popup_index: popupIdx,
           text: label,
           tag: tag,
+          element_kind: kind,
+          input_type: (tagUp === 'INPUT' ? (el.getAttribute('type') || 'text').toLowerCase() : ''),
           x: Math.round(r.left + r.width / 2),
           y: Math.round(r.top + r.height / 2),
           w: Math.round(r.width),

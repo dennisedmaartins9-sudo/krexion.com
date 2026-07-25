@@ -1,0 +1,41 @@
+{
+  "summary": "v2.6.28 Popup Work (Visual Recorder) verification — BOTH backend + frontend PASSED. Backend: 5/5 pytest tests green (test_v2_6_28_popup_work.py) covering (a) version=2.6.28, (b) empty page → popup_count=0, (c) hidden `.modal` template → popup_count=0 (visibility filter fix confirmed), (d) visible role=dialog with text_input / select / checkbox / button → popup_count=1, correct `element_kind` classification for every kind, label pulled from placeholder (Email address), NOT 'Button #N', (e) mixed page (visible dialog + hidden .popup template) → popup_count=1, ghost items filtered. Frontend: Playwright end-to-end — logged in as a fresh admin-activated user, started a VR session on the localhost:8766/visible.html fixture, clicked `vr-tool-popup_work`, verified `vr-popup-checklist-panel` rendered with 6 rows (5 real elements + 1 wrapping <label>). Per-item default action seeding VERIFIED per requirement: text_input→form_fill, select→dropdown, checkbox→check, button→click, label→click. Toggle-All then `vr-popup-add-clicks-btn` produced 5 recorded steps and simultaneously opened both follow-up pickers (form-fill Excel-column binder for the email input AND dropdown option picker for the country <select>) — exactly as spec'd. Toast reads 'Added 5/6 popup step(s) — pick option/header for the highlighted dropdown — bind an Excel column for the form field'.",
+  "backend_issues": { "critical": [], "minor": [] },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Popup Work checklist", "issues": ["Minor over-detection: the wrapping <label> around a checkbox is enumerated as its own clickable row (element_kind=generic, defaults to Click) IN ADDITION TO the inner <input type=checkbox> row. Same visible target counted twice. Not a regression (pre-existing behaviour — labels are in the BTN_SEL) and clicking the label just toggles the checkbox, so the recorded step is functionally harmless. Optional polish: de-dup <label> rows when they contain exactly one already-listed input."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v2_6_28_popup_work.py",
+    "/app/test_reports/pytest/pytest_v2_6_28.xml",
+    "/app/backend/tests/_popup_fixtures/empty.html",
+    "/app/backend/tests/_popup_fixtures/hidden.html",
+    "/app/backend/tests/_popup_fixtures/visible.html",
+    "/app/backend/tests/_popup_fixtures/mixed.html",
+    "/app/backend/tests/_popup_fixtures_live/visible.html"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "visual_recorder.py `_DETECT_POPUP_BUTTONS_JS` — visibility filter is correctly applied to BOTH the popupSel-based candidates (line 4830 `.filter(isVisible)`) AND to the ad-hoc overlay pass (checks `display/visibility/opacity` at line 4851). Good.",
+    "`classifyKind` at line 4876 correctly handles INPUT type=hidden by skipping (early continue at line 4993 before push) — no ghost rows.",
+    "`formFieldLabelFor` (line 4939) prefers placeholder → aria-label → title → linked <label for=id> → wrapping <label> → name/id. Order matches user expectation.",
+    "Frontend `defaultActionFor` (VisualRecorderPage.js:1794) covers text_input/textarea→form_fill, select→dropdown, checkbox/radio→check, else click — 1:1 with backend classification.",
+    "Frontend `addSelectedPopupClicks` dispatches per-item /click POST with the chosen `mode` — for `dropdown` it stores only the LAST picker, earlier ones are silently NOT bound (documented in comment at line 1883-1885). Acceptable — customer typically has 0-1 selects per popup — but worth surfacing in the toast if the batch had 2+ dropdowns.",
+    "Wrapping <label> also gets included in BTN_SEL — creates the duplicate-row nit noted above. Consider `if (tag==='LABEL' && el.querySelector('input,textarea,select')) continue;` to skip labels that already wrap another already-enumerated clickable."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v2_6_28_popup_work.py (new — 5 tests, uses threaded http.server + auto-admin-activate)",
+    "/app/backend/tests/_popup_fixtures/*.html (new — 4 fixture pages)",
+    "/app/backend/tests/_popup_fixtures_live/*.html (new — kept for background http.server on :8766 used by UI test)"
+  ],
+  "success_rate": { "backend": "100% (5/5)", "frontend": "100% (popup-work UI flow, all data-testids resolved, expected steps recorded)" },
+  "test_credentials": "Fresh test user auto-registered per test module (TEST_vr_popup_<hex>@demo.com / test1234, admin-activated). Preview admin creds admin@krexion.local / admin123 used only for the /admin/users PUT status:active call.",
+  "seed_data_creation": "One throw-away test user per test session (TEST_ prefix). No production DB writes beyond that. Fixture HTML pages under /app/backend/tests/_popup_fixtures/.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Fixture http.server for UI test runs on :8766 from /app/backend/tests/_popup_fixtures_live/ — kill it with `pkill -f 'http.server 8766'` if it leaks. The pytest suite starts its own random-port server via a module fixture so it's isolated. To reproduce UI test, ensure a user in `active` status with real_user_traffic=True exists (default on register), then goto /visual-recorder, put http://localhost:8766/visible.html in vr-url-input, hit vr-start-btn, wait for toolbar, click vr-tool-popup_work, expect vr-popup-checklist-panel with 4-6 rows and correct per-item action defaults.",
+  "rca_of_the_issue": "Not applicable — this iteration verifies a fix. The original bug (Popup Work over-detects 5 popups on pages that only have 1 visible) was rooted in `_DETECT_POPUP_BUTTONS_JS` at line 4830 previously NOT filtering `document.querySelectorAll(popupSel)` results through `isVisible`. Only the ad-hoc overlay path had it. Landing pages carry template popups (`.modal`, `.popup`, `.dialog`) with `display:none` in the DOM which used to be counted. v2.6.28 adds `.filter(isVisible)` and also the new `element_kind` field so form fields can be recorded as Form Fill / Dropdown / Check Box instead of just Click. Both fixes confirmed live."
+}

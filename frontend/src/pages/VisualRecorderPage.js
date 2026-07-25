@@ -354,8 +354,16 @@ export default function VisualRecorderPage() {
   const [detectingClickables, setDetectingClickables] = useState(false);
   // ── 2026-01 v2.4.2 — Popup Work state (parallel to detectedClickables
   //                     but scoped to elements INSIDE popups/modals) ──
+  // v2.6.28 — Added `popupItemActions` map so each detected popup item
+  //           can be given its own action mode (click / form_fill /
+  //           dropdown / check). Defaults are inferred from
+  //           `element_kind` returned by the backend: text_input →
+  //           form_fill, select → dropdown, checkbox/radio → check,
+  //           everything else → click.  Customer ask: "click form fill
+  //           wale button b use krein to wo b sab es pr use hun".
   const [detectedPopupItems, setDetectedPopupItems] = useState([]);
   const [selectedPopupKeys, setSelectedPopupKeys] = useState(() => new Set());
+  const [popupItemActions, setPopupItemActions] = useState(() => new Map()); // idx -> "click"|"form_fill"|"dropdown"|"check"
   const [popupContainerCount, setPopupContainerCount] = useState(0);
   const [detectingPopups, setDetectingPopups] = useState(false);
   // ── 2026-01 v2.4.2 — Scan tool result modal ──
@@ -1310,6 +1318,7 @@ export default function VisualRecorderPage() {
           } else {
             setDetectedPopupItems([]);
             setSelectedPopupKeys(new Set());
+            setPopupItemActions(new Map());
             setPopupContainerCount(0);
           }
           e.preventDefault();
@@ -1331,6 +1340,7 @@ export default function VisualRecorderPage() {
         setSelectedRandomKeys(new Set());
         setDetectedPopupItems([]);
         setSelectedPopupKeys(new Set());
+        setPopupItemActions(new Map());
         e.preventDefault();
       } else if (!editable && !ctrl && (e.key === "w" || e.key === "W")) {
         // 2026-07 v2.5.4 — "w" → Wait for Button tool
@@ -1340,6 +1350,7 @@ export default function VisualRecorderPage() {
         setSelectedRandomKeys(new Set());
         setDetectedPopupItems([]);
         setSelectedPopupKeys(new Set());
+        setPopupItemActions(new Map());
         e.preventDefault();
       }
     };
@@ -1776,11 +1787,24 @@ export default function VisualRecorderPage() {
   };
 
   // ── 2026-01 v2.4.2 — Popup Work: detect buttons INSIDE popups ─────
+  //  v2.6.28 — Also seeds `popupItemActions` from each item's
+  //  `element_kind` so form fields default to Form Fill, selects to
+  //  Dropdown, checkboxes/radios to Check Box, everything else to
+  //  Click.
+  const defaultActionFor = (item) => {
+    const k = (item && item.element_kind) || '';
+    if (k === 'text_input' || k === 'textarea') return 'form_fill';
+    if (k === 'select') return 'dropdown';
+    if (k === 'checkbox' || k === 'radio') return 'check';
+    return 'click';
+  };
+
   const detectPopupButtons = async () => {
     if (!sessionId) return;
     setDetectingPopups(true);
     setDetectedPopupItems([]);
     setSelectedPopupKeys(new Set());
+    setPopupItemActions(new Map());
     setPopupContainerCount(0);
     try {
       const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/detect-popup-buttons`, {
@@ -1791,13 +1815,17 @@ export default function VisualRecorderPage() {
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       const items = Array.isArray(d.items) ? d.items : [];
       setDetectedPopupItems(items);
+      // v2.6.28 — Seed default actions per element_kind
+      const seedActions = new Map();
+      items.forEach((it, idx) => { seedActions.set(idx, defaultActionFor(it)); });
+      setPopupItemActions(seedActions);
       setPopupContainerCount(Number(d.popup_count) || 0);
       if (!items.length) {
         toast.error(d.popup_count > 0
           ? `Found ${d.popup_count} popup(s) but no clickable buttons inside.`
           : "No popup/modal/dialog is currently visible on the page.");
       } else {
-        toast.success(`Detected ${items.length} button(s) across ${d.popup_count} popup(s) — tick the ones to click as steps.`);
+        toast.success(`Detected ${items.length} item(s) across ${d.popup_count} popup(s) — pick action per item (click / form-fill / dropdown / check) then Add as steps.`);
       }
     } catch (err) {
       toast.error(`Popup scan failed: ${err.message || err}`);
@@ -1806,38 +1834,88 @@ export default function VisualRecorderPage() {
     }
   };
 
-  // Add each ticked popup button as a normal click step (uses the
-  // existing /click endpoint — same code path as a manual click).
+  // Add each ticked popup item as a step using its selected action mode.
+  // v2.6.28 — Each item's `popupItemActions[idx]` (click | form_fill |
+  //           dropdown | check) drives the mode passed to `/click`.
+  //           - click / check → step recorded atomically
+  //           - form_fill (no header yet) → backend records
+  //             `wait_for_selector`; user can bind a header later via
+  //             /type or via the last-item follow-up picker below.
+  //           - dropdown → backend returns options; we open the
+  //             existing `pendingDropdown` picker for the LAST such
+  //             item so the user can bind option/header. Any earlier
+  //             dropdowns get their `wait_for_selector` recorded and
+  //             stay unbound (user can re-bind by clicking on them).
   const addSelectedPopupClicks = async () => {
     if (!sessionId) return;
     const picks = Array.from(selectedPopupKeys)
-      .map((idx) => detectedPopupItems[idx])
-      .filter(Boolean);
+      .map((idx) => ({ item: detectedPopupItems[idx], mode: popupItemActions.get(idx) || 'click' }))
+      .filter((p) => !!p.item);
     if (!picks.length) {
-      toast.error("Tick at least one popup button first");
+      toast.error("Tick at least one popup item first");
       return;
     }
     setBusy(true);
     let added = 0;
+    let lastFormFillPending = null;   // {selector, element}
+    let lastDropdownPending = null;   // {selector, options, ...}
     try {
-      for (const item of picks) {
+      for (const { item, mode } of picks) {
         const cx = Math.round(item.x);
         const cy = Math.round(item.y);
         try {
           const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/click`, {
             method: "POST",
             headers: authH(),
-            body: JSON.stringify({ x: cx, y: cy, mode: "default" }),
+            body: JSON.stringify({ x: cx, y: cy, mode }),
           });
           const d = await r.json();
-          if (r.ok && d.recorded !== false) added += 1;
+          if (!r.ok) continue;
+          if (mode === 'form_fill') {
+            // Backend records wait_for_selector (or fill if header
+            // supplied — not the case here). Count it as added and
+            // stash the last one for the bind-header prompt.
+            added += 1;
+            if (d.element) lastFormFillPending = { selector: d.selector || 'input', element: d.element };
+          } else if (mode === 'dropdown') {
+            // Dropdown mode returns options but does NOT record a step
+            // until /dropdown-bind is called. Open the picker for the
+            // LAST dropdown pick so the user can bind it. Earlier
+            // dropdowns won't have a step recorded — user can re-run
+            // them individually. (Rare in popups — usually 0-1 selects
+            // per popup so this covers the realistic case.)
+            if (Array.isArray(d.options) && d.options.length > 0) {
+              lastDropdownPending = {
+                selector: d.selector || 'select',
+                options: d.options,
+                element: d.element,
+                wrapper_kind: d.wrapper_kind || '',
+                is_hidden_select: !!d.is_hidden_select,
+              };
+            }
+          } else if (mode === 'check') {
+            if (d.recorded !== false) added += 1;
+          } else {
+            // click (default)
+            if (d.recorded !== false) added += 1;
+          }
         } catch {
           /* keep going — best effort across the batch */
         }
       }
-      toast.success(`Added ${added}/${picks.length} popup click step(s)`);
+      // Open the follow-up picker(s) for the LAST form_fill /
+      // dropdown pick so the user can bind them without re-clicking.
+      if (lastFormFillPending) setPendingFormFill(lastFormFillPending);
+      if (lastDropdownPending) setPendingDropdown(lastDropdownPending);
+
+      toast.success(
+        `Added ${added}/${picks.length} popup step(s)` +
+        (lastDropdownPending ? " — pick option/header for the highlighted dropdown" : "") +
+        (lastFormFillPending ? " — bind an Excel column for the form field" : "")
+      );
       setSelectedPopupKeys(new Set());
       setDetectedPopupItems([]);
+      setPopupItemActions(new Map());
       setPopupContainerCount(0);
       refreshState();
     } catch (err) {
@@ -4559,6 +4637,7 @@ export default function VisualRecorderPage() {
                         } else {
                           setDetectedPopupItems([]);
                           setSelectedPopupKeys(new Set());
+                          setPopupItemActions(new Map());
                           setPopupContainerCount(0);
                         }
                       }}
@@ -4730,7 +4809,7 @@ export default function VisualRecorderPage() {
                         </span>
                       ) : (
                         <>
-                          🪟 Popup Work — {popupContainerCount} popup{popupContainerCount === 1 ? "" : "s"} · {detectedPopupItems.length} button{detectedPopupItems.length === 1 ? "" : "s"} · tick the one(s) to add as click steps ({selectedPopupKeys.size}/{detectedPopupItems.length})
+                          🪟 Popup Work — {popupContainerCount} popup{popupContainerCount === 1 ? "" : "s"} · {detectedPopupItems.length} item{detectedPopupItems.length === 1 ? "" : "s"} · tick items & pick action per item ({selectedPopupKeys.size}/{detectedPopupItems.length})
                         </>
                       )}
                     </div>
@@ -4750,6 +4829,8 @@ export default function VisualRecorderPage() {
                       <div className="max-h-56 overflow-y-auto mb-2 flex flex-col gap-1">
                         {detectedPopupItems.map((el, i) => {
                           const checked = selectedPopupKeys.has(i);
+                          const currentAction = popupItemActions.get(i) || defaultActionFor(el);
+                          const kind = el.element_kind || 'generic';
                           return (
                             <label
                               key={i}
@@ -4769,16 +4850,38 @@ export default function VisualRecorderPage() {
                                   setSelectedPopupKeys(next);
                                 }}
                                 className="accent-rose-500 shrink-0"
+                                data-testid={`vr-popup-item-checkbox-${i}`}
                               />
                               <span className="text-[9px] font-mono px-1 py-0.5 rounded bg-rose-900/50 text-rose-200 shrink-0">
                                 #{(el.popup_index ?? 0) + 1}
                               </span>
-                              <span className="flex-1 leading-snug">
-                                <span className="font-medium">{el.text}</span>
-                                <span className="ml-1.5 text-[9px] uppercase tracking-wide text-zinc-500">
+                              <span className="flex-1 leading-snug min-w-0">
+                                <span className="font-medium truncate block">{el.text}</span>
+                                <span className="mt-0.5 text-[9px] uppercase tracking-wide text-zinc-500">
                                   {el.tag}
+                                  {kind && kind !== 'generic' && kind !== 'button' && kind !== 'link' ? ` · ${kind}` : ''}
                                 </span>
                               </span>
+                              {/* v2.6.28 — per-item action selector so Form Fill /
+                                  Dropdown / Check Box can be used INSIDE popups too. */}
+                              <select
+                                value={currentAction}
+                                onClick={(ev) => ev.stopPropagation()}
+                                onChange={(ev) => {
+                                  ev.stopPropagation();
+                                  const next = new Map(popupItemActions);
+                                  next.set(i, ev.target.value);
+                                  setPopupItemActions(next);
+                                }}
+                                className="text-[10px] px-1 py-0.5 rounded bg-zinc-800 text-rose-100 border border-rose-500/30 shrink-0"
+                                data-testid={`vr-popup-item-action-${i}`}
+                                title="Choose how this popup item should be recorded"
+                              >
+                                <option value="click">Click</option>
+                                <option value="form_fill">Form Fill</option>
+                                <option value="dropdown">Dropdown</option>
+                                <option value="check">Check Box</option>
+                              </select>
                             </label>
                           );
                         })}
@@ -4803,10 +4906,10 @@ export default function VisualRecorderPage() {
                           className="px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs font-medium"
                           data-testid="vr-popup-add-clicks-btn"
                         >
-                          Add {selectedPopupKeys.size} popup click{selectedPopupKeys.size === 1 ? "" : "s"} as step{selectedPopupKeys.size === 1 ? "" : "s"}
+                          Add {selectedPopupKeys.size} popup item{selectedPopupKeys.size === 1 ? "" : "s"} as step{selectedPopupKeys.size === 1 ? "" : "s"}
                         </button>
                         <span className="text-[10px] text-rose-200/70">
-                          Tip: Each tick becomes a separate click step. Use the ✕ close button in a popup to add a "dismiss popup" step mid-flow.
+                          Tip: Pick per-item action — Click / Form Fill / Dropdown / Check Box. Form-Fill items become <code>wait_for_selector</code> until you bind an Excel column. Dropdown picker opens for the last selected select.
                         </span>
                       </div>
                     </>

@@ -157,3 +157,126 @@ JsSdk/2.0 … AppId/1233 …`. iOS detection continues to work via `AppId/1233`.
 - OPTIONAL (bigger refactor): `server.py` is 25,706 lines — modular split recommended.
 - OPTIONAL: 21 pre-existing lint warnings in server.py (bare except, unused imports) — user forbade touching, but can be batched into a "cleanup" release.
 - OPTIONAL: `_FOREIGN_INAPP_STRIP_PATTERNS['tiktok']` regex still doesn't strip the trailing `ttwebview/... com.zhiliaoapp.musically/...` chain when coercing away — cosmetic, not customer-facing.
+
+
+## Session 4 — 2026-01-25 (v2.6.28 Visual Recorder Popup Work fix)
+
+### Setup
+- Cloned repo into `/app` (main branch at `112717f` — v2.6.27).
+- `.emergent/emergent.yml` + `.emergent/cron/webhook-crons` marked
+  `git update-index --skip-worktree` so pod-specific values never
+  leak into Save-to-GitHub commits.
+- Backend `.env` for preview: `MONGO_URL`, `DB_NAME=krexion`,
+  `KREXION_MODE=cloud`, `STRICT_CLOUD_HEAVY_BLOCK=false`,
+  `ADMIN_EMAIL=admin@krexion.local`, `ADMIN_PASSWORD=admin123`.
+- Preview URL: https://krexion-staging-15.preview.emergentagent.com
+
+### Bug Report (Urdu → English)
+1. On landing pages that render popups, the "Popup Work" tool
+   over-detects — screenshot showed `5 popups · 7 buttons` when
+   only ONE popup was visually on screen. Some detected rows had
+   useless "Button #1 / Button #2" labels.
+2. User wants the OTHER recorder tools (Click, Form Fill, Dropdown,
+   Check Box) to also work on popup items — currently Popup Work
+   only records Click steps.
+
+### Root Cause
+`_DETECT_POPUP_BUTTONS_JS` applied its visibility filter ONLY to
+the ad-hoc `position:fixed + high-z + covers >10% viewport` scan.
+The class-based selector (`document.querySelectorAll('.modal, .popup,
+.dialog, ...')`) was accepted verbatim — landing pages ship 3-5
+template popups sitting in the DOM at `display:none` with those
+class names, so all of them counted.
+
+Second gap: every clickable was returned to the front-end as a
+plain `{tag, text}` — no element_kind, so the UI couldn't tell an
+`<input type="text">` apart from a `<button>` and could only offer
+Click.
+
+### Fix (v2.6.28)
+**backend/visual_recorder.py**
+1. `isVisible()` helper: display/visibility/opacity/size/off-screen
+   gate. Applied to BOTH the popupSel candidates AND the ad-hoc
+   overlay pass (previously only the latter).
+2. Widened `BTN_SEL` so `<input type=text>`, `<textarea>`, `<select>`
+   are also enumerated.
+3. New `classifyKind(el)` → returns `text_input | textarea | select |
+   checkbox | radio | button | link | file | generic`. Emitted as
+   `element_kind` on every item plus `input_type` for `<input>`.
+4. `formFieldLabelFor(el)` — for form fields, prefer
+   placeholder → aria-label → title → linked `<label for=id>` →
+   wrapping `<label>` → name/id BEFORE falling back to `Button #N`.
+5. Skip `<input type=hidden>` (Firebase reCAPTCHA ghosts).
+6. Skip a wrapping `<label>` if it already contains an inner
+   input/textarea/select (avoids duplicate-row per checkbox).
+
+**frontend/src/pages/VisualRecorderPage.js**
+1. New state `popupItemActions: Map<idx, "click"|"form_fill"|"dropdown"|"check">`.
+2. `defaultActionFor(item)` seeds a sensible per-item default from
+   `element_kind` — form fields → form_fill, selects → dropdown,
+   checkboxes/radios → check, else click.
+3. Each row in the Popup Work checklist gets a new per-item
+   `<select>` (data-testid `vr-popup-item-action-{i}`) so operator
+   can override per row.
+4. `addSelectedPopupClicks()` now dispatches each ticked item to
+   `/click` with its selected mode. For the LAST `form_fill` and
+   LAST `dropdown` pick, the existing `pendingFormFill` /
+   `pendingDropdown` picker opens so the user can bind Excel
+   column / option literal without re-clicking.
+5. Panel copy updated: "Popup Work — N popups · M items · tick items
+   & pick action per item".
+6. State cleanup on tool switch / hotkey also clears `popupItemActions`.
+
+### Verification (testing subagent, iteration_21)
+- Backend 5/5 pytest tests pass (`test_v2_6_28_popup_work.py`):
+  version=2.6.28 · empty page → 0 popups · hidden template only →
+  0 popups (visibility filter fix confirmed) · visible dialog with
+  input/select/checkbox/button → popup_count=1 with correct
+  element_kind classification for each · mixed page (visible +
+  hidden template) → popup_count=1.
+- Frontend E2E (Playwright): started VR session on fixture, clicked
+  `vr-tool-popup_work`, verified per-item action defaults are
+  seeded correctly, ticked all rows, hit `vr-popup-add-clicks-btn`,
+  verified 5 steps were added and both pendingFormFill and
+  pendingDropdown pickers opened for their respective LAST picks.
+- Total: 5/5 backend + 100% frontend.
+
+### Files touched
+- `backend/VERSION`: 2.6.27 → 2.6.28
+- `backend/visual_recorder.py`: `_DETECT_POPUP_BUTTONS_JS` rewritten
+  (~150 lines) + doc comment.
+- `frontend/src/pages/VisualRecorderPage.js`: 5 state/logic sites +
+  UI panel row upgrade (~135-line diff).
+- `backend/tests/test_v2_6_28_popup_work.py`: NEW test module.
+- `backend/tests/_popup_fixtures/*.html`: NEW fixture pages (4).
+- `backend/tests/_popup_fixtures_live/*.html`: NEW (for UI test).
+
+### Pending Deploy Actions (when user says "deploy")
+- [x] `backend/VERSION` already bumped to `2.6.28`.
+- [ ] Append release note to `backend/VERSION_NOTES.txt`:
+  ```
+  # v2.6.28 (2026-01) — Visual Recorder Popup Work fix
+  # - Visibility filter applied to popup selectors — fixes over-detection
+  #   of hidden template popups (.modal, .popup, .dialog at display:none)
+  #   that landing pages ship 3-5 of. Popup Work count now matches what
+  #   the operator actually sees on screen.
+  # - Form fields inside popups (input / textarea / select / checkbox /
+  #   radio) are now enumerated with element_kind + input_type so the
+  #   Popup Work checklist can offer per-item Form Fill / Dropdown /
+  #   Check Box in addition to Click.
+  # - Form-field labels now come from placeholder / aria-label /
+  #   linked <label> / name — no more "Button #3" for real inputs.
+  # - <label> wrappers that already contain a listed input are
+  #   skipped to avoid duplicate rows.
+  # - Frontend per-item action <select> lets operator override the
+  #   auto-seeded default (data-testid vr-popup-item-action-{i}).
+  ```
+- [ ] `git push origin main` (user does this via Emergent Save-to-GitHub).
+
+### Regression risk
+- LOW. All prior tests still pass; new tests cover the exact
+  behavioural change. The visibility filter is strict but matches
+  what an operator visually sees on the page — no legitimate
+  visible popup can be missed. Widened BTN_SEL adds form fields
+  but excludes hidden inputs. `<label>` skip is idempotent
+  (only skips labels that WRAP an already-included input).
