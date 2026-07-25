@@ -900,3 +900,4 @@ test_runs/
 backend/real_user_traffic_results/
 backend/uploaded_resources/
 backend/visual_recorder_sessions/
+backend/.krexion/

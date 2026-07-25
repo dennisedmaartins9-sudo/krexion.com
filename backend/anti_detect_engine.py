@@ -161,17 +161,17 @@ def build_fingerprint(ua: Optional[str] = None) -> Dict[str, Any]:
         "languages": ["en-US", "en"],
         "hardware_concurrency": random.choice([4, 8, 12, 16]),
         "device_memory": random.choice([4, 8, 16]),
-        "max_touch_points": 0 if "Mobile" not in ua else 5,
-        "screen_width": 1920 if "Mobile" not in ua else 390,
-        "screen_height": 1080 if "Mobile" not in ua else 844,
+        "max_touch_points": 0 if not ("Mobile" in ua or "iPhone" in ua or "iPad" in ua or "Android" in ua) else 5,
+        "screen_width": 1920 if not ("Mobile" in ua or "iPhone" in ua or "Android" in ua) else 390,
+        "screen_height": 1080 if not ("Mobile" in ua or "iPhone" in ua or "Android" in ua) else 844,
         "color_depth": 24,
         "vendor": "Google Inc.",
         "audio_seed": random.random() * 1e-7,
         "canvas_seed": random.random(),
-        "is_mobile": "Mobile" in ua or "iPhone" in ua or "Android" in ua,
+        "is_mobile": "Mobile" in ua or "iPhone" in ua or "iPad" in ua or "Android" in ua,
         "viewport": {"width": 1366, "height": 768},
         "device_scale_factor": 1,
-        "has_touch": False,
+        "has_touch": "Mobile" in ua or "iPhone" in ua or "iPad" in ua or "Android" in ua,
     }
 
 
@@ -349,16 +349,38 @@ async def launch_stealth_session(
             minimal["proxy"] = proxy
         context = await browser.new_context(**minimal)
 
-    # 3. Attach stealth + extra headers
+    # 3. Attach stealth + v2.3.0 extras + client hints (RUT hints win)
     try:
         await context.add_init_script(build_stealth_script(fp, geo))
     except Exception as e:
         logger.warning(f"add_init_script failed ({e})")
 
+    _ch_hdrs = build_client_hint_headers(fp, actual_ua)
+    _merged_hdrs: Dict[str, str] = {
+        "Accept-Language": geo.get("accept_language", "en-US,en;q=0.9"),
+    }
+    _merged_hdrs.update(_ch_hdrs)
     try:
-        await context.set_extra_http_headers(build_client_hint_headers(fp, actual_ua))
+        from anti_detect_v230 import apply_v230_stealth as _v230_apply
+        _v230_r = await _v230_apply(
+            context, ua=actual_ua, viewport=vp, platform=fp.get("os") or "",
+        )
+        _v230_h = dict(_v230_r.get("headers") or {})
+        _v230_h.update(_merged_hdrs)
+        _merged_hdrs = _v230_h
+    except Exception as _v230_err:
+        logger.debug(f"v230 stealth on launch_stealth_session skipped: {_v230_err}")
+
+    try:
+        await context.set_extra_http_headers(_merged_hdrs)
     except Exception as e:
         logger.warning(f"set_extra_http_headers failed ({e})")
+
+    try:
+        from referrer_pro import make_sec_ch_ua_strip_route_handler
+        await context.route("**/*", make_sec_ch_ua_strip_route_handler())
+    except Exception as e:
+        logger.debug(f"sec-ch-ua route strip skipped: {e}")
 
     # 4. Open the first page
     page = await context.new_page()
@@ -377,6 +399,17 @@ async def apply_stealth_to_context(context, fp: Optional[Dict[str, Any]] = None,
     actual_ua = fp.get("ua") or ua or _pick_default_ua()
     try:
         await context.add_init_script(build_stealth_script(fp, geo))
+        try:
+            from anti_detect_v230 import natural_canvas_js as _natural_canvas, webgl_align_js as _webgl_align_js
+            if fp.get("webgl_vendor") and fp.get("webgl_renderer"):
+                _seed = int(fp.get("canvas_seed") or random.randint(1, 2**30))
+                await context.add_init_script(_natural_canvas(_seed))
+                await context.add_init_script(_webgl_align_js({
+                    "vendor": fp["webgl_vendor"],
+                    "renderer": fp["webgl_renderer"],
+                }))
+        except Exception:
+            pass
         await context.set_extra_http_headers(build_client_hint_headers(fp, actual_ua))
     except Exception as e:
         logger.warning(f"apply_stealth_to_context failed: {e}")

@@ -153,6 +153,144 @@ def _gen_random_viewport(is_mobile: bool = False) -> Dict[str, int]:
     return random.choice(_VIEWPORTS_MOBILE if is_mobile else _VIEWPORTS_DESKTOP).copy()
 
 
+def _infer_os_from_ua(ua: str, *, is_mobile: bool = False, fallback: str = "windows") -> str:
+    """Infer profile `os` from UA so Android mobile profiles don't get `ios`."""
+    try:
+        from visual_recorder import _detect_mobile_from_ua
+        _, os_kind = _detect_mobile_from_ua(ua or "")
+        if os_kind in ("ios", "ipados"):
+            return "ios"
+        if os_kind == "android":
+            return "android"
+        if os_kind == "macos":
+            return "macos"
+        if os_kind == "linux":
+            return "linux"
+        if os_kind == "windows":
+            return "windows"
+    except Exception:
+        pass
+    if is_mobile:
+        u = (ua or "").lower()
+        if "android" in u:
+            return "android"
+        if "iphone" in u or "ipad" in u or "ios" in u:
+            return "ios"
+        return "android"
+    return fallback
+
+
+def _parse_proxy_line(line: str) -> Dict[str, str]:
+    """Normalize a ProxyJet / provider proxy line → server + creds dict."""
+    line = (line or "").strip()
+    server = ""
+    username = ""
+    password = ""
+    if not line:
+        return {"server": "", "username": "", "password": ""}
+    try:
+        if "://" in line:
+            proto, rest = line.split("://", 1)
+            if "@" in rest:
+                creds, hostpart = rest.rsplit("@", 1)
+                username, _, password = creds.partition(":")
+                server = f"{proto}://{hostpart}"
+            else:
+                colon_parts = rest.split(":")
+                if len(colon_parts) >= 4:
+                    host, port, username = colon_parts[0], colon_parts[1], colon_parts[2]
+                    password = ":".join(colon_parts[3:])
+                    server = f"{proto}://{host}:{port}"
+                elif len(colon_parts) == 2:
+                    server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
+                else:
+                    server = line
+        elif "@" in line:
+            creds, hostport = line.rsplit("@", 1)
+            username, _, password = creds.partition(":")
+            server = f"http://{hostport}"
+        else:
+            parts = line.split(":")
+            if len(parts) >= 4:
+                host, port, username = parts[0], parts[1], parts[2]
+                password = ":".join(parts[3:])
+                server = f"http://{host}:{port}"
+            elif len(parts) >= 2:
+                server = f"http://{parts[0]}:{parts[1]}"
+            else:
+                server = line
+    except Exception as _pe:
+        logger.warning(f"proxy line parse failed: {_pe}")
+        server = line
+    return {"server": server, "username": username, "password": password}
+
+
+async def _resolve_proxy_for_launch(uid: str, user: dict, proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve ProxyJet / provider proxy to a concrete server URL before launch."""
+    cfg = dict(proxy_cfg or {})
+    if cfg.get("use_proxyjet") and not str(cfg.get("server") or "").strip():
+        if _PROXYJET_GEN is None:
+            logger.warning("[browser-profile] ProxyJet enabled but generator not bound")
+            return cfg
+        try:
+            from server import ProxyJetGenerateIn  # type: ignore
+            pj_payload = ProxyJetGenerateIn(
+                count=1,
+                country=(cfg.get("proxyjet_country") or "US").strip().upper() or None,
+                state=(cfg.get("proxyjet_state") or "").strip().upper() or None,
+                sticky_minutes=0,
+            )
+            pj_resp = await _PROXYJET_GEN(pj_payload, user)
+            lines = pj_resp.get("proxies") or []
+            if lines:
+                parsed = _parse_proxy_line(str(lines[0]))
+                if parsed.get("server"):
+                    cfg["enabled"] = True
+                    cfg["server"] = parsed["server"]
+                    if parsed.get("username"):
+                        cfg["username"] = parsed["username"]
+                    if parsed.get("password"):
+                        cfg["password"] = parsed["password"]
+        except Exception as e:
+            logger.warning(f"[browser-profile] ProxyJet resolve at launch failed: {e}")
+    return cfg
+
+
+async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, body: dict) -> None:
+    """Shared local/cloud session-update mirror for profile cards."""
+    sid = str(body.get("session_id") or session_id)
+    status = str(body.get("status") or "")
+    if not status:
+        return
+    await _DB.browser_profile_sessions.update_one(
+        {"id": sid},
+        {"$set": {
+            "status": status,
+            "fingerprint_hash": body.get("fingerprint_hash", ""),
+            "error_message": str(body.get("error_message") or "")[:512],
+            "updated_at": _now_iso(),
+        }},
+    )
+    prof_update: Dict[str, Any] = {}
+    if status == "running":
+        prof_update = {"status": "running", "session_id": sid, "last_error": ""}
+    elif status == "queued":
+        prof_update = {"status": "launching", "session_id": sid}
+    elif status == "stopping":
+        prof_update = {"status": "stopping", "session_id": sid}
+    elif status in ("stopped", "closed", "error"):
+        prof_update = {"status": "idle" if status in ("stopped", "closed") else "error", "session_id": ""}
+        if status == "error" and body.get("error_message"):
+            prof_update["last_error"] = str(body.get("error_message"))[:512]
+    elif status == "launching":
+        prof_update = {"status": "launching", "session_id": sid}
+    if prof_update:
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": prof_update},
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Schemas
 # ──────────────────────────────────────────────────────────────────────
@@ -461,6 +599,12 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["total_launches"] = existing.get("total_launches", 0)
     new_doc["last_launched_at"] = existing.get("last_launched_at", "")
     new_doc["fingerprint_hash"] = existing.get("fingerprint_hash", "")
+    # v2.6.32 — Preserve live session fields so editing a running profile
+    # doesn't orphan the headed browser or break Stop.
+    new_doc["session_id"] = existing.get("session_id") or ""
+    new_doc["status"] = existing.get("status") or "idle"
+    new_doc["last_session_duration_sec"] = existing.get("last_session_duration_sec", 0)
+    new_doc["last_error"] = existing.get("last_error", "")
     new_doc["updated_at"] = _now_iso()
     await _DB.browser_profiles.replace_one({"id": profile_id, "user_id": uid}, new_doc)
     return {"profile": _public_view(new_doc)}
@@ -510,6 +654,13 @@ async def launch_profile(request: Request, profile_id: str,
     doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
+
+    cur_status = str(doc.get("status") or "idle").lower()
+    if cur_status in ("running", "launching", "stopping"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Profile is already {cur_status}. Stop it first or wait for the current session to finish.",
+        )
 
     session_id = str(uuid.uuid4())
     session = {
@@ -565,6 +716,10 @@ async def launch_profile(request: Request, profile_id: str,
         except Exception as _pp_err:
             logger.warning(f"[browser-profile launch] provider resolve failed: {_pp_err}")
 
+    # v2.6.32 — ProxyJet-only profiles may have enabled=True but no server yet.
+    _proxy_cfg = await _resolve_proxy_for_launch(uid, user, _proxy_cfg)
+    doc["proxy"] = _proxy_cfg
+
     await _DB.browser_profile_sessions.insert_one(session)
 
     await _DB.browser_profiles.update_one(
@@ -590,31 +745,26 @@ async def launch_profile(request: Request, profile_id: str,
             from browser_profile_launcher import launch_profile_session
 
             async def _on_update(body: dict):
-                # Mirror the launcher's session updates straight into the
-                # local Mongo so the UI status badge (idle/launching/running)
-                # flips in real time — no cloud round-trip needed.
                 try:
-                    sid = str(body.get("session_id") or session_id)
-                    status = str(body.get("status") or "")
-                    if status:
-                        await _DB.browser_profile_sessions.update_one(
-                            {"id": sid},
-                            {"$set": {"status": status,
-                                      "fingerprint_hash": body.get("fingerprint_hash", ""),
-                                      "updated_at": _now_iso()}},
+                    await _mirror_profile_session(uid, profile_id, session_id, body)
+                    if body.get("storage_state") and isinstance(body["storage_state"], dict):
+                        await _DB.browser_profiles.update_one(
+                            {"id": profile_id, "user_id": uid},
+                            {"$set": {"storage_state": body["storage_state"]}},
                         )
-                        # Mirror onto the parent profile row too so the
-                        # card chip ("launching" → "running" → "idle") flips.
-                        if status == "running":
+                    if body.get("fingerprint_hash"):
+                        await _DB.browser_profiles.update_one(
+                            {"id": profile_id, "user_id": uid},
+                            {"$set": {"fingerprint_hash": str(body["fingerprint_hash"])[:128]}},
+                        )
+                    if body.get("duration_sec") is not None:
+                        try:
                             await _DB.browser_profiles.update_one(
                                 {"id": profile_id, "user_id": uid},
-                                {"$set": {"status": "running"}},
+                                {"$set": {"last_session_duration_sec": float(body["duration_sec"])}},
                             )
-                        elif status in ("stopped", "error"):
-                            await _DB.browser_profiles.update_one(
-                                {"id": profile_id, "user_id": uid},
-                                {"$set": {"status": "idle", "session_id": ""}},
-                            )
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.debug(f"local on_update failed: {e}")
 
@@ -653,6 +803,20 @@ async def launch_profile(request: Request, profile_id: str,
         except Exception as e:
             logger.warning(f"bridge enqueue failed: {e}")
 
+    # v2.6.32 — Desktop offline on cloud: don't leave card stuck on "launching".
+    if not desktop_available and not _is_local_desktop:
+        _offline_err = (
+            "Krexion desktop app is offline. Start the desktop app on your PC, then click Launch again."
+        )
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": {"status": "idle", "session_id": "", "last_error": _offline_err[:512]}},
+        )
+        await _DB.browser_profile_sessions.update_one(
+            {"id": session_id},
+            {"$set": {"status": "error", "error_message": _offline_err, "ended_at": _now_iso()}},
+        )
+
     return {
         "session_id": session_id,
         "bridge_job_id": bridge_job_id,
@@ -675,6 +839,12 @@ async def stop_profile(request: Request, profile_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
     sid = doc.get("session_id") or ""
+    cur_status = str(doc.get("status") or "idle").lower()
+    if not sid and cur_status not in ("running", "launching", "stopping"):
+        return {"stopped": True, "message": "No active session"}
+
+    stop_sent = False
+    cancelled_queued = False
 
     # 2026-06-11 (v2.1.41): On the local desktop, stop the headed browser
     # directly via the in-process launcher. Bridge-based stop only makes
@@ -691,40 +861,65 @@ async def stop_profile(request: Request, profile_id: str):
     _is_session0_service = bool(_is_local_desktop and (os.environ.get("KREXION_BUILD_TYPE") or "").strip().lower() == "binary")
     if _is_session0_service and sid:
         try:
-            await _DB.browser_launch_queue.update_one(
-                {"id": sid},
-                {"$set": {"stop_requested": True,
-                          "stop_requested_at": _now_iso()}},
+            cancelled = await _DB.browser_launch_queue.find_one_and_update(
+                {"id": sid, "status": "queued"},
+                {"$set": {
+                    "status": "cancelled",
+                    "stop_requested": True,
+                    "stop_requested_at": _now_iso(),
+                }},
             )
+            if cancelled:
+                cancelled_queued = True
+                stop_sent = True
+            else:
+                await _DB.browser_launch_queue.update_one(
+                    {"id": sid},
+                    {"$set": {"stop_requested": True, "stop_requested_at": _now_iso()}},
+                )
+                stop_sent = True
         except Exception as e:
             logger.warning(f"local browser-profile stop (queued) failed: {e}")
     elif _is_local_desktop and sid:
         try:
             from browser_profile_launcher import request_stop
-            request_stop(sid)
+            stop_sent = bool(request_stop(sid))
         except Exception as e:
             logger.warning(f"local browser-profile stop failed: {e}")
     elif _BRIDGE_QUEUE is not None and sid:
         try:
-            await _BRIDGE_QUEUE(uid, {
+            bridge_job_id = await _BRIDGE_QUEUE(uid, {
                 "kind": "browser_profile_stop",
                 "user_id": uid,
                 "profile_id": profile_id,
                 "session_id": sid,
                 "feature_override": "browser-profile/stop",
             })
+            stop_sent = bool(bridge_job_id)
         except Exception as e:
             logger.warning(f"stop bridge enqueue failed: {e}")
 
+    if cancelled_queued:
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": {"status": "idle", "session_id": ""}},
+        )
+        await _DB.browser_profile_sessions.update_many(
+            {"profile_id": profile_id, "user_id": uid, "id": sid},
+            {"$set": {"status": "stopped", "ended_at": _now_iso()}},
+        )
+        return {"stopped": True, "cancelled_before_launch": True}
+
+    # Mark stopping but keep session_id until desktop confirms closed/stopped.
     await _DB.browser_profiles.update_one(
         {"id": profile_id, "user_id": uid},
-        {"$set": {"status": "stopped", "session_id": ""}},
+        {"$set": {"status": "stopping"}},
     )
     await _DB.browser_profile_sessions.update_many(
-        {"profile_id": profile_id, "user_id": uid, "status": {"$in": ["queued", "running"]}},
-        {"$set": {"status": "stopped", "ended_at": _now_iso()}},
+        {"profile_id": profile_id, "user_id": uid, "status": {"$in": ["queued", "running", "launching"]}},
+        {"$set": {"status": "stopping", "ended_at": ""}},
     )
-    return {"stopped": True}
+    return {"stopped": stop_sent, "status": "stopping", "session_id": sid}
 
 
 @router.get("/{profile_id}/status")
@@ -795,7 +990,7 @@ async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_f
         device_scale_factor=3.0 if is_mobile else 1.0,
         user_agent=_gen_random_ua(is_mobile),
         viewport=_gen_random_viewport(is_mobile),
-        os="ios" if is_mobile else "windows",
+        os=_infer_os_from_ua(_gen_random_ua(is_mobile), is_mobile=is_mobile),
         anti_detect=AntiDetectConfig(master=True),
     )
     doc = _profile_doc(uid, pb)
@@ -1041,7 +1236,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             device_scale_factor=3.0 if is_mobile else 1.0,
             user_agent=uas[i],
             viewport=viewport,
-            os="ios" if is_mobile else "windows",
+            os=_infer_os_from_ua(uas[i], is_mobile=is_mobile),
             start_url=body.start_url or "https://www.google.com/",
             notes=body.notes or "",
             proxy=proxy_cfg,
@@ -1077,10 +1272,19 @@ async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(..
     if not pid or not sid:
         raise HTTPException(status_code=400, detail="profile_id + session_id required")
 
-    update: Dict[str, Any] = {"status": status}
+    # v2.6.32 — Map tray-queue "queued" to UI-friendly "launching".
+    display_status = status
+    if status == "queued":
+        display_status = "launching"
+
+    update: Dict[str, Any] = {"status": display_status}
     if status in ("closed", "stopped", "error"):
         update["session_id"] = ""
-        update["status"] = "idle" if status == "closed" else status
+        update["status"] = "idle" if status in ("closed", "stopped") else "error"
+    elif status == "running":
+        update["session_id"] = sid
+    elif status == "stopping":
+        update["session_id"] = sid
     if "storage_state" in body and isinstance(body["storage_state"], dict):
         update["storage_state"] = body["storage_state"]
     if "fingerprint_hash" in body:
@@ -1098,6 +1302,9 @@ async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(..
         update["last_error"] = str(err_msg)[:512]
     elif status == "running":
         update["last_error"] = ""
+        update["session_id"] = sid
+        if "storage_state" in body and isinstance(body["storage_state"], dict):
+            update["storage_state"] = body["storage_state"]
 
     await _DB.browser_profiles.update_one(
         {"id": pid, "user_id": uid}, {"$set": update}

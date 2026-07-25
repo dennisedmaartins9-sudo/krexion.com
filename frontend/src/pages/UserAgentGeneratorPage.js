@@ -350,7 +350,7 @@ export default function UserAgentGeneratorPage() {
     if (results.length === 0) return;
     const text = results.map((r) => r.user_agent).join("\n");
     localStorage.setItem("ua_generator_payload", text);
-    toast.success("User agents stashed — open Import Traffic → Real Traffic");
+    toast.success("User agents stashed — open Real User Traffic page to use them");
   };
 
   return (

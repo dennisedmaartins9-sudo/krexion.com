@@ -2050,6 +2050,45 @@ def is_non_chrome_inapp_ua(ua: str) -> bool:
     return False
 
 
+def make_sec_ch_ua_strip_route_handler():
+    """Playwright route handler — strip branded Sec-CH-UA for in-app UAs.
+
+    Shared by RUT, profile launcher, and anti_detect_engine so TikTok /
+    FB-iOS WebViews never leak ``Google Chrome`` client hints on
+    sub-resource requests."""
+    async def _handler(route, request):
+        try:
+            _req_ua = (
+                request.headers.get("user-agent")
+                or request.headers.get("User-Agent")
+                or ""
+            )
+            if not is_non_chrome_inapp_ua(_req_ua):
+                await route.continue_()
+                return
+            _hdrs = dict(request.headers or {})
+            _changed = False
+            for _k in list(_hdrs.keys()):
+                _kl = _k.lower()
+                if _kl.startswith("sec-ch-ua") and _kl not in (
+                    "sec-ch-ua-mobile",
+                    "sec-ch-ua-platform",
+                ):
+                    _hdrs.pop(_k, None)
+                    _changed = True
+            if _changed:
+                await route.continue_(headers=_hdrs)
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    return _handler
+
+
 
 def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
     """True iff `ua` already carries the in-app marker for `platform`.

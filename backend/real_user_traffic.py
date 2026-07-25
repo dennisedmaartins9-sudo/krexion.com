@@ -637,13 +637,16 @@ async def _install_full_chromium_background() -> None:
 # 2026-05 — single consolidated --disable-features=... entry: Chromium
 # honours ONLY the LAST --disable-features arg, so all keys MUST be in
 # one comma-separated list:
-#   • WebRtcHideLocalIpsWithMdns,AutomationControlled — original anti-detect
+#   • AutomationControlled — hide automation flag
 #   • UseDnsHttpsSvcb — block HTTPS DNS records that bypass our AAAA-skip
 #     and reintroduce IPv6 on Chrome 100+
+#   NOTE: do NOT disable WebRtcHideLocalIpsWithMdns — that feature HIDES
+#   local IPs via mDNS in real Chrome; listing it under --disable-features
+#   was a leak (v2.6.30 fix).
 _BROWSER_LAUNCH_ARGS_BASE = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-features=WebRtcHideLocalIpsWithMdns,AutomationControlled,UseDnsHttpsSvcb",
+    "--disable-features=AutomationControlled,UseDnsHttpsSvcb",
     "--disable-blink-features=AutomationControlled",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-extensions",
@@ -1209,6 +1212,47 @@ def _resolve_email_visit(brand: str) -> Tuple[str, str, str]:
     return ref, "email", esp
 
 
+def _referer_extras_for_traffic_type(cfg: Dict[str, Any], platform: str) -> Dict[str, Any]:
+    """v2.6.29 — attach decisive paid/organic verdict for legacy referer modes."""
+    try:
+        from referrer_pro import detect_is_paid as _dip
+        verdict = _dip(
+            str(cfg.get("traffic_type") or "auto"),
+            str(cfg.get("campaign_type") or "auto"),
+            str(platform or ""),
+        )
+        if verdict is True:
+            return {"traffic_type": "paid", "is_paid": True}
+        if verdict is False:
+            return {"traffic_type": "organic", "is_paid": False}
+    except Exception:
+        pass
+    return {}
+
+
+def _with_traffic_type_extras(
+    cfg: Dict[str, Any],
+    platform: str,
+    extras: Optional[Dict[str, Any]] = None,
+    *,
+    referer_url: str = "",
+) -> Dict[str, Any]:
+    """Merge paid/organic verdict + Sec-Fetch + network-click into referer extras."""
+    merged = dict(extras or {})
+    merged.update(_referer_extras_for_traffic_type(cfg, platform))
+    try:
+        from referrer_pro import build_sec_fetch_headers as _bsf, build_network_click_referer as _bnc
+        if not merged.get("sec_fetch"):
+            merged["sec_fetch"] = _bsf(referer_url or "", is_navigation=True)
+        if cfg.get("network_click_chain") and not merged.get("network_click_referer"):
+            _ncr = _bnc()
+            if _ncr:
+                merged["network_click_referer"] = _ncr
+    except Exception:
+        merged.setdefault("sec_fetch", {})
+    return merged
+
+
 def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str, str, str, Dict[str, Any]]:
     """Pick the (Referer URL, platform signal, esp signal, pro_extras) for ONE visit.
 
@@ -1239,7 +1283,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
         if not cfg or not cfg.get("enabled"):
             ref = _get_referer_from_ua(ua)
             plat = _platform_from_referer_url(ref)
-            return ref, plat, "", {}
+            return ref, plat, "", _with_traffic_type_extras(cfg or {}, plat, referer_url=ref)
 
         # ── 2026-07 CUSTOMER-REQUEST FIX A (v2.6.9) ────────────────────
         # Operator-explicit Custom URL / random-list MUST win over pro-mode.
@@ -1278,7 +1322,9 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     "utm_campaign": "",
                     "network_click_referer": "",
                 }
-            return _val_early, _plat_early or "", _esp_early, _extras_early
+            return _val_early, _plat_early or "", _esp_early, _with_traffic_type_extras(
+                cfg, _plat_early or "", _extras_early, referer_url=_val_early,
+            )
 
         if _mode_early == "random_list" and (cfg.get("value") or "").strip():
             # Random list of operator-curated URLs — also wins over pro.
@@ -1295,7 +1341,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                         "utm_medium": "cpc" if _p in ("tiktok","facebook","instagram","snapchat","twitter","x","pinterest","linkedin","youtube") else "referral",
                         "utm_campaign": "", "network_click_referer": "",
                     }
-                return _pick, _p or "", _e, _ex2
+                return _pick, _p or "", _e, _with_traffic_type_extras(cfg, _p or "", _ex2, referer_url=_pick)
 
         # ── 2026-06-11: PRO-MODE branch (weighted platform + email pools,
         # geo-localized search, social wrappers, in-app deep paths). Falls
@@ -1329,6 +1375,8 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     "utm_medium": pro.get("utm_medium", ""),
                     "utm_campaign": pro.get("utm_campaign", ""),
                     "network_click_referer": pro.get("network_click_referer", ""),
+                    "traffic_type": pro.get("traffic_type") or "",
+                    "is_paid": pro.get("is_paid"),
                 }
                 if ref or plat:
                     return ref, plat, esp, extras
@@ -1358,8 +1406,13 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
             if not inapp_deep_enabled or not ref_url or not plat:
                 return ref_url
             try:
-                from referrer_pro import build_inapp_deep_referer as _bid
-                deep = _bid(plat, str(cfg.get("target_url") or ""))
+                from referrer_pro import build_inapp_deep_referer as _bid, detect_is_paid as _dip
+                _is_paid = _dip(
+                    str(cfg.get("traffic_type") or "auto"),
+                    str(cfg.get("campaign_type") or "auto"),
+                    str(plat or ""),
+                )
+                deep = _bid(plat, str(cfg.get("target_url") or ""), is_paid=_is_paid)
                 return deep or ref_url
             except Exception:
                 return ref_url
@@ -1368,10 +1421,10 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
             ref = _get_referer_from_ua(ua)
             plat = _platform_from_referer_url(ref)
             ref = _maybe_deepen(ref, plat)
-            return ref, plat, "", {}
+            return ref, plat, "", _with_traffic_type_extras(cfg, plat, referer_url=ref)
 
         if mode in ("direct", "none", ""):
-            return "", "", "", {}
+            return "", "", "", _with_traffic_type_extras(cfg, "", referer_url="")
 
         if mode == "custom":
             ref = value.strip()
@@ -1389,7 +1442,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     plat = _pp
             esp = _esp_from_referer_url(ref) if plat == "email" else ""
             # Custom URL: operator picked it explicitly — DO NOT deepen.
-            return ref, plat, esp, {}
+            return ref, plat, esp, _with_traffic_type_extras(cfg, plat, referer_url=ref)
 
         if mode == "random_list":
             lines = [ln.strip() for ln in value.splitlines() if ln.strip()]
@@ -1397,7 +1450,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                 ref = _get_referer_from_ua(ua)
                 plat = _platform_from_referer_url(ref)
                 ref = _maybe_deepen(ref, plat)
-                return ref, plat, "", {}
+                return ref, plat, "", _with_traffic_type_extras(cfg, plat, referer_url=ref)
             ref = random.choice(lines)
             plat = _platform_from_referer_url(ref)
             # v2.6.5 — Same preset-platform fallback as `custom` mode:
@@ -1428,7 +1481,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     ref = _maybe_deepen(ref, plat)
             except Exception:
                 pass
-            return ref, plat, esp, {}
+            return ref, plat, esp, _with_traffic_type_extras(cfg, plat, referer_url=ref)
 
         if mode == "google_search":
             # BUG #3 fix (2026-07): honour cfg.search_engine + cfg.country
@@ -1451,7 +1504,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                 engine if engine in ("google", "bing", "duckduckgo", "yahoo", "yandex")
                 else "google"
             )
-            return ref, plat, "", {}
+            return ref, plat, "", _with_traffic_type_extras(cfg, plat, referer_url=ref)
 
         if mode == "platform_pool":
             # 2026-06-11: Accept JSON-dict weighted form too (forwards-
@@ -1474,7 +1527,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     ref = _get_referer_from_ua(ua)
                     plat = _platform_from_referer_url(ref)
                     ref = _maybe_deepen(ref, plat)
-                    return ref, plat, "", {}
+                    return ref, plat, "", _with_traffic_type_extras(cfg, plat, referer_url=ref)
                 chosen = random.choice(keys)
             if chosen == "email":
                 ew = cfg.get("email_weights")
@@ -1485,24 +1538,25 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                             resolve_email_visit_weighted as _rev,
                         )
                         ref2, plat2, esp2 = _rev(_pew(str(ew)))
-                        return ref2, plat2, esp2, {}
+                        return ref2, plat2, esp2, _with_traffic_type_extras(cfg, plat2, referer_url=ref2)
                     except Exception:
                         pass
                 ref2, plat2, esp2 = _resolve_email_visit(cfg.get("brand", ""))
-                return ref2, plat2, esp2, {}
+                return ref2, plat2, esp2, _with_traffic_type_extras(cfg, plat2, referer_url=ref2)
             signal = "twitter" if chosen == "x" else chosen
             ref = _PLATFORM_REFERER_POOL.get(chosen, "")
             ref = _maybe_deepen(ref, signal)
-            return ref, signal, "", {}
+            return ref, signal, "", _with_traffic_type_extras(cfg, signal, referer_url=ref)
 
         # Unknown mode → legacy fallback.
         ref = _get_referer_from_ua(ua)
         plat = _platform_from_referer_url(ref)
         ref = _maybe_deepen(ref, plat)
-        return ref, plat, "", {}
+        return ref, plat, "", _with_traffic_type_extras(cfg, plat, referer_url=ref)
     except Exception:
         ref = _get_referer_from_ua(ua)
-        return ref, _platform_from_referer_url(ref), "", {}
+        plat = _platform_from_referer_url(ref)
+        return ref, plat, "", _with_traffic_type_extras(cfg or {}, plat, referer_url=ref)
 
 
 # Map ESP click-tracking host substrings → ESP short-name. Used when
@@ -1655,7 +1709,7 @@ def _platform_from_referer_url(ref_url: str) -> str:
 # server.py (_kx_src_sign / build_kx_src_qs). We re-implement here so
 # real_user_traffic.py stays free of circular imports back into server.
 # ──────────────────────────────────────────────────────────────────────
-def _rut_build_kx_src_qs(platform: str, esp: str = "", brand: str = "") -> str:
+def _rut_build_kx_src_qs(platform: str, esp: str = "", brand: str = "", traffic_type: str = "") -> str:
     """Build the `_kx_src=<p>&_kx_sig=<hmac>` query fragment that the
     engine appends to the tracker URL for each visit. Returns "" when
     `platform` is empty (no signal → tracker keeps link's static
@@ -1675,6 +1729,9 @@ def _rut_build_kx_src_qs(platform: str, esp: str = "", brand: str = "") -> str:
                   affects UTM text, not behaviour, so HMAC isn't needed
                   for security (worst case: someone visiting with a
                   forged `_kx_brand` gets prettier UTMs).
+      - `traffic_type` : v2.6.29 — decisive paid/organic verdict for
+                  this visit so the tracker can inject sub2 even when
+                  it skips resolve_pro_visit for signed RUT visits.
     """
     import hmac as _hmac
     import hashlib as _hashlib
@@ -1682,7 +1739,8 @@ def _rut_build_kx_src_qs(platform: str, esp: str = "", brand: str = "") -> str:
     p = (platform or "").strip().lower()
     if not p:
         return ""
-    secret = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+    from krexion_auth_secret import get_hmac_secret
+    secret = get_hmac_secret()
     key = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
     sig = _hmac.new(key, p.encode("utf-8"), _hashlib.sha256).hexdigest()[:12]
     qs = f"_kx_src={p}&_kx_sig={sig}"
@@ -1696,6 +1754,10 @@ def _rut_build_kx_src_qs(platform: str, esp: str = "", brand: str = "") -> str:
         brand_clean = (brand or "").strip()[:64]
         if brand_clean:
             qs += f"&_kx_brand={quote(brand_clean, safe='')}"
+    tt = (traffic_type or "").strip().lower()
+    if tt in ("paid", "organic"):
+        tt_sig = _hmac.new(key, tt.encode("utf-8"), _hashlib.sha256).hexdigest()[:12]
+        qs += f"&_kx_traffic_type={tt}&_kx_tt_sig={tt_sig}"
     return qs
 
 
@@ -1721,6 +1783,9 @@ def _rut_append_kx_qs(url: str, qs_fragment: str) -> str:
 import re as _re
 
 _CHROME_VERSION_RE = _re.compile(r"(?:Chrome|CriOS|Edg|EdgA|EdgiOS|Chromium)/(\d+)(?:\.(\d+))?", _re.IGNORECASE)
+_CHROME_FULL_VERSION_RE = _re.compile(
+    r"(?:Chrome|CriOS|Edg|EdgA|EdgiOS|Chromium)/(\d+\.\d+\.\d+\.\d+)", _re.IGNORECASE
+)
 _SAFARI_VERSION_RE = _re.compile(r"Version/(\d+)(?:\.(\d+))?", _re.IGNORECASE)
 
 
@@ -1747,6 +1812,38 @@ def _extract_chrome_version(ua: str) -> Tuple[int, int]:
         if m:
             return int(m.group(1)), int(m.group(2) or 0)
     return 142, 0
+
+
+def _extract_chrome_full_version(ua: str) -> str:
+    """Return the 4-part Chrome version from UA, or a safe synthetic."""
+    if ua:
+        m = _CHROME_FULL_VERSION_RE.search(ua)
+        if m:
+            return m.group(1)
+    major, minor = _extract_chrome_version(ua)
+    return f"{major}.{minor or 0}.0.0"
+
+
+def _ua_platform_meta(os_key: str, ua_str: str) -> Dict[str, str]:
+    """Platform-version / architecture / model for userAgentData + Sec-CH-UA."""
+    ua_l = (ua_str or "").lower()
+    if os_key == "ios":
+        m = _re.search(r"iPhone OS (\d+)_(\d+)", ua_str or "")
+        pv = f"{m.group(1)}.{m.group(2)}.0" if m else "17.0.0"
+        model = "iPad" if "ipad" in ua_l else "iPhone"
+        return {"platform_version": pv, "architecture": "arm", "ua_model": model}
+    if os_key == "android":
+        m = _re.search(r"Android (\d+)(?:\.(\d+))?", ua_str or "")
+        pv = f"{m.group(1)}.{m.group(2) or '0'}.0" if m else "14.0.0"
+        dm = _re.search(r";\s*([^;)]+)\s+Build/", ua_str or "")
+        model = (dm.group(1).strip() if dm else "SM-S928B")[:40]
+        return {"platform_version": pv, "architecture": "arm", "ua_model": model}
+    if os_key == "macos":
+        return {"platform_version": "15.1.0", "architecture": "arm", "ua_model": ""}
+    if os_key == "windows":
+        arch = "arm" if "arm64" in ua_l or "aarch64" in ua_l else "x86"
+        return {"platform_version": "15.0.0", "architecture": arch, "ua_model": ""}
+    return {"platform_version": "6.5.0", "architecture": "x86", "ua_model": ""}
 
 
 def _extract_safari_version(ua: str) -> Tuple[int, int]:
@@ -2504,6 +2601,7 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
     # cannot fingerprint the headless-Chrome signature.
     chrome_major, _chrome_minor = _extract_chrome_version(ua_str)
     safari_major, _safari_minor = _extract_safari_version(ua_str)
+    _plat_meta = _ua_platform_meta(os_key, ua_str)
 
     # Screen dimensions match viewport + realistic toolbar/taskbar.
     # Desktop OSs have a taskbar (~40-100px); mobile = viewport.
@@ -2600,6 +2698,10 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         "label": f"{(ua.os.family + ' ' + ua.os.version_string) if ua else os_key}".strip() or ua_str[:40],
         # ── 2026-01 additions ──
         "chrome_version": chrome_major,
+        "chrome_full_version": _extract_chrome_full_version(ua_str),
+        "platform_version": _plat_meta["platform_version"],
+        "ua_architecture": _plat_meta["architecture"],
+        "ua_model": _plat_meta["ua_model"],
         "safari_version": safari_major,
         "audio_seed": random.randint(1, 2**30),
         "font_seed": random.randint(1, 2**30),
@@ -2619,6 +2721,84 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         "battery_charging": battery_charging,
         "fonts": _OS_FONTS.get(os_key, _OS_FONTS["windows"]),
     }
+
+
+def _sync_fingerprint_to_ua(
+    ua: str,
+    fp: Optional[Dict[str, Any]] = None,
+    identity_label: str = "",
+) -> Dict[str, Any]:
+    """Rebuild fingerprint after UA coercion so viewport / CH / WebGL match."""
+    new_fp = _fingerprint_from_ua(ua)
+    if identity_label:
+        try:
+            from anti_detect_v230 import align_webgl_to_ua_deterministic as _align_wgl
+            _wgl = _align_wgl(ua, identity_label)
+            new_fp["webgl_vendor"] = _wgl["vendor"]
+            new_fp["webgl_renderer"] = _wgl["renderer"]
+        except Exception:
+            pass
+    elif fp:
+        # Preserve deterministic canvas seed when UA tweak didn't change OS family.
+        try:
+            if fp.get("canvas_seed") and new_fp.get("os") == fp.get("os"):
+                new_fp["canvas_seed"] = fp["canvas_seed"]
+        except Exception:
+            pass
+    return new_fp
+
+
+async def _rut_apply_context_stealth(
+    context,
+    *,
+    fp: Dict[str, Any],
+    geo: Dict[str, Any],
+    ua: str,
+    platform: str = "",
+    ctx_headers: Optional[Dict[str, str]] = None,
+    fp_hash_override: Optional[int] = None,
+    identity_label: str = "",
+) -> None:
+    """Full RUT stealth stack — shared by main, context-retry, tunnel-retry paths."""
+    await context.add_init_script(
+        _build_stealth_script(fp, geo, fp_hash_override=fp_hash_override)
+    )
+    try:
+        from anti_detect_v230 import (
+            align_webgl_to_ua_deterministic as _align_webgl,
+            natural_canvas_js as _natural_canvas,
+            webgl_align_js as _webgl_align_js,
+        )
+        _wgl: Dict[str, Any] = {}
+        if identity_label:
+            _wgl = _align_webgl(ua, identity_label)
+        elif fp.get("webgl_vendor") and fp.get("webgl_renderer"):
+            _wgl = {
+                "vendor": fp["webgl_vendor"],
+                "renderer": fp["webgl_renderer"],
+                "gpu_family": fp.get("gpu_family", ""),
+            }
+        if _wgl.get("vendor") and _wgl.get("renderer"):
+            _seed = int(fp.get("canvas_seed") or random.randint(1, 2**30))
+            await context.add_init_script(_natural_canvas(_seed))
+            await context.add_init_script(_webgl_align_js(_wgl))
+    except Exception:
+        pass
+    try:
+        from anti_detect_v230 import apply_v230_stealth as _v230_apply
+        _v230_r = await _v230_apply(
+            context,
+            ua=ua,
+            viewport=fp.get("viewport") or {"width": 1920, "height": 1080},
+            platform=platform or "",
+        )
+        _v_hdrs = _v230_r.get("headers") or {}
+        if _v_hdrs:
+            _cur = dict(_v_hdrs)
+            _cur.update(ctx_headers or {})
+            await context.set_extra_http_headers(_cur)
+    except Exception:
+        pass
 
 
 _UNFILLED_MACRO_URL_RX = __import__("re").compile(r"\{\{[^}]+\}\}|%7[bB]%7[bB]")
@@ -3843,6 +4023,9 @@ def _build_stealth_script(fp: Dict[str, Any], geo: Dict[str, Any], *, fp_hash_ov
         # for Sec-CH-UA full-version-list spoof (#19). The existing
         # `chromeVersion` field above stays as int for legacy patches.
         "chromeFullVersion": str(fp.get("chrome_full_version") or fp.get("chrome_version") or "131.0.6778.85"),
+        "platformVersion": str(fp.get("platform_version") or "15.0.0"),
+        "uaArchitecture": str(fp.get("ua_architecture") or "x86"),
+        "uaModel": str(fp.get("ua_model") or ""),
         # 2026-02 Step 4 (P0 #4): deterministic per-fingerprint seed for
         # the ClientRects sub-pixel noise patch. Derives from the UA +
         # chrome version + timezone so the noise is stable across the
@@ -4097,6 +4280,7 @@ safe(() => {
     _ua_l.indexOf('bytedancewebview') !== -1 ||
     _ua_l.indexOf('com.zhiliaoapp.musically') !== -1 ||
     _ua_l.indexOf('fban/fbios') !== -1 ||
+    (_ua_l.indexOf('fbav/') !== -1 && _ua_l.indexOf('chrome/') === -1) ||
     (_ua_l.indexOf('instagram ') !== -1 && _ua_l.indexOf('iphone') !== -1) ||
     (_ua_l.indexOf('snapchat/') !== -1 && _ua_l.indexOf('chrome/') === -1)
   );
@@ -4106,7 +4290,9 @@ safe(() => {
   }
   if (navigator.userAgent && /Chrome\//.test(navigator.userAgent)) {
     const cv = String(__KX.chromeVersion);
+    const cvFull = String(__KX.chromeFullVersion || cv);
     const platformName = ({ windows: 'Windows', macos: 'macOS', ios: 'iOS', android: 'Android', linux: 'Linux' })[__KX.os] || 'Windows';
+    const arch = (__KX.uaArchitecture === 'arm') ? 'arm' : 'x86';
     const brands = [
       { brand: 'Chromium', version: cv },
       { brand: 'Google Chrome', version: cv },
@@ -4118,10 +4304,11 @@ safe(() => {
       platform: platformName,
       getHighEntropyValues: function (hints) {
         return Promise.resolve({
-          architecture: 'x86', bitness: '64', brands: brands,
-          fullVersionList: brands.map((b) => ({ brand: b.brand, version: cv + '.0.0.0' })),
-          mobile: __KX.isMobile, model: '', platform: platformName, platformVersion: '15.0.0',
-          uaFullVersion: cv + '.0.0.0', wow64: false,
+          architecture: arch, bitness: '64', brands: brands,
+          fullVersionList: brands.map((b) => ({ brand: b.brand, version: cvFull })),
+          mobile: __KX.isMobile, model: __KX.uaModel || '', platform: platformName,
+          platformVersion: __KX.platformVersion || '15.0.0',
+          uaFullVersion: cvFull, wow64: false,
         });
       },
       toJSON: function () { return { brands: brands, mobile: __KX.isMobile, platform: platformName }; },
@@ -4219,15 +4406,47 @@ safe(() => {
         return origAdd(cand);
       };
       // Also strip local candidates from generated ICE
+      const scrubSdp = (sdp) => {
+        try {
+          return String(sdp || '')
+            .replace(/^a=candidate.+typ host.+\r?\n/gm, '')
+            .replace(/^a=candidate.+\.local .+\r?\n/gm, '');
+        } catch (e) { return sdp; }
+      };
       const origCreateOffer = pc.createOffer.bind(pc);
       pc.createOffer = function () {
         return origCreateOffer.apply(this, arguments).then((offer) => {
-          try {
-            offer.sdp = offer.sdp.replace(/^a=candidate.+typ host.+\r?\n/gm, '');
-            offer.sdp = offer.sdp.replace(/^a=candidate.+\.local .+\r?\n/gm, '');
-          } catch (e) {}
+          try { offer.sdp = scrubSdp(offer.sdp); } catch (e) {}
           return offer;
         });
+      };
+      const origCreateAnswer = pc.createAnswer.bind(pc);
+      pc.createAnswer = function () {
+        return origCreateAnswer.apply(this, arguments).then((answer) => {
+          try { answer.sdp = scrubSdp(answer.sdp); } catch (e) {}
+          return answer;
+        });
+      };
+      const origSetLocal = pc.setLocalDescription.bind(pc);
+      pc.setLocalDescription = function (desc) {
+        try {
+          if (desc && desc.sdp) desc = Object.assign({}, desc, { sdp: scrubSdp(desc.sdp) });
+        } catch (e) {}
+        return origSetLocal(desc);
+      };
+      const origAddEv = pc.addEventListener.bind(pc);
+      pc.addEventListener = function (type, listener, options) {
+        if (type === 'icecandidate' && typeof listener === 'function') {
+          const wrapped = function (ev) {
+            try {
+              const c = ev && ev.candidate && ev.candidate.candidate;
+              if (c && (/typ host/.test(c) || /\.local /.test(c))) return;
+            } catch (e) {}
+            return listener.call(this, ev);
+          };
+          return origAddEv(type, wrapped, options);
+        }
+        return origAddEv(type, listener, options);
       };
       return pc;
     };
@@ -6621,6 +6840,26 @@ async def _resolve_tracker_via_localhost(
                 except Exception:
                     pass
 
+            # v2.6.33 — TLS-impersonated S2S resolve first (matches browser JA3).
+            if _TLS_AD_OK and _tls_ad is not None:
+                try:
+                    _loc_tls = await _tls_ad.resolve_redirect_location(
+                        url,
+                        headers=req_headers,
+                        ua=safe_ua,
+                        timeout=timeout,
+                    )
+                    if _loc_tls:
+                        _loc_low = _loc_tls.lower()
+                        if (
+                            "127.0.0.1" not in _loc_low
+                            and "://localhost" not in _loc_low
+                            and not _loc_low.startswith("localhost")
+                        ):
+                            return _loc_tls
+                except Exception:
+                    pass
+
             async with httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=timeout,
@@ -8239,6 +8478,13 @@ async def run_real_user_traffic_job(
             pass
 
         ua = pick_next_ua()
+        try:
+            from anti_detect_v230 import align_ua_to_chromium as _align_chrome
+            _aligned = _align_chrome(ua)
+            if _aligned:
+                ua = _aligned
+        except Exception:
+            pass
         # Track UA strings used so the upload-consume hook removes only
         # those that were actually attempted, not the entire UA batch.
         try:
@@ -8248,6 +8494,14 @@ async def run_real_user_traffic_job(
         except Exception:
             pass
         fp = _fingerprint_from_ua(ua)
+        if identity_label:
+            try:
+                from anti_detect_v230 import align_webgl_to_ua_deterministic as _align_wgl
+                _wgl = _align_wgl(ua, identity_label)
+                fp["webgl_vendor"] = _wgl["vendor"]
+                fp["webgl_renderer"] = _wgl["renderer"]
+            except Exception:
+                pass
 
         entry["proxy"] = proxy.get("server", "")
         entry["os"] = fp["os"]
@@ -8774,6 +9028,19 @@ async def run_real_user_traffic_job(
                         # Never fail a visit because of UA coerce —
                         # legacy UA remains in use.
                         pass
+                # v2.6.33 — Rebuild fingerprint + entry metadata after UA changes.
+                fp = _sync_fingerprint_to_ua(ua, fp, identity_label or "")
+                try:
+                    entry["os"] = fp["os"]
+                    entry["ua"] = ua
+                    entry["viewport"] = f"{fp['viewport']['width']}x{fp['viewport']['height']}"
+                    entry["device_name"] = _device_name_from_ua(ua)
+                    entry["webgl_renderer"] = fp.get("webgl_renderer", "")
+                    entry["canvas_seed"] = fp.get("canvas_seed", 0)
+                    entry["hardware_concurrency"] = fp.get("hardware_concurrency", 0)
+                    entry["device_memory"] = fp.get("device_memory", 0)
+                except Exception:
+                    pass
                 # ── 2026-06-12 (referrer header fix) ────────────────────────
                 # Chromium's NetworkService SILENTLY DROPS the "Referer"
                 # header from `extra_http_headers` for the initial
@@ -8845,6 +9112,7 @@ async def run_real_user_traffic_job(
                         _kx_platform,
                         esp=_kx_esp,
                         brand=(_referer_cfg.get("brand") or ""),
+                        traffic_type=str((_pro_extras or {}).get("traffic_type") or ""),
                     ),
                 )
 
@@ -9021,6 +9289,8 @@ async def run_real_user_traffic_job(
                         )
                     except Exception:
                         pass
+                # v2.6.33 — Final fp sync after UA-leak defence / pass-to-offer.
+                fp = _sync_fingerprint_to_ua(ua, fp, identity_label or "")
                 # 2026-01: Sec-CH-UA client hint headers matching UA's
                 # Chrome version + OS. MaxMind / IPQS / Anura cross-check
                 # these against the UA — a mismatch is a HARD bot signal.
@@ -9055,46 +9325,19 @@ async def run_real_user_traffic_job(
                 msg = str(_nce)
                 if ("closed" in msg.lower()) or ("TargetClosed" in type(_nce).__name__):
                     browser = await _get_live_browser()
-                    # Reuse same Referer strategy for the retry context
-                    # (2026-06: honours the per-job override too).
-                    # We discard the platform + esp signals here because
-                    # the outer `_kx_platform` already drove the tracker
-                    # URL rewrite for this visit — retry navigates to
-                    # the SAME URL (no second handshake to compute).
-                    _ua_referer_retry, _retry_platform, _, _ = _resolve_visit_referer(ua, _referer_cfg)
-                    # 2026-06-14: keep UA coerced in retry path too (the
-                    # context was destroyed but the per-visit UA can
-                    # still be adjusted if the resolver re-rolled a
-                    # different platform).
-                    if _referer_cfg.get("match_ua_to_platform", True) and _retry_platform:
-                        try:
-                            from referrer_pro import coerce_ua_for_platform as _coerce_ua
-                            _coerced_retry = _coerce_ua(ua, _retry_platform)
-                            if _coerced_retry and _coerced_retry != ua:
-                                ua = _coerced_retry
-                        except Exception:
-                            pass
-                    # 2026-06-12 (referrer header fix) — update goto-kwargs
-                    # so the re-attempted navigation also sends the right
-                    # Referer via `page.goto(..., referer=...)`. The retry
-                    # branch may have re-rolled a different platform pool
-                    # selection — honour whatever the resolver picked this
-                    # time.
-                    _goto_referer_kw = {"referer": _ua_referer_retry} if _ua_referer_retry else {}
-                    _ua_referer = _ua_referer_retry  # keep main loop's var in sync
-                    _ctx_headers_retry = {"Accept-Language": geo["accept_language"]}
-                    if _ua_referer_retry:
-                        _ctx_headers_retry["Referer"] = _ua_referer_retry
-                    # 2026-01: Sec-CH-UA client hints on retry context too
+                    # v2.6.33 — FREEZE referer on context retry. Re-rolling
+                    # platform pool would desync tracker URL (_kx_src) from
+                    # the Referer the browser actually sends.
+                    _ctx_headers_retry = dict(_ctx_headers)
                     try:
                         _ctx_headers_retry.update(_build_client_hint_headers(fp, ua))
                     except Exception:
                         pass
                     context = await browser.new_context(
                         proxy={
-                            "server": proxy["server"],
-                            **({"username": proxy["username"]} if proxy.get("username") else {}),
-                            **({"password": proxy["password"]} if proxy.get("password") else {}),
+                            "server": _effective_proxy["server"],
+                            **({"username": _effective_proxy["username"]} if _effective_proxy.get("username") else {}),
+                            **({"password": _effective_proxy["password"]} if _effective_proxy.get("password") else {}),
                         },
                         user_agent=ua,
                         viewport=fp["viewport"],
@@ -9106,32 +9349,20 @@ async def run_real_user_traffic_job(
                         geolocation={"latitude": geo["lat"], "longitude": geo["lon"]},
                         permissions=["geolocation"],
                         extra_http_headers=_ctx_headers_retry,
+                        **({"storage_state": _identity_storage_state} if _identity_storage_state else {}),
                     )
                 else:
                     raise
-            await context.add_init_script(_build_stealth_script(fp, geo, fp_hash_override=_identity_fp_hash))
-
-            # 2026-07 v2.3.0 — apply next-level anti-detect stack.
-            # HTTP/2 fingerprint + Sec-Fetch-* + Full Client Hints +
-            # bot-vendor cohorts + mobile signals + WebGL exts + speech
-            # voices + battery + privacy sandbox + extensions + ad
-            # blocker realism + first-party sets + post-conversion.
-            try:
-                from anti_detect_v230 import apply_v230_stealth as _v230_apply
-                _v230_r = await _v230_apply(context, ua=ua, viewport=fp.get("viewport") or {"width": 1920, "height": 1080}, platform=_kx_platform or "")
-                _v_hdrs = _v230_r.get("headers") or {}
-                if _v_hdrs:
-                    # 2026-02 v2.6.13 fix — `ctx_args` was never defined in
-                    # this scope (F821 NameError swallowed by bare except).
-                    # The intended source is the `_ctx_headers` dict we
-                    # already built for browser.new_context(). Merging
-                    # v230's Sec-Fetch/CH-UA extras on top preserves the
-                    # Referer + Accept-Language we set earlier.
-                    _cur = dict(_ctx_headers or {})
-                    _cur.update(_v_hdrs)
-                    await context.set_extra_http_headers(_cur)
-            except Exception:
-                pass
+            await _rut_apply_context_stealth(
+                context,
+                fp=fp,
+                geo=geo,
+                ua=ua,
+                platform=_kx_platform or "",
+                ctx_headers=_ctx_headers,
+                fp_hash_override=_identity_fp_hash,
+                identity_label=identity_label or "",
+            )
 
             # Defensive guard: block navigations to URLs that contain
             # unfilled tracker macros like `{{ccpa}}`, `{{sub}}`, etc.
@@ -9391,31 +9622,54 @@ async def run_real_user_traffic_job(
                 # SAFE-by-default: any failure leaves the context
                 # unchanged and the regular goto flow runs as before.
                 #
-                # 2026-02 v2.6.17 — TRACKER-TARGET HARD SKIP:
-                # For tracker targets (krexion.com/api/t/...), TLS prewarm
-                # would fetch the target through curl_cffi via the same
-                # proxy exit IP. That hit is recorded by the tracker as
-                # a click AND (via the tracker's 302 redirect chain in
-                # curl_cffi's `follow_redirects=True` default) also lands
-                # on the offer's edge — creating the exact duplicate-IP
-                # burn we spent v2.6.15/16 eliminating from the httpx
-                # probe. Skip prewarm entirely for tracker targets so the
-                # browser's own page.goto is the SOLE HTTP touch on the
-                # offer from this exit IP.
+                # v2.6.34 — TRACKER TARGET: never curl_cffi the tracker URL
+                # (records a duplicate click). Resolve the OFFER URL
+                # server-side and prewarm THAT so cf_clearance / datadome
+                # cookies seed without touching the tracker.
                 _tls_prewarm_effective = bool(tls_prewarm)
+                _prewarm_url = target_url
                 if _tls_prewarm_effective and _is_tracker_target:
-                    _tls_prewarm_effective = False
-                    push_live_step(
-                        job_id, i + 1, "browser", "info",
-                        "TLS prewarm skipped for tracker target (avoids duplicate-IP burn)",
-                    )
+                    _prewarm_url = ""
+                    if _ptro_swapped and _visit_target_url:
+                        _prewarm_url = _visit_target_url
+                    else:
+                        try:
+                            _resolved_offer_prewarm = await _resolve_tracker_via_localhost(
+                                _visit_target_url or target_url,
+                                geo.get("exit_ip") or "",
+                                ua,
+                                timeout=8.0,
+                                referer=_ua_referer or "",
+                                accept_language=geo.get("accept_language") or "",
+                                sec_ch_ua_headers={
+                                    k: v for k, v in (_ctx_headers or {}).items()
+                                    if k.lower().startswith("sec-ch-")
+                                },
+                            )
+                            if _resolved_offer_prewarm:
+                                _prewarm_url = _resolved_offer_prewarm
+                        except Exception:
+                            pass
+                    if not _prewarm_url:
+                        _tls_prewarm_effective = False
+                        push_live_step(
+                            job_id, i + 1, "browser", "info",
+                            "TLS prewarm skipped — could not resolve offer URL for tracker target",
+                        )
+                    else:
+                        push_live_step(
+                            job_id, i + 1, "browser", "info",
+                            f"TLS prewarm → offer only (not tracker): {_prewarm_url[:80]}",
+                        )
                 if _tls_prewarm_effective and _TLS_AD_OK and _tls_ad is not None:
                     try:
                         _pw_res = await _tls_ad.prewarm_target(
-                            target_url,
+                            _prewarm_url,
                             proxy=proxy,
                             ua=ua,
                             timeout=20.0,
+                            accept_language=geo.get("accept_language") or "en-US,en;q=0.9",
+                            sec_fetch_kind="ad_click",
                         )
                         if _pw_res and _pw_res.get("ok") and _pw_res.get("cookies"):
                             try:
@@ -9662,11 +9916,23 @@ async def run_real_user_traffic_job(
                         try:
                             proxy = new_proxy
                             entry["proxy"] = proxy.get("server", "")
+                            # v2.6.33 — Re-probe geo on rotated proxy so locale/TZ match exit IP.
+                            _new_geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
+                            if _new_geo.get("ok"):
+                                geo = _new_geo
+                                entry["exit_ip"] = geo.get("exit_ip") or entry.get("exit_ip", "")
+                                entry["country"] = geo.get("country_name") or entry.get("country", "")
+                                entry["city"] = geo.get("city") or entry.get("city", "")
+                                entry["timezone"] = geo.get("timezone") or entry.get("timezone", "")
+                                entry["locale"] = geo.get("locale") or entry.get("locale", "")
+                                _ctx_headers["Accept-Language"] = geo.get("accept_language") or _ctx_headers.get("Accept-Language", "en-US,en;q=0.9")
+                            if _chain_handle is None:
+                                _effective_proxy = dict(proxy)
                             context = await browser.new_context(
                                 proxy={
-                                    "server": proxy["server"],
-                                    **({"username": proxy["username"]} if proxy.get("username") else {}),
-                                    **({"password": proxy["password"]} if proxy.get("password") else {}),
+                                    "server": _effective_proxy["server"],
+                                    **({"username": _effective_proxy["username"]} if _effective_proxy.get("username") else {}),
+                                    **({"password": _effective_proxy["password"]} if _effective_proxy.get("password") else {}),
                                 },
                                 user_agent=ua,
                                 viewport=fp["viewport"],
@@ -9678,11 +9944,25 @@ async def run_real_user_traffic_job(
                                 geolocation={"latitude": geo["lat"], "longitude": geo["lon"]},
                                 permissions=["geolocation"],
                                 extra_http_headers=_ctx_headers,
+                                **({"storage_state": _identity_storage_state} if _identity_storage_state else {}),
                             )
-                            await context.add_init_script(_build_stealth_script(fp, geo, fp_hash_override=_identity_fp_hash))
+                            await _rut_apply_context_stealth(
+                                context,
+                                fp=fp,
+                                geo=geo,
+                                ua=ua,
+                                platform=_kx_platform or "",
+                                ctx_headers=_ctx_headers,
+                                fp_hash_override=_identity_fp_hash,
+                                identity_label=identity_label or "",
+                            )
                             await context.route(
                                 "**/*",
-                                _make_macro_guard(job_id, i + 1),
+                                _make_macro_guard(
+                                    job_id, i + 1,
+                                    force_referer=(_ua_referer or "") if bool(_referer_cfg.get("enabled")) else "",
+                                    target_url=_visit_target_url or "",
+                                ),
                             )
                             page = await context.new_page()
                         except Exception as _rebuild_e:

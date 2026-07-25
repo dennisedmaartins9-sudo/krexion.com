@@ -60,13 +60,12 @@ def test_detectors_accept_http_status_param():
     assert "async def _detect_offer_vpn_block(\n    page:" in src
 
 
-def test_tls_prewarm_skipped_for_tracker():
-    """TLS prewarm force-off for tracker targets (avoids double-hit
-    to offer via curl_cffi through same exit IP)."""
+def test_tls_prewarm_offer_only_for_tracker():
+    """v2.6.34 — TLS prewarm hits offer URL only for tracker targets."""
     src = RUT_FILE.read_text(encoding="utf-8")
     assert "_tls_prewarm_effective = bool(tls_prewarm)" in src
-    assert "if _tls_prewarm_effective and _is_tracker_target:" in src
-    assert "TLS prewarm skipped for tracker target" in src
+    assert "TLS prewarm → offer only (not tracker)" in src
+    assert "_resolved_offer_prewarm = await _resolve_tracker_via_localhost(" in src
 
 
 def test_persist_burnt_ip_writes_bson_date():

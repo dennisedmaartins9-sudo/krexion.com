@@ -232,7 +232,15 @@ def test_stop_request_propagates_via_request_stop():
         "stop_requested": True,
     }
     queue_collection = AsyncMock()
-    queue_collection.find = MagicMock(return_value=_async_iter([stop_record]))
+    def _find_side_effect(query):
+        q = query or {}
+        if q.get("status") == "queued":
+            return _async_iter([])
+        if q.get("status") == "claimed":
+            return _async_iter([stop_record])
+        return _async_iter([])
+
+    queue_collection.find = MagicMock(side_effect=_find_side_effect)
     queue_collection.update_one = AsyncMock()
     queue_collection.find_one_and_update = AsyncMock(return_value=None)
 

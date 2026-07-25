@@ -433,6 +433,28 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
     """Return all Sec-CH-UA-* / Sec-CH-* / Sec-CH-Prefers-* headers
     real Chrome 128+ sends, matching the UA + viewport passed in."""
     viewport = viewport or {"width": 1920, "height": 1080}
+    # v2.6.30 — non-Chrome in-app UAs must not get branded Sec-CH-UA.
+    # Mirrors real_user_traffic._build_client_hint_headers() so profile
+    # launcher and v230 paths don't undo TikTok/FB-iOS suppression.
+    try:
+        from referrer_pro import is_non_chrome_inapp_ua as _is_nci
+        if _is_nci(ua):
+            ua_low = (ua or "").lower()
+            headers: Dict[str, str] = {"Sec-CH-UA": ""}
+            if "iphone" in ua_low or "ipad" in ua_low:
+                headers["Sec-CH-UA-Platform"] = '"iOS"'
+                headers["Sec-CH-UA-Mobile"] = "?1"
+                _ios_m = re.search(r"iPhone OS (\d+)_(\d+)", ua or "")
+                if _ios_m:
+                    headers["Sec-CH-UA-Platform-Version"] = f'"{_ios_m.group(1)}.{_ios_m.group(2)}.0"'
+            elif "android" in ua_low:
+                headers["Sec-CH-UA-Platform"] = '"Android"'
+                headers["Sec-CH-UA-Mobile"] = "?1"
+            else:
+                headers["Sec-CH-UA-Mobile"] = "?0"
+            return headers
+    except Exception:
+        pass
     m = re.search(r"Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)", ua or "")
     full_ver = m.group(0).split("/")[1] if m else "128.0.6613.146"
     major_ver = m.group(1) if m else "128"
@@ -443,8 +465,11 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
         platform = '"Windows"'; platform_ver = '"15.0.0"'; arch = '"x86"'; bitness = '"64"'
         model = '""'; mobile = "?0"
     elif "iphone" in ua_low or "ipad" in ua_low:
-        platform = '"iOS"'; platform_ver = '"26.4.1"'; arch = '"arm"'; bitness = '"64"'
-        model = '"iPhone"'; mobile = "?1"
+        platform = '"iOS"'
+        _ios_m = re.search(r"iPhone OS (\d+)_(\d+)", ua or "")
+        platform_ver = f'"{_ios_m.group(1)}.{_ios_m.group(2)}.0"' if _ios_m else '"17.0.0"'
+        arch = '"arm"'; bitness = '"64"'
+        model = '"iPhone"' if "iphone" in ua_low else '"iPad"'; mobile = "?1"
     elif "android" in ua_low:
         platform = '"Android"'; platform_ver = '"14.0.0"'; arch = '"arm"'; bitness = '"64"'
         model = '"SM-S928B"'; mobile = "?1"

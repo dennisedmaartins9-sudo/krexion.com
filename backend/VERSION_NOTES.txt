@@ -1,3 +1,69 @@
+# v2.6.34 — 2026-07 — Close remaining anti-detect tradeoff gaps
+#
+# - JWT secret: load from backend/.env + persist to backend/.krexion/jwt_secret.
+# - Tracker TLS prewarm: offer-only resolve (never curl_cffi the tracker URL).
+# - Browser Profiles: wire behavioral_bio + ip_warmup (RUT parity).
+# - Playwright TLS note: browser JA3 remains Chromium-native; curl_cffi prewarm
+#   seeds cookies/challenges — true TLS parity would require patched Chromium.
+#
+# v2.6.33 — 2026-07 — RUT anti-detect + referrer hardening (P0/P1/P2)
+#
+# - P0: Shared JWT/HMAC secret via krexion_auth_secret (cloud + desktop RUT match).
+# - P0: Context retry freezes referer (no platform-pool re-roll desync).
+# - P0: Tunnel retry re-probes geo + full v230/natural-canvas/macro-guard stack.
+# - P1: Legacy referer modes get paid/organic + Sec-Fetch + network-click extras.
+# - P1: UA coerce + align_ua_to_chromium rebuild fingerprint + client hints.
+# - P2: _rut_apply_context_stealth helper (main + retry paths share stack).
+# - P2: TLS prewarm passes Accept-Language + ad_click Sec-Fetch headers.
+# - P2: Tracker S2S resolve tries curl_cffi TLS first (resolve_redirect_location).
+# - P2: anti_detect_engine.apply_stealth_to_context adds natural canvas/WebGL.
+#
+# v2.6.32 — 2026-07 — Browser Profiles full audit fix batch
+#
+# - Launcher: pass --user-data-dir for Chromium profile badge + persistence.
+# - Launcher: resolve ProxyJet at launch when enabled but server missing.
+# - Launcher: coerce in-app UAs, country geo lat/lon, TLS prewarm, Referrer Pro goto.
+# - Launcher: fingerprint_hash, identity_persist toggle, periodic storage_state flush.
+# - Launcher: Session-0 queue honours stop before claim; skip stop_requested rows.
+# - Module: duplicate launch guard (409), desktop-offline un-sticks launching.
+# - Module: update_profile preserves session_id/status; stop uses stopping state.
+# - Module: advanced/quick create infer os from UA (Android ≠ ios).
+# - Frontend: status polling + stopping/queued badge states.
+#
+# v2.6.31 — 2026-07 — Remaining anti-detect + VR→RUT automation handoff
+#
+# - TLS prewarm/probes: wire http2_settings_for_ua() into curl_cffi sessions.
+# - TLS prewarm: Sec-Fetch-Site cross-site for ad-click flows (was "none").
+# - Sec-CH-UA route stripper shared via referrer_pro (profile + Form Filler).
+# - userAgentData platformVersion/arch/model aligned with UA + OS.
+# - Deterministic WebGL GPU when RUT identity_label is set.
+# - v230 iOS platform-version parsed from UA (not hardcoded 26.4.1).
+# - VR "Use in RUT" button + localStorage handoff; RUT picker always visible.
+#
+# v2.6.30 — 2026-07 — Bridge stop, VR iframe popups, anti-detect hardening
+#
+# - Bridge Stop: cloud POST /jobs/{id}/stop now signals desktop worker via
+#   bridge_jobs (was only updating cloud MongoDB — job kept running on PC).
+# - VR Popup Work: same-origin iframe modals now scanned (iframe_path on items).
+# - VR Popup Work: multiple dropdown picks queued for sequential bind UI.
+# - Anti-detect: removed inverted WebRtcHideLocalIpsWithMdns disable flag.
+# - Anti-detect: stronger WebRTC ICE/onicecandidate/createAnswer scrubbing.
+# - Anti-detect: v230 full_client_hints respects is_non_chrome_inapp_ua().
+# - Anti-detect: RUT + profile launcher client hints win over v230 merge.
+# - Anti-detect: anti_detect_engine.launch_stealth_session() applies v230 +
+#   RUT client hints; iPhone/iPad fallback fingerprint touch fix.
+#
+# v2.6.29 — 2026-07 — Referrer paid/organic fixes (RUT sub2 inject, preview, traffic_type_param UI)
+#
+# - CRITICAL: RUT visits now forward signed `_kx_traffic_type` to tracker so
+#   sub2=paid|organic injects on redirect (was empty for all RUT traffic).
+# - Links preview API + UI honour Traffic Type dropdown.
+# - Optional `traffic_type_param` on links (sub2 / aff_sub2 / s2 …).
+# - Legacy RUT google_search + platform_pool modes attach paid/organic extras.
+# - v2.6.29b — custom / random_list / auto / in-app-preset referer paths also
+#   forward paid/organic extras (sub2 inject on all common RUT flows).
+# - Traffic Source Presets set refererTrafficType; UA Generator → RUT handoff.
+#
 # v2.6.28 — 2026-01 — Visual Recorder Popup Work: visibility filter + per-item action selector
 #
 # =================================================================

@@ -180,6 +180,36 @@ def impersonate_for_ua(ua: str) -> str:
     return "chrome131"
 
 
+def _async_session_kwargs(
+    ua: str = "",
+    *,
+    timeout: float = 30.0,
+    verify: bool = False,
+) -> Dict[str, Any]:
+    """Build curl_cffi AsyncSession kwargs with TLS + HTTP/2 alignment."""
+    kwargs: Dict[str, Any] = {
+        "impersonate": impersonate_for_ua(ua) if ua else "chrome131",
+        "timeout": timeout,
+        "verify": verify,
+    }
+    try:
+        from anti_detect_v230 import http2_settings_for_ua as _h2_for_ua
+        h2 = _h2_for_ua(ua or "") or {}
+        for key in (
+            "http2_settings",
+            "http2_headers_order",
+            "http2_pseudo_headers_order",
+            "http2_window_update",
+            "http2_stream_weight",
+            "http2_stream_exclusive",
+        ):
+            if key in h2:
+                kwargs[key] = h2[key]
+    except Exception:
+        pass
+    return kwargs
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public async helpers — all return Optional[...] so callers can
 # easily detect "not available, fall back" without try/except.
@@ -228,7 +258,6 @@ async def get_json(
     if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
         return None
     proxy_uri = _build_proxy_uri(proxy) if proxy else None
-    impersonate = impersonate_for_ua(ua) if ua else "chrome131"
 
     req_headers = {
         "User-Agent": ua or _fallback_ua(),
@@ -239,11 +268,7 @@ async def get_json(
         req_headers.update(headers)
 
     try:
-        async with _AsyncSession(
-            impersonate=impersonate,
-            timeout=timeout,
-            verify=False,
-        ) as session:
+        async with _AsyncSession(**_async_session_kwargs(ua, timeout=timeout)) as session:
             kwargs: Dict[str, Any] = {"headers": req_headers}
             if proxy_uri:
                 kwargs["proxy"] = proxy_uri
@@ -276,7 +301,6 @@ async def get_text(
     if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
         return None
     proxy_uri = _build_proxy_uri(proxy) if proxy else None
-    impersonate = impersonate_for_ua(ua) if ua else "chrome131"
 
     req_headers = {
         "User-Agent": ua or _fallback_ua(),
@@ -288,11 +312,7 @@ async def get_text(
         req_headers.update(headers)
 
     try:
-        async with _AsyncSession(
-            impersonate=impersonate,
-            timeout=timeout,
-            verify=False,
-        ) as session:
+        async with _AsyncSession(**_async_session_kwargs(ua, timeout=timeout)) as session:
             kwargs: Dict[str, Any] = {
                 "headers": req_headers,
                 "allow_redirects": True,
@@ -327,6 +347,7 @@ async def prewarm_target(
     ua: str = "",
     timeout: float = 30.0,
     accept_language: str = "en-US,en;q=0.9",
+    sec_fetch_kind: str = "ad_click",
 ) -> Optional[Dict[str, Any]]:
     """Pre-warm ``url`` with a real Chrome TLS handshake and return a
     Playwright-compatible payload:
@@ -364,18 +385,20 @@ async def prewarm_target(
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
     }
+    try:
+        from anti_detect_v230 import sec_fetch_headers as _sec_fetch
+        req_headers.update(_sec_fetch(sec_fetch_kind))
+    except Exception:
+        req_headers.update({
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+        })
 
     try:
-        async with _AsyncSession(
-            impersonate=impersonate,
-            timeout=timeout,
-            verify=False,
-        ) as session:
+        async with _AsyncSession(**_async_session_kwargs(ua, timeout=timeout)) as session:
             kwargs: Dict[str, Any] = {
                 "headers": req_headers,
                 "allow_redirects": True,
@@ -433,6 +456,48 @@ async def prewarm_target(
     except Exception as e:
         logger.debug(f"[tls_anti_detect] prewarm_target {url} failed via curl_cffi: {e}")
         return None
+
+
+async def resolve_redirect_location(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    ua: str = "",
+    timeout: float = 15.0,
+) -> Optional[str]:
+    """GET ``url`` without following redirects; return ``Location`` on 3xx.
+
+    Used by RUT server-side tracker resolve so S2S TLS matches the browser UA.
+    Returns None on any error — caller falls back to httpx.
+    """
+    if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
+        return None
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return None
+
+    req_headers = dict(headers or {})
+    if ua and "User-Agent" not in req_headers:
+        req_headers["User-Agent"] = ua
+    req_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    req_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+    try:
+        from anti_detect_v230 import sec_fetch_headers as _sec_fetch
+        req_headers.update(_sec_fetch("ad_click"))
+    except Exception:
+        req_headers.setdefault("Sec-Fetch-Dest", "document")
+        req_headers.setdefault("Sec-Fetch-Mode", "navigate")
+        req_headers.setdefault("Sec-Fetch-Site", "cross-site")
+        req_headers.setdefault("Sec-Fetch-User", "?1")
+
+    try:
+        async with _AsyncSession(**_async_session_kwargs(ua or req_headers.get("User-Agent", ""), timeout=timeout)) as session:
+            r = await session.get(url, headers=req_headers, allow_redirects=False)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
+                return loc or None
+    except Exception as e:
+        logger.debug(f"[tls_anti_detect] resolve_redirect_location {url} failed: {e}")
+    return None
 
 
 async def head_or_get_status(

@@ -181,6 +181,25 @@ export default function BrowserProfilesPage() {
     fetchProfiles();
   }, []);
 
+  // v2.6.32 — Poll while any profile is mid-launch so cloud-bridged cards update.
+  useEffect(() => {
+    const active = profiles.some((p) =>
+      ["launching", "running", "stopping", "queued"].includes(p.status)
+    );
+    if (!active) return undefined;
+    const timer = setInterval(fetchProfiles, 3000);
+    return () => clearInterval(timer);
+  }, [profiles]);
+
+  const statusBadgeClass = (status) => {
+    const s = status || "idle";
+    if (s === "running") return "bg-emerald-950/40 border-emerald-700 text-emerald-300";
+    if (s === "launching" || s === "queued") return "bg-amber-950/40 border-amber-700 text-amber-300";
+    if (s === "stopping") return "bg-orange-950/40 border-orange-700 text-orange-300";
+    if (s === "error") return "bg-red-950/40 border-red-700 text-red-300";
+    return "bg-zinc-900 border-zinc-700 text-zinc-400";
+  };
+
   const handleQuickGenerate = async (deviceType = "desktop") => {
     try {
       const r = await fetch(`${API}/quick-generate`, {
@@ -345,7 +364,11 @@ export default function BrowserProfilesPage() {
         method: "POST", headers: authHeaders,
         body: JSON.stringify({ start_url: startUrl || undefined }),
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) {
+        const txt = await r.text();
+        if (r.status === 409) throw new Error(txt || "Profile is already running — stop it first");
+        throw new Error(txt);
+      }
       const d = await r.json();
       setStatusMap((m) => ({ ...m, [id]: { ...d } }));
       if (d.desktop_available) {
@@ -361,7 +384,9 @@ export default function BrowserProfilesPage() {
     try {
       const r = await fetch(`${API}/${id}/stop`, { method: "POST", headers: authHeaders });
       if (!r.ok) throw new Error(await r.text());
-      toast.success("Stop signal sent"); fetchProfiles();
+      const d = await r.json();
+      toast.success(d.status === "stopping" ? "Stop signal sent — closing browser…" : "Profile stopped");
+      fetchProfiles();
     } catch (e) { toast.error(`Stop failed: ${e.message}`); }
   };
 
@@ -457,7 +482,7 @@ export default function BrowserProfilesPage() {
                             <Shield className="w-3 h-3 mr-0.5" /> AD
                           </Badge>
                         )}
-                        <Badge variant="outline" className={`text-[10px] ${p.status === 'running' ? 'bg-emerald-950/40 border-emerald-700 text-emerald-300' : p.status === 'launching' ? 'bg-amber-950/40 border-amber-700 text-amber-300' : p.status === 'error' ? 'bg-red-950/40 border-red-700 text-red-300' : 'bg-zinc-900 border-zinc-700 text-zinc-400'}`}>
+                        <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>
                           {p.status || "idle"}
                         </Badge>
                       </div>
@@ -475,7 +500,7 @@ export default function BrowserProfilesPage() {
                     )}
                   </div>
                   <div className="flex flex-wrap gap-1">
-                    {p.status === "running" || p.status === "launching" ? (
+                    {["running", "launching", "stopping", "queued"].includes(p.status) ? (
                       <Button data-testid={`bp-stop-${p.id}`} onClick={() => handleStop(p.id)} size="sm" className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
                         <StopCircle className="w-3 h-3 mr-1" /> Stop
                       </Button>

@@ -423,6 +423,7 @@ export default function LinksPage() {
     referrer_pro_campaign_type: "auto",
     referrer_pro_quality_tier: "standard",
     referrer_pro_traffic_type: "auto",
+    traffic_type_param: "",
     referrer_pro_offer_urls: "",
     postback_url: "",
     referrer_pro_auto_pause_enabled: false,
@@ -566,6 +567,7 @@ export default function LinksPage() {
       referrer_pro_campaign_type: "auto",
       referrer_pro_quality_tier: "standard",
       referrer_pro_traffic_type: "auto",
+      traffic_type_param: "",
       referrer_pro_offer_urls: "",
       postback_url: "",
       referrer_pro_auto_pause_enabled: false,
@@ -622,6 +624,7 @@ export default function LinksPage() {
         referrer_pro_network_click_chain: formData.referrer_pro_network_click_chain,
         referrer_pro_network_click_host: formData.referrer_pro_network_click_host,
         referrer_pro_wrapper_redirect: formData.referrer_pro_wrapper_redirect,
+        referrer_pro_traffic_type: formData.referrer_pro_traffic_type || "auto",
         sample_count: 20
       }, { headers: { Authorization: `Bearer ${token}` } });
       setPreviewData(res.data);
@@ -752,6 +755,7 @@ export default function LinksPage() {
       referrer_pro_campaign_type: link.referrer_pro_campaign_type || "auto",
       referrer_pro_quality_tier: link.referrer_pro_quality_tier || "standard",
       referrer_pro_traffic_type: link.referrer_pro_traffic_type || "auto",
+      traffic_type_param: link.traffic_type_param || "",
       referrer_pro_offer_urls: link.referrer_pro_offer_urls || "",
       postback_url: link.postback_url || "",
       referrer_pro_auto_pause_enabled: link.referrer_pro_auto_pause_enabled || false,
@@ -1894,6 +1898,22 @@ export default function LinksPage() {
                             </select>
                             <p className="text-[10px] text-[#52525B] mt-1">
                               Applies platform-specific real-capture referer patterns for all 10 supported platforms. &quot;Auto&quot; preserves legacy behaviour for existing links — pick Paid / Organic / Mixed to force a specific mode.
+                            </p>
+                          </div>
+
+                          {/* v2.6.29 — Custom tracker param key for paid/organic inject */}
+                          <div className="mt-3">
+                            <Label className="text-xs text-[#A1A1AA]">📊 Traffic Type Param Key</Label>
+                            <input
+                              type="text"
+                              value={formData.traffic_type_param || ""}
+                              onChange={(e) => setFormData({ ...formData, traffic_type_param: e.target.value })}
+                              placeholder="sub2 (default) — or aff_sub2, s2, p2 …"
+                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm font-mono"
+                              data-testid="traffic-type-param"
+                            />
+                            <p className="text-[10px] text-[#52525B] mt-1">
+                              Query param injected on redirect when Traffic Type resolves to paid/organic. Leave blank for default <span className="font-mono">sub2</span>.
                             </p>
                           </div>
 

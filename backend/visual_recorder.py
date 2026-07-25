@@ -4805,6 +4805,38 @@ _DETECT_POPUP_BUTTONS_JS = r"""
   };
 
   // ── Step 1: find popup / modal / dialog containers ────────────────
+  // v2.6.30 — same-origin iframe scan (survey funnels often render
+  // modals inside iframes; top-document-only scan missed them).
+  function iframeSelector(iframeEl) {
+    if (iframeEl.id) return 'iframe#' + iframeEl.id;
+    if (iframeEl.getAttribute && iframeEl.getAttribute('name'))
+      return 'iframe[name="' + iframeEl.getAttribute('name') + '"]';
+    if (iframeEl.getAttribute && iframeEl.getAttribute('data-testid'))
+      return 'iframe[data-testid="' + iframeEl.getAttribute('data-testid') + '"]';
+    var src = (iframeEl.src || '').trim();
+    if (src) {
+      var m = src.match(/([^/?#]+)(?:[?#].*)?$/);
+      if (m && m[1]) return 'iframe[src*="' + m[1].replace(/"/g, '\\"') + '"]';
+    }
+    var idx = 1, sib = iframeEl.previousElementSibling;
+    while (sib) {
+      if (sib.tagName === 'IFRAME' || sib.tagName === 'FRAME') idx++;
+      sib = sib.previousElementSibling;
+    }
+    return 'iframe:nth-of-type(' + idx + ')';
+  }
+
+  const isVisibleInDoc = (el) => {
+    try {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity || '1') < 0.05) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 20 || r.height < 20) return false;
+      return true;
+    } catch (e) { return false; }
+  };
+
   const popupSel = [
     '[role="dialog"]',
     '[role="alertdialog"]',
@@ -4823,40 +4855,61 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     '.sweet-alert',
     '.fancybox-container',
   ].join(', ');
-  // v2.6.28 fix — apply visibility filter to class/role matches too.
-  // Landing pages often carry 3-5 hidden template popups in the DOM;
-  // without this filter Popup Work over-reports (e.g. "5 popups") when
-  // only 1 is on screen.
-  const candidates = Array.from(document.querySelectorAll(popupSel)).filter(isVisible);
 
-  // Also detect ad-hoc overlays: position:fixed / :absolute + high z-index
-  // + covers > 25 % of the viewport. Catches hand-rolled popups on lead-
-  // gen offer pages that don't use any of the standard class names.
-  const vw = window.innerWidth || document.documentElement.clientWidth || 1;
-  const vh = window.innerHeight || document.documentElement.clientHeight || 1;
-  const vwvh = vw * vh;
-  const scanRoot = document.body ? document.body.querySelectorAll('*') : [];
-  for (const el of scanRoot) {
-    if (candidates.indexOf(el) !== -1) continue;
-    try {
-      const cs = window.getComputedStyle(el);
-      const pos = cs.position;
-      if (pos !== 'fixed' && pos !== 'absolute') continue;
-      const zi = parseFloat(cs.zIndex || '0');
-      if (!(zi >= 100)) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width < 100 || r.height < 100) continue;
-      const area = r.width * r.height;
-      if (area / vwvh < 0.10) continue;  // < 10 % viewport → probably not a modal
-      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.15) continue;
-      candidates.push(el);
-    } catch (e) { /* skip */ }
+  const popupEntries = [];
+
+  function collectPopupsInDoc(doc, ox, oy, iframePath) {
+    const win = doc.defaultView || window;
+    const candidates = Array.from(doc.querySelectorAll(popupSel)).filter(isVisibleInDoc);
+
+    const vw = win.innerWidth || doc.documentElement.clientWidth || 1;
+    const vh = win.innerHeight || doc.documentElement.clientHeight || 1;
+    const vwvh = vw * vh;
+    const scanRoot = doc.body ? doc.body.querySelectorAll('*') : [];
+    for (const el of scanRoot) {
+      if (candidates.indexOf(el) !== -1) continue;
+      try {
+        const cs = win.getComputedStyle(el);
+        const pos = cs.position;
+        if (pos !== 'fixed' && pos !== 'absolute') continue;
+        const zi = parseFloat(cs.zIndex || '0');
+        if (!(zi >= 100)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 100 || r.height < 100) continue;
+        const area = r.width * r.height;
+        if (area / vwvh < 0.10) continue;
+        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.15) continue;
+        candidates.push(el);
+      } catch (e) { /* skip */ }
+    }
+
+    for (const el of candidates) {
+      popupEntries.push({ el: el, ox: ox, oy: oy, iframePath: iframePath.slice() });
+    }
+
+    doc.querySelectorAll('iframe, frame').forEach((ifr) => {
+      try {
+        const idoc = ifr.contentDocument;
+        if (!idoc) return;
+        const ir = ifr.getBoundingClientRect();
+        collectPopupsInDoc(
+          idoc,
+          ox + ir.left,
+          oy + ir.top,
+          iframePath.concat([iframeSelector(ifr)])
+        );
+      } catch (e) { /* cross-origin */ }
+    });
   }
+
+  collectPopupsInDoc(document, 0, 0, []);
 
   // De-dupe: if a container is nested inside another container we keep
   // ONLY the inner one (buttons live at the leaf of the popup tree).
-  const kept = candidates.filter((el) =>
-    !candidates.some((other) => other !== el && other.contains(el))
+  const kept = popupEntries.filter((entry) =>
+    !popupEntries.some((other) =>
+      other.el !== entry.el && other.el.contains && other.el.contains(entry.el)
+    )
   );
 
   // ── Step 2: enumerate clickables inside each popup ────────────────
@@ -4964,7 +5017,11 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     return '';
   };
 
-  kept.forEach((popup, popupIdx) => {
+  kept.forEach((entry, popupIdx) => {
+    const popup = entry.el;
+    const ox = entry.ox || 0;
+    const oy = entry.oy || 0;
+    const iframePath = entry.iframePath || [];
     const rectP = popup.getBoundingClientRect();
     if (rectP.width < 20 || rectP.height < 20) return;
     const inside = Array.from(popup.querySelectorAll(BTN_SEL));
@@ -5044,10 +5101,11 @@ _DETECT_POPUP_BUTTONS_JS = r"""
           tag: tag,
           element_kind: kind,
           input_type: (tagUp === 'INPUT' ? (el.getAttribute('type') || 'text').toLowerCase() : ''),
-          x: Math.round(r.left + r.width / 2),
-          y: Math.round(r.top + r.height / 2),
+          x: Math.round(r.left + r.width / 2 + ox),
+          y: Math.round(r.top + r.height / 2 + oy),
           w: Math.round(r.width),
           h: Math.round(r.height),
+          iframe_path: iframePath.length ? iframePath : undefined,
         });
       } catch (e) {}
     }

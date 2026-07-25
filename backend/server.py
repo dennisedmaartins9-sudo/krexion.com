@@ -1711,28 +1711,9 @@ async def debug_ip(request: Request):
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ─── 2026-07 SECRET_KEY hardening ──────────────────────────────────────
-# Legacy default `"your-secret-key-change-in-production"` was public in
-# the source, meaning anyone could forge admin JWTs against any install
-# whose .env didn't override it. New behaviour:
-#   1. If JWT_SECRET_KEY is set in env → use it (production path).
-#   2. Otherwise generate a cryptographically-random key on startup +
-#      log a big WARNING telling the admin to persist it. All tokens
-#      issued this run are valid; on restart a new random key is
-#      generated so tokens get invalidated (safer than a static
-#      publicly-known default).
-_env_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
-_INSECURE_DEFAULT_SECRETS = {"", "your-secret-key-change-in-production", "change-me", "changeme"}
-if _env_secret in _INSECURE_DEFAULT_SECRETS:
-    import secrets as _secrets_mod
-    SECRET_KEY = _secrets_mod.token_urlsafe(48)
-    print(
-        "⚠️  WARNING: JWT_SECRET_KEY missing or set to an insecure default. "
-        "A random key was generated for this run. Set JWT_SECRET_KEY in "
-        "backend/.env to a strong random string to keep tokens valid across "
-        "restarts.", flush=True,
-    )
-else:
-    SECRET_KEY = _env_secret
+# v2.6.33 — shared with real_user_traffic RUT handshake signing.
+from krexion_auth_secret import resolve_jwt_secret_for_server
+SECRET_KEY = resolve_jwt_secret_for_server()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 7 * 24 * 60
 POSTBACK_TOKEN = os.environ.get("POSTBACK_TOKEN", "secure-postback-token-123")
@@ -2320,6 +2301,7 @@ class LinkCreate(BaseModel):
     referrer_pro_campaign_type: str = "auto"               # Feature 5 — utm campaign preset (auto|static_image|video_ad|carousel_ad|story_ad|lookalike_prospect|retargeting_warm|retargeting_cold|cold_email|search_cpc)
     referrer_pro_quality_tier: str = "standard"            # Feature 6 — one-word preset: premium | standard | aggressive
     referrer_pro_traffic_type: str = "auto"                # v2.6.24 — Paid vs Organic referer split (auto|paid|organic|mixed)
+    traffic_type_param: Optional[str] = None               # v2.6.29 — tracker param key for paid/organic inject (default sub2)
     referrer_pro_offer_urls: Optional[str] = None          # Feature 7 — weighted multi-URL rotation ("url:weight,url:weight" or JSON)
     postback_url: Optional[str] = None                     # Feature 8 — outbound S2S postback (forwarded on conversion, supports {click_id}/{payout} macros)
     referrer_pro_auto_pause_enabled: bool = False          # Feature 10 — auto-pause after N consecutive non-converting clicks
@@ -2364,6 +2346,7 @@ class LinkUpdate(BaseModel):
     referrer_pro_campaign_type: Optional[str] = None
     referrer_pro_quality_tier: Optional[str] = None
     referrer_pro_traffic_type: Optional[str] = None  # v2.6.24
+    traffic_type_param: Optional[str] = None       # v2.6.29
     referrer_pro_offer_urls: Optional[str] = None
     postback_url: Optional[str] = None
     referrer_pro_auto_pause_enabled: Optional[bool] = None
@@ -2411,6 +2394,7 @@ class LinkResponse(BaseModel):
     referrer_pro_campaign_type: str = "auto"
     referrer_pro_quality_tier: str = "standard"
     referrer_pro_traffic_type: str = "auto"  # v2.6.24 — Paid vs Organic
+    traffic_type_param: Optional[str] = None  # v2.6.29 — sub2 / aff_sub2 / s2 …
     referrer_pro_offer_urls: Optional[str] = None
     postback_url: Optional[str] = None
     referrer_pro_auto_pause_enabled: bool = False
@@ -3408,6 +3392,30 @@ def _kx_esp_verify(platform: str, esp: str, sig: str) -> bool:
         if not platform or not esp or not sig:
             return False
         expected = _kx_esp_sign(platform, esp)
+        return _hmac.compare_digest(expected, str(sig)[:12])
+    except Exception:
+        return False
+
+
+def _kx_traffic_type_sign(traffic_type: str) -> str:
+    """HMAC tag for paid/organic verdict forwarded by the RUT engine."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    tt = (traffic_type or "").strip().lower()
+    if tt not in ("paid", "organic"):
+        return ""
+    key = SECRET_KEY.encode("utf-8") if isinstance(SECRET_KEY, str) else bytes(SECRET_KEY)
+    return _hmac.new(key, tt.encode("utf-8"), _hashlib.sha256).hexdigest()[:12]
+
+
+def _kx_traffic_type_verify(traffic_type: str, sig: str) -> bool:
+    """Constant-time HMAC verification of the RUT traffic_type handshake."""
+    import hmac as _hmac
+    try:
+        tt = (traffic_type or "").strip().lower()
+        if tt not in ("paid", "organic") or not sig:
+            return False
+        expected = _kx_traffic_type_sign(tt)
         return _hmac.compare_digest(expected, str(sig)[:12])
     except Exception:
         return False
@@ -10251,8 +10259,94 @@ async def _package_partial_results(job_id: str, job_dir_path=None):
         return None
 
 
+async def _rut_bridge_stop_to_desktop(
+    job_id: str,
+    user: dict,
+    request: Request,
+) -> Optional[dict]:
+    """When RUT runs on the customer's desktop, cloud stop must signal
+    the local worker — not only update cloud MongoDB."""
+    if not IS_CLOUD:
+        return None
+    try:
+        from bridge_module import enqueue_bridge_job, is_user_local_online
+    except Exception:
+        return None
+    local_status = await is_user_local_online(user["id"])
+    if not local_status.get("online"):
+        return None
+
+    # Cancel any still-queued bridge jobs for this RUT job (start/poll).
+    try:
+        _u_match: list = [{"user_id": user["id"]}]
+        if user.get("email"):
+            _u_match.append({"email": user["email"]})
+        _now_iso = datetime.now(timezone.utc).isoformat()
+        _job_path_re = f"real-user-traffic/jobs/{job_id}"
+        await db.bridge_jobs.update_many(
+            {
+                "$and": [
+                    {"$or": _u_match},
+                    {"status": {"$in": ["pending", "running"]}},
+                    {
+                        "$or": [
+                            {"feature": {"$in": ["rut/start", "real-user-traffic/jobs", "real-user-traffic/stop"]}},
+                            {"payload.path": {"$regex": _job_path_re.replace("/", r"\/")}},
+                        ]
+                    },
+                ]
+            },
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": "cancelled: RUT stop requested",
+                    "completed_at": _now_iso,
+                }
+            },
+        )
+    except Exception as _cancel_err:
+        logger.debug(f"[rut_stop] bridge cancel sweep skipped: {_cancel_err}")
+
+    try:
+        bridge_resp = await enqueue_bridge_job(
+            user,
+            "real-user-traffic/stop",
+            {
+                "method": "POST",
+                "path": f"/api/real-user-traffic/jobs/{job_id}/stop",
+                "body": {},
+                "authorization": (request.headers.get("Authorization") or "").strip(),
+            },
+            wait_for_result=True,
+            wait_timeout=20,
+        )
+    except HTTPException:
+        raise
+    except Exception as _enq_err:
+        logger.warning(f"[rut_stop] bridge enqueue failed for {job_id[:8]}: {_enq_err}")
+        return None
+
+    if bridge_resp.get("status") == "done":
+        result = bridge_resp.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"stopped": True, "message": "Stop signal sent via desktop app", "bridged": True}
+    if bridge_resp.get("status") in ("pending", "running"):
+        return {
+            "stopped": True,
+            "message": "Stop signal queued — desktop app will cancel the job shortly",
+            "bridged": True,
+            "bridge_job_id": bridge_resp.get("job_id"),
+        }
+    return None
+
+
 @api_router.post("/real-user-traffic/jobs/{job_id}/stop")
-async def rut_stop_job(job_id: str, user: dict = Depends(get_current_user)):
+async def rut_stop_job(
+    job_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     """Signal a running job to stop. In-flight visits finish their current
     step then exit; remaining visits are skipped. Partial ZIP + Excel are
     built automatically at the end. Idempotent — safe to call twice."""
@@ -10261,6 +10355,12 @@ async def rut_stop_job(job_id: str, user: dict = Depends(get_current_user)):
     j_db = await db.real_user_traffic_jobs.find_one(
         {"job_id": job_id, "user_id": user["id"]}, {"_id": 0}
     )
+    # v2.6.30 — Cloud: job may run on desktop only; bridge stop there first.
+    if not j:
+        bridged = await _rut_bridge_stop_to_desktop(job_id, user, request)
+        if bridged is not None:
+            return bridged
+
     if not j and not j_db:
         raise HTTPException(status_code=404, detail="Job not found")
     if j_db and j_db.get("user_id") not in (None, user["id"]):
@@ -14846,6 +14946,7 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "referrer_pro_campaign_type":         (link.referrer_pro_campaign_type or "auto"),
         "referrer_pro_quality_tier":          (link.referrer_pro_quality_tier or "standard"),
         "referrer_pro_traffic_type":          (link.referrer_pro_traffic_type or "auto"),  # v2.6.24
+        "traffic_type_param":                 (link.traffic_type_param or None),  # v2.6.29
         "referrer_pro_offer_urls":            link.referrer_pro_offer_urls,
         "postback_url":                       link.postback_url,
         "referrer_pro_auto_pause_enabled":    bool(link.referrer_pro_auto_pause_enabled),
@@ -14941,6 +15042,7 @@ class LinkPreviewRequest(BaseModel):
     referrer_pro_network_click_chain: bool = False
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: bool = False
+    referrer_pro_traffic_type: str = "auto"  # v2.6.24 — auto|paid|organic|mixed
     sample_count: int = 20
 
 
@@ -14994,6 +15096,7 @@ async def preview_referrer_settings(
                 strip_search_path=bool(req.referrer_pro_strip_search_path),
                 network_click_chain_enabled=bool(req.referrer_pro_network_click_chain),
                 network_click_host=req.referrer_pro_network_click_host or None,
+                traffic_type=str(req.referrer_pro_traffic_type or "auto"),  # v2.6.29
             )
         except Exception as e:
             samples.append({"index": i + 1, "error": str(e)})
@@ -15011,6 +15114,8 @@ async def preview_referrer_settings(
             "utm_medium": pro.get("utm_medium") or "",
             "utm_campaign": pro.get("utm_campaign") or "",
             "network_click_referer": pro.get("network_click_referer") or "",
+            "traffic_type": pro.get("traffic_type") or "",
+            "is_paid": pro.get("is_paid"),
             "wrapper_will_bounce": bool(req.referrer_pro_wrapper_redirect and pro.get("referer")),
         })
 
@@ -19007,18 +19112,22 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     _kx_src_was_verified = False  # v2.1.80: gate so link-level pro-referrer
                                   # only fires for MANUAL clicks (RUT already
                                   # did its own resolve_pro_visit for signed visits).
+    _kx_tt = None
+    _kx_tt_sig = None
     try:
         _kx_src     = (url_params or {}).pop("_kx_src",     None) if isinstance(url_params, dict) else None
         _kx_sig     = (url_params or {}).pop("_kx_sig",     None) if isinstance(url_params, dict) else None
         _kx_esp     = (url_params or {}).pop("_kx_esp",     None) if isinstance(url_params, dict) else None
         _kx_esp_sig = (url_params or {}).pop("_kx_esp_sig", None) if isinstance(url_params, dict) else None
         _kx_brand   = (url_params or {}).pop("_kx_brand",   None) if isinstance(url_params, dict) else None
+        _kx_tt      = (url_params or {}).pop("_kx_traffic_type", None) if isinstance(url_params, dict) else None
+        _kx_tt_sig  = (url_params or {}).pop("_kx_tt_sig",  None) if isinstance(url_params, dict) else None
         if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
             simulate_platform = _kx_src
             _kx_src_was_verified = True
             # Also drop them from custom_params if echoed there.
             if isinstance(custom_params, dict):
-                for _k in ("_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand"):
+                for _k in ("_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand", "_kx_traffic_type", "_kx_tt_sig"):
                     custom_params.pop(_k, None)
             # Force the chosen ESP for email visits if signature checks.
             if (_kx_src == "email" and _kx_esp and _kx_esp_sig
@@ -19053,6 +19162,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     # want click_id / country / ip macros to work on classic links).
     _pro_result: Dict[str, Any] = {}
     _visit_accept_language = ""
+    # v2.6.29 — RUT signed traffic_type so sub2 / {traffic_type} macros work
+    # on tracker redirects even when resolve_pro_visit is skipped for _kx_src.
+    if _kx_src_was_verified:
+        try:
+            if _kx_tt in ("paid", "organic") and _kx_tt_sig and _kx_traffic_type_verify(str(_kx_tt), str(_kx_tt_sig)):
+                _pro_result = {"traffic_type": str(_kx_tt), "is_paid": (str(_kx_tt) == "paid")}
+        except Exception:
+            pass
     if (not _kx_src_was_verified) and bool(link.get("referrer_pro_enabled")):
         try:
             from referrer_pro import resolve_pro_visit as _rpv, is_inapp_browser_ua as _iiba

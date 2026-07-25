@@ -171,6 +171,124 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _infer_os_from_ua(ua: str, *, fallback: str = "windows") -> str:
+    try:
+        from visual_recorder import _detect_mobile_from_ua
+        _, os_kind = _detect_mobile_from_ua(ua or "")
+        if os_kind in ("ios", "ipados"):
+            return "ios"
+        if os_kind == "android":
+            return "android"
+        if os_kind == "macos":
+            return "macos"
+        if os_kind == "linux":
+            return "linux"
+    except Exception:
+        pass
+    return fallback
+
+
+def _resolve_geo_for_profile(profile_config: Dict[str, Any]) -> Dict[str, Any]:
+    country = str(profile_config.get("country") or "us").lower()
+    try:
+        from visual_recorder import _resolve_country_geo
+        loc, tz, al, lat, lon = _resolve_country_geo(country)
+    except Exception:
+        loc, tz, al, lat, lon = "en-US", "America/New_York", "en-US,en;q=0.9", 40.7128, -74.0060
+    return {
+        "locale": profile_config.get("locale") or loc,
+        "timezone": profile_config.get("timezone") or tz,
+        "accept_language": profile_config.get("accept_language") or al,
+        "lat": lat,
+        "lon": lon,
+    }
+
+
+def _coerce_profile_ua(ua: str, profile_config: Dict[str, Any]) -> str:
+    referrer = profile_config.get("referrer") or {}
+    platform = ""
+    if referrer.get("enabled"):
+        pw = referrer.get("platform_weights") or {}
+        if isinstance(pw, dict) and pw:
+            try:
+                platform = max(pw, key=lambda k: float(pw.get(k) or 0))
+            except Exception:
+                platform = next(iter(pw.keys()), "")
+        if not platform and referrer.get("brand"):
+            platform = str(referrer.get("brand")).lower()
+    if not platform:
+        try:
+            from real_user_traffic import _get_referer_from_ua, _platform_from_referer_url
+            ref = _get_referer_from_ua(ua)
+            platform = _platform_from_referer_url(ref) or ""
+        except Exception:
+            platform = ""
+    if platform:
+        try:
+            from referrer_pro import coerce_ua_for_platform
+            return coerce_ua_for_platform(ua, platform)
+        except Exception:
+            pass
+    return ua
+
+
+def _compute_fingerprint_hash(
+    ua: str,
+    viewport: Dict[str, Any],
+    profile_id: str,
+    webgl_cfg: Optional[Dict[str, Any]],
+) -> str:
+    import hashlib
+    payload = "|".join([
+        ua or "",
+        str(viewport.get("width", "")),
+        str(viewport.get("height", "")),
+        profile_id or "",
+        str((webgl_cfg or {}).get("vendor", "")),
+        str((webgl_cfg or {}).get("renderer", "")),
+    ])
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+async def _resolve_referer_for_goto(
+    ua: str,
+    profile_config: Dict[str, Any],
+    target_url: str,
+) -> tuple:
+    """Return (referer_url, extra_headers) for the first navigation."""
+    referrer = profile_config.get("referrer") or {}
+    if not referrer.get("enabled"):
+        return "", {}
+    try:
+        from real_user_traffic import _resolve_visit_referer
+        pw = referrer.get("platform_weights") or {}
+        ew = referrer.get("email_weights") or {}
+        cfg = {
+            "enabled": True,
+            "pro_mode": bool(referrer.get("pro_mode", True)),
+            "platform_weights": json.dumps(pw) if isinstance(pw, dict) else str(pw or ""),
+            "email_weights": json.dumps(ew) if isinstance(ew, dict) else str(ew or ""),
+            "brand": str(referrer.get("brand") or ""),
+            "target_url": target_url,
+            "country": profile_config.get("country"),
+            "search_engine": str(referrer.get("search_engine") or "google"),
+            "search_keywords": str(referrer.get("search_keywords") or ""),
+            "social_wrapper": bool(referrer.get("social_wrapper", True)),
+            "inapp_deep_path": bool(referrer.get("inapp_deep_path", True)),
+            "strip_search_path": bool(referrer.get("strip_search_path", True)),
+            "network_click_chain": bool(referrer.get("network_click_chain", False)),
+        }
+        ref_url, _plat, _esp, extras = _resolve_visit_referer(ua, cfg)
+        extra_headers: Dict[str, str] = {}
+        sf = (extras or {}).get("sec_fetch") or {}
+        if isinstance(sf, dict):
+            extra_headers.update({str(k): str(v) for k, v in sf.items()})
+        return ref_url or "", extra_headers
+    except Exception as _ref_err:
+        logger.debug(f"profile referer resolve skipped: {_ref_err}")
+        return "", {}
+
+
 async def launch_profile_session(
     profile_config: Dict[str, Any],
     *,
@@ -383,15 +501,32 @@ async def _launch_profile_session_inner(
     is_mobile = bool(profile_config.get("is_mobile"))
     has_touch = bool(profile_config.get("has_touch") or is_mobile)
     dsf = float(profile_config.get("device_scale_factor") or (3.0 if is_mobile else 1.0))
-    locale = profile_config.get("locale") or "en-US"
-    timezone_id = profile_config.get("timezone") or "America/New_York"
-    accept_lang = profile_config.get("accept_language") or f"{locale},en;q=0.9"
+    anti = profile_config.get("anti_detect") or {}
+    master = bool(anti.get("master", True))
+    identity_persist = bool(anti.get("identity_persist", True))
+    tls_prewarm = bool(anti.get("tls_prewarm", True)) and master
+    behavioral_bio = bool(anti.get("behavioral_bio", True)) and master
+    ip_warmup = bool(anti.get("ip_warmup", False)) and master
+    paranoia_mode = bool(anti.get("paranoia_mode", False))
+
+    ua = _coerce_profile_ua(ua, profile_config)
+    profile_os = profile_config.get("os") or _infer_os_from_ua(
+        ua, fallback=("ios" if is_mobile else "windows")
+    )
+    geo = _resolve_geo_for_profile(profile_config)
+    locale = geo["locale"]
+    timezone_id = geo["timezone"]
+    accept_lang = geo["accept_language"]
+
     storage_state = profile_config.get("storage_state") or None
+    if not identity_persist:
+        storage_state = None
 
     proxy_cfg = profile_config.get("proxy") or {}
     proxy_arg = None
     proxy_diag: Dict[str, Any] = {"requested": False, "server": "", "ok": None, "error": ""}
-    if proxy_cfg.get("enabled") and proxy_cfg.get("server"):
+    _proxy_enabled = bool(proxy_cfg.get("enabled")) or bool(proxy_cfg.get("use_proxyjet"))
+    if _proxy_enabled and proxy_cfg.get("server"):
         # ── 2026-06 — Normalize the proxy server URL ──────────────
         # Customer report: launching a profile errored with
         # ERR_TIMED_OUT on google.com. Root cause: ProxyJet returned
@@ -491,9 +626,10 @@ async def _launch_profile_session_inner(
             proxy_arg["password"] = password
         proxy_diag["requested"] = True
         proxy_diag["server"] = raw_server
-
-    anti = profile_config.get("anti_detect") or {}
-    master = bool(anti.get("master", True))
+    elif _proxy_enabled and not proxy_cfg.get("server"):
+        proxy_diag["requested"] = True
+        proxy_diag["ok"] = False
+        proxy_diag["error"] = "Proxy enabled but no server URL could be resolved (check ProxyJet credentials)"
 
     async with async_playwright() as p:
         # Browser binary selection — prefer Chrome channel for realism,
@@ -572,6 +708,8 @@ async def _launch_profile_session_inner(
                 f"--window-name=Krexion \u2014 {_profile_label} ({_profile_first_letter})",
             ],
         }
+        if _kx_user_data_dir:
+            launch_kwargs["args"].append(f"--user-data-dir={_kx_user_data_dir}")
         if proxy_arg:
             launch_kwargs["proxy"] = proxy_arg
 
@@ -645,6 +783,15 @@ async def _launch_profile_session_inner(
 
         context = await browser.new_context(**context_kwargs)
 
+        _webgl_cfg: Optional[Dict[str, Any]] = None
+        _profile_ua = str(context_kwargs.get("user_agent") or ua)
+        try:
+            from anti_detect_v230 import align_webgl_to_ua_deterministic as _align_webgl
+            _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
+        except Exception:
+            _webgl_cfg = None
+        _fingerprint_hash = _compute_fingerprint_hash(_profile_ua, context_kwargs["viewport"], profile_id, _webgl_cfg)
+
         # v2.4.1 — Per-tab Krexion favicon + title-prefix injection has
         # been INTENTIONALLY REMOVED.  Prior versions (v2.2.6 → v2.4.0)
         # ran an init script on every page that:
@@ -667,6 +814,22 @@ async def _launch_profile_session_inner(
         # matching how a stock Chrome install behaves — professional
         # and correct.
 
+        # v2.6.30 — RUT-grade client hints before v2.3.0 merge (TikTok/FB-iOS
+        # Sec-CH-UA suppression must not be overwritten by Chrome brands).
+        _profile_ch_hints: Dict[str, str] = {}
+        try:
+            from real_user_traffic import _build_client_hint_headers as _bld_ch
+            _os_hint = profile_os or ("ios" if is_mobile else "windows")
+            _profile_ch_hints = _bld_ch(
+                {"os": _os_hint, "is_mobile": is_mobile},
+                ua,
+            )
+            _pre = dict(context_kwargs.get("extra_http_headers") or {})
+            _pre.update(_profile_ch_hints)
+            context_kwargs["extra_http_headers"] = _pre
+        except Exception as _ch_err:
+            logger.debug(f"profile client-hint build skipped: {_ch_err}")
+
         # ── 2026-07 v2.3.0 — Apply next-level anti-detect stack ──
         # 15 industry-standard enhancements: HTTP/2 fingerprint, Sec-Fetch-*,
         # Full Client Hints, bot-vendor cohorts (PerimeterX/Kasada/Imperva/F5/
@@ -685,6 +848,7 @@ async def _launch_profile_session_inner(
             # full Chrome 128+ header suite).
             _extra_hdrs = dict(context_kwargs.get("extra_http_headers") or {})
             _extra_hdrs.update(_v230_report.get("headers") or {})
+            _extra_hdrs.update(_profile_ch_hints)
             _extra_hdrs["Accept-Language"] = accept_lang
             await context.set_extra_http_headers(_extra_hdrs)
             logger.info(
@@ -695,12 +859,24 @@ async def _launch_profile_session_inner(
         except Exception as _v230_err:
             logger.debug(f"v2.3.0 anti-detect apply skipped: {_v230_err}")
 
+        try:
+            from referrer_pro import make_sec_ch_ua_strip_route_handler
+            await context.route("**/*", make_sec_ch_ua_strip_route_handler())
+        except Exception as _route_err:
+            logger.debug(f"profile sec-ch-ua route strip skipped: {_route_err}")
+
         if master:
             try:
                 # Reuse RUT's stealth builder so the SAME ~35 JS patches
                 # land here. Falls back to a minimal stub if the import
                 # ever fails (keeps the launcher usable in isolation).
                 from real_user_traffic import _build_stealth_script
+                from anti_detect_v230 import (
+                    align_webgl_to_ua_deterministic as _align_webgl,
+                    natural_canvas_js as _natural_canvas,
+                    webgl_align_js as _webgl_align_js,
+                    _stable_hash as _stable_hash_fn,
+                )
 
                 # 2026-07 — DETERMINISTIC WebGL GPU alignment.
                 # Compute the GPU descriptor from (UA, profile_id) so
@@ -711,24 +887,18 @@ async def _launch_profile_session_inner(
                 # platform (macOS → Apple/Intel, Windows → NVIDIA/AMD/
                 # Intel, iOS → Apple GPU, etc.).
                 _profile_ua = str(context_kwargs.get("user_agent") or profile_config.get("user_agent") or "")
-                _webgl_cfg = None
-                try:
-                    from anti_detect_v230 import (
-                        align_webgl_to_ua_deterministic as _align_webgl,
-                        natural_canvas_js as _natural_canvas,
-                        webgl_align_js as _webgl_align_js,
-                        _stable_hash as _stable_hash_fn,
-                    )
-                    _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
-                except Exception as _we:
-                    logger.debug(f"webgl deterministic alignment skipped: {_we}")
+                if _webgl_cfg is None:
+                    try:
+                        _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
+                    except Exception as _we:
+                        logger.debug(f"webgl deterministic alignment skipped: {_we}")
 
                 fp = {
                     "viewport": context_kwargs["viewport"],
                     "device_scale_factor": dsf,
                     "is_mobile": is_mobile,
                     "has_touch": has_touch,
-                    "os": profile_config.get("os") or ("ios" if is_mobile else "windows"),
+                    "os": profile_os or ("ios" if is_mobile else "windows"),
                 }
                 # Push aligned WebGL vendor/renderer into fp so the
                 # baseline stealth script's UNMASKED_VENDOR/RENDERER
@@ -737,14 +907,21 @@ async def _launch_profile_session_inner(
                 if _webgl_cfg:
                     fp["webgl_vendor"] = _webgl_cfg["vendor"]
                     fp["webgl_renderer"] = _webgl_cfg["renderer"]
-                geo = {
+                geo_stealth = {
                     "locale": locale,
                     "timezone": timezone_id,
                     "accept_language": accept_lang,
-                    "lat": 40.7128, "lon": -74.0060,
+                    "lat": geo["lat"],
+                    "lon": geo["lon"],
                 }
-                stealth_js = _build_stealth_script(fp, geo)
+                stealth_js = _build_stealth_script(fp, geo_stealth)
                 await context.add_init_script(stealth_js)
+
+                if paranoia_mode:
+                    await context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        "window.chrome = window.chrome || { runtime: {} };"
+                    )
 
                 # 2026-07 — Natural canvas + WebGL alignment overrides.
                 # Injected AFTER the baseline so they override the
@@ -774,6 +951,55 @@ async def _launch_profile_session_inner(
                 )
 
         page = await context.new_page()
+
+        # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
+        if tls_prewarm:
+            try:
+                from tls_anti_detect import prewarm_target as _prewarm_target
+                _pw_res = await _prewarm_target(
+                    start_url or "https://www.google.com/",
+                    proxy=proxy_arg,
+                    ua=ua,
+                    timeout=20.0,
+                    accept_language=accept_lang,
+                    sec_fetch_kind="ad_click",
+                )
+                if _pw_res and _pw_res.get("ok") and _pw_res.get("cookies"):
+                    await context.add_cookies(_pw_res["cookies"])
+            except Exception as _pw_err:
+                logger.debug(f"[profile-launch] tls prewarm skipped: {_pw_err}")
+
+        # v2.6.34 — IP warm-up before first navigation (RUT parity, opt-in).
+        if ip_warmup:
+            try:
+                from advanced_anti_detect import warm_up_ip as _warm
+                _warm_page = await context.new_page()
+                try:
+                    _sites = await _warm(_warm_page, visits=2, dwell_sec=4.0)
+                    if _sites:
+                        logger.info(
+                            f"[profile-launch] ip_warmup OK via {len(_sites)} site(s) "
+                            f"session={session_id[:8]}"
+                        )
+                finally:
+                    try:
+                        await _warm_page.close()
+                    except Exception:
+                        pass
+            except Exception as _wu_err:
+                logger.debug(f"[profile-launch] ip_warmup skipped: {_wu_err}")
+
+        _referer_url, _referer_hdrs = await _resolve_referer_for_goto(
+            ua, profile_config, start_url or "https://www.google.com/"
+        )
+        if _referer_hdrs:
+            try:
+                _cur = dict(context_kwargs.get("extra_http_headers") or {})
+                _cur.update(_referer_hdrs)
+                await context.set_extra_http_headers(_cur)
+            except Exception:
+                pass
+
         # ── 2026-06 — Proxy health pre-check + clear error diagnostic ──
         # Customer report: profile launch errored with "ERR_TIMED_OUT"
         # on google.com with no clue WHY. Most common root cause is
@@ -964,11 +1190,28 @@ async def _launch_profile_session_inner(
             # Chrome "This site can't be reached" screen.
             _goto_err: Optional[str] = None
             _target_url = start_url or "https://www.google.com/"
+            _goto_kwargs: Dict[str, Any] = {"timeout": 45000, "wait_until": "domcontentloaded"}
+            if _referer_url:
+                _goto_kwargs["referer"] = _referer_url
             for attempt in (1, 2):
                 try:
                     _t_goto = 45000 if attempt == 1 else 75000
-                    await page.goto(_target_url, timeout=_t_goto, wait_until="domcontentloaded")
+                    _goto_kwargs["timeout"] = _t_goto
+                    await page.goto(_target_url, **_goto_kwargs)
                     _goto_err = None
+                    # v2.6.34 — Behavioral bio warm-up after landing (RUT parity).
+                    if behavioral_bio:
+                        try:
+                            from real_user_traffic import _human_warmup as _profile_warmup
+                            _fp_warm = {
+                                "viewport": context_kwargs.get("viewport") or viewport,
+                                "is_mobile": is_mobile,
+                            }
+                            await _profile_warmup(
+                                page, _fp_warm, paranoia=paranoia_mode,
+                            )
+                        except Exception as _bw_err:
+                            logger.debug(f"[profile-launch] behavioral_bio skipped: {_bw_err}")
                     break
                 except Exception as e:
                     _goto_err = f"attempt {attempt}/2 ({_t_goto/1000:.0f}s): {type(e).__name__}: {str(e)[:160]}"
@@ -1029,8 +1272,10 @@ async def _launch_profile_session_inner(
         if on_session_update:
             try:
                 await on_session_update({
-                    "profile_id": profile_id, "session_id": session_id,
+                    "profile_id": profile_id,
+                    "session_id": session_id,
                     "status": "running",
+                    "fingerprint_hash": _fingerprint_hash,
                 })
             except Exception:
                 pass
@@ -1039,6 +1284,7 @@ async def _launch_profile_session_inner(
         # We poll instead of using a single await so we can also respond
         # to a programmatic stop request from the cloud /stop endpoint.
         closed_event = asyncio.Event()
+        _last_storage_flush = time.time()
 
         def _on_disconnected():
             closed_event.set()
@@ -1049,7 +1295,6 @@ async def _launch_profile_session_inner(
             try:
                 await asyncio.wait_for(closed_event.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                # Check for external stop signal
                 sess = _RUNNING_SESSIONS.get(session_id) or {}
                 if sess.get("stop_requested"):
                     try:
@@ -1061,6 +1306,21 @@ async def _launch_profile_session_inner(
                     except Exception:
                         pass
                     break
+                # Periodic storage_state flush (crash recovery when identity_persist ON)
+                if identity_persist and (time.time() - _last_storage_flush) >= 120.0:
+                    _last_storage_flush = time.time()
+                    try:
+                        _snap = await context.storage_state()
+                        if on_session_update and _snap:
+                            await on_session_update({
+                                "profile_id": profile_id,
+                                "session_id": session_id,
+                                "status": "running",
+                                "storage_state": _snap,
+                                "fingerprint_hash": _fingerprint_hash,
+                            })
+                    except Exception as _sf_err:
+                        logger.debug(f"[profile-launch] periodic storage flush skipped: {_sf_err}")
 
         # ── Save storage_state + push to cloud ────────────────────────
         new_storage: Dict[str, Any] = {}
@@ -1076,14 +1336,16 @@ async def _launch_profile_session_inner(
             logger.warning(f"storage_state export failed: {e}")
 
         duration = round(time.time() - started_at, 1)
+        _final_status = "stopped" if (_RUNNING_SESSIONS.get(session_id) or {}).get("stop_requested") else "closed"
         if on_session_update:
             try:
                 await on_session_update({
                     "profile_id": profile_id,
                     "session_id": session_id,
-                    "status": "closed",
+                    "status": _final_status,
                     "storage_state": new_storage,
                     "duration_sec": duration,
+                    "fingerprint_hash": _fingerprint_hash,
                 })
             except Exception as e:
                 logger.warning(f"final session update failed: {e}")
@@ -1135,7 +1397,34 @@ async def process_pending_user_session_launches(
     profile was launched from the cloud UI (krexion.com), so the
     customer's cloud view stays in sync.
     """
-    # 1. Honour stop requests on already-claimed launches first. The
+    # 1. Cancel queued launches that were stopped before the tray picked them up.
+    try:
+        async for _cancel_doc in motor_db[_LAUNCH_QUEUE_COLLECTION].find({
+            "status": "queued",
+            "stop_requested": True,
+        }):
+            try:
+                _cancel_sid = str(_cancel_doc.get("id") or "")
+                _cancel_pid = str((_cancel_doc.get("profile_config") or {}).get("id") or _cancel_doc.get("profile_id") or "")
+                await motor_db[_LAUNCH_QUEUE_COLLECTION].update_one(
+                    {"id": _cancel_doc.get("id")},
+                    {"$set": {"status": "cancelled", "completed_at": _now_iso()}},
+                )
+                await motor_db.browser_profile_sessions.update_one(
+                    {"id": _cancel_sid},
+                    {"$set": {"status": "stopped", "ended_at": _now_iso()}},
+                )
+                await motor_db.browser_profiles.update_one(
+                    {"id": _cancel_pid},
+                    {"$set": {"status": "idle", "session_id": ""}},
+                )
+                logger.info(f"[user-session] cancelled queued launch session_id={_cancel_sid[:8]}")
+            except Exception as _cancel_err:  # noqa: BLE001
+                logger.debug(f"[user-session] queued cancel failed: {_cancel_err}")
+    except Exception as _cancel_drain_err:  # noqa: BLE001
+        logger.debug(f"[user-session] queued cancel drain failed: {_cancel_drain_err}")
+
+    # 2. Honour stop requests on already-claimed launches first. The
     #    backend writes `stop_requested=true` into the queue record;
     #    we forward it to the in-process `request_stop()` so the
     #    polling loop inside `_launch_session_inline` closes Chromium.
@@ -1160,10 +1449,10 @@ async def process_pending_user_session_launches(
     except Exception as _drain_err:  # noqa: BLE001
         logger.debug(f"[user-session] stop drain query failed: {_drain_err}")
 
-    # 2. Atomically claim one queued launch
+    # 3. Atomically claim one queued launch (skip stop-requested rows)
     try:
         doc = await motor_db[_LAUNCH_QUEUE_COLLECTION].find_one_and_update(
-            {"status": "queued"},
+            {"status": "queued", "stop_requested": {"$ne": True}},
             {"$set": {"status": "claimed", "claimed_at": _now_iso()}},
             sort=[("queued_at", 1)],
         )
@@ -1202,12 +1491,35 @@ async def process_pending_user_session_launches(
                 if status == "running":
                     await motor_db.browser_profiles.update_one(
                         {"id": profile_id},
-                        {"$set": {"status": "running"}},
+                        {"$set": {"status": "running", "session_id": sid}},
+                    )
+                elif status == "queued":
+                    await motor_db.browser_profiles.update_one(
+                        {"id": profile_id},
+                        {"$set": {"status": "launching", "session_id": sid}},
+                    )
+                elif status == "stopping":
+                    await motor_db.browser_profiles.update_one(
+                        {"id": profile_id},
+                        {"$set": {"status": "stopping", "session_id": sid}},
                     )
                 elif status in ("stopped", "closed", "error"):
                     await motor_db.browser_profiles.update_one(
                         {"id": profile_id},
-                        {"$set": {"status": "idle", "session_id": ""}},
+                        {"$set": {
+                            "status": "idle" if status in ("stopped", "closed") else "error",
+                            "session_id": "",
+                        }},
+                    )
+                if body.get("storage_state") and isinstance(body["storage_state"], dict):
+                    await motor_db.browser_profiles.update_one(
+                        {"id": profile_id},
+                        {"$set": {"storage_state": body["storage_state"]}},
+                    )
+                if body.get("fingerprint_hash"):
+                    await motor_db.browser_profiles.update_one(
+                        {"id": profile_id},
+                        {"$set": {"fingerprint_hash": str(body["fingerprint_hash"])[:128]}},
                     )
         except Exception as _local_err:  # noqa: BLE001
             logger.debug(f"[user-session] local mirror failed: {_local_err}")

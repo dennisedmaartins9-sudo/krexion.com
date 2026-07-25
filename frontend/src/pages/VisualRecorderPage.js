@@ -226,6 +226,21 @@ const DEVICE_PRESETS = [
 // localStorage keys for recent recordings + draft state
 const LS_RECENT_KEY = "vr_recent_v1";
 const LS_DRAFT_KEY = "vr_draft_v1";
+const LS_VR_RUT_HANDOFF = "vr_automation_handoff";
+
+function stashVrAutomationForRut(bundle) {
+  if (!bundle) return;
+  try {
+    localStorage.setItem(
+      LS_VR_RUT_HANDOFF,
+      JSON.stringify({
+        automation_json: bundle.automation_json || bundle.steps || [],
+        url: bundle.url || "",
+        headers: bundle.headers || [],
+      }),
+    );
+  } catch { /* quota / private mode */ }
+}
 
 // Tiny JSON colorizer — safe (escapes HTML, only adds <span class>)
 function colorizeJson(obj) {
@@ -336,7 +351,8 @@ export default function VisualRecorderPage() {
   const [pageMeta, setPageMeta] = useState({ url: "", title: "" });
   const [tool, setTool] = useState("default");
   const [pendingFormFill, setPendingFormFill] = useState(null); // {selector, header_name?}
-  const [pendingDropdown, setPendingDropdown] = useState(null); // {selector, options:[{value,label,...}], element}
+  const [pendingDropdownQueue, setPendingDropdownQueue] = useState([]); // queued dropdown binds
+  const pendingDropdown = pendingDropdownQueue[0] || null;
   // 2026-06: If / Else branch editor modal. When non-null an overlay
   // dialog appears letting the user define 2+ branches with conditions
   // (URL contains / selector visible / text visible) and the inline
@@ -1291,7 +1307,7 @@ export default function VisualRecorderPage() {
       // Esc — cancel pending bindings
       if (e.key === "Escape") {
         if (pendingFormFill) { setPendingFormFill(null); e.preventDefault(); return; }
-        if (pendingDropdown) { setPendingDropdown(null); e.preventDefault(); return; }
+        if (pendingDropdown) { setPendingDropdownQueue([]); e.preventDefault(); return; }
         if (pendingRandom.length) { setPendingRandom([]); e.preventDefault(); return; }
         if (detectedClickables.length || selectedRandomKeys.size) {
           setDetectedClickables([]);
@@ -1577,13 +1593,13 @@ export default function VisualRecorderPage() {
         } else if (!Array.isArray(d.options) || d.options.length === 0) {
           toast.error("No <select> options found at that point — click the dropdown control itself.");
         } else {
-          setPendingDropdown({
+          setPendingDropdownQueue([{
             selector: d.selector || "select",
             options: d.options,
             element: d.element,
             wrapper_kind: d.wrapper_kind || "",
             is_hidden_select: !!d.is_hidden_select,
-          });
+          }]);
           if (d.wrapper_kind) {
             toast.success(
               d.is_hidden_select
@@ -1708,7 +1724,7 @@ export default function VisualRecorderPage() {
           ? `Dropdown bound to {{${opts.header_name}}}`
           : `Dropdown will select "${opts.value}"`,
       );
-      setPendingDropdown(null);
+      setPendingDropdownQueue((prev) => prev.slice(1));
       refreshState();
     } catch (err) {
       toast.error(err.message || String(err));
@@ -1841,11 +1857,8 @@ export default function VisualRecorderPage() {
   //           - form_fill (no header yet) → backend records
   //             `wait_for_selector`; user can bind a header later via
   //             /type or via the last-item follow-up picker below.
-  //           - dropdown → backend returns options; we open the
-  //             existing `pendingDropdown` picker for the LAST such
-  //             item so the user can bind option/header. Any earlier
-  //             dropdowns get their `wait_for_selector` recorded and
-  //             stay unbound (user can re-bind by clicking on them).
+  //           - dropdown → backend returns options; queue ALL dropdown
+  //             picks so the user can bind each one in sequence.
   const addSelectedPopupClicks = async () => {
     if (!sessionId) return;
     const picks = Array.from(selectedPopupKeys)
@@ -1858,7 +1871,7 @@ export default function VisualRecorderPage() {
     setBusy(true);
     let added = 0;
     let lastFormFillPending = null;   // {selector, element}
-    let lastDropdownPending = null;   // {selector, options, ...}
+    const dropdownQueue = [];         // all dropdown binds to queue
     try {
       for (const { item, mode } of picks) {
         const cx = Math.round(item.x);
@@ -1872,45 +1885,35 @@ export default function VisualRecorderPage() {
           const d = await r.json();
           if (!r.ok) continue;
           if (mode === 'form_fill') {
-            // Backend records wait_for_selector (or fill if header
-            // supplied — not the case here). Count it as added and
-            // stash the last one for the bind-header prompt.
             added += 1;
             if (d.element) lastFormFillPending = { selector: d.selector || 'input', element: d.element };
           } else if (mode === 'dropdown') {
-            // Dropdown mode returns options but does NOT record a step
-            // until /dropdown-bind is called. Open the picker for the
-            // LAST dropdown pick so the user can bind it. Earlier
-            // dropdowns won't have a step recorded — user can re-run
-            // them individually. (Rare in popups — usually 0-1 selects
-            // per popup so this covers the realistic case.)
             if (Array.isArray(d.options) && d.options.length > 0) {
-              lastDropdownPending = {
+              dropdownQueue.push({
                 selector: d.selector || 'select',
                 options: d.options,
                 element: d.element,
                 wrapper_kind: d.wrapper_kind || '',
                 is_hidden_select: !!d.is_hidden_select,
-              };
+              });
             }
           } else if (mode === 'check') {
             if (d.recorded !== false) added += 1;
           } else {
-            // click (default)
             if (d.recorded !== false) added += 1;
           }
         } catch {
           /* keep going — best effort across the batch */
         }
       }
-      // Open the follow-up picker(s) for the LAST form_fill /
-      // dropdown pick so the user can bind them without re-clicking.
       if (lastFormFillPending) setPendingFormFill(lastFormFillPending);
-      if (lastDropdownPending) setPendingDropdown(lastDropdownPending);
+      if (dropdownQueue.length) setPendingDropdownQueue(dropdownQueue);
 
       toast.success(
         `Added ${added}/${picks.length} popup step(s)` +
-        (lastDropdownPending ? " — pick option/header for the highlighted dropdown" : "") +
+        (dropdownQueue.length
+          ? ` — bind ${dropdownQueue.length} dropdown${dropdownQueue.length === 1 ? "" : "s"} (first shown)`
+          : "") +
         (lastFormFillPending ? " — bind an Excel column for the form field" : "")
       );
       setSelectedPopupKeys(new Set());
@@ -5004,6 +5007,11 @@ export default function VisualRecorderPage() {
                   <div className="text-[11px] text-zinc-400 mb-2">
                     {pendingDropdown.options.length} option{pendingDropdown.options.length === 1 ? "" : "s"} found —
                     pick a fixed one OR bind to an Excel column.
+                    {pendingDropdownQueue.length > 1 && (
+                      <span className="ml-1 text-amber-300">
+                        ({pendingDropdownQueue.length - 1} more queued)
+                      </span>
+                    )}
                   </div>
 
                   {/* Excel column bindings (preferred for per-row values) */}
@@ -5050,7 +5058,7 @@ export default function VisualRecorderPage() {
 
                   <div className="flex justify-end mt-2">
                     <button
-                      onClick={() => setPendingDropdown(null)}
+                      onClick={() => setPendingDropdownQueue([])}
                       className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs"
                       data-testid="vr-dd-cancel"
                     >
@@ -6397,7 +6405,17 @@ export default function VisualRecorderPage() {
               )}
             </details>
 
-            <div className="mt-5 flex gap-3">
+            <div className="mt-5 flex flex-wrap gap-3">
+              <button
+                onClick={() => {
+                  stashVrAutomationForRut(finalBundle);
+                  window.location.href = "/real-user-traffic";
+                }}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium"
+                data-testid="vr-use-in-rut-btn"
+              >
+                <ArrowLeft className="w-4 h-4" /> Use in RUT
+              </button>
               <button
                 onClick={() => {
                   setFinalBundle(null);
@@ -6415,6 +6433,7 @@ export default function VisualRecorderPage() {
               </button>
               <Link
                 to="/real-user-traffic"
+                onClick={() => stashVrAutomationForRut(finalBundle)}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm"
               >
                 <ArrowLeft className="w-4 h-4" /> Back to RUT

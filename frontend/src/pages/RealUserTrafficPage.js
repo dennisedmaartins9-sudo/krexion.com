@@ -395,6 +395,32 @@ export default function RealUserTrafficPage() {
   // Proxies & UAs
   const [proxies, setProxies] = useState("");
   const [userAgents, setUserAgents] = useState("");
+  // v2.6.29 — accept UAs stashed from User Agent Generator page
+  useEffect(() => {
+    try {
+      const stash = localStorage.getItem("ua_generator_payload");
+      if (stash && stash.trim()) {
+        setUserAgents(stash.trim());
+        localStorage.removeItem("ua_generator_payload");
+        toast.success("User agents loaded from UA Generator");
+      }
+      const vrStash = localStorage.getItem("vr_automation_handoff");
+      if (vrStash && vrStash.trim()) {
+        const parsed = JSON.parse(vrStash);
+        localStorage.removeItem("vr_automation_handoff");
+        const steps = parsed?.automation_json ?? parsed?.steps;
+        if (steps) {
+          setFormFillEnabled(true);
+          setUseCustomJson(true);
+          setAutomationJson(
+            typeof steps === "string" ? steps : JSON.stringify(steps, null, 2)
+          );
+          if (parsed?.url) setTargetUrlOverride(parsed.url);
+          toast.success("Automation JSON loaded from Visual Recorder");
+        }
+      }
+    } catch { /* ignore */ }
+  }, []);
   const [useStoredProxies, setUseStoredProxies] = useState(false);
   // ── Auto Mode (via Proxy Provider) ─────────────────────────────
   // When ON, the user does NOT have to paste / upload any proxies —
@@ -914,6 +940,7 @@ export default function RealUserTrafficPage() {
     setInappBrowserPreset("none");        // let matchUaToPlatform rotate per visit
     setRefererValue("");                   // preset owns the source
     if (trafficSourcePreset === "mixed_realistic") {
+      setRefererTrafficType("auto");
       // Balanced 4-way mix — best all-round default for most offers.
       setRefererPlatformWeights({
         facebook: 30, instagram: 15, tiktok: 20,
@@ -922,6 +949,7 @@ export default function RealUserTrafficPage() {
       setRefererNetworkClickChain(true);   // affiliate-chain look
       setRefererSearchEngine("google");
     } else if (trafficSourcePreset === "social_media_ads") {
+      setRefererTrafficType("paid");
       // Paid-social heavy: FB / IG / TikTok / Twitter, no search
       setRefererPlatformWeights({
         facebook: 40, instagram: 30, tiktok: 25, twitter: 5,
@@ -929,6 +957,7 @@ export default function RealUserTrafficPage() {
       setRefererNetworkClickChain(true);
       setRefererSearchEngine("google");
     } else if (trafficSourcePreset === "search_engine_ads") {
+      setRefererTrafficType("paid");
       // Google / Bing SEM + a slice of privacy engines
       setRefererPlatformWeights({
         google: 65, bing: 25, duckduckgo: 5, yandex: 5,
@@ -938,6 +967,7 @@ export default function RealUserTrafficPage() {
       setRefererInappDeep(false);           // search has no in-app deep paths
       setRefererSocialWrapper(false);
     } else if (trafficSourcePreset === "email_campaign") {
+      setRefererTrafficType("organic");
       // Pure email — ESP weights drive per-visit ESP choice
       setRefererPlatformWeights({ email: 100 });
       setRefererEmailWeights({
@@ -948,6 +978,7 @@ export default function RealUserTrafficPage() {
       setRefererInappDeep(false);
       setRefererSocialWrapper(false);
     } else if (trafficSourcePreset === "direct_traffic") {
+      setRefererTrafficType("auto");
       // Bookmark / direct-typed URL / native mail app — no Referer.
       // pass_to_offer STAYS ON: Bug #9 fix allows pass-to-offer with
       // blank Referer, so the browser navigates DIRECTLY to the offer
@@ -5515,12 +5546,12 @@ export default function RealUserTrafficPage() {
               </p>
               {useCustomJson && (
                 <>
-                  {/* Uploaded automation-json template picker (reusable, never auto-deletes) */}
-                  {uploadedLibrary.filter(u => u.type === "automation_json").length > 0 && (
-                    <div className="mb-2 p-2 bg-emerald-950/30 border border-emerald-900/50 rounded">
-                      <Label className="text-emerald-300 text-xs mb-1 block">
-                        Or pick a <span className="font-semibold">saved template</span> from Uploaded Things (reusable — never deleted)
-                      </Label>
+                  {/* Saved automation-json templates (Uploaded Things + VR handoff) */}
+                  <div className="mb-2 p-2 bg-emerald-950/30 border border-emerald-900/50 rounded">
+                    <Label className="text-emerald-300 text-xs mb-1 block">
+                      Pick a <span className="font-semibold">saved automation template</span> (Uploaded Things — reusable, never deleted)
+                    </Label>
+                    {uploadedLibrary.filter(u => u.type === "automation_json").length > 0 ? (
                       <select
                         value={selectedUploadAjId}
                         onChange={(e) => setSelectedUploadAjId(e.target.value)}
@@ -5534,8 +5565,13 @@ export default function RealUserTrafficPage() {
                           </option>
                         ))}
                       </select>
-                    </div>
-                  )}
+                    ) : (
+                      <p className="text-[11px] text-zinc-500">
+                        No saved templates yet — record in Visual Recorder and click
+                        {" "}<b>Use in RUT</b>, or save one under Uploaded Things → Automation JSON.
+                      </p>
+                    )}
+                  </div>
                   <Textarea
                     data-testid="rut-automation-json"
                     rows={10}
