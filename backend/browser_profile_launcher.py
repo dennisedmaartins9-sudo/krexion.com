@@ -1103,6 +1103,12 @@ async def _launch_profile_session_inner(
                             proxy_diag["risk"] = str(_fraud_res.get("risk", "") or "")
                             if _fraud_res.get("is_vpn"):
                                 _score = _fraud_res.get("vpn_score", 0)
+                                proxy_diag["fraud_blocked"] = True
+                                proxy_diag["ok"] = False
+                                proxy_diag["error"] = (
+                                    f"Exit IP flagged by fraud detection "
+                                    f"({_psource}, score={_score})"
+                                )
                                 logger.warning(
                                     f"[profile-launch] exit IP {_exit_ip} flagged by "
                                     f"{_psource} (fraud_score={_score}) — session={session_id[:8]}"
@@ -1128,7 +1134,32 @@ async def _launch_profile_session_inner(
         #   • the configured server + username (no password)
         #   • a "Continue without proxy" button via JS that just
         #     navigates to the start_url anyway (proxy-less)
-        if proxy_diag["requested"] and proxy_diag["ok"] is False:
+        if proxy_diag.get("fraud_blocked"):
+            try:
+                _safe_err = str(proxy_diag.get("error") or "").replace("<", "&lt;").replace(">", "&gt;")
+                _fraud_html = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<title>Krexion — Fraud detection blocked</title>"
+                    "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+                    "background:#0b0b10;color:#e4e4e7;margin:0;padding:48px;"
+                    "min-height:100vh;box-sizing:border-box}"
+                    ".card{max-width:720px;margin:0 auto;background:#18181b;"
+                    "border:1px solid #3f3f46;border-radius:12px;padding:32px}"
+                    "h1{margin:0 0 8px;font-size:22px;color:#fb7185}"
+                    ".muted{color:#71717a;font-size:13px;line-height:1.6}"
+                    "code{background:#0a0a0f;border:1px solid #27272a;padding:2px 6px;"
+                    "border-radius:4px;font-size:13px;color:#fbbf24;word-break:break-all}"
+                    "</style></head><body><div class='card'>"
+                    "<h1>⚠ Exit IP blocked by fraud detection</h1>"
+                    "<p class='muted'>This browser profile's proxy exit IP failed your Settings → Fraud Detection rules. "
+                    "Change proxy / country or adjust your fraud threshold before relaunching.</p>"
+                    "<code>"+_safe_err+"</code>"
+                    "</div></body></html>"
+                )
+                await page.set_content(_fraud_html, timeout=5000)
+            except Exception as _fe:
+                logger.warning(f"[profile-launch] fraud block page render failed: {_fe}")
+        elif proxy_diag["requested"] and proxy_diag["ok"] is False:
             try:
                 _safe_server = str(proxy_diag.get("server") or "").replace("<", "&lt;").replace(">", "&gt;")
                 _safe_err = str(proxy_diag.get("error") or "").replace("<", "&lt;").replace(">", "&gt;")

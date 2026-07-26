@@ -85,9 +85,10 @@ async def get_defaults():
 
     # Stable display order for UI rendering
     platform_order = [
-        "facebook", "instagram", "tiktok", "youtube", "twitter",
+        "facebook", "messenger", "instagram", "tiktok", "youtube", "twitter",
         "snapchat", "pinterest", "reddit", "linkedin",
         "google", "bing", "duckduckgo", "yahoo", "yandex",
+        "baidu", "naver", "ecosia", "brave",
         "email", "whatsapp", "telegram", "discord",
     ]
     email_order = [
@@ -105,7 +106,7 @@ async def get_defaults():
         "email_default_weights": DEFAULT_EMAIL_WEIGHTS,
         "search_engines": [
             "google", "bing", "yahoo", "duckduckgo",
-            "yandex", "youtube", "baidu", "naver",
+            "yandex", "youtube", "baidu", "naver", "ecosia", "brave",
         ],
         "countries": [
             # Common affiliate-traffic countries (ISO-2)

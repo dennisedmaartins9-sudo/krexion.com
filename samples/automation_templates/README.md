@@ -11,6 +11,17 @@ Ready-to-import Visual Recorder / RUT step JSONs for common offer flows.
 
 ## Available templates
 
+### `linkthem_offer250_FINAL.json` (351 steps) — **YOUR OFFER**
+- **Offer URL**: https://linkthem.net/aff_c?offer_id=250&aff_id=171338
+- **Funnel**: retailproductsusa Q1–Q3 (Yes/No → Use it myself/Share with family → Weekly/Monthly) → **email Continue (required)** → displayoptoffers surveys → **lead form (required, visible #lfirstname wait)** → 3 deals → conversion
+- **Forms are NOT optional** — `#lfirstname` visible hone tak wait (120s), phir full form + phone 3-part fill
+- **Excel columns**: `first, last, address, city, state, zip_code, cellphone, email, gender, day, month, year`
+- **Phone/SMS popup**: always **No thanks**
+- **Email newsletter popup**: always **Yes**
+- **Survey**: random answer each step; `Math.random()` per visit — unique user behavior
+- **Deal page**: clicks 3 different CONTINUE deals (`dataset.rfClicked` tracks done deals); skips survey when deal page detected
+- **Excel columns required**: `first, last, address, city, state, zip_code, cellphone, email, gender, day, month, year` (optional: `dob`)
+
 ### `upLevelRewards_2X_cash_summer.json` (35 steps)
 - **Offer URL**: https://offer-luxe-spot.lovable.app
 - **Funnel**: lovable landing → trksy.org tracker → uplevelrewards.com form → surveys (random per visit) → lead form → deal page (Fillwords / JustPlay / Bingo Billions — 3 free deals click)

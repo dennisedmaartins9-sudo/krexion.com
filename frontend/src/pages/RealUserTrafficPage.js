@@ -559,6 +559,11 @@ export default function RealUserTrafficPage() {
   const [postSubmitWait, setPostSubmitWait] = useState(6);
   const [automationJson, setAutomationJson] = useState("");
   const [useCustomJson, setUseCustomJson] = useState(false);
+  // ── 2026-07 — Native Smart Funnel (adaptive survey/form/deals) ──
+  const [funnelMode, setFunnelMode] = useState("legacy"); // legacy | smart | custom
+  const [smartFunnelPattern, setSmartFunnelPattern] = useState("auto");
+  const [smartFunnelMinDeals, setSmartFunnelMinDeals] = useState(2);
+  const [smartFunnelWaitUntilConversion, setSmartFunnelWaitUntilConversion] = useState(true);
   const [selectedUploadAjId, setSelectedUploadAjId] = useState("");
   const [selfHeal, setSelfHeal] = useState(true);
   // ── 2026-05: Pure JSON Mode ──
@@ -578,7 +583,7 @@ export default function RealUserTrafficPage() {
   // tls_prewarm: real-Chrome JA3 curl_cffi handshake before goto.
   const [pacingPerHour, setPacingPerHour] = useState(0);
   const [identityLabel, setIdentityLabel] = useState("");
-  const [tlsPrewarm, setTlsPrewarm] = useState(false);
+  const [tlsPrewarm, setTlsPrewarm] = useState(true);
 
   // ── 2026-02 v2.1.31 — Step 3: Multi-Hop Proxy Chain + Browser Variant ──
   const [proxyChainEnabled, setProxyChainEnabled] = useState(false);
@@ -588,8 +593,8 @@ export default function RealUserTrafficPage() {
   const [adCapabilities, setAdCapabilities] = useState(null);
 
   // ── 2026-02 v2.1.31 — Step 4: Phase-4 Anti-Detect ──
-  const [behavioralBioEnabled, setBehavioralBioEnabled] = useState(false);
-  const [ipWarmupEnabled, setIpWarmupEnabled] = useState(false);
+  const [behavioralBioEnabled, setBehavioralBioEnabled] = useState(true);
+  const [ipWarmupEnabled, setIpWarmupEnabled] = useState(true);
 
   // ── 2026-06-11: UNIFIED Anti-Detect master toggle ──
   // Single user-facing switch. When ON, all underlying flags above
@@ -1911,7 +1916,7 @@ export default function RealUserTrafficPage() {
       }
       if (dataSource === "gsheet" && !gsheetUrl.trim()) return toast.error("Paste the Google Sheet URL");
       if (dataSource === "pending_from_job" && !importPendingJobId) return toast.error("Select a previous job to import pending leads from");
-      if (useCustomJson) {
+      if (useCustomJson || funnelMode === "custom") {
         // Either a saved template is selected OR user pasted JSON
         if (!selectedUploadAjId && !automationJson.trim()) {
           return toast.error("Paste the custom automation JSON, pick a saved template, or disable the toggle");
@@ -1920,6 +1925,9 @@ export default function RealUserTrafficPage() {
           try { JSON.parse(automationJson); }
           catch (e) { return toast.error("Automation JSON is not valid: " + e.message); }
         }
+      }
+      if (funnelMode === "smart" && !formFillEnabled) {
+        return toast.error("Smart Funnel requires Form Fill with Excel/Sheet lead data");
       }
     }
 
@@ -1971,6 +1979,12 @@ export default function RealUserTrafficPage() {
       let effectiveProxies = proxies;
       let effectiveUseProxyJetAuto = useProxyJetAuto;
       if (autoModeViaProvider) {
+        const multiGeo = pjGeoMode === "many" && pjCountriesPool.length >= 2;
+        if (multiGeo) {
+          // Multi-geo mix needs backend on-demand ROW-FIRST — skip single-country pre-gen.
+          effectiveUseProxyJetAuto = true;
+          toast.info("Multi-geo Auto Mode: per-visit proxy mix handled by the engine (no pre-gen).");
+        } else {
         try {
           const desired = Math.max(1, parseInt(totalClicks, 10) || 10);
           const genRes = await fetch(
@@ -2004,10 +2018,11 @@ export default function RealUserTrafficPage() {
           setSubmitting(false);
           return toast.error(`Auto Mode failed: ${e.message || e}. Try disabling Auto Mode and pasting proxies manually.`);
         }
+        }
       }
       const wantProxies = !effectiveUseProxyJetAuto && !useStoredProxies && !selectedUploadProxyId && selectedUploadProxyIds.length === 0 && effectiveProxies && effectiveProxies.trim();
       const wantUas = !selectedUploadUaId && selectedUploadUaIds.length === 0 && userAgents && userAgents.trim();
-      const wantAj = formFillEnabled && useCustomJson && !selectedUploadAjId && automationJson.trim();
+      const wantAj = formFillEnabled && (useCustomJson || funnelMode === "custom") && !selectedUploadAjId && automationJson.trim();
       const wantTarget = !!targetScreenshotFile;
 
       const [
@@ -2162,6 +2177,8 @@ export default function RealUserTrafficPage() {
       // 2026-02 v2.1.31 — Step 4
       fd.append("behavioral_bio_enabled", String(!!behavioralBioEnabled));
       fd.append("ip_warmup_enabled", String(!!ipWarmupEnabled));
+      fd.append("ad_chain_simulation_enabled", "true");
+      fd.append("ip_quality_check_enabled", "true");
 
       // 2026-06 — Referrer Override (off-by-default, customer opt-in)
       fd.append("referer_override_enabled", String(!!refererOverrideEnabled));
@@ -2240,7 +2257,13 @@ export default function RealUserTrafficPage() {
         fd.append("step_timeout_multiplier", String(stepTimeoutMultiplier));
         fd.append("skip_captcha", String(skipCaptcha));
         fd.append("post_submit_wait", String(postSubmitWait));
-        if (useCustomJson) {
+        fd.append("smart_funnel_enabled", String(funnelMode === "smart"));
+        if (funnelMode === "smart") {
+          fd.append("smart_funnel_pattern", smartFunnelPattern || "auto");
+          fd.append("smart_funnel_min_deals", String(smartFunnelMinDeals));
+          fd.append("smart_funnel_wait_until_conversion", String(!!smartFunnelWaitUntilConversion));
+        }
+        if (useCustomJson || funnelMode === "custom") {
           const finalAjId = selectedUploadAjId || autoAjId;
           if (finalAjId) {
             fd.append("upload_automation_json_id", finalAjId);
@@ -3485,10 +3508,9 @@ export default function RealUserTrafficPage() {
                       // — Tor adds ~3-5s per visit). Auto-enable only when
                       // proxies list exists and customer wants paranoia.
                     } else {
-                      // Reset to legacy defaults
-                      setTlsPrewarm(false);
-                      setBehavioralBioEnabled(false);
-                      setIpWarmupEnabled(false);
+                      // Reset heavy opt-ins only — production anti-detect
+                      // baselines (TLS prewarm, IP warm-up, behavioral bio)
+                      // stay ON per v2.6.35 defaults.
                       setBrowserVariant("auto");
                       setProxyChainEnabled(false);
                     }
@@ -4208,7 +4230,7 @@ export default function RealUserTrafficPage() {
                       className="mt-1 bg-zinc-800 border-zinc-700 text-zinc-100"
                     />
                     <p className="text-xs text-gray-500 mt-1">
-                      One platform is picked per visit at random. Available: facebook, instagram, tiktok, youtube, twitter, snapchat, pinterest, reddit, linkedin, whatsapp, telegram, discord, google, bing, duckduckgo, yahoo, yandex, <span className="text-emerald-300 font-medium">email</span>.
+                      One platform is picked per visit at random. Available: facebook, messenger, instagram, tiktok, youtube, twitter, snapchat, pinterest, reddit, linkedin, whatsapp, telegram, discord, google, bing, duckduckgo, yahoo, yandex, baidu, naver, ecosia, brave, <span className="text-emerald-300 font-medium">email</span>.
                     </p>
                     <p className="text-xs text-gray-500 mt-1">
                       Want full % control + ESP mix? Turn on <span className="text-fuchsia-300 font-medium">Pro Mode</span> for the multi-select UI.
@@ -5525,14 +5547,111 @@ export default function RealUserTrafficPage() {
               )}
             </div>
 
+            {/* ── 2026-07: Smart Funnel (native adaptive engine) ── */}
+            <div className="pt-3 border-t border-emerald-900/30">
+              <p className="text-zinc-200 text-sm font-medium mb-2">🧠 Funnel Mode</p>
+              <div className="space-y-2 ml-1">
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="funnelMode"
+                    checked={funnelMode === "smart"}
+                    onChange={() => { setFunnelMode("smart"); setUseCustomJson(false); }}
+                    className="mt-1 accent-violet-500"
+                    data-testid="rut-funnel-smart"
+                  />
+                  <span className="text-xs text-zinc-300">
+                    <b className="text-violet-300">Smart Funnel</b> (Recommended) — surveys, forms, deals auto-detect.
+                    Page-order resilient, no 400-step JSON. Excel placeholders auto-clean (zip, DOB, phone).
+                  </span>
+                </label>
+                {funnelMode === "smart" && (
+                  <div className="ml-6 p-3 bg-violet-950/20 border border-violet-900/40 rounded space-y-3">
+                    <div>
+                      <Label className="text-violet-300 text-xs">Pattern</Label>
+                      <select
+                        value={smartFunnelPattern}
+                        onChange={(e) => setSmartFunnelPattern(e.target.value)}
+                        className="w-full h-8 px-2 mt-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-100 text-xs"
+                        data-testid="rut-smart-funnel-pattern"
+                      >
+                        <option value="auto">Auto Detect</option>
+                        <option value="reward_survey_funnel">Reward Survey Funnel</option>
+                        <option value="survey_form_deals">Survey + Form + Deals</option>
+                        <option value="form_deals">Form + Deals</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-wrap gap-4 items-center">
+                      <div>
+                        <Label className="text-violet-300 text-xs">Min deals</Label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={5}
+                          value={smartFunnelMinDeals}
+                          onChange={(e) => setSmartFunnelMinDeals(Math.max(1, Math.min(5, parseInt(e.target.value, 10) || 2)))}
+                          className="w-20 h-8 px-2 mt-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-100 text-xs"
+                          data-testid="rut-smart-funnel-min-deals"
+                        />
+                      </div>
+                      <label className="flex items-center gap-2 cursor-pointer mt-4">
+                        <input
+                          type="checkbox"
+                          checked={smartFunnelWaitUntilConversion}
+                          onChange={(e) => setSmartFunnelWaitUntilConversion(e.target.checked)}
+                          className="w-4 h-4 accent-violet-500"
+                          data-testid="rut-smart-funnel-wait-conversion"
+                        />
+                        <span className="text-xs text-zinc-300">Wait until conversion (extended watchdog, no early exit)</span>
+                      </label>
+                    </div>
+                    <p className="text-[11px] text-violet-300/70">
+                      Tip: Stuck Watchdog ≥ 1800s recommended for long survey offers when wait-until-conversion is ON.
+                    </p>
+                  </div>
+                )}
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="funnelMode"
+                    checked={funnelMode === "custom"}
+                    onChange={() => { setFunnelMode("custom"); setUseCustomJson(true); }}
+                    className="mt-1 accent-emerald-500"
+                    data-testid="rut-funnel-custom"
+                  />
+                  <span className="text-xs text-zinc-300">
+                    <b>Custom Automation JSON</b> — Visual Recorder step-by-step script (402-step flows, Pure JSON mode, etc.)
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="funnelMode"
+                    checked={funnelMode === "legacy"}
+                    onChange={() => { setFunnelMode("legacy"); setUseCustomJson(false); }}
+                    className="mt-1 accent-zinc-500"
+                    data-testid="rut-funnel-legacy"
+                  />
+                  <span className="text-xs text-zinc-300">
+                    <b>Legacy auto-fill</b> — built-in heuristic form filler (older offers)
+                  </span>
+                </label>
+              </div>
+            </div>
+
             {/* Custom Automation JSON */}
             <div className="pt-3 border-t border-emerald-900/30">
               <label className="flex items-center gap-2 cursor-pointer mb-2">
                 <input
                   type="checkbox"
-                  checked={useCustomJson}
-                  onChange={(e) => setUseCustomJson(e.target.checked)}
-                  className="w-4 h-4 accent-emerald-500"
+                  checked={useCustomJson || funnelMode === "custom"}
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setUseCustomJson(on);
+                    setFunnelMode(on ? "custom" : (funnelMode === "custom" ? "legacy" : funnelMode));
+                  }}
+                  disabled={funnelMode === "smart"}
+                  className="w-4 h-4 accent-emerald-500 disabled:opacity-40"
                   data-testid="rut-use-custom-json"
                 />
                 <span className="text-zinc-200 text-sm font-medium">
@@ -5544,7 +5663,7 @@ export default function RealUserTrafficPage() {
                 Supports: <code className="text-zinc-400">click · fill · type · select · check · press · wait · wait_for_selector · scroll · evaluate · screenshot</code>.
                 Placeholders: <code className="text-zinc-400">{"{{first}} {{email}} {{phone}} {{random.10}}"}</code>.
               </p>
-              {useCustomJson && (
+              { (useCustomJson || funnelMode === "custom") && (
                 <>
                   {/* Saved automation-json templates (Uploaded Things + VR handoff) */}
                   <div className="mb-2 p-2 bg-emerald-950/30 border border-emerald-900/50 rounded">

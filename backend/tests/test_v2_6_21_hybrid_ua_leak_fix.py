@@ -171,10 +171,11 @@ def test_plain_android_webview_becomes_cronet_on_tiktok_coerce():
     assert "musical_ly" in out.lower()
 
 
-# ─── (e) Regression: clean TikTok Cronet UA is idempotent ───────────
-def test_clean_tiktok_cronet_ua_is_idempotent():
-    """A clean, fully-formed TikTok Cronet Android UA should be returned
-    unchanged by coerce (no double musical_ly, no rebuild artifacts)."""
+# ─── (e) Incomplete TikTok Cronet UA gets FB_IAB upgrade ────────────
+def test_incomplete_tiktok_cronet_ua_gets_fb_iab_upgrade():
+    """Legacy TikTok Cronet Android UA (musical_ly but no FB_IAB bracket)
+    must be UPGRADED by coerce — not returned unchanged. Advertiser
+    parsers label those UAs as generic Android browser."""
     rp = _get_rp()
     clean = (
         "Mozilla/5.0 (Linux; U; Android 14; en_US; SM-S928B; "
@@ -185,13 +186,13 @@ def test_clean_tiktok_cronet_ua_is_idempotent():
         "BytedanceWebview/d8a21c6 ttwebview/05080411"
     )
     out = rp.coerce_ua_for_platform(clean, "tiktok")
-    # No Chrome / Safari / duplicate musical_ly should appear.
     assert "Chrome/" not in out
     assert "Mobile Safari/" not in out
-    # musical_ly should appear exactly once
     assert out.lower().count("musical_ly_") == 1, f"duplicate musical_ly_: {out}"
-    # Cronet must still be there.
     assert "Cronet/" in out
+    assert "FBAN/TikTokAndroid" in out, (
+        f"v2.6.33: incomplete legacy UA must gain TikTokAndroid bracket: {out}"
+    )
 
 
 # ─── (f) Regression: FB in-app coerce keeps Chrome/Safari ───────────

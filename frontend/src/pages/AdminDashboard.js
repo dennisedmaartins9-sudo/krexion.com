@@ -13,6 +13,7 @@ import { Textarea } from "../components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import SystemCheckPanel from "../components/SystemCheckPanel";
+import CrossUserIpIsolationPanel from "../components/CrossUserIpIsolationPanel";
 import { toast } from "sonner";
 import { format } from "date-fns";
 import { 
@@ -1104,6 +1105,14 @@ export default function AdminDashboard() {
             >
               <Mail size={16} className="mr-2" />
               Email
+            </TabsTrigger>
+            <TabsTrigger 
+              value="ip-isolation" 
+              className="data-[state=active]:bg-[#27272A] data-[state=active]:text-white"
+              data-testid="ip-isolation-tab"
+            >
+              <ShieldCheck size={16} className="mr-2" />
+              IP Isolation
             </TabsTrigger>
             <TabsTrigger 
               value="system" 
@@ -2446,6 +2455,11 @@ export default function AdminDashboard() {
                 )}
               </CardContent>
             </Card>
+          </TabsContent>
+
+          {/* ── Cross-user IP isolation ──────────────────── */}
+          <TabsContent value="ip-isolation" className="mt-6">
+            <CrossUserIpIsolationPanel users={users} getAdminToken={getAdminToken} />
           </TabsContent>
 
           {/* ── System Check tab ─────────────────────────── */}

@@ -50,10 +50,12 @@ Author: Krexion team, July 2026
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
 import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -380,6 +382,56 @@ def intermediate_hop_urls(platform: str, offer_url: str, hops: int = 1) -> List[
     return out
 
 
+async def fire_pixel_prefire(
+    page: Any,
+    *,
+    platform: str = "",
+    ttclid: str = "",
+    fbclid: str = "",
+    gclid: str = "",
+    timeout_ms: int = 8000,
+) -> List[str]:
+    """Fire platform pixel URLs before the offer navigation.
+
+    Uses Playwright's request API so pixels hit the network without
+    leaving the current page. Never raises — returns the list of URLs
+    that returned a sub-500 response."""
+    urls = pixel_prefire_urls(platform, ttclid=ttclid, fbclid=fbclid, gclid=gclid)
+    fired: List[str] = []
+    for url in urls:
+        try:
+            resp = await page.request.get(url, timeout=timeout_ms)
+            if resp and int(resp.status or 0) < 500:
+                fired.append(url)
+        except Exception as exc:
+            logger.debug("pixel prefire failed %s: %s", url[:80], exc)
+    return fired
+
+
+async def navigate_intermediate_hops(
+    page: Any,
+    *,
+    platform: str = "",
+    offer_url: str = "",
+    hops: int = 1,
+    timeout_ms: int = 15000,
+) -> List[str]:
+    """Visit 1-N intermediate redirect hops before the final offer URL.
+
+    Mimics the multi-hop journey of a real ad click (l.facebook.com,
+    t.co, bit.ly, …). Never raises — returns URLs successfully visited."""
+    urls = intermediate_hop_urls(platform, offer_url, hops=max(1, int(hops or 1)))
+    visited: List[str] = []
+    for url in urls:
+        try:
+            await page.goto(url, wait_until="commit", timeout=timeout_ms)
+            visited.append(url)
+            await asyncio.sleep(random.uniform(0.35, 1.15))
+        except Exception as exc:
+            logger.debug("intermediate hop failed %s: %s", url[:80], exc)
+    return visited
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 6. POST-CONVERSION BEHAVIOUR SIMULATION
 # ══════════════════════════════════════════════════════════════════════
@@ -516,20 +568,7 @@ def align_ua_to_chromium(ua: str, actual_chromium_ver: Optional[int] = None) -> 
     if not ua:
         return ua
     if actual_chromium_ver is None:
-        try:
-            import subprocess
-            # Try common Chromium/Chrome binaries
-            for cmd in (["chromium", "--version"], ["chrome", "--version"], ["google-chrome", "--version"]):
-                try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
-                    m = re.search(r"(\d+)\.\d+\.\d+\.\d+", r.stdout or "")
-                    if m:
-                        actual_chromium_ver = int(m.group(1))
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            actual_chromium_ver = None
+        actual_chromium_ver = detect_installed_chromium_major()
     if not actual_chromium_ver:
         return ua
     m = re.search(r"Chrome/(\d+)", ua)
@@ -545,6 +584,150 @@ def align_ua_to_chromium(ua: str, actual_chromium_ver: Optional[int] = None) -> 
         lambda m2: f"{m2.group(1)}{actual_chromium_ver}{m2.group(2)}",
         ua, count=1,
     )
+
+
+def detect_installed_chromium_major() -> Optional[int]:
+    """Best-effort major Chrome version from Playwright's full Chromium
+    binary or a system Chrome install. Used to align UA strings with
+    the actual TLS / Sec-CH-UA binary the visit runs."""
+    try:
+        import os
+        import subprocess
+        from pathlib import Path
+
+        browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+        try:
+            import playwright as _pw
+            bj = Path(_pw.__file__).parent / "driver" / "package" / "browsers.json"
+            if bj.exists():
+                with open(bj, "r", encoding="utf-8") as fh:
+                    data = __import__("json").load(fh)
+                rev = None
+                for entry in data.get("browsers", []):
+                    if entry.get("name") == "chromium":
+                        rev = str(entry.get("revision") or "").strip() or None
+                        break
+                if rev:
+                    plat = "win64" if os.name == "nt" else ("mac-arm64" if os.uname().machine == "arm64" else "linux64")
+                    if os.name == "nt":
+                        bin_name = "chrome.exe"
+                    elif sys.platform == "darwin":
+                        bin_name = "Chromium"
+                        plat = "mac-arm64" if "arm" in (os.uname().machine or "").lower() else "mac-x64"
+                    else:
+                        bin_name = "chrome"
+                    exe = Path(browsers_root) / f"chromium-{rev}" / plat / bin_name
+                    if exe.exists():
+                        r = subprocess.run(
+                            [str(exe), "--version"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        m = re.search(r"(\d+)\.\d+\.\d+\.\d+", (r.stdout or r.stderr or ""))
+                        if m:
+                            return int(m.group(1))
+        except Exception:
+            pass
+        for cmd in (["chromium", "--version"], ["chrome", "--version"], ["google-chrome", "--version"]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                m = re.search(r"(\d+)\.\d+\.\d+\.\d+", r.stdout or r.stderr or "")
+                if m:
+                    return int(m.group(1))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 8b. CDP / PLAYWRIGHT RUNTIME STEALTH
+# ══════════════════════════════════════════════════════════════════════
+# Playwright MUST keep CDP attached for automation — we cannot detach it
+# without breaking the visit. These JS patches hide the *detectable*
+# side-effects of an attached CDP session (debugger traps, binding
+# objects, devtools dimension skew, missing chrome.runtime, etc.).
+
+_CDP_STEALTH_JS = r"""
+(function(){try{
+  // ── Strip Playwright / Puppeteer binding leaks on window ──
+  const HIDE_KEYS = [
+    '__playwright','__pw_manual','__pwInitScripts','__pw_recorder',
+    '__playwright__binding__','__pw','_playwright','playwright',
+  ];
+  HIDE_KEYS.forEach(function(k){
+    try{ delete window[k]; }catch(e){}
+    try{ Object.defineProperty(window,k,{get:function(){return undefined;},configurable:true}); }catch(e){}
+  });
+
+  // ── Filter cdc_ / webdriver artifacts from enumeration ──
+  const BAD = /^(cdc_|__webdriver|__driver|__fxdriver|__selenium|\$cdc_|__playwright|__pw)/i;
+  const origOwn = Object.getOwnPropertyNames;
+  Object.getOwnPropertyNames = function(t){
+    var keys = origOwn.apply(this, arguments);
+    return t === window ? keys.filter(function(k){ return !BAD.test(String(k)); }) : keys;
+  };
+  const origKeys = Reflect.ownKeys;
+  Reflect.ownKeys = function(t){
+    var keys = origKeys.apply(this, arguments);
+    return t === window ? keys.filter(function(k){ return !BAD.test(String(k)); }) : keys;
+  };
+
+  // ── Neutralize debugger; loops used to detect attached DevTools ──
+  try{
+    const origFunc = Function;
+    const wrapped = function(){
+      var args = Array.prototype.slice.call(arguments);
+      if(args.length){
+        var body = String(args[args.length - 1] || '');
+        if(/debugger\s*;?/.test(body)){
+          args[args.length - 1] = body.replace(/\bdebugger\s*;?/g, ';');
+        }
+      }
+      return origFunc.apply(this, args);
+    };
+    wrapped.prototype = origFunc.prototype;
+    Function = wrapped;
+  }catch(e){}
+
+  // ── chrome.runtime stub (extension-less real Chrome still has it) ──
+  try{
+    window.chrome = window.chrome || {};
+    if(!window.chrome.runtime){
+      window.chrome.runtime = {
+        connect: function(){ return { onMessage: { addListener: function(){} }, postMessage: function(){} }; },
+        sendMessage: function(){ return Promise.resolve(undefined); },
+        id: undefined,
+      };
+    }
+    if(!window.chrome.app){
+      window.chrome.app = { isInstalled: false, getDetails: function(){ return null; } };
+    }
+  }catch(e){}
+
+  // ── DevTools dock skew — detectors compare outer vs inner width ──
+  try{
+    var ow = window.outerWidth, oh = window.outerHeight;
+    var iw = window.innerWidth, ih = window.innerHeight;
+    if(ow - iw > 180 || oh - ih > 180){
+      Object.defineProperty(window,'outerWidth',{get:function(){ return iw; }, configurable:true});
+      Object.defineProperty(window,'outerHeight',{get:function(){ return ih + 85; }, configurable:true});
+    }
+  }catch(e){}
+
+  // ── Block Error.prepareStackTrace CDP hooks when present ──
+  try{
+    if(Error.prepareStackTrace){
+      Error.prepareStackTrace = undefined;
+    }
+  }catch(e){}
+}catch(_kxE){}})();
+"""
+
+
+def cdp_stealth_js() -> str:
+    """JS patches that hide attached CDP / Playwright runtime side-effects."""
+    return _CDP_STEALTH_JS
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -622,6 +805,41 @@ _MOBILE_SIGNALS_JS = r"""
         return new OrigPE(type, init);
       };
       window.PointerEvent.prototype = OrigPE.prototype;
+    }
+  }catch(e){}
+
+  // userAgentData mobile bit — real Android/iOS Chrome exposes this
+  try{
+    if(navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues==='function'){
+      const origGet = navigator.userAgentData.getHighEntropyValues.bind(navigator.userAgentData);
+      navigator.userAgentData.getHighEntropyValues = function(hints){
+        return origGet(hints).then(function(v){
+          v = v || {};
+          v.mobile = true;
+          v.platform = /iphone|ipad|ipod/i.test(navigator.userAgent) ? 'iOS' : 'Android';
+          return v;
+        });
+      };
+    }else if(!navigator.userAgentData){
+      Object.defineProperty(navigator,'userAgentData',{
+        get:function(){
+          return {
+            mobile:true,
+            platform:/iphone|ipad|ipod/i.test(navigator.userAgent)?'iOS':'Android',
+            brands:[{brand:'Google Chrome',version:'131'},{brand:'Chromium',version:'131'}],
+            getHighEntropyValues:function(){
+              return Promise.resolve({ mobile:true, platform:this.platform, brands:this.brands });
+            }
+          };
+        }
+      });
+    }
+  }catch(e){}
+
+  // Real mobile pages expose ontouchstart on the document element
+  try{
+    if(document && document.documentElement && !('ontouchstart' in document.documentElement)){
+      document.documentElement.ontouchstart = null;
     }
   }catch(e){}
 }catch(_kxE){}})();
@@ -1257,6 +1475,7 @@ def build_v230_stealth_bundle() -> str:
     Caller passes this into a single `context.add_init_script(...)`
     call — one round-trip instead of 11."""
     return "\n".join([
+        cdp_stealth_js(),
         bot_vendor_stealth_js(),
         mobile_signals_js(),
         webgl_extensions_js(),

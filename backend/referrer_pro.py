@@ -169,6 +169,16 @@ def build_search_referer(engine: str, keyword: str, country: Optional[str] = Non
             return "https://search.naver.com/"
         return f"https://search.naver.com/search.naver?query={quote_plus(kw)}"
 
+    if engine == "ecosia":
+        if strip_path or not kw:
+            return "https://www.ecosia.org/"
+        return f"https://www.ecosia.org/search?q={quote_plus(kw)}"
+
+    if engine == "brave":
+        if strip_path or not kw:
+            return "https://search.brave.com/"
+        return f"https://search.brave.com/search?q={quote_plus(kw)}"
+
     # Unknown engine → safe fallback
     host = hosts["google"]
     if strip_path or not kw:
@@ -201,6 +211,12 @@ _SOCIAL_WRAPPER_REFERERS: Dict[str, List[Tuple[float, str]]] = {
         (0.45, "https://www.facebook.com/"),
         (0.20, "https://m.facebook.com/"),
         (0.10, ""),  # strict-origin-when-cross-origin policy strips referrer entirely
+    ],
+    "messenger": [
+        (0.20, "https://l.messenger.com/l.php?u={enc_u}&h={hash16}"),
+        (0.50, "https://www.messenger.com/"),
+        (0.20, "https://messenger.com/"),
+        (0.10, ""),  # in-app webview strip
     ],
     "instagram": [
         # 2026-07 v2.2.0 — de-emphasised l.instagram.com wrapper for the
@@ -444,15 +460,23 @@ def is_inapp_browser_ua(ua: str) -> str:
     ual = ua.lower()
     if "instagram" in ual:
         return "instagram"
+    # Messenger BEFORE generic Facebook — FB_IAB/MESSENGER and fbms markers.
+    if (
+        "messenger" in ual
+        or "fb_iab/messenger" in ual
+        or "fbms" in ual
+        or "fban/messenger" in ual
+    ):
+        return "messenger"
     if "fbav" in ual or "fban" in ual or "fb_iab" in ual:
         return "facebook"
     if "tiktok" in ual or "musical_ly" in ual or "trill" in ual:
         return "tiktok"
     if "snapchat" in ual:
         return "snapchat"
-    if "linkedinapp" in ual:
+    if "linkedinapp" in ual or "com.linkedin.android/" in ual:
         return "linkedin"
-    if "twitter" in ual and "android" in ual:
+    if "twitterandroid" in ual or "twitterios" in ual or ("twitter" in ual and "android" in ual):
         return "twitter"
     return ""
 
@@ -575,6 +599,21 @@ def build_inapp_deep_referer(platform: str, target_url: str = "",
             return f"https://www.facebook.com/{page_slug}/posts/{pfbid}"
         else:
             return ""
+    if p == "messenger":
+        roll = random.random()
+        if roll < 0.65:
+            if target_url:
+                enc_u = quote_plus(target_url)
+            else:
+                enc_u = quote_plus("https://www.messenger.com/")
+            hash_body = "".join(random.choices(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+                k=random.randint(58, 104),
+            ))
+            return f"https://l.messenger.com/l.php?u={enc_u}&h=AT{hash_body}"
+        if roll < 0.90:
+            return "https://www.messenger.com/"
+        return ""
     if p == "snapchat":
         return "https://www.snapchat.com/discover"
     if p == "linkedin":
@@ -1552,8 +1591,11 @@ def resolve_pro_visit(
             out["network_click_referer"] = build_network_click_referer(network_click_host)
         return out
 
-    # Search engines (google / bing / yahoo / duckduckgo / yandex / youtube / baidu / naver)
-    if chosen in ("google", "bing", "duckduckgo", "yahoo", "yandex"):
+    # Search engines (google / bing / yahoo / duckduckgo / yandex / baidu / naver / ecosia / brave)
+    if chosen in (
+        "google", "bing", "duckduckgo", "yahoo", "yandex",
+        "baidu", "naver", "ecosia", "brave",
+    ):
         # If pool entry maps to search, use the user's chosen search engine
         kws = [ln.strip() for ln in (search_keywords or "").splitlines() if ln.strip()]
         kw = random.choice(kws) if kws else ""
@@ -1564,8 +1606,10 @@ def resolve_pro_visit(
         # engine wins; otherwise we fall back to the pool selection.
         # BUG #4 fix: removed dead `eng = chosen if chosen != "duckduckgo" else "duckduckgo"`
         se = (search_engine or "").strip().lower()
-        _VALID_SE = ("google", "bing", "duckduckgo", "ddg", "yahoo",
-                     "yandex", "youtube", "baidu", "naver")
+        _VALID_SE = (
+            "google", "bing", "duckduckgo", "ddg", "yahoo",
+            "yandex", "youtube", "baidu", "naver", "ecosia", "brave",
+        )
         if se and se in _VALID_SE and se != "google":
             # "google" is our internal default → treat as "no override";
             # anything else (bing/ddg/yandex/…) counts as an explicit
@@ -1588,7 +1632,10 @@ def resolve_pro_visit(
                 _v2_ref_se = _build_inapp_deep_referer_v2(
                     actual_signal, target_url or "", bool(_is_paid_v2_se)
                 )
-                if _v2_ref_se is not None:
+                # Empty string in the paid/organic pool means "direct
+                # navigation" for social — for search engines we already
+                # built a SERP referer above; keep it instead of blanking.
+                if _v2_ref_se:
                     ref = _v2_ref_se
             except Exception:
                 pass  # keep legacy build_search_referer output
@@ -1660,6 +1707,8 @@ def resolve_pro_visit(
             "yandex":     "https://yandex.com/",
             "baidu":      "https://www.baidu.com/",
             "naver":      "https://search.naver.com/",
+            "ecosia":     "https://www.ecosia.org/",
+            "brave":      "https://search.brave.com/",
         }
         ref = homepages.get(signal, "")
 
@@ -2090,6 +2139,23 @@ def make_sec_ch_ua_strip_route_handler():
 
 
 
+def _is_tiktok_android_ua_complete(ua: str) -> bool:
+    """True when Android UA has the v2.6.27 TikTok in-app signature.
+
+    Advertiser parsers label Cronet + `musical_ly` as generic Android
+    unless `[FB_IAB/;FBAN/TikTokAndroid;…]` is present.
+    """
+    if not ua:
+        return False
+    ual = ua.lower()
+    if "android" not in ual:
+        return False
+    if "fban/tiktokandroid" not in ual:
+        return False
+    markers = _INAPP_MARKER_LOOKUP.get("tiktok", ())
+    return any(m and m in ual for m in markers)
+
+
 def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
     """True iff `ua` already carries the in-app marker for `platform`.
 
@@ -2108,6 +2174,9 @@ def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
     "Facebook for Android (Unknown)" cluster on advertiser dashboards.
     Re-running coercion on those UAs now properly appends a fresh
     `[FB_IAB/FB4A;FBAV/<real_ver>;IABMV/1;]` suffix.
+
+    2026-07 v2.6.33: Android TikTok requires FBAN/TikTokAndroid —
+    musical_ly alone is incomplete and must be upgraded.
     """
     if not ua or not platform:
         return False
@@ -2128,6 +2197,11 @@ def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
         m = re.search(r"fbav/([\d.]+)", ual)
         if not m or len(m.group(1)) < 5 or "." not in m.group(1):
             return False
+        return True
+
+    if p == "tiktok" and _is_mobile_ua(ua) == "android":
+        return _is_tiktok_android_ua_complete(ua)
+
     return True
 
 
@@ -2258,6 +2332,26 @@ def _rebuild_tiktok_android_ua_base(ua: str) -> str:
     if not ua:
         return ua or ""
     try:
+        # Real TikTok Cronet shape:
+        # `(Linux; U; Android 14; en_US; SM-S928B; Build/UP1A…; Cronet/58…)`
+        m_cronet = re.match(
+            r"^Mozilla/5\.0\s*\(Linux;\s*U;\s*Android\s+([\d.]+);\s*"
+            r"([a-z]{2}_[A-Z]{2});\s*"
+            r"([^;]+?);\s*Build/([^;)\s]+);\s*Cronet/",
+            ua,
+            flags=re.IGNORECASE,
+        )
+        if m_cronet:
+            android_ver = (m_cronet.group(1) or "14").strip()
+            locale_short = (m_cronet.group(2) or "en_US").strip()
+            device = (m_cronet.group(3) or "SM-S928B").strip()
+            build_id = (m_cronet.group(4) or "UP1A.231005.007").strip()
+            cronet_ver = random.choice(_TIKTOK_CRONET_VERSIONS)
+            return (
+                f"Mozilla/5.0 (Linux; U; Android {android_ver}; {locale_short}; "
+                f"{device}; Build/{build_id}; Cronet/{cronet_ver})"
+            )
+
         # Parse `Linux; Android <ver>; <device> Build/<id>[; wv]` block.
         m = re.match(
             r"^Mozilla/5\.0\s*\(Linux;\s*(?:U;\s*)?Android\s+"
@@ -2277,6 +2371,17 @@ def _rebuild_tiktok_android_ua_base(ua: str) -> str:
         android_ver = (m.group(1) or "14").strip()
         device = (m.group(2) or "SM-S928B").strip()
         build_id = (m.group(3) or "UP1A.231005.007").strip()
+        # WebView shape sometimes has locale where device should be.
+        if re.fullmatch(r"[a-z]{2}_[A-Z]{2}", device, flags=re.IGNORECASE):
+            m_dev = re.search(
+                r"Android\s+[\d.]+\s*;\s*(?:[a-z]{2}_[A-Z]{2}\s*;\s*)?"
+                r"([^;]+?)\s+Build/([^;)\s]+)",
+                ua,
+                flags=re.IGNORECASE,
+            )
+            if m_dev:
+                device = (m_dev.group(1) or device).strip()
+                build_id = (m_dev.group(2) or build_id).strip()
         # Locale — biased towards en_US since that dominates TikTok's
         # US audience which is the majority of advertiser targeting.
         locale_short = random.choice(
@@ -2598,10 +2703,11 @@ def coerce_ua_for_platform(ua: str, platform: str) -> str:
                     )
                     _existing_tt_suffix = _mm.group(0).strip() if _mm else ""
                     new_ua = _rebuilt
-                    if _existing_tt_suffix:
-                        # Re-append the existing clean TikTok suffix so
-                        # the UA still declares TikTok immediately (no
-                        # need to fall through to build_inapp_ua_suffix).
+                    if _existing_tt_suffix and _is_tiktok_android_ua_complete(
+                        f"{new_ua} {_existing_tt_suffix}"
+                    ):
+                        # Re-append only when the suffix already carries
+                        # the v2.6.27 FB_IAB TikTokAndroid bracket.
                         new_ua = f"{new_ua} {_existing_tt_suffix}"
 
         # Now idempotency check on the CLEANED UA. If clean UA still
@@ -2759,6 +2865,7 @@ def coerce_ua_for_platform(ua: str, platform: str) -> str:
         if family == "ios" and p in (
             "facebook", "messenger", "tiktok", "instagram",
             "snapchat", "linkedin", "twitter",
+            "youtube", "google", "reddit", "pinterest",
         ):
             # 1. Strip the trailing `Safari/<X.X.X>` token (real in-app
             #    UAs don't carry it).
@@ -3659,6 +3766,46 @@ _PAID_ORGANIC_POOLS: Dict[str, Dict[str, List[Tuple[str, float]]]] = {
             ("https://www.bing.com/",                85.0),
             (_TOK_BING_SERP,                         10.0),
             ("",                                      5.0),
+        ],
+    },
+    "baidu": {
+        "paid": [
+            ("https://www.baidu.com/",               65.0),
+            ("",                                     35.0),
+        ],
+        "organic": [
+            ("https://www.baidu.com/",               90.0),
+            ("",                                     10.0),
+        ],
+    },
+    "naver": {
+        "paid": [
+            ("https://search.naver.com/",            65.0),
+            ("",                                     35.0),
+        ],
+        "organic": [
+            ("https://search.naver.com/",            90.0),
+            ("",                                     10.0),
+        ],
+    },
+    "ecosia": {
+        "paid": [
+            ("https://www.ecosia.org/",              60.0),
+            ("",                                     40.0),
+        ],
+        "organic": [
+            ("https://www.ecosia.org/",              88.0),
+            ("",                                     12.0),
+        ],
+    },
+    "brave": {
+        "paid": [
+            ("https://search.brave.com/",            60.0),
+            ("",                                     40.0),
+        ],
+        "organic": [
+            ("https://search.brave.com/",            88.0),
+            ("",                                     12.0),
         ],
     },
 }

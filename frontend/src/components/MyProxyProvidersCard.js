@@ -48,6 +48,17 @@ const PROXY_TYPES = [
   { value: "socks4",   label: "SOCKS4" },
 ];
 
+/** Every provider gets the full generator UI — backend applies what it can. */
+const FULL_GENERATOR_SUPPORTS = {
+  country: true,
+  state: true,
+  city: true,
+  zip: true,
+  asn: true,
+  sticky_minutes: true,
+  session_mode: true,
+};
+
 /**
  * "My Proxy Providers" — provider-agnostic on-demand proxy generator.
  *
@@ -118,9 +129,9 @@ export default function MyProxyProvidersCard() {
     if (selected?.proxy_type) setProxyType(selected.proxy_type);
   }, [selectedId, authHeaders, selected?.proxy_type]);
 
-  const supports = profile?.supported || {};
-  const anyGeo = supports.country || supports.state || supports.city || supports.zip || supports.asn;
+  const supports = FULL_GENERATOR_SUPPORTS;
   const ttlCap = profile?.ttl_cap_min || 120;
+  const kindHint = profile?.hint || "";
 
   // Reference options for the geo comboboxes — refresh whenever the
   // selected country changes so cities/ISPs update in sync.
@@ -159,11 +170,26 @@ export default function MyProxyProvidersCard() {
   // gets sent. Uses only client-side heuristics; backend is source of
   // truth. Only shown for rotating_gateway providers.
   const dslPreview = useMemo(() => {
-    if (!selected || selected.kind !== "rotating_gateway") return "";
+    if (!selected) return "";
+    if (selected.kind === "native_proxyjet") {
+      const bits = [];
+      if (country) bits.push(`country=${country}`);
+      if (state) bits.push(`state=${state}`);
+      if (sessionMode === "sticky" && stickyMinutes) bits.push(`sticky=${stickyMinutes}m`);
+      return bits.length
+        ? `ProxyJet session · ${bits.join(" · ")}`
+        : "ProxyJet session · uses saved Auto Mode country/state";
+    }
+    if (selected.kind === "manual_list") {
+      return "Manual list · returns saved lines (geo fields ignored)";
+    }
+    if (selected.kind === "api_endpoint") {
+      return "API endpoint · fetches from configured API URL";
+    }
     const host = selected?.config_summary?.gateway_host
       || selected?.gateway_host
       || (selected?.name || "").toLowerCase();
-    const detect = profile?.detected_provider || "";
+    const detect = profile?.detected_provider || selected?.name || "";
     let sep = "-", kv = "-", prefix = "-";
     let keys = { country: "country", state: "state", city: "city", zip: "zip", asn: "asn" };
     let sidKey = "session", ttlKey = null;
@@ -217,12 +243,12 @@ export default function MyProxyProvidersCard() {
         proxy_type: proxyType,
         session_mode: sessionMode,
       };
-      if (supports.country && country) payload.country = country.trim().toUpperCase();
-      if (supports.state && state) payload.state = state.trim().toUpperCase();
-      if (supports.city && city) payload.city = city.trim();
-      if (supports.zip && zip) payload.zip = zip.trim();
-      if (supports.asn && asn) payload.asn = asn.trim();
-      if (supports.sticky_minutes && sessionMode === "sticky" && stickyMinutes) {
+      if (country) payload.country = country.trim().toUpperCase();
+      if (state) payload.state = state.trim().toUpperCase();
+      if (city) payload.city = city.trim();
+      if (zip) payload.zip = zip.trim();
+      if (asn) payload.asn = asn.trim();
+      if (sessionMode === "sticky" && stickyMinutes) {
         payload.sticky_minutes = Math.max(1, Math.min(parseInt(stickyMinutes, 10) || 10, ttlCap));
       }
       const r = await axios.post(
@@ -383,26 +409,24 @@ export default function MyProxyProvidersCard() {
                     ))}
                   </select>
                 </div>
-                {supports.session_mode && (
-                  <div>
-                    <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                      <Timer size={11} /> Session type
-                    </Label>
-                    <select
-                      value={sessionMode}
-                      onChange={(e) => setSessionMode(e.target.value)}
-                      className="w-full h-10 px-2 rounded-md bg-zinc-900/60 border border-zinc-700 text-white text-sm"
-                      data-testid="mpp-gen-session-mode"
-                    >
-                      <option value="rotating">Rotating (fresh IP per connect)</option>
-                      <option value="sticky">Sticky (hold IP for N min)</option>
-                    </select>
-                  </div>
-                )}
+                <div>
+                  <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                    <Timer size={11} /> Session type
+                  </Label>
+                  <select
+                    value={sessionMode}
+                    onChange={(e) => setSessionMode(e.target.value)}
+                    className="w-full h-10 px-2 rounded-md bg-zinc-900/60 border border-zinc-700 text-white text-sm"
+                    data-testid="mpp-gen-session-mode"
+                  >
+                    <option value="rotating">Rotating (fresh IP per connect)</option>
+                    <option value="sticky">Sticky (hold IP for N min)</option>
+                  </select>
+                </div>
               </div>
 
               {/* Sticky duration slider */}
-              {supports.sticky_minutes && sessionMode === "sticky" && (
+              {sessionMode === "sticky" && (
                 <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3">
                   <Label className="text-[11px] text-emerald-300 uppercase tracking-wider flex items-center gap-1 mb-2">
                     <Timer size={11} /> Sticky duration
@@ -437,141 +461,124 @@ export default function MyProxyProvidersCard() {
                 </div>
               )}
 
-              {/* Advanced Targeting section */}
-              {anyGeo && (
-                <div className="rounded-lg border border-blue-500/25 bg-zinc-950/40">
-                  <button
-                    type="button"
-                    onClick={() => setShowTargeting((v) => !v)}
-                    className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-blue-500/5 transition"
-                    data-testid="mpp-targeting-toggle"
-                  >
-                    <span className="flex items-center gap-2 text-sm">
-                      <Globe2 size={14} className="text-blue-300" />
-                      <span className="text-blue-100 font-medium">Geo targeting</span>
-                      <span className="text-[10px] text-zinc-500 italic">— optional, uses provider&apos;s native DSL</span>
-                    </span>
-                    {showTargeting ? <ChevronUp size={14} className="text-zinc-400" /> : <ChevronDown size={14} className="text-zinc-400" />}
-                  </button>
-                  {showTargeting && (
-                    <div className="px-3 pb-3 space-y-3">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                        {supports.country && (
-                          <div>
-                            <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                              <Globe2 size={11} /> Country
-                            </Label>
-                            <SearchableCombo
-                              value={country}
-                              onChange={(v) => {
-                                setCountry(v);
-                                // Reset dependents when country changes
-                                if (v !== country) {
-                                  setState("");
-                                  setCity("");
-                                  setAsn("");
-                                }
-                              }}
-                              options={COUNTRY_OPTIONS}
-                              placeholder="Any country — search or type ISO"
-                              testid="mpp-gen-country"
-                            />
-                          </div>
-                        )}
-                        {supports.state && (
-                          <div>
-                            <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                              <MapPin size={11} /> State / Region
-                              {country && country !== "US" && (
-                                <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
-                              )}
-                            </Label>
-                            <SearchableCombo
-                              value={state}
-                              onChange={setState}
-                              options={stateOptions}
-                              placeholder={country === "US" ? "Any state — search or type code" : "e.g. bavaria, ontario, ile-de-france"}
-                              testid="mpp-gen-state"
-                            />
-                          </div>
-                        )}
-                        {supports.city && (
-                          <div>
-                            <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                              <Building2 size={11} /> City
-                              {cityOptions.length === 0 && (
-                                <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
-                              )}
-                            </Label>
-                            <SearchableCombo
-                              value={city}
-                              onChange={setCity}
-                              options={cityOptions}
-                              placeholder={cityOptions.length ? "Search cities or type your own" : "e.g. miami, london, tokyo"}
-                              testid="mpp-gen-city"
-                            />
-                          </div>
-                        )}
-                        {supports.zip && (
-                          <div>
-                            <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                              <Hash size={11} /> ZIP / Postal
-                            </Label>
-                            <Input
-                              value={zip}
-                              onChange={(e) => setZip(e.target.value)}
-                              placeholder="e.g. 33101, SW1A"
-                              className="bg-zinc-900/60 border-zinc-700 text-white"
-                              data-testid="mpp-gen-zip"
-                            />
-                          </div>
-                        )}
-                        {supports.asn && (
-                          <div>
-                            <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
-                              <Server size={11} /> ISP / ASN
-                              {ispOptions.length === 0 && (
-                                <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
-                              )}
-                            </Label>
-                            <SearchableCombo
-                              value={asn}
-                              onChange={setAsn}
-                              options={ispOptions}
-                              placeholder={ispOptions.length ? "Pick an ISP or type ASN like 7018" : "e.g. comcast, 7018"}
-                              testid="mpp-gen-asn"
-                            />
-                          </div>
-                        )}
-                      </div>
-
-                      {/* DSL preview */}
-                      {dslPreview && (
-                        <div className="rounded border border-zinc-700/60 bg-black/40 px-3 py-2 flex items-start gap-2">
-                          <Wand2 size={12} className="text-amber-300 mt-0.5 shrink-0" />
-                          <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-0.5">
-                              Provider will receive
-                            </div>
-                            <code className="text-[11px] text-amber-200/90 font-mono block break-all">
-                              {dslPreview}
-                            </code>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {selected && selected.kind === "rotating_gateway" && !anyGeo && (
-                <div className="rounded border border-zinc-700/60 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-400 flex items-start gap-2">
-                  <Info size={12} className="text-zinc-500 mt-0.5 shrink-0" />
-                  <span>
-                    Session-only mode. To enable Country / State / City / ZIP / ASN targeting, edit your provider in Settings and either use a supported gateway host (DataImpulse, Bright Data, Oxylabs, IPRoyal, Smartproxy, ProxyEmpire, Soax, PacketStream) or add <code className="text-amber-300 mx-0.5">{`{country}`}</code> / <code className="text-amber-300 mx-0.5">{`{state}`}</code> / <code className="text-amber-300 mx-0.5">{`{city}`}</code> / <code className="text-amber-300 mx-0.5">{`{zip}`}</code> / <code className="text-amber-300 mx-0.5">{`{asn}`}</code> / <code className="text-amber-300 mx-0.5">{`{ttl}`}</code> / <code className="text-amber-300 mx-0.5">{`{sid}`}</code> placeholders in the username template.
+              {/* Advanced Targeting section — always visible for every provider */}
+              <div className="rounded-lg border border-blue-500/25 bg-zinc-950/40">
+                <button
+                  type="button"
+                  onClick={() => setShowTargeting((v) => !v)}
+                  className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-blue-500/5 transition"
+                  data-testid="mpp-targeting-toggle"
+                >
+                  <span className="flex items-center gap-2 text-sm">
+                    <Globe2 size={14} className="text-blue-300" />
+                    <span className="text-blue-100 font-medium">Geo targeting</span>
+                    <span className="text-[10px] text-zinc-500 italic">— optional, uses provider&apos;s native DSL</span>
                   </span>
-                </div>
-              )}
+                  {showTargeting ? <ChevronUp size={14} className="text-zinc-400" /> : <ChevronDown size={14} className="text-zinc-400" />}
+                </button>
+                {showTargeting && (
+                  <div className="px-3 pb-3 space-y-3">
+                    {kindHint && (
+                      <div className="rounded border border-zinc-700/60 bg-zinc-900/40 px-3 py-2 text-[11px] text-zinc-400 flex items-start gap-2">
+                        <Info size={12} className="text-blue-400 mt-0.5 shrink-0" />
+                        <span>{kindHint}</span>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                      <div>
+                        <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                          <Globe2 size={11} /> Country
+                        </Label>
+                        <SearchableCombo
+                          value={country}
+                          onChange={(v) => {
+                            setCountry(v);
+                            if (v !== country) {
+                              setState("");
+                              setCity("");
+                              setAsn("");
+                            }
+                          }}
+                          options={COUNTRY_OPTIONS}
+                          placeholder="Any country — search or type ISO"
+                          testid="mpp-gen-country"
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                          <MapPin size={11} /> State / Region
+                          {country && country !== "US" && (
+                            <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
+                          )}
+                        </Label>
+                        <SearchableCombo
+                          value={state}
+                          onChange={setState}
+                          options={stateOptions}
+                          placeholder={country === "US" ? "Any state — search or type code" : "e.g. bavaria, ontario, ile-de-france"}
+                          testid="mpp-gen-state"
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                          <Building2 size={11} /> City
+                          {cityOptions.length === 0 && (
+                            <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
+                          )}
+                        </Label>
+                        <SearchableCombo
+                          value={city}
+                          onChange={setCity}
+                          options={cityOptions}
+                          placeholder={cityOptions.length ? "Search cities or type your own" : "e.g. miami, london, tokyo"}
+                          testid="mpp-gen-city"
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                          <Hash size={11} /> ZIP / Postal
+                        </Label>
+                        <Input
+                          value={zip}
+                          onChange={(e) => setZip(e.target.value)}
+                          placeholder="e.g. 33101, SW1A"
+                          className="bg-zinc-900/60 border-zinc-700 text-white"
+                          data-testid="mpp-gen-zip"
+                        />
+                      </div>
+                      <div>
+                        <Label className="text-[11px] text-zinc-400 uppercase tracking-wider flex items-center gap-1 mb-1">
+                          <Server size={11} /> ISP / ASN
+                          {ispOptions.length === 0 && (
+                            <span className="text-zinc-600 lowercase text-[10px]">(free text)</span>
+                          )}
+                        </Label>
+                        <SearchableCombo
+                          value={asn}
+                          onChange={setAsn}
+                          options={ispOptions}
+                          placeholder={ispOptions.length ? "Pick an ISP or type ASN like 7018" : "e.g. comcast, 7018"}
+                          testid="mpp-gen-asn"
+                        />
+                      </div>
+                    </div>
+
+                    {dslPreview && (
+                      <div className="rounded border border-zinc-700/60 bg-black/40 px-3 py-2 flex items-start gap-2">
+                        <Wand2 size={12} className="text-amber-300 mt-0.5 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-0.5">
+                            Provider will receive
+                          </div>
+                          <code className="text-[11px] text-amber-200/90 font-mono block break-all">
+                            {dslPreview}
+                          </code>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
 
               <Button
                 onClick={generateBatch}

@@ -1,3 +1,15 @@
+# v2.6.35 — 2026-07 — Anti-detect audit: full implementation
+#
+# - Defaults ON: tls_prewarm, ip_warmup, behavioral_bio, ad_chain_simulation.
+# - Auto identity_label (rut-{job_id}) + Full Chromium executable_path launch.
+# - Ad chain wired: pixel prefire + intermediate hops before offer goto.
+# - CDP stealth JS (Playwright binding hide, debugger neutralize, chrome.runtime).
+# - Mobile realism: userAgentData.mobile + ontouchstart on documentElement.
+# - TLS companion prewarm (favicon/robots via curl_cffi) before Playwright nav.
+# - IP quality gate: datacenter ISP heuristics + skipped_low_quality_ip filter.
+# - SwiftShader WebGL sanitize + v230 stealth failure logging.
+# - Naver organic referer: empty paid/organic pool token no longer blanks SERP referer.
+#
 # v2.6.34 — 2026-07 — Close remaining anti-detect tradeoff gaps
 #
 # - JWT secret: load from backend/.env + persist to backend/.krexion/jwt_secret.

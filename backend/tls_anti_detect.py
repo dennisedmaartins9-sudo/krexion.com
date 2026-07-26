@@ -458,6 +458,54 @@ async def prewarm_target(
         return None
 
 
+async def prewarm_companion_origins(
+    url: str,
+    *,
+    proxy: Optional[Dict[str, Any]] = None,
+    ua: str = "",
+    timeout: float = 12.0,
+    accept_language: str = "en-US,en;q=0.9",
+) -> Optional[List[Dict[str, Any]]]:
+    """Seed same-origin TLS session cookies via curl_cffi before Playwright
+    navigates. Complements ``prewarm_target`` by warming the origin root +
+    lightweight assets so the browser's first navigation inherits a
+    Chrome JA3 session closer to curl_cffi's fingerprint."""
+    if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
+        return None
+    try:
+        from urllib.parse import urlparse as _urlparse
+        parsed = _urlparse(url or "")
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        return None
+
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for companion in (origin + "/", origin + "/favicon.ico", origin + "/robots.txt"):
+        try:
+            res = await prewarm_target(
+                companion,
+                proxy=proxy,
+                ua=ua,
+                timeout=timeout,
+                accept_language=accept_language,
+                sec_fetch_kind="same_site_link",
+            )
+            if not res or not res.get("cookies"):
+                continue
+            for ck in res.get("cookies") or []:
+                key = (ck.get("name"), ck.get("domain"), ck.get("path"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(ck)
+        except Exception as exc:
+            logger.debug(f"[tls_anti_detect] companion prewarm {companion} failed: {exc}")
+    return merged or None
+
+
 async def resolve_redirect_location(
     url: str,
     *,

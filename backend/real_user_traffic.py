@@ -244,6 +244,21 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
         ul = (u or "").lower()
         return any(n in ul for n in _foreign_needles)
 
+    def _is_incomplete_tiktok_android(u: str) -> bool:
+        """Legacy/partial TikTok Android UAs that lack FBAN/TikTokAndroid."""
+        if (_pp or "").lower() != "tiktok":
+            return False
+        ul = (u or "").lower()
+        if "android" not in ul:
+            return False
+        has_tt_tail = any(
+            tok in ul
+            for tok in ("musical_ly", "bytedancewebview", "trill_", "tiktok/")
+        )
+        if not has_tt_tail:
+            return False
+        return "fban/tiktokandroid" not in ul
+
     if not user_agents:
         n = max(1, min(int(want_count or 20), 500))
         return [_mobile_ua_for_inapp() for _ in range(n)]
@@ -252,7 +267,7 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
         u = (ua or "").strip()
         if not u:
             continue
-        if _is_mob(u) and not _has_foreign_marker(u):
+        if _is_mob(u) and not _has_foreign_marker(u) and not _is_incomplete_tiktok_android(u):
             out.append(u)
         else:
             out.append(_mobile_ua_for_inapp())
@@ -731,6 +746,22 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
         except Exception as _v_err:  # noqa: BLE001
             logger.debug(f"browser_variants import/use failed: {_v_err}")
 
+    fc_exe = _full_chromium_binary_path()
+    if _use_full_chromium() and fc_exe is not None:
+        # Prefer the pinned full-chromium binary path over Playwright's
+        # channel lookup — guarantees we launch the exact revision that
+        # matches our installed build (stronger anti-detect than shell).
+        try:
+            return await pw.chromium.launch(
+                executable_path=str(fc_exe),
+                headless=False,
+                args=["--headless=new", *_BROWSER_LAUNCH_ARGS_BASE],
+            )
+        except Exception as e:
+            logger.warning(
+                f"Full chromium exe launch failed ({fc_exe}, {e}) — "
+                f"retrying via channel='chromium'"
+            )
     if _use_full_chromium():
         # Full chromium: pass --headless=new explicitly via args. We
         # ALSO set headless=False so Playwright doesn't pass --headless
@@ -748,8 +779,13 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
             # job still runs. Logged so operators can investigate.
             logger.warning(
                 f"Full chromium launch failed ({e}) — falling back to "
-                f"chromium-headless-shell"
+                f"chromium-headless-shell (weaker stealth — run "
+                f"`playwright install chromium --no-shell`)"
             )
+    logger.warning(
+        "ANTI-DETECT: launching chromium-headless-shell fallback — "
+        "install full chromium for --headless=new stealth"
+    )
     return await pw.chromium.launch(
         headless=True,
         args=list(_BROWSER_LAUNCH_ARGS_BASE),
@@ -1019,7 +1055,7 @@ _UA_REFERER_MAP: List[Tuple[Tuple[str, ...], str]] = [
     # In-app browsers — these strings appear in mobile webview UAs
     (("musical_ly", "musically", "tiktok", "ttwebview"), "https://www.tiktok.com/"),
     (("fban/", "fbav/", "fbios", "fb_iab", "fb4a"), "https://www.facebook.com/"),
-    (("messenger", "fbms"),                        "https://www.facebook.com/"),
+    (("messenger", "fbms", "fb_iab/messenger"),    "https://www.messenger.com/"),
     (("instagram",),                               "https://www.instagram.com/"),
     (("snapchat",),                                "https://www.snapchat.com/"),
     (("pinterest",),                               "https://www.pinterest.com/"),
@@ -1096,6 +1132,7 @@ def _get_referer_from_ua(ua: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 _PLATFORM_REFERER_POOL: Dict[str, str] = {
     "facebook":   "https://www.facebook.com/",
+    "messenger":  "https://www.messenger.com/",
     "instagram":  "https://www.instagram.com/",
     "tiktok":     "https://www.tiktok.com/",
     "youtube":    "https://www.youtube.com/",
@@ -1113,6 +1150,10 @@ _PLATFORM_REFERER_POOL: Dict[str, str] = {
     "duckduckgo": "https://duckduckgo.com/",
     "yahoo":      "https://search.yahoo.com/",
     "yandex":     "https://yandex.com/",
+    "baidu":      "https://www.baidu.com/",
+    "naver":      "https://search.naver.com/",
+    "ecosia":     "https://www.ecosia.org/",
+    "brave":      "https://search.brave.com/",
     # ── 2026-06: Email marketing source ──────────────────────────
     # Pool value here is just a placeholder — real email visits
     # carry one of FOUR Referer types depending on the click path.
@@ -2508,6 +2549,46 @@ def _pick_ios_gpu_from_ua(ua_str: str) -> Tuple[str, str, int, int]:
             random.choice([4, 6, 8]))
 
 
+def _sanitize_swiftshader_webgl(
+    os_key: str,
+    webgl_vendor: str,
+    webgl_renderer: str,
+) -> Tuple[str, str]:
+    """Replace SwiftShader / llvmpipe software-render signatures with a
+    realistic GPU string for the target OS. Headless-shell sometimes
+    reports software GL even when our init script claims a real GPU."""
+    bad = ("swiftshader", "llvmpipe", "softpipe", "lavapipe", "microsoft basic render")
+    if not any(b in (webgl_renderer or "").lower() for b in bad):
+        return webgl_vendor, webgl_renderer
+    if os_key == "windows":
+        return "Google Inc. (NVIDIA)", random.choice([
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)",
+        ])
+    if os_key == "macos":
+        return "Google Inc. (Apple)", random.choice([
+            "ANGLE (Apple, Apple M1 Pro, OpenGL 4.1)",
+            "ANGLE (Apple, Apple M2, OpenGL 4.1)",
+            "ANGLE (Apple, Apple M3, OpenGL 4.1)",
+        ])
+    if os_key == "linux":
+        return "Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620)"
+    if os_key in ("android", "ios"):
+        return "Google Inc. (Qualcomm)", random.choice([
+            "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)",
+            "ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)",
+            "ANGLE (ARM, Mali-G78 MP24, OpenGL ES 3.2)",
+        ])
+    return webgl_vendor, webgl_renderer
+
+
+def _auto_identity_label(job_id: str) -> str:
+    """Stable per-job identity label when the operator leaves the field blank."""
+    slug = (job_id or "").replace("-", "").strip()[:12]
+    return f"rut-{slug}" if slug else "rut-auto"
+
+
 def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
     """Derive viewport / DPR / platform / mobile flags from a user-agent."""
     try:
@@ -2681,6 +2762,10 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         battery_level = round(random.uniform(0.45, 0.98), 2)
         battery_charging = random.random() < 0.7  # 70% plugged in for desktop
 
+    webgl_vendor, webgl_renderer = _sanitize_swiftshader_webgl(
+        os_key, webgl_vendor, webgl_renderer,
+    )
+
     return {
         "os": os_key,
         "platform": platform,
@@ -2782,8 +2867,8 @@ async def _rut_apply_context_stealth(
             _seed = int(fp.get("canvas_seed") or random.randint(1, 2**30))
             await context.add_init_script(_natural_canvas(_seed))
             await context.add_init_script(_webgl_align_js(_wgl))
-    except Exception:
-        pass
+    except Exception as _wgl_err:
+        logger.debug(f"WebGL/canvas stealth inject failed: {_wgl_err}")
     try:
         from anti_detect_v230 import apply_v230_stealth as _v230_apply
         _v230_r = await _v230_apply(
@@ -2797,8 +2882,8 @@ async def _rut_apply_context_stealth(
             _cur = dict(_v_hdrs)
             _cur.update(ctx_headers or {})
             await context.set_extra_http_headers(_cur)
-    except Exception:
-        pass
+    except Exception as _v230_err:
+        logger.warning(f"v2.3.0 stealth apply failed (continuing): {_v230_err}")
 
 
 _UNFILLED_MACRO_URL_RX = __import__("re").compile(r"\{\{[^}]+\}\}|%7[bB]%7[bB]")
@@ -3435,6 +3520,35 @@ def _detect_rotating_gateway(host: str, username: str) -> bool:
     return False
 
 
+_DATACENTER_ISP_KEYWORDS: Tuple[str, ...] = (
+    "amazon", "aws", "google cloud", "gcp", "microsoft azure", "azure",
+    "digitalocean", "ovh", "hetzner", "linode", "vultr", "choopa",
+    "datacenter", "data center", "hosting", "leaseweb", "psychz",
+    "m247", "quadranet", "server", "dedicated", "colocation", "contabo",
+    "hostinger", "godaddy", "ionos", "rackspace", "softlayer",
+)
+
+
+def _assess_ip_quality(geo: Dict[str, Any]) -> Dict[str, Any]:
+    """Heuristic residential-vs-datacenter scoring from ISP/org/AS fields."""
+    isp = (geo.get("isp") or "").lower()
+    org = (geo.get("org") or "").lower()
+    as_name = str(geo.get("as_name") or "").lower()
+    blob = f"{isp} {org} {as_name}"
+    is_datacenter = any(k in blob for k in _DATACENTER_ISP_KEYWORDS)
+    score = int(geo.get("vpn_score") or 0)
+    if is_datacenter and score < 55:
+        score = max(score, 55)
+    if geo.get("is_vpn") and score < 70:
+        score = max(score, 70)
+    is_low = bool(geo.get("is_vpn") or is_datacenter or score >= 75)
+    return {
+        "is_datacenter": is_datacenter,
+        "ip_quality_score": score,
+        "is_low_quality": is_low,
+    }
+
+
 async def _probe_proxy_geo(
     proxy: Dict[str, Any],
     ua: str,
@@ -3649,6 +3763,10 @@ async def _probe_proxy_geo(
             result["accept_language"] = lang_map.get(cc, "en-US,en;q=0.9")
             result["locale"] = locale_map.get(cc, "en-US")
             result["ok"] = True
+            try:
+                result.update(_assess_ip_quality(result))
+            except Exception:
+                pass
 
             # ── 2026-01 STRICT VPN CHECK — multi-source consensus ────
             # Even when ONE source said "not VPN", cross-check the
@@ -6168,6 +6286,13 @@ async def _persist_burnt_ip(
         return
     try:
         _now_dt = datetime.now(timezone.utc)
+        _user_ids_to_tag: List[str] = []
+        if user_id:
+            try:
+                from cross_user_ip_isolation import get_isolation_group_member_ids as _iso_members
+                _user_ids_to_tag = await _iso_members(db, user_id)
+            except Exception:
+                _user_ids_to_tag = [user_id]
         await db.rut_burnt_ips.update_one(
             {"ip": ip.strip()},
             {
@@ -6179,7 +6304,7 @@ async def _persist_burnt_ip(
                 },
                 "$addToSet": {
                     "reasons": reason or "unknown",
-                    **({"user_ids": user_id} if user_id else {}),
+                    **({"user_ids": {"$each": _user_ids_to_tag}} if _user_ids_to_tag else {}),
                     **({"offer_urls": offer_url} if offer_url else {}),
                     **({"states": state.upper()} if state else {}),
                     **({"job_ids": job_id} if job_id else {}),
@@ -6702,6 +6827,27 @@ def _normalize_unresolvable_tracker_host(url: str) -> str:
 _NORMALIZE_TRACKER_CACHE: Dict[str, str] = {}
 
 
+def _append_rut_defer_click_qs(url: str) -> str:
+    """Tell tracker to skip click insert — RUT early log owns the row."""
+    try:
+        import hmac as _hmac
+        import hashlib as _hashlib
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+        key_raw = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY") or "krexion-default-cookie-key"
+        key = key_raw.encode("utf-8") if isinstance(key_raw, str) else bytes(key_raw)
+        sig = _hmac.new(key, b"rut_defer_click", _hashlib.sha256).hexdigest()[:16]
+        parsed = urlparse(url)
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        q["_kx_rut_defer"] = "1"
+        q["_kx_rut_defer_sig"] = sig
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path, parsed.params,
+            urlencode(q), parsed.fragment,
+        ))
+    except Exception:
+        return url
+
+
 async def _resolve_tracker_via_localhost(
     target_url: str,
     exit_ip: str,
@@ -6742,6 +6888,7 @@ async def _resolve_tracker_via_localhost(
     """
     if not (target_url and exit_ip):
         return None
+    target_url = _append_rut_defer_click_qs(target_url)
 
     # ── 2026-06-15 (UA-leak defence): refuse to fire the server-side
     # tracker resolve with a suspicious / empty / dot-only UA. Earlier
@@ -7018,9 +7165,9 @@ async def run_real_user_traffic_job(
     # Playwright's first navigation, then injects the resulting
     # cookies (cf_clearance, datadome, …) into the Playwright context.
     # Bypass-rate on Cloudflare BM / DataDome / Akamai BM protected
-    # offers: ~50% → ~75-80% on the very first navigation. False
-    # (default) preserves the previous behaviour exactly.
-    tls_prewarm: bool = False,
+    # offers: ~50% → ~75-80% on the very first navigation.
+    # v2.6.35: default ON (production anti-detect baseline).
+    tls_prewarm: bool = True,
     # ── 2026-02 v2.1.31 — Step 3: Multi-Hop Proxy Chains ─────────────
     # When True, every visit's proxy is wrapped through a local HTTP
     # CONNECT relay that internally chains Tor (first hop) → exit
@@ -7046,14 +7193,25 @@ async def run_real_user_traffic_job(
     # bezier-curve mouse approach (overshoot + correction + micro-shake)
     # and 1-2s hover dwell, defeating BioCatch / NuData / Forter
     # behavioral biometrics that flag straight-line cursor moves.
-    behavioral_bio_enabled: bool = False,
+    # v2.6.35: default ON.
+    behavioral_bio_enabled: bool = True,
     # `ip_warmup_enabled` — when True, the worker visits 2 benign
     # public sites (google/wikipedia/etc) via the same proxy BEFORE
     # the target offer, seeding cf_clearance + Akamai BM cookies and
     # making the IP look "warmed" instead of cold. Adds ~10-15s per
     # visit. Combined with TLS prewarm gives the strongest cold-IP
     # bypass possible without a real human session.
-    ip_warmup_enabled: bool = False,
+    # v2.6.35: default ON.
+    ip_warmup_enabled: bool = True,
+    # `ad_chain_simulation_enabled` — when True, fire platform pixel
+    # preflight pings + 1 intermediate redirect hop before the offer
+    # navigation so the session looks like a real ad-click journey.
+    # v2.6.35: default ON.
+    ad_chain_simulation_enabled: bool = True,
+    # v2.6.35 — Block datacenter / high fraud-score exit IPs before the
+    # visit loads. Uses ISP/org heuristics + premium fraud APIs already
+    # wired into `_probe_proxy_geo`. Complements skip_vpn.
+    ip_quality_check_enabled: bool = True,
     # ── 2026-06: User-configurable referrer override ────────────────
     # When `referer_override_enabled` is False (default), the engine
     # uses the existing UA-derived referer behaviour (TikTok UA →
@@ -7147,10 +7305,28 @@ async def run_real_user_traffic_job(
     #   with the built-in pool at detection time.
     abort_on_tracker_block: bool = True,
     tracker_block_extra_patterns: str = "",
+    # ── 2026-07 — Native Smart Funnel (adaptive survey/form/deals) ──
+    # Replaces 400+ step JSON loops with condition-based page watcher +
+    # SMART_FLOW handler. Mutually exclusive with automation_steps.
+    smart_funnel_enabled: bool = False,
+    smart_funnel_pattern: str = "auto",
+    smart_funnel_min_deals: int = 2,
+    smart_funnel_wait_until_conversion: bool = True,
 ):
     """
     Main orchestrator. Emits progress into RUT_JOBS[job_id].
     """
+    # v2.6.35 — Auto identity persistence when operator leaves field blank.
+    if not (identity_label or "").strip():
+        identity_label = _auto_identity_label(job_id)
+        try:
+            push_live_step(
+                job_id, 0, "identity", "info",
+                f"Auto identity label: {identity_label} (cookies + profile persist across visits)",
+            )
+        except Exception:
+            pass
+
     # ── 2026-07 v2.6.5 — In-App Browser Preset: force referrer + mobile UAs
     # Applied BEFORE the referer_cfg dict is built so all downstream
     # logic (referer resolution, UA coercion, pass-to-offer, etc.) sees
@@ -7416,8 +7592,10 @@ async def run_real_user_traffic_job(
 
     # Pre-filter UAs by allowed_os
     allowed_os_set = set((allowed_os or []))
+    _skipped_os_prefilter = 0
     if allowed_os_set:
         uas_ok = [u for u in uas if _os_key_from_ua(u) in allowed_os_set]
+        _skipped_os_prefilter = max(0, len(uas) - len(uas_ok))
         if not uas_ok:
             sample_detect = [(u[:60], _os_key_from_ua(u)) for u in uas[:3]]
             await _finalise_and_persist(job_id=job_id, db=db, status="failed",
@@ -7474,7 +7652,7 @@ async def run_real_user_traffic_job(
         "conversions": 0,
         "skipped_captcha": 0,
         "skipped_country": 0,
-        "skipped_os": 0,
+        "skipped_os": _skipped_os_prefilter,
         "skipped_duplicate_ip": 0,
         "skipped_vpn": 0,
         "skipped_state_mismatch": 0,
@@ -8559,7 +8737,7 @@ async def run_real_user_traffic_job(
             push_live_step(job_id, i + 1, "filter", "skipped", f"Country not allowed: {geo['country_name']}")
             return await _record(job_id, entry, report, report_lock, db)
 
-        # Pre-filter: VPN
+        # Pre-filter: VPN / low IP quality
         if skip_vpn and geo["is_vpn"]:
             entry["status"] = "skipped_vpn"
             # 2026-07 — surface the actual provider reason when a
@@ -8572,6 +8750,20 @@ async def run_real_user_traffic_job(
             entry["vpn_score"] = geo.get("vpn_score", 0)
             push_live_step(job_id, i + 1, "filter", "skipped",
                            f"Skipped: {_vpn_reason}" + (f" [{_vpn_src}]" if _vpn_src else ""))
+            return await _record(job_id, entry, report, report_lock, db)
+
+        if ip_quality_check_enabled and geo.get("is_low_quality") and not geo.get("is_vpn"):
+            entry["status"] = "skipped_low_quality_ip"
+            entry["error"] = (
+                f"Exit IP low quality "
+                f"(score={geo.get('ip_quality_score', 0)}"
+                f"{', datacenter' if geo.get('is_datacenter') else ''})"
+            )
+            entry["vpn_score"] = geo.get("ip_quality_score", 0)
+            push_live_step(
+                job_id, i + 1, "filter", "skipped",
+                entry["error"],
+            )
             return await _record(job_id, entry, report, report_lock, db)
 
         # Pre-filter: duplicate IP — already enforced inside the
@@ -8967,6 +9159,31 @@ async def run_real_user_traffic_job(
                                 _hint_plat = _k
                                 _hint_url = _INAPP_PRESET_REFERER[_k]
                                 break
+                    if not _hint_url and _referer_cfg.get("platform_weights"):
+                        try:
+                            import json as _json_pw
+                            _pw_raw = _json_pw.loads(
+                                str(_referer_cfg.get("platform_weights") or "{}")
+                            )
+                            if isinstance(_pw_raw, dict):
+                                for _k in sorted(
+                                    _pw_raw.keys(),
+                                    key=lambda x: -float(_pw_raw.get(x) or 0),
+                                ):
+                                    _kk = str(_k).strip().lower()
+                                    if _kk in _INAPP_PRESET_REFERER:
+                                        _hint_plat = _kk
+                                        _hint_url = _INAPP_PRESET_REFERER[_kk]
+                                        break
+                        except Exception:
+                            pass
+                    if not _hint_url:
+                        _ppreset = str(
+                            _referer_cfg.get("preset_platform") or ""
+                        ).strip().lower()
+                        if _ppreset in _INAPP_PRESET_REFERER:
+                            _hint_plat = _ppreset
+                            _hint_url = _INAPP_PRESET_REFERER[_ppreset]
                     if _hint_url:
                         _ua_referer = _hint_url
                         if _hint_plat and not _kx_platform:
@@ -9024,12 +9241,46 @@ async def run_real_user_traffic_job(
                         _coerced_ua = _coerce_ua(ua, _kx_platform)
                         if _coerced_ua and _coerced_ua != ua:
                             ua = _coerced_ua
-                    except Exception:
-                        # Never fail a visit because of UA coerce —
-                        # legacy UA remains in use.
-                        pass
+                        elif _coerced_ua:
+                            ua = _coerced_ua
+                        else:
+                            try:
+                                push_live_step(
+                                    job_id, i + 1, "ua", "warn",
+                                    f"UA coerce for {_kx_platform} returned empty — using base UA",
+                                )
+                            except Exception:
+                                pass
+                    except Exception as _coerce_err:
+                        try:
+                            push_live_step(
+                                job_id, i + 1, "ua", "warn",
+                                f"UA coerce for {_kx_platform} failed "
+                                f"({type(_coerce_err).__name__}) — using base UA",
+                            )
+                        except Exception:
+                            pass
                 # v2.6.33 — Rebuild fingerprint + entry metadata after UA changes.
                 fp = _sync_fingerprint_to_ua(ua, fp, identity_label or "")
+                if allowed_os_set and _os_key_from_ua(ua) not in allowed_os_set:
+                    entry["status"] = "skipped_os"
+                    entry["error"] = (
+                        f"UA OS '{_os_key_from_ua(ua)}' not in allowed "
+                        f"{sorted(allowed_os_set)}"
+                    )
+                    try:
+                        async with report_lock:
+                            RUT_JOBS[job_id]["skipped_os"] = (
+                                int(RUT_JOBS[job_id].get("skipped_os") or 0) + 1
+                            )
+                    except Exception:
+                        pass
+                    push_live_step(
+                        job_id, i + 1, "setup", "skipped",
+                        entry["error"],
+                    )
+                    await _record(job_id, entry, report, report_lock, db)
+                    return
                 try:
                     entry["os"] = fp["os"]
                     entry["ua"] = ua
@@ -9490,14 +9741,14 @@ async def run_real_user_traffic_job(
                             # `_tracker_ips_set`.
                             if not _data:
                                 _data = _data_one
-                            for _k in ("primary", "ipv4"):
+                            for _k in ("primary", "ipv4", "ipv6"):
                                 _v = (_data_one.get(_k) or "").strip()
-                                if _v and ":" not in _v and _v not in _BAD:
+                                if _v and _v not in _BAD:
                                     _tracker_ips_set.add(_v)
                             for _k in ("all", "proxy_ips"):
                                 for _v in (_data_one.get(_k) or []):
                                     _v = (str(_v) or "").strip()
-                                    if _v and ":" not in _v and _v not in _BAD:
+                                    if _v and _v not in _BAD:
                                         _tracker_ips_set.add(_v)
                         except Exception:
                             # Probe origin unreachable (chrome-error,
@@ -9682,13 +9933,80 @@ async def run_real_user_traffic_job(
                                 )
                             except Exception as _ck_err:  # noqa: BLE001
                                 logger.debug(f"prewarm add_cookies failed: {_ck_err}")
-                        else:
+                        # v2.6.35 — companion origin prewarm (favicon/robots)
+                        # seeds same-origin TLS session cookies so the
+                        # Playwright navigation inherits curl_cffi JA3.
+                        try:
+                            _companion = await _tls_ad.prewarm_companion_origins(
+                                _prewarm_url,
+                                proxy=proxy,
+                                ua=ua,
+                                timeout=12.0,
+                                accept_language=geo.get("accept_language") or "en-US,en;q=0.9",
+                            )
+                            if _companion:
+                                await context.add_cookies(_companion)
+                                push_live_step(
+                                    job_id, i + 1, "browser", "ok",
+                                    f"TLS companion prewarm · +{len(_companion)} cookie(s) from origin assets",
+                                )
+                        except Exception as _cmp_err:  # noqa: BLE001
+                            logger.debug(f"companion tls prewarm failed: {_cmp_err}")
+                        if not (_pw_res and _pw_res.get("ok") and _pw_res.get("cookies")):
                             push_live_step(
                                 job_id, i + 1, "browser", "info",
                                 "TLS prewarm skipped (no cookies / non-2xx) — continuing with stock context",
                             )
                     except Exception as _pw_err:  # noqa: BLE001
                         logger.debug(f"tls prewarm exception: {_pw_err}")
+
+                # ── 2026-07 v2.6.35 — Ad chain simulation (pixel + hops) ─
+                if ad_chain_simulation_enabled:
+                    try:
+                        from anti_detect_v230 import (
+                            fire_pixel_prefire as _fire_pixels,
+                            navigate_intermediate_hops as _nav_hops,
+                        )
+                        from urllib.parse import parse_qs as _parse_qs, urlparse as _ad_urlparse
+
+                        _ad_plat = (
+                            (_kx_platform or _inapp_preset_key or "")
+                            .strip()
+                            .lower()
+                        )
+                        _ad_offer = (_visit_target_url or target_url or "").strip()
+                        _ad_qs = _parse_qs((_ad_urlparse(_ad_offer).query or ""))
+                        _fbclid = (_ad_qs.get("fbclid") or [""])[0]
+                        _ttclid = (_ad_qs.get("ttclid") or [""])[0]
+                        _gclid = (_ad_qs.get("gclid") or [""])[0]
+
+                        _px_fired = await _fire_pixels(
+                            page,
+                            platform=_ad_plat,
+                            ttclid=_ttclid,
+                            fbclid=_fbclid,
+                            gclid=_gclid,
+                        )
+                        if _px_fired:
+                            push_live_step(
+                                job_id, i + 1, "adchain", "ok",
+                                f"Pixel prefire · {len(_px_fired)} ping(s) · platform={_ad_plat or 'generic'}",
+                            )
+
+                        if _ad_offer:
+                            _hops_done = await _nav_hops(
+                                page,
+                                platform=_ad_plat,
+                                offer_url=_ad_offer,
+                                hops=1,
+                            )
+                            if _hops_done:
+                                push_live_step(
+                                    job_id, i + 1, "adchain", "ok",
+                                    f"Intermediate hop(s) · {len(_hops_done)} visited",
+                                )
+                    except Exception as _ad_err:  # noqa: BLE001
+                        logger.debug(f"ad chain simulation failed: {_ad_err}")
 
                 # Tunnel-error retry: ProxyJet sticky sessions sometimes
                 # have a dead egress for a specific target host. Detect
@@ -10476,7 +10794,7 @@ async def run_real_user_traffic_job(
                 # lands on offer page then says Visit complete instead
                 # of running my survey JSON" — was caused by this
                 # branch returning early before the automation runner.
-                if not form_fill_enabled and not automation_steps:
+                if not form_fill_enabled and not automation_steps and not smart_funnel_enabled:
                     try:
                         entry["final_url"] = page.url
                     except Exception:
@@ -10516,9 +10834,112 @@ async def run_real_user_traffic_job(
                          + (f" (retry {retry_attempt}/{MAX_INVALID_RETRIES})" if retry_attempt else ""))
                         if row else "Filling form",
                     )
-                    # If user provided a custom Automation JSON, run that.
-                    # Otherwise fall through to the smart auto-fill heuristic.
-                    if automation_steps:
+                    # Native Smart Funnel → custom JSON → legacy heuristic.
+                    if smart_funnel_enabled:
+                        from smart_funnel import SmartFunnelConfig, execute_smart_funnel
+
+                        async def _sf_progress_cb(event: Dict[str, Any]) -> None:
+                            try:
+                                j_state = RUT_JOBS.get(job_id)
+                                if j_state is None:
+                                    return
+                                lv = j_state.setdefault("live_visits", {})
+                                vkey = str(i + 1)
+                                v = lv.setdefault(vkey, {
+                                    "visit_idx": i + 1,
+                                    "started_at": time.time(),
+                                    "events_count": 0,
+                                    "latest_event": None,
+                                    "latest_frame_b64": "",
+                                    "page_url": "",
+                                    "status": "running",
+                                })
+                                v["latest_event"] = {
+                                    k: ev_val for k, ev_val in event.items()
+                                    if k != "screenshot_b64"
+                                }
+                                if event.get("page_url"):
+                                    v["page_url"] = event["page_url"]
+                                v["events_count"] = int(v.get("events_count", 0)) + 1
+                                v["last_update"] = time.time()
+                            except Exception:
+                                pass
+
+                        _sf_cfg = SmartFunnelConfig(
+                            pattern=smart_funnel_pattern or "auto",
+                            min_deals=max(1, min(5, int(smart_funnel_min_deals or 2))),
+                            wait_until_conversion=bool(smart_funnel_wait_until_conversion),
+                        )
+                        push_live_step(
+                            job_id, i + 1, "smart_funnel", "info",
+                            f"Smart Funnel ({_sf_cfg.normalized_pattern()}) — adaptive survey/form/deals…",
+                        )
+                        _sf_task = asyncio.create_task(
+                            execute_smart_funnel(
+                                page,
+                                row or {},
+                                substitute=_substitute,
+                                config=_sf_cfg,
+                                on_step_progress=_sf_progress_cb,
+                                job_id=job_id,
+                                visit_idx=i + 1,
+                            )
+                        )
+
+                        def _trigger_abort_sf():
+                            if not _sf_task.done():
+                                _sf_task.cancel()
+
+                        _sf_wd_threshold = float(stuck_watchdog_seconds or 600.0)
+                        if smart_funnel_wait_until_conversion:
+                            _sf_wd_threshold = max(_sf_wd_threshold, 3600.0)
+                        _sf_wd_state: Dict[str, Any] = {"progressed": False, "progression_count": 0}
+                        _sf_watchdog = asyncio.create_task(
+                            _stuck_watchdog(
+                                page, job_id, i + 1,
+                                threshold_s=_sf_wd_threshold,
+                                shots_dir=shots_dir,
+                                on_stuck=_trigger_abort_sf,
+                                state=_sf_wd_state,
+                            )
+                        )
+                        try:
+                            try:
+                                step_res = await _sf_task
+                            except asyncio.CancelledError:
+                                _stuck_url_sf = ""
+                                try:
+                                    _stuck_url_sf = page.url or ""
+                                except Exception:
+                                    pass
+                                if bool(_sf_wd_state.get("progressed")):
+                                    step_res = {
+                                        "status": "ok",
+                                        "executed_steps": 0,
+                                        "smart_funnel": True,
+                                        "deals_done": 0,
+                                        "conversion_signal": False,
+                                        "error": (
+                                            f"Smart funnel idled after progress on {_stuck_url_sf[:160]}"
+                                        ),
+                                    }
+                                else:
+                                    step_res = {
+                                        "status": "stuck",
+                                        "error": (
+                                            f"Smart funnel aborted — page stuck >{int(_sf_wd_threshold)}s "
+                                            f"on {_stuck_url_sf[:200]}"
+                                        ),
+                                        "executed_steps": 0,
+                                        "smart_funnel": True,
+                                    }
+                        finally:
+                            _sf_watchdog.cancel()
+                            try:
+                                await _sf_watchdog
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                    elif automation_steps:
                         # Hand the runner a screenshot-callback so any
                         # {"action":"screenshot",...} step the user added
                         # via the Visual Recorder's Capture tool surfaces
@@ -10903,7 +11324,16 @@ async def run_real_user_traffic_job(
                     # show ho").
                     entry["automation_status"] = step_res.get("status") or ""
                     entry["automation_executed_steps"] = int(step_res.get("executed_steps") or 0)
-                    entry["_required_steps_total"] = len(automation_steps or [])
+                    entry["_required_steps_total"] = (
+                        0 if smart_funnel_enabled else len(automation_steps or [])
+                    )
+                    if step_res.get("smart_funnel"):
+                        entry["smart_funnel"] = True
+                        entry["smart_funnel_pattern"] = step_res.get("pattern") or smart_funnel_pattern
+                    if step_res.get("deals_done") is not None:
+                        entry["deals_completed"] = int(step_res.get("deals_done") or 0)
+                    if step_res.get("conversion_signal"):
+                        entry["_smart_funnel_conversion"] = True
                     if step_res.get("error"):
                         entry["error"] = step_res["error"]
                     # ── 2026-05: best-effort `screenshot` steps on failure ──
@@ -11189,6 +11619,10 @@ async def run_real_user_traffic_job(
                     )
                 except Exception:
                     entry["thank_you_reached"] = False
+
+                # Smart Funnel: honour engine conversion signal (deals + page win)
+                if entry.get("_smart_funnel_conversion") and entry.get("status") == "ok":
+                    entry["thank_you_reached"] = True
 
                 # ── 2026-06 — Customer ask: "jidar converstion show
                 # krna ho waha capture taran ka aik button lag jay
@@ -11665,6 +12099,19 @@ async def run_real_user_traffic_job(
     _browser_holder["pw"] = pw
     _browser_holder["pw_cm"] = pw_cm
     shared_browser: Optional[Browser] = None
+    if not _use_full_chromium():
+        push_live_step(
+            job_id, 0, "preflight", "warn",
+            "Full Chromium not installed — using headless-shell (weaker stealth). "
+            "Background install started for future jobs.",
+        )
+        asyncio.create_task(_install_full_chromium_background())
+    else:
+        _fc = _full_chromium_binary_path()
+        push_live_step(
+            job_id, 0, "preflight", "ok",
+            f"Full Chromium ready · --headless=new · exe={_fc}",
+        )
     try:
         shared_browser = await _launch_anti_detect_browser(pw, variant=browser_variant)
         _browser_holder["b"] = shared_browser
@@ -16439,6 +16886,7 @@ async def _log_click_for_link(
         early_id = entry.get("_early_click_id")
         if (not early) and early_id:
             try:
+                _final_st = (entry.get("status") or "").strip().lower()
                 await user_db.clicks.update_one(
                     {"id": early_id},
                     {"$set": {
@@ -16446,13 +16894,16 @@ async def _log_click_for_link(
                         "final_url": entry.get("final_url") or "",
                         "conversion_page_reached": bool(entry.get("conversion_page_reached")),
                         "is_vpn": is_vpn,
-                        # If we somehow learned a better/canonical exit
-                        # IP between early-insert and now, refresh those
-                        # fields too. exit_ip is usually unchanged.
                         **({"ip_address": exit_ip} if exit_ip else {}),
                         **({"ipv4": exit_ip} if exit_ip and ":" not in exit_ip else {}),
                     }},
                 )
+                # Roll back link counter when visit failed after early log (keep row for dup detection)
+                if _final_st != "ok":
+                    try:
+                        await main_db.links.update_one({"id": link_id}, {"$inc": {"clicks": -1}})
+                    except Exception:
+                        pass
             except Exception as _ue:
                 logger.warning(f"RUT click UPDATE failed: {_ue}")
             return
@@ -16537,14 +16988,9 @@ async def _log_click_for_link(
         }
         await user_db.clicks.insert_one(click_doc)
         if early:
-            # Stash the id so the end-of-visit call updates this row
-            # instead of inserting a duplicate.
             entry["_early_click_id"] = new_id
-        # Bump link-level click counter on the main DB (only once per
-        # visit — on the EARLY insert if that path runs, else on the
-        # late insert. The branch-A update path returns above without
-        # bumping, so this is safe).
-        await main_db.links.update_one({"id": link_id}, {"$inc": {"clicks": 1}})
+        _link_inc: Dict[str, Any] = {"clicks": 1, "consecutive_no_conversions": 1}
+        await main_db.links.update_one({"id": link_id}, {"$inc": _link_inc})
     except Exception as e:
         # Best-effort — never crash the visit because click logging failed
         logger.warning(f"RUT click log failed (job_id-unknown, early={early}): {e}")
@@ -16587,6 +17033,7 @@ async def _record(
             "skipped_vpn",
             "skipped_dead_proxy",
             "skipped_no_unique_ip",
+            "skipped_tracker_block",
         )
         silent_skip = (
             s in _SILENT_SKIP_STATUSES

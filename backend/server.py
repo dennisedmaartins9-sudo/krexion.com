@@ -113,6 +113,20 @@ _CLICK_IPS_CACHE_TTL = 60  # seconds
 _link_cache = {}
 _link_cache_ttl = 30  # Reduced to 30 seconds for more accurate status checking
 
+# ProxiesPage writes alive/pending; legacy rows may still use working/active.
+STORED_PROXY_ACTIVE_STATUSES = ["alive", "pending", "working", "active"]
+
+
+def invalidate_link_cache(short_code: Optional[str] = None) -> None:
+    """Drop cached link doc so pause/update/delete takes effect immediately."""
+    global _link_cache
+    if not short_code:
+        return
+    sc = (short_code or "").strip()
+    if sc:
+        _link_cache.pop(sc, None)
+        _link_cache.pop(sc.lower(), None)
+
 # NO VPN cache - check fresh every time for accuracy
 
 # ─── 2026-07 VPS load-reduction caches ─────────────────────────────────
@@ -406,23 +420,20 @@ async def get_all_click_ips_from_entire_database(
                 logger.warning(f"Error extracting IPs from {db_name}: {e}")
         return extracted
 
-    if user_id:
-        # ── Per-user (CORRECT for any RUT/proxy duplicate check) ──
+    async def _load_ips_for_user(uid: str, offer_scope: Optional[str]) -> set:
+        """Click + burnt IPs for one main user (self or isolation peer)."""
+        merged: set = set()
+        if not uid:
+            return merged
         try:
-            user_db_instance = get_user_db(user_id)
-            user_ips = await extract_ips_from_db(
-                user_db_instance, f"krexion_user_{user_id}"
-            )
-            all_click_ips.update(user_ips)
+            user_db_instance = get_user_db(uid)
+            merged.update(await extract_ips_from_db(user_db_instance, f"krexion_user_{uid}"))
         except Exception as e:
-            logger.error(f"Error fetching IPs from user DB {user_id}: {e}")
+            logger.error(f"Error fetching IPs from user DB {uid}: {e}")
 
-        # Also peek at MAIN db.clicks because VERY old accounts may
-        # still have content there (pre-per-tenant migration). Scoped
-        # by user_id so we don't pick up other users' rows.
         try:
             legacy_links = await db.links.find(
-                {"user_id": user_id}, {"_id": 0, "id": 1},
+                {"user_id": uid}, {"_id": 0, "id": 1},
             ).to_list(100000)
             legacy_link_ids = [l["id"] for l in legacy_links if l.get("id")]
             if legacy_link_ids:
@@ -435,41 +446,41 @@ async def get_all_click_ips_from_entire_database(
                         async for doc in cursor:
                             ip = doc.get(field)
                             if ip and ip != "unknown" and isinstance(ip, str):
-                                all_click_ips.add(ip)
+                                merged.add(ip)
                     except Exception:
                         pass
         except Exception as e:
-            logger.warning(f"Legacy main-db scan failed for {user_id}: {e}")
+            logger.warning(f"Legacy main-db scan failed for {uid}: {e}")
 
-        # Per-user rut_burnt_ips: STRICTLY only rows this user
-        # contributed to. Earlier this query also included rows with
-        # missing/empty `user_ids` as a "legacy compatibility" path —
-        # but those rows (left over from before user-scoping was
-        # introduced) get loaded for EVERY user, re-introducing the
-        # exact cross-tenant pollution the user reported as
-        # "duplicates with no data". Strict scoping is the only
-        # correct behavior.
-        #
-        # 2026-02 v2.6.17: when `offer_url` is provided, additionally
-        # restrict to rows whose `offer_urls` array contains this URL
-        # — so an IP burnt on offer A no longer blocks offers B/C/D.
         try:
-            burnt_count = 0
-            _burnt_query: Dict[str, Any] = {"user_ids": user_id}
-            if offer_url:
-                _burnt_query["offer_urls"] = offer_url
+            _burnt_query: Dict[str, Any] = {"user_ids": uid}
+            if offer_scope:
+                _burnt_query["offer_urls"] = offer_scope
             async for doc in db.rut_burnt_ips.find(_burnt_query, {"ip": 1, "_id": 0}):
                 ip = doc.get("ip")
                 if ip and isinstance(ip, str):
-                    all_click_ips.add(ip.strip())
-                    burnt_count += 1
-            if burnt_count:
-                logger.info(
-                    f"Loaded {burnt_count} burnt IPs for user {user_id}"
-                    + (f" (scoped to offer {offer_url[:60]})" if offer_url else "")
-                )
+                    merged.add(ip.strip())
         except Exception as e:
-            logger.warning(f"Could not load rut_burnt_ips for {user_id}: {e}")
+            logger.warning(f"Could not load rut_burnt_ips for {uid}: {e}")
+        return merged
+
+    if user_id:
+        # ── Per-user (CORRECT for any RUT/proxy duplicate check) ──
+        all_click_ips.update(await _load_ips_for_user(user_id, offer_url))
+
+        # Cross-user IP isolation — merge admin-selected peers' histories
+        try:
+            from cross_user_ip_isolation import get_isolation_peer_user_ids as _iso_peers
+            _peer_ids = await _iso_peers(db, user_id)
+            for _peer_id in _peer_ids:
+                all_click_ips.update(await _load_ips_for_user(_peer_id, offer_url))
+            if _peer_ids:
+                logger.info(
+                    f"Cross-user IP isolation: merged {len(_peer_ids)} peer(s) "
+                    f"for user {user_id[:8]}… → {len(all_click_ips)} total IPs"
+                )
+        except Exception as _iso_err:
+            logger.warning(f"Cross-user IP isolation peer load failed: {_iso_err}")
     else:
         # ── Legacy "all users" path (kept for debug + global refresh) ──
         try:
@@ -3371,6 +3382,55 @@ def _kx_src_verify(platform: str, sig: str) -> bool:
         return _hmac.compare_digest(expected, str(sig)[:12])
     except Exception:
         return False
+
+
+def _kx_rut_defer_sign() -> str:
+    """HMAC for server-side tracker resolve — RUT owns click logging."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    key = SECRET_KEY.encode("utf-8") if isinstance(SECRET_KEY, str) else bytes(SECRET_KEY)
+    return _hmac.new(key, b"rut_defer_click", _hashlib.sha256).hexdigest()[:16]
+
+
+def _kx_rut_defer_verify(sig: str) -> bool:
+    import hmac as _hmac
+    try:
+        if not sig:
+            return False
+        return _hmac.compare_digest(_kx_rut_defer_sign(), str(sig)[:16])
+    except Exception:
+        return False
+
+
+def _should_defer_click_log_to_rut(request: Request) -> bool:
+    """RUT-signed visits defer tracker click insert — engine logs once via early log."""
+    try:
+        qp = dict(request.query_params)
+        _kx_src = qp.get("_kx_src")
+        _kx_sig = qp.get("_kx_sig")
+        if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
+            return True
+        if qp.get("_kx_rut_defer") == "1" and _kx_rut_defer_verify(qp.get("_kx_rut_defer_sig") or ""):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def build_kx_rut_defer_qs() -> str:
+    return f"_kx_rut_defer=1&_kx_rut_defer_sig={_kx_rut_defer_sign()}"
+
+
+def _validate_offer_url(url: str) -> None:
+    """Block dangerous redirect targets on link create/update."""
+    u = (url or "").strip()
+    if not u:
+        raise HTTPException(status_code=400, detail="offer_url is required")
+    low = u.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise HTTPException(status_code=400, detail="offer_url must start with http:// or https://")
+    if low.startswith("javascript:") or low.startswith("data:") or low.startswith("file:"):
+        raise HTTPException(status_code=400, detail="offer_url scheme not allowed")
 
 
 def _kx_esp_sign(platform: str, esp: str) -> str:
@@ -6547,6 +6607,117 @@ async def admin_burnt_ips_stats(admin: dict = Depends(get_current_admin)):
     }
 
 
+# ── Cross-user IP isolation groups (admin) ───────────────────────────
+class CrossUserIpGroupCreate(BaseModel):
+    name: str = "Isolation Group"
+    user_ids: List[str] = []
+    enabled: bool = True
+
+
+class CrossUserIpGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    user_ids: Optional[List[str]] = None
+    enabled: Optional[bool] = None
+
+
+def _invalidate_all_click_ips_cache() -> None:
+    global _click_ips_cache
+    _click_ips_cache = {}
+
+
+@api_router.get("/admin/cross-user-ip-groups")
+async def admin_list_cross_user_ip_groups(admin: dict = Depends(get_current_admin)):
+    """List isolation groups + user labels for the admin UI."""
+    from cross_user_ip_isolation import list_groups as _list_iso_groups
+
+    groups = await _list_iso_groups(db)
+    user_map: Dict[str, Dict[str, str]] = {}
+    async for u in db.users.find({}, {"_id": 0, "id": 1, "email": 1, "name": 1}):
+        uid = u.get("id")
+        if uid:
+            user_map[uid] = {
+                "email": u.get("email") or "",
+                "name": u.get("name") or u.get("email") or uid[:8],
+            }
+    enriched = []
+    for g in groups:
+        members = []
+        for uid in g.get("user_ids") or []:
+            info = user_map.get(uid, {})
+            members.append({
+                "id": uid,
+                "email": info.get("email") or uid,
+                "name": info.get("name") or info.get("email") or uid,
+            })
+        enriched.append({**g, "members": members})
+    return {"ok": True, "groups": enriched}
+
+
+@api_router.post("/admin/cross-user-ip-groups")
+async def admin_create_cross_user_ip_group(
+    body: CrossUserIpGroupCreate,
+    admin: dict = Depends(get_current_admin),
+):
+    from cross_user_ip_isolation import create_group as _create_iso_group
+
+    clean_ids = sorted({str(u).strip() for u in (body.user_ids or []) if str(u).strip()})
+    if len(clean_ids) < 2:
+        raise HTTPException(status_code=400, detail="Select at least 2 users")
+    found = await db.users.count_documents({"id": {"$in": clean_ids}})
+    if found != len(clean_ids):
+        raise HTTPException(status_code=400, detail="One or more user IDs not found")
+    try:
+        doc = await _create_iso_group(db, name=body.name, user_ids=clean_ids, enabled=body.enabled)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    _invalidate_all_click_ips_cache()
+    return {"ok": True, "group": doc}
+
+
+@api_router.put("/admin/cross-user-ip-groups/{group_id}")
+async def admin_update_cross_user_ip_group(
+    group_id: str,
+    body: CrossUserIpGroupUpdate,
+    admin: dict = Depends(get_current_admin),
+):
+    from cross_user_ip_isolation import update_group as _update_iso_group
+
+    if body.user_ids is not None:
+        clean_ids = sorted({str(u).strip() for u in body.user_ids if str(u).strip()})
+        if len(clean_ids) < 2:
+            raise HTTPException(status_code=400, detail="Select at least 2 users")
+        found = await db.users.count_documents({"id": {"$in": clean_ids}})
+        if found != len(clean_ids):
+            raise HTTPException(status_code=400, detail="One or more user IDs not found")
+    else:
+        clean_ids = None
+    try:
+        updated = await _update_iso_group(
+            db,
+            group_id,
+            name=body.name,
+            user_ids=clean_ids,
+            enabled=body.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not updated:
+        raise HTTPException(status_code=404, detail="Group not found")
+    _invalidate_all_click_ips_cache()
+    return {"ok": True, "group": updated}
+
+
+@api_router.delete("/admin/cross-user-ip-groups/{group_id}")
+async def admin_delete_cross_user_ip_group(
+    group_id: str,
+    admin: dict = Depends(get_current_admin),
+):
+    from cross_user_ip_isolation import delete_group as _delete_iso_group
+
+    if not await _delete_iso_group(db, group_id):
+        raise HTTPException(status_code=404, detail="Group not found")
+    _invalidate_all_click_ips_cache()
+    return {"ok": True}
 
 
 # ──────────── Admin-managed email settings (SMTP / Resend) ─────────────
@@ -6980,13 +7151,13 @@ async def form_filler_create_job(
     # ── 2026-02 v2.1.31 — Anti-Detect Wiring (Phase 1) ──────────────
     pacing_per_hour: int = Form(0),
     identity_label: str = Form(""),
-    tls_prewarm: bool = Form(False),
+    tls_prewarm: bool = Form(True),
     # 2026-02 Step 5 — Phase 3+4 parity with RUT (Big-1)
     proxy_chain_enabled: bool = Form(False),
     proxy_chain_use_tor: bool = Form(True),
     browser_variant: str = Form("auto"),
-    behavioral_bio_enabled: bool = Form(False),
-    ip_warmup_enabled: bool = Form(False),
+    behavioral_bio_enabled: bool = Form(True),
+    ip_warmup_enabled: bool = Form(True),
     user: dict = Depends(get_current_user),
     _cloud_gate: bool = Depends(require_local_mode),
 ):
@@ -7052,19 +7223,14 @@ async def form_filler_create_job(
     proxy_list = None
     if use_proxies:
         proxies = await db.proxies.find(
-            {"user_id": user["id"], "status": {"$in": ["active", "online", None]}},
-            {"_id": 0, "proxy_ip": 1, "proxy_port": 1, "username": 1, "password": 1},
+            {"user_id": user["id"], "status": {"$in": STORED_PROXY_ACTIVE_STATUSES + [None]}},
+            {"_id": 0, "proxy_string": 1, "proxy_type": 1},
         ).to_list(500)
         proxy_list = []
         for p in proxies:
-            ip = p.get("proxy_ip")
-            port = p.get("proxy_port")
-            if not ip or not port:
-                continue
-            if p.get("username") and p.get("password"):
-                proxy_list.append(f"{ip}:{port}:{p['username']}:{p['password']}")
-            else:
-                proxy_list.append(f"{ip}:{port}")
+            ps = (p.get("proxy_string") or "").strip()
+            if ps:
+                proxy_list.append(ps)
         if not proxy_list:
             proxy_list = None  # fall through to no-proxy mode
 
@@ -7968,7 +8134,7 @@ async def _rut_prepare_and_run(
                 upload_proxy_id = None
         elif use_stored_proxies:
             stored = await db.proxies.find(
-                {"user_id": user["id"], "status": {"$in": ["working", "active", None]}},
+                {"user_id": user["id"], "status": {"$in": STORED_PROXY_ACTIVE_STATUSES + [None]}},
                 {"_id": 0, "proxy_string": 1},
             ).to_list(length=5000)
             proxy_lines = [p["proxy_string"] for p in stored if p.get("proxy_string")]
@@ -8336,6 +8502,7 @@ async def _rut_prepare_and_run(
                 "user_agents_count": len(ua_lines),
                 "rows_loaded": len(rows) if rows else 0,
                 "custom_automation": bool(automation_steps),
+                "smart_funnel_enabled": bool(params.get("smart_funnel_enabled")),
                 "preparing": False,
                 "prep_finished_at": datetime.now(timezone.utc).isoformat(),
                 # ── PREP-SUCCESS rc-RESET ─────────────────────────────
@@ -8407,18 +8574,24 @@ async def _rut_prepare_and_run(
             # Default raised 60 → 240 (2026-05) → 600 (2026-06-27, user request).
             # UI exposes a number input so operators can tune per offer.
             stuck_watchdog_seconds=float(params.get("stuck_watchdog_seconds") or 600.0),
+            smart_funnel_enabled=bool(params.get("smart_funnel_enabled")),
+            smart_funnel_pattern=str(params.get("smart_funnel_pattern") or "auto"),
+            smart_funnel_min_deals=int(params.get("smart_funnel_min_deals") or 2),
+            smart_funnel_wait_until_conversion=bool(params.get("smart_funnel_wait_until_conversion", True)),
             # 2026-02 v2.1.31 — Anti-Detect wiring (Phase 1)
             pacing_per_hour=int(params.get("pacing_per_hour") or 0),
             identity_label=str(params.get("identity_label") or "").strip(),
-            tls_prewarm=bool(params.get("tls_prewarm")),
+            tls_prewarm=bool(params.get("tls_prewarm", True)),
             # 2026-02 v2.1.31 — Step 3 wiring
             proxy_chain_enabled=bool(params.get("proxy_chain_enabled")),
             proxy_chain_use_tor=bool(params.get("proxy_chain_use_tor", True)),
             proxy_chain_extra_hops=list(params.get("proxy_chain_extra_hops") or []),
             browser_variant=str(params.get("browser_variant") or "auto").strip().lower(),
             # 2026-02 v2.1.31 — Step 4 wiring
-            behavioral_bio_enabled=bool(params.get("behavioral_bio_enabled")),
-            ip_warmup_enabled=bool(params.get("ip_warmup_enabled")),
+            behavioral_bio_enabled=bool(params.get("behavioral_bio_enabled", True)),
+            ip_warmup_enabled=bool(params.get("ip_warmup_enabled", True)),
+            ad_chain_simulation_enabled=bool(params.get("ad_chain_simulation_enabled", True)),
+            ip_quality_check_enabled=bool(params.get("ip_quality_check_enabled", True)),
             # 2026-06 — Referrer override wiring
             referer_override_enabled=bool(params.get("referer_override_enabled")),
             referer_mode=str(params.get("referer_mode") or "auto"),
@@ -8466,6 +8639,13 @@ async def _rut_prepare_and_run(
 # list so a "State filter" UI can be shown. The user picks which states
 # to run on; the chosen list is then passed to job creation via the
 # `selected_states` form field. Read-only — no DB write, no side effect.
+@api_router.get("/real-user-traffic/smart-funnel/patterns")
+async def rut_smart_funnel_patterns(user: dict = Depends(get_current_user)):
+    """Return Smart Funnel pattern metadata for the RUT UI dropdown."""
+    from smart_funnel import list_patterns
+    return {"patterns": list_patterns()}
+
+
 @api_router.post("/real-user-traffic/preview-data-file")
 async def rut_preview_data_file(
     file: Optional[UploadFile] = File(None),
@@ -8678,6 +8858,11 @@ async def rut_create_job(
     # learning (Thompson sampling for survey picks) is bypassed. Default
     # OFF preserves current behaviour exactly.
     pure_json_mode: bool = Form(False),
+    # ── 2026-07 — Native Smart Funnel (adaptive offer flow) ─────────
+    smart_funnel_enabled: bool = Form(False),
+    smart_funnel_pattern: str = Form("auto"),
+    smart_funnel_min_deals: int = Form(2),
+    smart_funnel_wait_until_conversion: bool = Form(True),
     # Auto-resume opt-IN (default OFF per 2026-01 user feedback). When
     # False, a backend restart marks the job `failed` and the user
     # clicks "Retry" manually — predictable, no surprise resumes mid-run.
@@ -8770,7 +8955,7 @@ async def rut_create_job(
     # Chrome JA3) BEFORE Playwright's first navigation, then injects the
     # warmed cookies into the Playwright context. Bypass Cloudflare BM /
     # DataDome / Akamai BM on cold visits.
-    tls_prewarm: bool = Form(False),
+    tls_prewarm: bool = Form(True),
     # ── 2026-02 v2.1.31 — Step 3: Multi-Hop Proxy Chain ───────────────
     proxy_chain_enabled: bool = Form(False),
     proxy_chain_use_tor: bool = Form(True),
@@ -8781,8 +8966,12 @@ async def rut_create_job(
     # "auto" | "chromium" | "headless-shell" | "brave" | "rotate"
     browser_variant: str = Form("auto"),
     # ── 2026-02 v2.1.31 — Step 4: Phase-4 Anti-Detect ────────────────
-    behavioral_bio_enabled: bool = Form(False),
-    ip_warmup_enabled: bool = Form(False),
+    behavioral_bio_enabled: bool = Form(True),
+    ip_warmup_enabled: bool = Form(True),
+    # v2.6.35 — Pixel prefire + intermediate redirect hops before offer.
+    ad_chain_simulation_enabled: bool = Form(True),
+    # v2.6.35 — Block datacenter / high fraud-score exit IPs pre-visit.
+    ip_quality_check_enabled: bool = Form(True),
     # ── 2026-06: User-configurable Referrer Override ─────────────────
     # OFF by default → legacy UA-derived referer behaviour is preserved
     # exactly. When ON, the operator's chosen strategy (auto / custom /
@@ -8921,11 +9110,9 @@ async def rut_create_job(
                     if _pp_res.get("state"):
                         proxyjet_state = _pp_res["state"]
                 elif _pp_res.get("lines"):
-                    _pp_block = "\n".join(_pp_res["lines"])
-                    if proxies and proxies.strip():
-                        proxies = f"{_pp_block}\n{proxies.strip()}"
-                    else:
-                        proxies = _pp_block
+                    proxies = "\n".join(_pp_res["lines"])
+                    # Backend bulk fetch is authoritative — do not merge
+                    # frontend pre-gen lines (often unprobed duplicates).
                     # v2.5.4 override: we now have concrete proxy lines
                     # from the customer's chosen provider — turn OFF the
                     # ProxyJet auto path so the BG task consumes these
@@ -9083,9 +9270,17 @@ async def rut_create_job(
     if not upload_proxy_id and not use_stored_proxies and not paste_proxy_lines and not use_proxyjet_auto:
         raise HTTPException(status_code=400, detail="At least one proxy required (paste, pick a saved batch, enable Use Stored Proxies, or turn on ProxyJet Auto Mode)")
     if use_proxyjet_auto:
-        _pj_creds = await _pj.get_credentials(db, user["id"])
-        if not _pj_creds:
-            raise HTTPException(status_code=400, detail="ProxyJet Auto Mode is on but credentials are not configured. Save them in Proxies → ProxyJet Auto.")
+        _has_provider = bool((proxy_provider_id or "").strip())
+        if not _has_provider:
+            _pj_creds = await _pj.get_credentials(db, user["id"])
+            if not _pj_creds:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Auto Mode requires a Proxy Provider (Settings → Proxy Providers) "
+                        "or saved ProxyJet credentials."
+                    ),
+                )
         # Auto Mode mandates strongest anti-duplicate posture: each
         # generated proxy is used at most once and the engine's own
         # dup-IP filter remains on as a belt-and-suspenders guard.
@@ -9097,6 +9292,10 @@ async def rut_create_job(
         raise HTTPException(status_code=400, detail="Excel/CSV file required when form fill is enabled (upload a file, pick a saved data-file, or import from a previous job)")
     if form_fill_enabled and data_source == "gsheet" and not (gsheet_url or "").strip():
         raise HTTPException(status_code=400, detail="gsheet_url required when form fill is enabled with data_source='gsheet'")
+    if smart_funnel_enabled and not form_fill_enabled:
+        raise HTTPException(status_code=400, detail="Smart Funnel requires Form Fill enabled with lead data (Excel/Sheet)")
+    if smart_funnel_enabled and ((automation_json or "").strip() or upload_automation_json_id):
+        raise HTTPException(status_code=400, detail="Smart Funnel and Custom Automation JSON cannot be used together")
 
     # 5. Create job_id + RUT_JOBS in-memory entry + DB record (status=queued)
     job_id = str(uuid.uuid4())
@@ -9146,6 +9345,7 @@ async def rut_create_job(
         "upload_ua_ids": upload_ua_ids,
         "upload_data_file_id": upload_data_file_id,
         "upload_automation_json_id": upload_automation_json_id,
+        "proxy_provider_id": (proxy_provider_id or "").strip(),
         "data_source": data_source,
         "gsheet_url": gsheet_url,
         "import_pending_from_job_id": import_pending_from_job_id,
@@ -9156,6 +9356,10 @@ async def rut_create_job(
         "automation_json": automation_json,
         "self_heal": self_heal,
         "pure_json_mode": bool(pure_json_mode),
+        "smart_funnel_enabled": bool(smart_funnel_enabled),
+        "smart_funnel_pattern": (smart_funnel_pattern or "auto").strip().lower()[:64],
+        "smart_funnel_min_deals": max(1, min(5, int(smart_funnel_min_deals or 2))),
+        "smart_funnel_wait_until_conversion": bool(smart_funnel_wait_until_conversion),
         "auto_resume_enabled": bool(auto_resume_enabled),
         "skip_duplicate_ip": skip_duplicate_ip,
         "skip_vpn": skip_vpn,
@@ -9169,8 +9373,14 @@ async def rut_create_job(
         "invalid_data_retry_limit": max(1, min(50, int(invalid_data_retry_limit or 10))),
         "step_timeout_multiplier": max(0.5, min(5.0, float(step_timeout_multiplier or 1.0))),
         # 2026-06-25 — Per-job watchdog inactivity ceiling (seconds).
-        # Clamped 30..1800. Default 240 preserves existing behaviour.
-        "stuck_watchdog_seconds": max(30.0, min(1800.0, float(stuck_watchdog_seconds or 600.0))),
+        # Clamped 30..1800 (3600 when Smart Funnel waits for conversion).
+        "stuck_watchdog_seconds": max(
+            30.0,
+            min(
+                3600.0 if (smart_funnel_enabled and smart_funnel_wait_until_conversion) else 1800.0,
+                float(stuck_watchdog_seconds or 600.0),
+            ),
+        ),
         "target_screenshot_threshold": target_screenshot_threshold,
         "target_screenshot_upload_id": target_screenshot_upload_id,
         "target_screenshot_bytes": target_screenshot_bytes,
@@ -9221,6 +9431,8 @@ async def rut_create_job(
         # 2026-02 v2.1.31 — Step 4 wiring
         "behavioral_bio_enabled": bool(behavioral_bio_enabled),
         "ip_warmup_enabled": bool(ip_warmup_enabled),
+        "ad_chain_simulation_enabled": bool(ad_chain_simulation_enabled),
+        "ip_quality_check_enabled": bool(ip_quality_check_enabled),
         # 2026-06 — User-configurable Referrer override
         "referer_override_enabled": bool(referer_override_enabled),
         "referer_mode": (referer_mode or "auto").strip().lower()[:32],
@@ -9314,7 +9526,17 @@ async def rut_create_job(
             "invalid_data_retry_limit": max(1, min(50, int(invalid_data_retry_limit or 10))),
             "step_timeout_multiplier": max(0.5, min(5.0, float(step_timeout_multiplier or 1.0))),
             # 2026-06-25 — Per-job watchdog inactivity ceiling (persisted)
-            "stuck_watchdog_seconds": max(30.0, min(1800.0, float(stuck_watchdog_seconds or 600.0))),
+            "stuck_watchdog_seconds": max(
+                30.0,
+                min(
+                    3600.0 if (smart_funnel_enabled and smart_funnel_wait_until_conversion) else 1800.0,
+                    float(stuck_watchdog_seconds or 600.0),
+                ),
+            ),
+            "smart_funnel_enabled": bool(smart_funnel_enabled),
+            "smart_funnel_pattern": (smart_funnel_pattern or "auto").strip().lower()[:64],
+            "smart_funnel_min_deals": max(1, min(5, int(smart_funnel_min_deals or 2))),
+            "smart_funnel_wait_until_conversion": bool(smart_funnel_wait_until_conversion),
             "force_tracker_url": force_tracker_url,
             "use_proxyjet_auto": bool(use_proxyjet_auto),
             "proxyjet_country": (proxyjet_country or "US").strip().upper() or "US",
@@ -9357,6 +9579,8 @@ async def rut_create_job(
             # 2026-02 v2.1.31 — Step 4 wiring (persisted)
             "behavioral_bio_enabled": bool(behavioral_bio_enabled),
             "ip_warmup_enabled": bool(ip_warmup_enabled),
+            "ad_chain_simulation_enabled": bool(ad_chain_simulation_enabled),
+        "ip_quality_check_enabled": bool(ip_quality_check_enabled),
             # 2026-06 — Referrer override (persisted so Past-Jobs + retry
             # see the exact settings used for the run)
             "referer_override_enabled": bool(referer_override_enabled),
@@ -13840,6 +14064,14 @@ def _detect_inapp(ua: str) -> dict:
     """
     import re
     ua_low = ua or ""
+    ual = ua_low.lower()
+    # TikTok Android — FB_IAB TikTokAndroid bracket (check BEFORE generic FB_IAB).
+    if "fban/tiktokandroid" in ual:
+        m_av = re.search(r"fbav/([\d.]+)", ua_low, flags=re.IGNORECASE)
+        if not m_av:
+            m_av = re.search(r"app_version/([\d.]+)", ua_low, flags=re.IGNORECASE)
+        ver = m_av.group(1) if m_av else None
+        return {"app": "tiktok", "app_name": "TikTok", "app_version": ver, "is_inapp": True}
     # TikTok  →  musical_ly_XX.X.X   or   trill_XX.X.X
     # 2026-06 BUGFIX: musical_ly_NNNNN / trill_NNNNNN is a BUILD CODE,
     # not the human app version. Real TikTok UAs always also carry an
@@ -13860,7 +14092,9 @@ def _detect_inapp(ua: str) -> dict:
     if m:
         return {"app": "facebook", "app_name": "Facebook", "app_version": m.group(1), "is_inapp": True}
     if "FB_IAB" in ua_low or "FBAN/FBIOS" in ua_low:
-        return {"app": "facebook", "app_name": "Facebook", "app_version": None, "is_inapp": True}
+        # Exclude TikTok Android FB_IAB bracket (FBAN/TikTokAndroid handled above).
+        if "fban/tiktokandroid" not in ual:
+            return {"app": "facebook", "app_name": "Facebook", "app_version": None, "is_inapp": True}
     # Pinterest
     m = re.search(r"Pinterest/([\d.]+)", ua_low)
     if m:
@@ -14883,6 +15117,7 @@ async def send_real_traffic(
 async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_with_fresh_data)):
     # Check feature access
     check_user_feature(user, "links")
+    _validate_offer_url(link.offer_url)
     
     if link.custom_short_code:
         if not validate_short_code(link.custom_short_code):
@@ -14891,11 +15126,10 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
                 detail="Invalid short code. Use 3-50 characters: letters, numbers, hyphens, underscores only"
             )
         
-        existing = await db.links.find_one({"short_code": link.custom_short_code})
+        short_code = link.custom_short_code.lower().strip()
+        existing = await db.links.find_one({"short_code": short_code})
         if existing:
-            raise HTTPException(status_code=400, detail=f"Short code '{link.custom_short_code}' is already taken")
-        
-        short_code = link.custom_short_code
+            raise HTTPException(status_code=400, detail=f"Short code '{short_code}' is already taken")
     else:
         short_code = generate_short_code()
         while await db.links.find_one({"short_code": short_code}):
@@ -14962,6 +15196,14 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "created_by": user.get("sub_user_id") if user.get("is_sub_user") else None,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
+    try:
+        from referrer_pro import quality_tier_defaults as _qtd
+        _tier = (link_doc.get("referrer_pro_quality_tier") or "standard").strip().lower()
+        if _tier != "standard":
+            link_doc.update(_qtd(_tier))
+            link_doc["referrer_pro_quality_tier"] = _tier
+    except Exception:
+        pass
     
     await db.links.insert_one(link_doc)
     return LinkResponse(**link_doc)
@@ -14993,7 +15235,12 @@ async def update_link(link_id: str, link_update: LinkUpdate, user: dict = Depend
     if not link:
         raise HTTPException(status_code=404, detail="Link not found")
     
+    _old_short = link.get("short_code")
+    
     update_data = {}
+    
+    if link_update.offer_url is not None:
+        _validate_offer_url(link_update.offer_url)
     
     # Handle custom_short_code update
     if link_update.custom_short_code:
@@ -15012,10 +15259,24 @@ async def update_link(link_id: str, link_update: LinkUpdate, user: dict = Depend
     for k, v in link_update.model_dump().items():
         if v is not None and k not in ["custom_short_code"]:  # Skip custom_short_code as we handle it above
             update_data[k] = v
+
+    if link_update.referrer_pro_quality_tier is not None:
+        try:
+            from referrer_pro import quality_tier_defaults as _qtd
+            _tier = (link_update.referrer_pro_quality_tier or "standard").strip().lower()
+            if _tier != "standard":
+                update_data.update(_qtd(_tier))
+            update_data["referrer_pro_quality_tier"] = _tier
+        except Exception:
+            pass
     
     if update_data:
         await db.links.update_one({"id": link_id}, {"$set": update_data})
         link.update(update_data)
+        _new_short = link.get("short_code") or _old_short
+        if _old_short and _new_short != _old_short:
+            invalidate_link_cache(_old_short)
+        invalidate_link_cache(_new_short)
     
     return LinkResponse(**link)
 
@@ -15043,6 +15304,10 @@ class LinkPreviewRequest(BaseModel):
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: bool = False
     referrer_pro_traffic_type: str = "auto"  # v2.6.24 — auto|paid|organic|mixed
+    referrer_pro_lang_match: bool = True
+    referrer_pro_device_mode: str = "auto"
+    referrer_pro_tod_enabled: bool = False
+    referrer_pro_campaign_type: str = "auto"
     sample_count: int = 20
 
 
@@ -15081,6 +15346,8 @@ async def preview_referrer_settings(
     platform_counts: Dict[str, int] = {}
     for i in range(n):
         ua = _SAMPLE_UAS[i % len(_SAMPLE_UAS)]
+        _ua_low = (ua or "").lower()
+        _visitor_is_mobile = ("mobi" in _ua_low or "iphone" in _ua_low or "android" in _ua_low)
         try:
             pro = _rpv(
                 ua=ua,
@@ -15096,6 +15363,11 @@ async def preview_referrer_settings(
                 strip_search_path=bool(req.referrer_pro_strip_search_path),
                 network_click_chain_enabled=bool(req.referrer_pro_network_click_chain),
                 network_click_host=req.referrer_pro_network_click_host or None,
+                lang_match=bool(req.referrer_pro_lang_match),
+                visitor_is_mobile=_visitor_is_mobile,
+                device_mode=str(req.referrer_pro_device_mode or "auto"),
+                tod_enabled=bool(req.referrer_pro_tod_enabled),
+                campaign_type=str(req.referrer_pro_campaign_type or "auto"),
                 traffic_type=str(req.referrer_pro_traffic_type or "auto"),  # v2.6.29
             )
         except Exception as e:
@@ -15104,12 +15376,25 @@ async def preview_referrer_settings(
 
         plat = pro.get("platform") or "unknown"
         platform_counts[plat] = platform_counts.get(plat, 0) + 1
+        coerced_ua = ua
+        ua_coerced = False
+        if plat and plat not in ("email", "direct", "unknown"):
+            try:
+                from referrer_pro import coerce_ua_for_platform as _coerce_preview_ua
+                _cua = _coerce_preview_ua(ua, plat)
+                if _cua:
+                    coerced_ua = _cua
+                    ua_coerced = (_cua != ua)
+            except Exception:
+                pass
         samples.append({
             "index": i + 1,
             "ua_type": "mobile" if ("Mobile" in ua or "iPhone" in ua) else "desktop",
             "platform": plat,
             "esp": pro.get("esp") or "",
             "referer": pro.get("referer") or "",
+            "ua_coerced": ua_coerced,
+            "ua_preview_snippet": (coerced_ua or "")[:160],
             "utm_source": pro.get("utm_source") or "",
             "utm_medium": pro.get("utm_medium") or "",
             "utm_campaign": pro.get("utm_campaign") or "",
@@ -15417,7 +15702,7 @@ async def get_link_believability(link_id: str, user: dict = Depends(get_current_
         if _dev in ("", "auto"):
             _deduct(5, "Device distribution set to auto — some red-flag combos may slip through",
                     "set_device_mode", "Pin device mode to mobile-heavy for social ads (+5%)",
-                    {"referrer_pro_device_mode": "mobile"})
+                    {"referrer_pro_device_mode": "mobile_only"})
         # Brand tag
         if not str(link.get("referrer_pro_brand") or "").strip():
             _deduct(4, "No brand tag — utm_campaign will be generic",
@@ -15516,7 +15801,7 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
             "referrer_pro_platform_pool": "facebook:100",
             "referrer_pro_lang_match": True,
             "referrer_pro_tod_enabled": True,
-            "referrer_pro_device_mode": "mobile",
+            "referrer_pro_device_mode": "mobile_only",
             "referrer_pro_social_wrapper": True,
             "referrer_pro_inapp_deep_path": True,
             "referrer_pro_wrapper_redirect": True,
@@ -15527,7 +15812,7 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
             "referrer_pro_platform_pool": "tiktok:100",
             "referrer_pro_lang_match": True,
             "referrer_pro_tod_enabled": True,
-            "referrer_pro_device_mode": "mobile",
+            "referrer_pro_device_mode": "mobile_only",
             "referrer_pro_social_wrapper": True,
             "referrer_pro_inapp_deep_path": True,
             "referrer_pro_wrapper_redirect": False,  # TT wrapper triggers warnings
@@ -15544,18 +15829,18 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
             "referrer_pro_wrapper_redirect": True,  # google.com/url is safe
             "referrer_pro_strip_search_path": True,
             "referrer_pro_search_engine": "google",
-            "referrer_pro_campaign_type": "search_ad",
+            "referrer_pro_campaign_type": "search_cpc",
         },
         "linkedin_ads": {
             "referrer_pro_enabled": True,
             "referrer_pro_platform_pool": "linkedin:100",
             "referrer_pro_lang_match": True,
             "referrer_pro_tod_enabled": True,
-            "referrer_pro_device_mode": "desktop",
+            "referrer_pro_device_mode": "desktop_only",
             "referrer_pro_social_wrapper": True,
             "referrer_pro_inapp_deep_path": False,
             "referrer_pro_wrapper_redirect": True,
-            "referrer_pro_campaign_type": "sponsored_content",
+            "referrer_pro_campaign_type": "static_image",
         },
         "maxbounty_premium": {
             "referrer_pro_enabled": True,
@@ -15619,6 +15904,8 @@ async def report_link_bounce(link_id: str, user: dict = Depends(get_current_user
             _upd["auto_paused_at"] = datetime.now(timezone.utc).isoformat()
             _paused = True
     await db.links.update_one({"id": link_id}, {"$set": _upd})
+    if link.get("short_code"):
+        invalidate_link_cache(link["short_code"])
     return {"ok": True, "total_bounces": _new_bounces, "streak": _new_streak, "auto_paused": _paused}
 
 
@@ -15634,6 +15921,8 @@ async def resume_link(link_id: str, user: dict = Depends(get_current_user_with_f
         {"id": link_id},
         {"$set": {"status": "active", "consecutive_no_conversions": 0, "auto_paused_at": None}},
     )
+    if link.get("short_code"):
+        invalidate_link_cache(link["short_code"])
     return {"ok": True, "resumed": True}
 
 
@@ -15641,9 +15930,12 @@ async def resume_link(link_id: str, user: dict = Depends(get_current_user_with_f
 @api_router.delete("/links/{link_id}")
 async def delete_link(link_id: str, user: dict = Depends(get_current_user_with_fresh_data)):
     check_user_feature(user, "links")
+    link = await db.links.find_one({"id": link_id, "user_id": user["id"]}, {"_id": 0, "short_code": 1})
     result = await db.links.delete_one({"id": link_id, "user_id": user["id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Link not found")
+    if link and link.get("short_code"):
+        invalidate_link_cache(link["short_code"])
     return {"message": "Link deleted"}
 
 @api_router.post("/clicks/import")
@@ -16109,22 +16401,38 @@ async def get_clicks_count(
             month_ago = datetime.now(timezone.utc) - timedelta(days=30)
             query["created_at"] = {"$gte": month_ago.isoformat()}
     
-    # Count from BOTH user_db and main db
-    user_db_count = await user_db.clicks.count_documents(query)
-    main_db_count = await db.clicks.count_documents(query)
-    total_count = user_db_count + main_db_count
+    # Count from BOTH user_db and main db — dedupe by id/click_id (same as /clicks list)
+    _id_rows_u = await user_db.clicks.find(query, {"_id": 0, "id": 1, "click_id": 1}).to_list(None)
+    _id_rows_m = await db.clicks.find(query, {"_id": 0, "id": 1, "click_id": 1}).to_list(None)
+    _seen_ids: set = set()
+    for _row in _id_rows_u + _id_rows_m:
+        _cid = _row.get("id") or _row.get("click_id")
+        if _cid:
+            _seen_ids.add(_cid)
+    total_count = len(_seen_ids)
     
-    # Get unique IPs count
+    # Get unique IPs count (deduped across both DBs)
     user_db_ips = await user_db.clicks.distinct("ip_address", query)
     main_db_ips = await db.clicks.distinct("ip_address", query)
     unique_ips = set(user_db_ips + main_db_ips)
+    unique_ips.discard("")
+    unique_ips.discard(None)
     unique_count = len(unique_ips)
     
-    # Count duplicates and VPN
-    duplicate_count = await user_db.clicks.count_documents({**query, "is_duplicate_proxy": True}) + \
-                     await db.clicks.count_documents({**query, "is_duplicate_proxy": True})
-    vpn_count = await user_db.clicks.count_documents({**query, "is_vpn": True}) + \
-               await db.clicks.count_documents({**query, "is_vpn": True})
+    # Count duplicates and VPN (dedupe by click id across both DBs)
+    _flag_rows_u = await user_db.clicks.find(
+        query, {"_id": 0, "id": 1, "click_id": 1, "is_duplicate_proxy": 1, "is_vpn": 1},
+    ).to_list(None)
+    _flag_rows_m = await db.clicks.find(
+        query, {"_id": 0, "id": 1, "click_id": 1, "is_duplicate_proxy": 1, "is_vpn": 1},
+    ).to_list(None)
+    _seen_flags: Dict[str, Dict[str, Any]] = {}
+    for _row in _flag_rows_u + _flag_rows_m:
+        _cid = _row.get("id") or _row.get("click_id")
+        if _cid and _cid not in _seen_flags:
+            _seen_flags[_cid] = _row
+    duplicate_count = sum(1 for _r in _seen_flags.values() if _r.get("is_duplicate_proxy"))
+    vpn_count = sum(1 for _r in _seen_flags.values() if _r.get("is_vpn"))
     
     return {
         "count": total_count,
@@ -16217,18 +16525,24 @@ async def export_clicks(
 
     total_available = 0
     try:
-        total_available = (
-            await user_db.clicks.count_documents(query)
-            + await db.clicks.count_documents(query)
-        )
+        _id_rows_u = await user_db.clicks.find(query, {"_id": 0, "id": 1, "click_id": 1}).to_list(None)
+        _id_rows_m = await db.clicks.find(query, {"_id": 0, "id": 1, "click_id": 1}).to_list(None)
+        _export_seen_ids: set = set()
+        for _row in _id_rows_u + _id_rows_m:
+            _cid = _row.get("id") or _row.get("click_id")
+            if _cid:
+                _export_seen_ids.add(_cid)
+        total_available = len(_export_seen_ids)
     except Exception:
         pass
 
     export_data: List[Dict[str, Any]] = []
+    _seen_export_ids: set = set()
 
     async def _stream_from(collection):
         cursor = collection.find(query, {
             "_id": 0,
+            "id": 1, "click_id": 1,
             "ipv4": 1, "ipv6": 1, "ip_address": 1, "proxy_ips": 1,
             "country": 1, "city": 1, "region": 1,
             "device": 1, "device_type": 1, "browser": 1, "os_name": 1,
@@ -16238,6 +16552,11 @@ async def export_clicks(
         async for click in cursor:
             if len(export_data) >= EXPORT_CLICKS_MAX:
                 break
+            _cid = click.get("id") or click.get("click_id")
+            if _cid:
+                if _cid in _seen_export_ids:
+                    continue
+                _seen_export_ids.add(_cid)
             export_data.append({
                 "ipv4": click.get("ipv4") or (click.get("ip_address") if click.get("ip_address") and ":" not in str(click.get("ip_address")) else ""),
                 "ipv6": click.get("ipv6") or (click.get("ip_address") if click.get("ip_address") and ":" in str(click.get("ip_address")) else ""),
@@ -18676,6 +18995,16 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     is_vpn = ip_info["is_vpn"]
     is_proxy = ip_info["is_proxy"]
     vpn_score = ip_info.get("vpn_score", 0)
+
+    # Respect user's Settings → Fraud Detection (premium keys, threshold, rules)
+    if link.get("block_vpn") and client_ip and client_ip not in ("unknown", "Unknown", ""):
+        try:
+            _fraud = await check_vpn_detailed(client_ip, user_id=main_user_id)
+            is_vpn = bool(_fraud.get("is_vpn"))
+            is_proxy = bool(_fraud.get("is_proxy")) or is_vpn or bool(_fraud.get("is_tor"))
+            vpn_score = int(_fraud.get("vpn_score") or vpn_score)
+        except Exception as _fraud_err:
+            logger.debug(f"[/r] user fraud check fallback: {_fraud_err}")
     
     # print(f"DEBUG: Geolocation - Country: {country}, City: {city}, Region: {region}, VPN: {is_vpn}, Score: {vpn_score}")
     
@@ -18938,6 +19267,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     
     # Get all URL parameters for referrer detection
     url_params = dict(request.query_params)
+    # RUT-signed visits defer tracker click insert — engine logs once via early log.
+    _defer_click_to_rut = _should_defer_click_log_to_rut(request)
     
     # Categorize referrer source - use forced_source from link if set
     if link.get("forced_source"):
@@ -19015,36 +19346,37 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
-    # Save click to user's database
-    await user_db.clicks.insert_one(click_doc)
-    
-    # Update link click count in main database (where links are stored)
-    # v2.1.83 Feature 10 — Also increment `consecutive_no_conversions`
-    # every click; the postback / pixel handlers below reset it to 0 on
-    # each conversion. When it crosses the customer-set threshold AND
-    # auto-pause is enabled, we flip the link's status to "paused" so
-    # future clicks 404 instead of wasting proxy quota.
-    _link_inc = {"clicks": 1, "consecutive_no_conversions": 1}
-    await db.links.update_one({"id": link["id"]}, {"$inc": _link_inc})
-    if bool(link.get("referrer_pro_auto_pause_enabled")):
-        try:
-            _threshold = int(link.get("referrer_pro_auto_pause_threshold") or 10)
-            _new_streak = int(link.get("consecutive_no_conversions", 0) or 0) + 1
-            if _threshold > 0 and _new_streak >= _threshold and link.get("status") == "active":
-                await db.links.update_one(
-                    {"id": link["id"]},
-                    {"$set": {"status": "paused", "auto_paused_at": datetime.now(timezone.utc).isoformat()}},
-                )
-                logger.warning(
-                    f"[auto-pause] link {link.get('short_code')} paused after "
-                    f"{_new_streak} consecutive non-converting clicks (threshold={_threshold})"
-                )
-        except Exception as _ap_err:
-            logger.debug(f"[auto-pause] check failed: {_ap_err}")
-    
-    # Broadcast new click to user via WebSocket for real-time updates
-    click_doc.pop("_id", None)
-    asyncio.create_task(manager.broadcast_click(main_user_id, click_doc))
+    # Save click to user's database (skip when RUT engine owns logging)
+    if not _defer_click_to_rut:
+        await user_db.clicks.insert_one(click_doc)
+        
+        # Update link click count in main database (where links are stored)
+        # v2.1.83 Feature 10 — Also increment `consecutive_no_conversions`
+        # every click; the postback / pixel handlers below reset it to 0 on
+        # each conversion. When it crosses the customer-set threshold AND
+        # auto-pause is enabled, we flip the link's status to "paused" so
+        # future clicks 404 instead of wasting proxy quota.
+        _link_inc = {"clicks": 1, "consecutive_no_conversions": 1}
+        await db.links.update_one({"id": link["id"]}, {"$inc": _link_inc})
+        if bool(link.get("referrer_pro_auto_pause_enabled")):
+            try:
+                _threshold = int(link.get("referrer_pro_auto_pause_threshold") or 10)
+                _new_streak = int(link.get("consecutive_no_conversions", 0) or 0) + 1
+                if _threshold > 0 and _new_streak >= _threshold and link.get("status") == "active":
+                    await db.links.update_one(
+                        {"id": link["id"]},
+                        {"$set": {"status": "paused", "auto_paused_at": datetime.now(timezone.utc).isoformat()}},
+                    )
+                    logger.warning(
+                        f"[auto-pause] link {link.get('short_code')} paused after "
+                        f"{_new_streak} consecutive non-converting clicks (threshold={_threshold})"
+                    )
+            except Exception as _ap_err:
+                logger.debug(f"[auto-pause] check failed: {_ap_err}")
+        
+        # Broadcast new click to user via WebSocket for real-time updates
+        click_doc.pop("_id", None)
+        asyncio.create_task(manager.broadcast_click(main_user_id, click_doc))
     
     offers = await db.offers.find({"link_id": link["id"]}, {"_id": 0}).to_list(100)
     
@@ -19327,6 +19659,19 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             custom_params = _expanded_params
         except Exception as _me:
             logger.debug(f"[/r/{short_code}] url_params macro expand skipped: {_me}")
+
+    # referrer_mode "with_params" — merge utm_source / fbclid / gclid etc.
+    # into the offer URL when platform simulation wasn't explicitly set.
+    if referrer_mode == "with_params" and not simulate_platform:
+        _wp = (
+            link.get("simulate_platform")
+            or link.get("forced_source")
+            or referrer_info.get("source")
+            or ""
+        )
+        _wp = str(_wp).strip().lower()
+        if _wp and _wp not in ("direct", "unknown", "other", "krexion"):
+            simulate_platform = _wp
 
     if simulate_platform:
         # 2026-06-14: forward the brand (from _kx_brand handshake) so the
@@ -25667,6 +26012,14 @@ async def _krexion_customer_startup_tasks():
         )
     except Exception as _ttl_e:  # noqa: BLE001
         logger.warning(f"[rut_burnt_ips] index creation failed: {_ttl_e}")
+
+    try:
+        await db.cross_user_ip_groups.create_index("id", unique=True)
+        await db.cross_user_ip_groups.create_index([("user_ids", 1)])
+        await db.cross_user_ip_groups.create_index([("enabled", 1)])
+        logger.info("[cross_user_ip_groups] Indexes ready")
+    except Exception as _iso_idx_e:  # noqa: BLE001
+        logger.warning(f"[cross_user_ip_groups] index creation failed: {_iso_idx_e}")
 
 
     # v2.1.75 — Background pre-warm of bridge response cache for

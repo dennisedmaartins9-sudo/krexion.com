@@ -330,14 +330,33 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
 _TARGETING_PLACEHOLDER_KEYS = ("country", "state", "city", "zip", "asn", "ttl", "sid")
 
 
-def _detect_profile(host: str) -> Optional[Dict[str, Any]]:
+def _detect_profile(host: str, provider_name: str = "") -> Optional[Dict[str, Any]]:
     h = (host or "").lower().strip()
-    if not h:
-        return None
+    n = (provider_name or "").lower().strip()
     for prof in _PROVIDER_PROFILES:
         for needle in prof["hosts"]:
             if needle in h:
                 return prof
+    # Fallback: match common provider names when gateway host is custom/CDN.
+    _name_needles = {
+        "dataimpulse": "DataImpulse",
+        "bright data": "Bright Data",
+        "luminati": "Bright Data",
+        "oxylabs": "Oxylabs",
+        "smartproxy": "Smartproxy / Decodo",
+        "decodo": "Smartproxy / Decodo",
+        "iproyal": "IPRoyal",
+        "proxyempire": "ProxyEmpire",
+        "soax": "Soax",
+        "packetstream": "PacketStream",
+        "webshare": "IPRoyal",
+        "netnut": "Oxylabs",
+    }
+    for needle, pname in _name_needles.items():
+        if needle in n:
+            for prof in _PROVIDER_PROFILES:
+                if prof["name"] == pname:
+                    return prof
     return None
 
 
@@ -367,6 +386,7 @@ def _apply_targeting_to_username(
     username_tpl: str,
     gateway_host: str,
     targeting: Dict[str, Any],
+    provider_name: str = "",
 ) -> str:
     """Return the username template with targeting overrides applied.
 
@@ -391,7 +411,7 @@ def _apply_targeting_to_username(
         return username_tpl
 
     out = username_tpl
-    profile = _detect_profile(gateway_host or "")
+    profile = _detect_profile(gateway_host or "", provider_name)
 
     # 1. Placeholder substitution — universal, provider-agnostic.
     for key in ("country", "state", "city", "zip", "asn"):
@@ -915,6 +935,18 @@ async def _probe_ip_via_proxy(proxy_url: str) -> Optional[Dict[str, Any]]:
     if not ip:
         return None
 
+    cached = await _get_cached_ip_reputation(ip)
+    if cached:
+        return {
+            "ip":           ip,
+            "is_proxy":     bool(cached.get("is_proxy")),
+            "is_hosting":   bool(cached.get("is_hosting")),
+            "is_mobile":    bool(cached.get("is_mobile")),
+            "country_code": str(cached.get("country_code") or ""),
+            "city":         str(cached.get("city") or ""),
+            "isp":          str(cached.get("isp") or ""),
+        }
+
     # Persist to cache for the next probe.
     await _set_cached_ip_reputation(ip, data)
 
@@ -1417,7 +1449,9 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
                 targeting.get(k) for k in ("country", "state", "city", "zip", "asn", "sticky_minutes")
             )
             if has_targeting:
-                username_tpl = _apply_targeting_to_username(username_tpl, host, targeting)
+                username_tpl = _apply_targeting_to_username(
+                    username_tpl, host, targeting, str(provider.get("name") or "")
+                )
 
             for _ in range(count):
                 # For sticky mode we still need unique per-line session
@@ -1476,6 +1510,36 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
         else:
             raise HTTPException(400, f"unknown provider kind: {kind}")
 
+        # Honour provider strict/DC toggles — same guarantees as bulk fetch.
+        _strict = bool(cfg.get("strict_unique_ip", True))
+        _skip_dc = bool(cfg.get("skip_datacenter_ip", True))
+        if out and (_strict or _skip_dc):
+            _seen_ips: set = set()
+            _filtered: List[str] = []
+            _probe_enabled = True
+            for _line in out:
+                if not _probe_enabled:
+                    _filtered.append(_line)
+                    continue
+                _info = await _probe_ip_via_proxy(_line)
+                if not _info:
+                    _filtered.append(_line)
+                    continue
+                _ip = _info.get("ip") or ""
+                if _strict and _ip and _ip in _seen_ips:
+                    continue
+                if _skip_dc and (_info.get("is_hosting") or _info.get("is_proxy")):
+                    continue
+                if _ip:
+                    _seen_ips.add(_ip)
+                _filtered.append(_line)
+            out = _filtered
+            if not out:
+                raise HTTPException(
+                    400,
+                    "No proxies passed strict unique / datacenter checks after probing",
+                )
+
         return {
             "ok": True,
             "count": len(out),
@@ -1529,36 +1593,26 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
         cfg = provider.get("config") or {}
 
         supported = {
-            "country": False, "state": False, "city": False,
-            "zip": False, "asn": False,
-            "sticky_minutes": False, "session_mode": False,
+            "country": True, "state": True, "city": True,
+            "zip": True, "asn": True,
+            "sticky_minutes": True, "session_mode": True,
         }
         detected_provider = None
         ttl_cap_min = 120
         hint = ""
+        provider_name = str(provider.get("name") or "")
 
         if kind == "native_proxyjet":
-            supported.update({
-                "country": True, "state": True,
-                "sticky_minutes": True, "session_mode": True,
-            })
             detected_provider = "ProxyJet (native)"
             ttl_cap_min = 120
             hint = "Native ProxyJet — country + US state + sticky window supported."
 
         elif kind == "rotating_gateway":
-            supported["session_mode"] = True
             host = str(cfg.get("gateway_host") or "").strip()
             username_tpl = str(cfg.get("username") or "")
-            profile = _detect_profile(host)
+            profile = _detect_profile(host, provider_name)
             if profile:
                 detected_provider = profile["name"]
-                for key in ("country", "state", "city", "zip", "asn"):
-                    if profile["keys"].get(key):
-                        supported[key] = True
-                if profile.get("ttl_key"):
-                    supported["sticky_minutes"] = True
-                # TTL caps per provider (empirical / from docs).
                 caps = {
                     "DataImpulse": 120,
                     "Bright Data": 30,
@@ -1571,28 +1625,28 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
                 }
                 ttl_cap_min = caps.get(profile["name"], 120)
                 hint = f"{profile['name']} detected — auto-applies its DSL for the fields you fill."
-            # Placeholder overrides always work — check template.
-            for key, ph in (
-                ("country", "{country}"), ("state", "{state}"),
-                ("city", "{city}"), ("zip", "{zip}"),
-                ("asn", "{asn}"), ("sticky_minutes", "{ttl}"),
+            if "{ttl}" in username_tpl or (profile and profile.get("ttl_key")):
+                supported["sticky_minutes"] = True
+            if not detected_provider and any(
+                ph in username_tpl for ph in ("{country}", "{state}", "{city}", "{zip}", "{asn}", "{ttl}", "{sid}")
             ):
-                if ph in username_tpl:
-                    supported[key] = True
-            if not detected_provider and any(supported.values()):
                 detected_provider = "Custom gateway (via {placeholders})"
                 hint = "Custom gateway — placeholders detected in the username template."
             if not detected_provider:
                 detected_provider = "Custom gateway"
-                hint = "Custom gateway — session-only mode. To enable geo targeting, edit your provider and use {country}/{state}/{city}/{zip}/{asn}/{ttl}/{sid} placeholders in the username."
+                hint = (
+                    "All targeting fields are available. For unknown gateways, add "
+                    "{country}/{state}/{city}/{zip}/{asn}/{ttl}/{sid} placeholders to the username "
+                    "in Settings, or use a known provider host/name so Krexion auto-detects the DSL."
+                )
 
         elif kind == "api_endpoint":
             detected_provider = "API endpoint"
-            hint = "This provider fetches proxies from an API you configured. Geo targeting must be set inside the API URL/body."
+            hint = "All fields shown — geo/session values apply only if your API URL/body uses {country}/{state}/… placeholders."
 
         elif kind == "manual_list":
             detected_provider = "Manual list"
-            hint = "Static list of proxies — no per-fetch targeting."
+            hint = "Static proxy list — count/format apply; geo targeting is ignored for manual lists."
 
         return {
             "provider_id": provider_id,

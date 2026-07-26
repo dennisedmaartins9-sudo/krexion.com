@@ -625,6 +625,10 @@ export default function LinksPage() {
         referrer_pro_network_click_host: formData.referrer_pro_network_click_host,
         referrer_pro_wrapper_redirect: formData.referrer_pro_wrapper_redirect,
         referrer_pro_traffic_type: formData.referrer_pro_traffic_type || "auto",
+        referrer_pro_lang_match: formData.referrer_pro_lang_match,
+        referrer_pro_device_mode: formData.referrer_pro_device_mode || "auto",
+        referrer_pro_tod_enabled: formData.referrer_pro_tod_enabled,
+        referrer_pro_campaign_type: formData.referrer_pro_campaign_type || "auto",
         sample_count: 20
       }, { headers: { Authorization: `Bearer ${token}` } });
       setPreviewData(res.data);
@@ -1028,8 +1032,8 @@ export default function LinksPage() {
                   <div className="flex items-center gap-2">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[#F59E0B]"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                     <div>
-                      <Label className="text-base font-medium">Duplicate IP Timer</Label>
-                      <p className="text-xs text-muted-foreground mt-1">Auto-close duplicate IP page after specified seconds</p>
+                      <Label className="text-base font-medium">Duplicate IP Block Page Timer</Label>
+                      <p className="text-xs text-muted-foreground mt-1">Auto-close the duplicate-IP block screen after N seconds (does not re-allow the IP)</p>
                     </div>
                   </div>
                   <button

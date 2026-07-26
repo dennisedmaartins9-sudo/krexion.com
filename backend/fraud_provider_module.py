@@ -215,6 +215,70 @@ async def _set_rules(user_id: str, rules: FraudRules) -> None:
     )
 
 
+def _enrich_provider_geo(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill country/asn/hosting flags from provider raw payloads for custom rules."""
+    if not result:
+        return result
+    raw = result.get("raw") or {}
+    if isinstance(raw, dict) and len(raw) == 1:
+        only_val = next(iter(raw.values()))
+        if isinstance(only_val, dict):
+            raw = only_val
+    if not result.get("country"):
+        result["country"] = str(
+            raw.get("country_code")
+            or raw.get("countryCode")
+            or raw.get("country")
+            or result.get("country_code")
+            or ""
+        ).upper()
+    if not result.get("country_code") and result.get("country"):
+        result["country_code"] = result["country"]
+    if not result.get("asn"):
+        asn = raw.get("ASN") or raw.get("asn") or raw.get("as")
+        if asn:
+            result["asn"] = asn
+    ptype = str(raw.get("connection_type") or raw.get("usage_type") or raw.get("type") or "").lower()
+    if "hosting" in ptype or raw.get("hosting"):
+        result["is_hosting"] = True
+    if "datacenter" in ptype or "data center" in ptype:
+        result["is_datacenter"] = True
+    if raw.get("tor"):
+        result["is_tor"] = True
+    return result
+
+
+async def _enrich_geo_for_rules(ip: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Backfill country/ASN via ip-api when providers omit geo fields."""
+    result = _enrich_provider_geo(result)
+    if (result.get("country") or result.get("country_code")) and result.get("asn"):
+        return result
+    if not ip:
+        return result
+    try:
+        async with httpx.AsyncClient(timeout=4) as c:
+            r = await c.get(
+                f"http://ip-api.com/json/{ip}?fields=status,countryCode,as,hosting,proxy,mobile"
+            )
+            if r.status_code != 200:
+                return result
+            data = r.json() or {}
+            if str(data.get("status") or "").lower() != "success":
+                return result
+            if not result.get("country"):
+                result["country"] = str(data.get("countryCode") or "").upper()
+                result["country_code"] = result["country"]
+            if not result.get("asn") and data.get("as"):
+                result["asn"] = data.get("as")
+            if data.get("hosting"):
+                result["is_hosting"] = True
+            if data.get("proxy"):
+                result["is_proxy"] = True
+    except Exception:
+        pass
+    return result
+
+
 def _apply_rules(result: Dict[str, Any], rules: Dict[str, Any]) -> Dict[str, Any]:
     """Post-process a provider result through the user's custom rules.
 
@@ -505,13 +569,19 @@ async def _call_ipqualityscore(ip: str, acc: Dict[str, Any]) -> Optional[Dict[st
             data = r.json()
             score = int(data.get("fraud_score", 0) or 0)
             is_vpn = bool(data.get("vpn") or data.get("proxy") or data.get("tor"))
-            return {
+            return _enrich_provider_geo({
                 "is_vpn": is_vpn,
                 "vpn_score": score,
                 "risk": "high" if score >= 75 else ("medium" if score >= 40 else "low"),
                 "source": f"ipqualityscore:{acc.get('account_name')}",
+                "country": str(data.get("country_code") or "").upper(),
+                "country_code": str(data.get("country_code") or "").upper(),
+                "asn": data.get("ASN") or data.get("asn"),
+                "is_tor": bool(data.get("tor")),
+                "is_hosting": bool(data.get("hosting")),
+                "is_datacenter": str(data.get("connection_type") or "").lower() == "datacenter",
                 "raw": data,
-            }
+            })
     except Exception as e:
         logger.debug("ipqualityscore call failed: %s", e)
         return None
@@ -533,13 +603,16 @@ async def _call_iphub(ip: str, acc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             data = r.json()
             block = int(data.get("block", 0) or 0)
             score = 100 if block == 2 else (60 if block == 1 else 0)
-            return {
+            return _enrich_provider_geo({
                 "is_vpn": block >= 1,
                 "vpn_score": score,
                 "risk": "high" if block == 2 else ("medium" if block == 1 else "low"),
                 "source": f"iphub:{acc.get('account_name')}",
+                "country": str(data.get("countryCode") or data.get("country") or "").upper(),
+                "country_code": str(data.get("countryCode") or data.get("country") or "").upper(),
+                "asn": data.get("asn"),
                 "raw": data,
-            }
+            })
     except Exception as e:
         logger.debug("iphub call failed: %s", e)
         return None
@@ -564,13 +637,16 @@ async def _call_proxycheck(ip: str, acc: Dict[str, Any]) -> Optional[Dict[str, A
             proxy = str(entry.get("proxy", "no")).lower() == "yes"
             risk = int(entry.get("risk", 0) or 0)
             score = risk if risk else (100 if proxy else 0)
-            return {
+            return _enrich_provider_geo({
                 "is_vpn": proxy or risk >= 66,
                 "vpn_score": score,
                 "risk": "high" if score >= 66 else ("medium" if score >= 33 else "low"),
                 "source": f"proxycheck:{acc.get('account_name')}",
+                "country": str(entry.get("country") or entry.get("isocode") or "").upper(),
+                "country_code": str(entry.get("isocode") or entry.get("country") or "").upper(),
+                "asn": entry.get("asn"),
                 "raw": entry,
-            }
+            })
     except Exception as e:
         logger.debug("proxycheck call failed: %s", e)
         return None
@@ -600,24 +676,6 @@ async def check_ip_for_user(user_id: str, ip: str) -> Dict[str, Any]:
       4. If fallback disabled and all fail → return neutral "unknown".
     """
     settings = await _get_settings(user_id)
-    if not settings.get("personal_filter_enabled"):
-        return await _existing_check_vpn(ip)
-
-    # 2026-07 — historical cache lookup FIRST. Saves provider quota
-    # dramatically on repeat visits (RUT jobs often hit same IPs).
-    _threshold_for_cache = int(settings.get("min_fraud_score", 75))
-    cached = await _cache_get(user_id, ip, _threshold_for_cache)
-    if cached is not None:
-        # Load rules and re-apply (rules may have changed since cache write).
-        _rules_for_cache = await _get_rules(user_id)
-        cached["min_fraud_score"] = _threshold_for_cache
-        return _apply_rules(cached, _rules_for_cache)
-
-    # Per-user fraud-score threshold. Any provider that returns a
-    # vpn_score/fraud_score >= this value will force is_vpn=True so
-    # downstream skip_vpn filters block the IP even when the provider
-    # didn't set the raw boolean flag (some providers e.g. IPQS mark
-    # medium-risk IPs with a numeric score but proxy/vpn=false).
     _threshold = int(settings.get("min_fraud_score", 75))
     _rules = await _get_rules(user_id)
 
@@ -630,16 +688,30 @@ async def check_ip_for_user(user_id: str, ip: str) -> Dict[str, Any]:
             res["is_vpn"] = True
             res["risk"] = res.get("risk") or "high"
             res["source"] = f"{res.get('source', 'user-account')}:threshold({_threshold})"
-        # Always expose the threshold + raw score so the caller can log it.
         res["min_fraud_score"] = _threshold
         return res
 
     async def _finalize(res: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply threshold + rules + persist to cache."""
+        res = await _enrich_geo_for_rules(ip, res)
         res = _apply_threshold(res)
         res = _apply_rules(res, _rules)
         await _cache_put(user_id, ip, res)
         return res
+
+    # Custom rules can run even when personal premium providers are OFF.
+    if not settings.get("personal_filter_enabled"):
+        res = await _existing_check_vpn(ip)
+        return await _finalize(res)
+
+    # 2026-07 — historical cache lookup FIRST. Saves provider quota
+    # dramatically on repeat visits (RUT jobs often hit same IPs).
+    _threshold_for_cache = int(settings.get("min_fraud_score", 75))
+    cached = await _cache_get(user_id, ip, _threshold_for_cache)
+    if cached is not None:
+        cached["min_fraud_score"] = _threshold
+        cached = await _enrich_geo_for_rules(ip, cached)
+        cached = _apply_threshold(cached)
+        return _apply_rules(cached, _rules)
 
     accounts = await _list_accounts(user_id)
     usable = [a for a in accounts if a.get("enabled") and not _is_quota_exhausted(a) and not _is_rate_limited(a)]
