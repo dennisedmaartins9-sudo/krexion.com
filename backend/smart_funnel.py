@@ -68,11 +68,12 @@ SMART_FUNNEL_PATTERNS: Dict[str, Dict[str, str]] = {
 # Safety cap — ~25 min at 1.5s/action; conversion usually ~8–15 min
 MAX_ITERATIONS_DEFAULT = 1000
 
-DEAL_SCRIPT = r"""(function(){window.__krxDealsDone=window.__krxDealsDone||0;window.__krxDealKeys=window.__krxDealKeys||{};var u=location.href;var n=0;if(/BVA=True/i.test(u))n++;if(/BVB=True/i.test(u))n++;if(/BVC=True/i.test(u))n++;if(/BVD=True/i.test(u))n++;if(/BVE=True/i.test(u))n++;window.__krxDealsDone=Math.max(window.__krxDealsDone||0,n);var bt=(document.body.innerText||'').toLowerCase();var host=(location.host||'').toLowerCase();function vis(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var r=e.getBoundingClientRect();return r.width>20&&r.height>10;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function btns(){return Array.from(document.querySelectorAll('button,a,div,span')).filter(vis);}function rf(el){if(!el)return;try{el.scrollIntoView({block:'center'});el.click();}catch(e){}}if(/do you already have/i.test(bt)){var no=btns().find(function(e){var t=txt(e).toUpperCase();return t==='NO'||t==='NO!';});if(no){rf(no);return;}}var hasCost=/your cost:\s*\$|minimum\s*deposit|best match for you|complete\s*\d+\s*deal/i.test(bt);var contBtns=btns().filter(function(e){var t=txt(e);return t==='CONTINUE'||t==='Continue';});if(!hasCost&&contBtns.length<1&&!( /uplevelrewards|levelrewards|rewardsgiant/i.test(host)))return;for(var i=0;i<contBtns.length;i++){var b=contBtns[i];var key=(b.href||'')+'|'+txt(b)+'|'+Math.round(b.getBoundingClientRect().top);if(window.__krxDealKeys[key])continue;window.__krxDealKeys[key]=1;window.__krxDealsDone=(window.__krxDealsDone||0)+1;rf(b);return;}})();"""
+# Deal clicks only — deal COUNT comes from URL params (BVA/BVC/BVE), not button clicks.
+DEAL_SCRIPT = r"""(function(){window.__krxDealsDone=window.__krxDealsDone||0;window.__krxDealKeys=window.__krxDealKeys||{};var u=location.href;var n=0;if(/BVA=True/i.test(u))n++;if(/BVB=True/i.test(u))n++;if(/BVC=True/i.test(u))n++;if(/BVD=True/i.test(u))n++;if(/BVE=True/i.test(u))n++;window.__krxDealsDone=n;var bt=(document.body.innerText||'').toLowerCase();var host=(location.host||'').toLowerCase();function vis(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var r=e.getBoundingClientRect();return r.width>20&&r.height>10;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function btns(){return Array.from(document.querySelectorAll('button,a,div,span')).filter(vis);}function rf(el){if(!el)return;try{el.scrollIntoView({block:'center'});el.click();}catch(e){}}if(/do you already have/i.test(bt)){var no=btns().find(function(e){var t=txt(e).toUpperCase();return t==='NO'||t==='NO!';});if(no){rf(no);return;}}var hasCost=/your cost:\s*\$|minimum\s*deposit|best match for you|complete\s*\d+\s*deal/i.test(bt);var contBtns=btns().filter(function(e){var t=txt(e);return t==='CONTINUE'||t==='Continue';});if(!hasCost&&contBtns.length<1&&!( /uplevelrewards|levelrewards|rewardsgiant/i.test(host)))return;for(var i=0;i<contBtns.length;i++){var b=contBtns[i];var key=(b.href||'')+'|'+txt(b)+'|'+Math.round(b.getBoundingClientRect().top);if(window.__krxDealKeys[key])continue;window.__krxDealKeys[key]=1;rf(b);return;}})();"""
 
 MODAL_NO_SCRIPT = r"""(function(){var bt=(document.body.innerText||'').toLowerCase();if(!/do you already have/i.test(bt))return;var no=Array.from(document.querySelectorAll('button,a,div,span')).find(function(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var t=((e.innerText||e.textContent||'')+'').trim().toUpperCase();return t==='NO'||t==='NO!';});if(no){try{no.scrollIntoView({block:'center'});no.click();}catch(e){}}})();"""
 
-CONVERSION_SCRIPT = r"""(function(){window.__krxDealsDone=window.__krxDealsDone||0;var u=location.href;var n=0;if(/BVA=True/i.test(u))n++;if(/BVB=True/i.test(u))n++;if(/BVC=True/i.test(u))n++;if(/BVD=True/i.test(u))n++;if(/BVE=True/i.test(u))n++;window.__krxDealsDone=Math.max(window.__krxDealsDone||0,n);var dealsDone=window.__krxDealsDone||0;var bt=(document.body.innerText||'').toLowerCase();var url=(location.href||'').toLowerCase();var host=(location.host||'').toLowerCase();var onDealHost=/uplevelrewards|levelrewards|rewardsgiant|myprize|deal/i.test(host);var pageWin=onDealHost&&(/congrat|thank you|success|completed|you.?re all set|all deals/i.test(bt)||/congrat|thank-you|success/i.test(url));window.__krxConversionSignal=(dealsDone>=2)||pageWin;window.__krxDone=window.__krxConversionSignal;})();"""
+CONVERSION_SCRIPT = r"""(function(){var u=location.href;var n=0;if(/BVA=True/i.test(u))n++;if(/BVB=True/i.test(u))n++;if(/BVC=True/i.test(u))n++;if(/BVD=True/i.test(u))n++;if(/BVE=True/i.test(u))n++;window.__krxDealsDone=n;var bt=(document.body.innerText||'').toLowerCase();var url=(location.href||'').toLowerCase();var host=(location.host||'').toLowerCase();var retail=/retailproductsusa|displayoptoffers/i.test(host);var onDealHost=/uplevelrewards|levelrewards|rewardsgiant|myprize/i.test(host);var pageWin=!retail&&onDealHost&&(/congrat|thank you|success|completed|you.?re all set|all deals/i.test(bt)||/congrat|thank-you|success/i.test(url));window.__krxConversionSignal=(n>=2)||pageWin;window.__krxDone=window.__krxConversionSignal;})();"""
 
 PROGRESS_FINGERPRINT_JS = (
     "()=>{try{"
@@ -116,6 +117,51 @@ def load_handler_script() -> str:
 
 def handler_path_for_tests() -> Path:
     return _resolve_handler_path()
+
+
+def url_deals_from_href(url: str) -> int:
+    """Count completed deals from authoritative URL params (BVA…BVE=True)."""
+    if not url:
+        return 0
+    u = url.upper()
+    return sum(
+        1
+        for tag in ("BVA=TRUE", "BVB=TRUE", "BVC=TRUE", "BVD=TRUE", "BVE=TRUE")
+        if tag in u
+    )
+
+
+def conversion_verified(metrics: Dict[str, Any], min_deals: int, wait_until_conversion: bool) -> bool:
+    """True only when URL deal params (or deal-host win) satisfy min_deals."""
+    url = str(metrics.get("url") or "")
+    host = str(metrics.get("host") or "").lower()
+    url_deals = url_deals_from_href(url)
+    min_d = max(1, int(min_deals or 2))
+
+    if url_deals >= min_d:
+        return True
+
+    if not wait_until_conversion:
+        return False
+
+    # Retail interstitial must never convert without URL deal markers.
+    if any(h in host for h in ("retailproductsusa", "displayoptoffers")):
+        return False
+
+    if bool(metrics.get("conv")) and any(
+        h in host for h in ("uplevelrewards", "levelrewards", "rewardsgiant", "myprize")
+    ):
+        return True
+
+    return False
+
+
+def _metrics_with_url_deals(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(metrics)
+    url_deals = url_deals_from_href(str(out.get("url") or ""))
+    out["deals"] = url_deals
+    out["url_deals"] = url_deals
+    return out
 
 
 def list_patterns() -> List[Dict[str, str]]:
@@ -213,38 +259,22 @@ async def execute_smart_funnel(
 
     for iteration in range(1, cfg.max_iterations + 1):
         executed = iteration
-        metrics = await _get_metrics(page)
-        deals = int(metrics.get("deals") or 0)
-        conv = bool(metrics.get("conv"))
+        metrics = _metrics_with_url_deals(await _get_metrics(page))
+        deals = int(metrics.get("url_deals") or 0)
         min_d = max(1, int(cfg.min_deals or 2))
 
-        # Never treat conv=True alone as success — retail landing pages
-        # used to false-positive on generic "reward/conversion" copy.
-        if deals >= min_d and (conv or not cfg.wait_until_conversion):
+        if conversion_verified(metrics, min_d, cfg.wait_until_conversion):
             await _emit("conversion", "ok", {"deals": deals, "url": metrics.get("url", "")})
             return {
                 "status": "ok",
                 "executed_steps": executed,
                 "smart_funnel": True,
                 "deals_done": deals,
+                "url_deals": deals,
                 "conversion_signal": True,
                 "final_url": metrics.get("url", ""),
                 "pattern": cfg.normalized_pattern(),
             }
-
-        if cfg.wait_until_conversion and deals >= min_d:
-            await page.evaluate(CONVERSION_SCRIPT)
-            metrics = await _get_metrics(page)
-            if metrics.get("conv") or int(metrics.get("deals") or 0) >= cfg.min_deals:
-                return {
-                    "status": "ok",
-                    "executed_steps": executed,
-                    "smart_funnel": True,
-                    "deals_done": int(metrics.get("deals") or 0),
-                    "conversion_signal": True,
-                    "final_url": metrics.get("url", ""),
-                    "pattern": cfg.normalized_pattern(),
-                }
 
         # Main brain
         try:
@@ -260,9 +290,9 @@ async def execute_smart_funnel(
         except Exception:
             pass
 
-        metrics = await _get_metrics(page)
+        metrics = _metrics_with_url_deals(await _get_metrics(page))
         phase = _guess_phase(metrics.get("snippet", ""), metrics.get("url", ""))
-        await _emit(phase, "running", {"deals": metrics.get("deals", 0), "url": metrics.get("url", "")})
+        await _emit(phase, "running", {"deals": metrics.get("url_deals", 0), "url": metrics.get("url", "")})
 
         cur_fp = await _page_fingerprint(page)
         if cur_fp.get("hash") == prev_fp.get("hash") and cur_fp.get("url") == prev_fp.get("url"):
@@ -289,18 +319,20 @@ async def execute_smart_funnel(
                 pass
             stuck_same_screen = 0
 
-    # Safety cap reached — still report metrics
-    metrics = await _get_metrics(page)
-    deals = int(metrics.get("deals") or 0)
+    # Safety cap reached — report URL-authoritative deal count only
+    metrics = _metrics_with_url_deals(await _get_metrics(page))
+    deals = int(metrics.get("url_deals") or 0)
+    verified = conversion_verified(metrics, cfg.min_deals, cfg.wait_until_conversion)
     return {
-        "status": "ok" if deals >= cfg.min_deals else "incomplete",
+        "status": "ok" if verified else "incomplete",
         "executed_steps": executed,
         "smart_funnel": True,
         "deals_done": deals,
-        "conversion_signal": bool(metrics.get("conv")) or deals >= cfg.min_deals,
+        "url_deals": deals,
+        "conversion_signal": verified,
         "final_url": metrics.get("url", ""),
         "pattern": cfg.normalized_pattern(),
-        "error": None if deals >= cfg.min_deals else f"Max iterations ({cfg.max_iterations}) without min deals",
+        "error": None if verified else f"Max iterations ({cfg.max_iterations}) without {cfg.min_deals} URL deal markers",
     }
 
 

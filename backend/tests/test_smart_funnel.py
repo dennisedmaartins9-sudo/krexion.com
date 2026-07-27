@@ -56,3 +56,19 @@ def test_guess_phase_deals():
     assert _guess_phase("your cost: $1.00 complete 2 deals", "https://x.com") == "deals"
     assert _guess_phase("first name last name", "https://x.com") == "form"
     assert _guess_phase("how often do you shop", "https://survey.com") == "survey"
+
+
+def test_url_deals_from_href():
+    from smart_funnel import conversion_verified, url_deals_from_href
+
+    u = "https://x.com/?BVA=True&BVC=True&BVE=True"
+    assert url_deals_from_href(u) == 3
+    assert url_deals_from_href("https://retailproductsusa.com/rewards") == 0
+    assert conversion_verified(
+        {"url": u, "host": "x.com", "conv": False}, min_deals=2, wait_until_conversion=True
+    )
+    assert not conversion_verified(
+        {"url": "https://retailproductsusa.com/", "host": "retailproductsusa.com", "conv": True},
+        min_deals=2,
+        wait_until_conversion=True,
+    )

@@ -1,3 +1,9 @@
+# v2.6.37 — 2026-07 — Smart Funnel: conversion only after URL deal markers
+#
+# - Deal count is URL-authoritative (BVA/BVC/BVE=True), not CONTINUE click inflation.
+# - Block premature conversion on retailproductsusa "Rewards" interstitial.
+# - RUT conversion gate re-validates url_deals before counting CV.
+#
 # v2.6.36 — 2026-07 — Smart Funnel handler bundled in native installer
 #
 # - Bundle smart_flow_handler.js alongside smart_funnel.py (backend/app/).

@@ -11330,8 +11330,11 @@ async def run_real_user_traffic_job(
                     if step_res.get("smart_funnel"):
                         entry["smart_funnel"] = True
                         entry["smart_funnel_pattern"] = step_res.get("pattern") or smart_funnel_pattern
+                        entry["_smart_funnel_min_deals"] = max(
+                            1, min(5, int(smart_funnel_min_deals or 2))
+                        )
                     if step_res.get("deals_done") is not None:
-                        entry["deals_completed"] = int(step_res.get("deals_done") or 0)
+                        entry["deals_completed"] = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
                     if step_res.get("conversion_signal"):
                         entry["_smart_funnel_conversion"] = True
                     if step_res.get("error"):
@@ -11620,9 +11623,33 @@ async def run_real_user_traffic_job(
                 except Exception:
                     entry["thank_you_reached"] = False
 
-                # Smart Funnel: honour engine conversion signal (deals + page win)
+                # Smart Funnel: conversion only after URL deal markers (BVA/BVC/BVE…)
                 if entry.get("_smart_funnel_conversion") and entry.get("status") == "ok":
-                    entry["thank_you_reached"] = True
+                    from smart_funnel import conversion_verified, url_deals_from_href
+                    from urllib.parse import urlparse
+
+                    _sf_min = int(entry.get("_smart_funnel_min_deals") or 2)
+                    _sf_url = entry.get("final_url") or ""
+                    _sf_url_deals = url_deals_from_href(_sf_url)
+                    entry["deals_completed"] = _sf_url_deals
+                    _sf_metrics = {
+                        "url": _sf_url,
+                        "host": (urlparse(_sf_url).netloc if _sf_url else ""),
+                        "conv": True,
+                        "url_deals": _sf_url_deals,
+                    }
+                    if conversion_verified(_sf_metrics, _sf_min, True):
+                        entry["thank_you_reached"] = True
+                    else:
+                        entry["thank_you_reached"] = False
+                        entry["_smart_funnel_conversion"] = False
+                        entry["conversion_page_reached"] = False
+                        entry["_conversion_suppressed_reason"] = (
+                            f"smart_funnel: url_deals={_sf_url_deals}<{_sf_min} (need BVA/BVC/BVE in URL)"
+                        )
+                        if entry.get("status") == "ok" and _sf_url_deals < _sf_min:
+                            entry["status"] = "incomplete"
+                            entry["error"] = entry["_conversion_suppressed_reason"]
 
                 # ── 2026-06 — Customer ask: "jidar converstion show
                 # krna ho waha capture taran ka aik button lag jay
@@ -17261,8 +17288,18 @@ def _is_thank_you_page(landing_url: str, final_url: str,
     if not fu.netloc:
         return False
 
-    lh = (lu.netloc or "").lower().lstrip("www.")
     fh = (fu.netloc or "").lower().lstrip("www.")
+    # Retail interstitial is NOT a conversion unless URL carries deal markers.
+    if "retailproductsusa" in fh or "displayoptoffers" in fh:
+        try:
+            from smart_funnel import url_deals_from_href
+
+            if url_deals_from_href(final_url or "") < 2:
+                return False
+        except Exception:
+            return False
+
+    lh = (lu.netloc or "").lower().lstrip("www.")
 
     # 0. HIGH-CONFIDENCE HOST SHORT-CIRCUIT — if the final URL lands on one
     # of the known deal-page / offer-wall hosts (e.g. eward4spot.com), we
