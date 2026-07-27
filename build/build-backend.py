@@ -446,7 +446,7 @@ def copy_backend_source() -> None:
         # fell back to the hardcoded 1.0.17 in desktop/__init__.py.
         # That's why the customer's v1.0.21 install kept showing v1.0.17
         # in the dashboard top-right pill.
-        allowed_suffix = src.suffix in {".py", ".json", ".html", ".txt", ".md", ".yml", ".yaml", ".ico", ".png"}
+        allowed_suffix = src.suffix in {".py", ".json", ".html", ".txt", ".md", ".yml", ".yaml", ".ico", ".png", ".js"}
         allowed_no_suffix = src.is_file() and src.suffix == "" and src.name in {"VERSION"}
         if src.is_file() and (allowed_suffix or allowed_no_suffix):
             rel = src.relative_to(BACKEND_DIR)

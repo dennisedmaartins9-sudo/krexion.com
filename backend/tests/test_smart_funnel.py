@@ -10,11 +10,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_handler_script_exists():
-    p = ROOT / "scripts" / "smart_flow_handler.js"
+    from smart_funnel import handler_path_for_tests, load_handler_script
+
+    p = handler_path_for_tests()
     assert p.is_file(), f"missing {p}"
-    text = p.read_text(encoding="utf-8")
+    text = load_handler_script()
     assert "SMART_FLOW" in text or "function" in text
     assert len(text) > 500
+    assert (ROOT / "backend" / "smart_flow_handler.js").is_file(), "bundled backend copy missing"
 
 
 def test_smart_funnel_patterns():

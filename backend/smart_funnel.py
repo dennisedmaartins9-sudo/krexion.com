@@ -21,8 +21,30 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[1]
-HANDLER_PATH = ROOT / "scripts" / "smart_flow_handler.js"
+_HANDLER_BASENAME = "smart_flow_handler.js"
+
+
+def _resolve_handler_path() -> Path:
+    """Find smart_flow_handler.js in native install, dev repo, or legacy scripts/."""
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        module_dir / _HANDLER_BASENAME,
+        module_dir.parent / "scripts" / _HANDLER_BASENAME,
+        module_dir.parents[1] / "scripts" / _HANDLER_BASENAME,
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        "Smart funnel handler not found. Tried: "
+        + ", ".join(str(p) for p in candidates)
+    )
+
 
 SMART_FUNNEL_PATTERNS: Dict[str, Dict[str, str]] = {
     "auto": {
@@ -89,9 +111,11 @@ class SmartFunnelConfig:
 
 
 def load_handler_script() -> str:
-    if HANDLER_PATH.is_file():
-        return HANDLER_PATH.read_text(encoding="utf-8").strip()
-    raise FileNotFoundError(f"Smart funnel handler not found: {HANDLER_PATH}")
+    return _resolve_handler_path().read_text(encoding="utf-8").strip()
+
+
+def handler_path_for_tests() -> Path:
+    return _resolve_handler_path()
 
 
 def list_patterns() -> List[Dict[str, str]]:
