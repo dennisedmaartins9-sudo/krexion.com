@@ -4,7 +4,7 @@
   window.__krxDealKeys = window.__krxDealKeys || {};
 
   function rfFire(el) {
-    if (!el) return;
+    if (!el || isBlockedClick(el)) return;
     var r = el.getBoundingClientRect();
     var x = r.left + r.width / 2,
       y = r.top + r.height / 2;
@@ -36,8 +36,36 @@
   function txt(e) {
     return ((e.innerText || e.textContent || e.value || "") + "").trim();
   }
+  function isBlockedClick(el) {
+    if (!el) return true;
+    var tag = (el.tagName || "").toUpperCase();
+    if (tag === "INPUT") {
+      var typ = (el.type || "").toLowerCase();
+      if (typ === "checkbox" || typ === "submit" || typ === "button") return false;
+    }
+    var t = txt(el).toLowerCase().replace(/\s+/g, " ").trim();
+    var href = (el.href || el.getAttribute("href") || "").toLowerCase();
+    if (/terms\s*(and|&)\s*conditions?|terms\s*of\s*(service|use)|privacy\s*policy|cookie\s*policy|legal\s*notice|disclaimer|program\s*requirements|\bt\s*&\s*c\b|about the survey|about survey|member support|about our program|skip the survey/i.test(t)) {
+      return true;
+    }
+    if (/policies|privacy|terms|legal|flashrewards|contact\.|program|member|disclaimer|cookie-policy|\/terms\b|\/privacy\b/i.test(href)) {
+      return true;
+    }
+    try {
+      var a = el.closest("a[href]");
+      if (a) {
+        var ah = (a.href || "").toLowerCase();
+        var at = txt(a).toLowerCase();
+        if (/terms|privacy|legal|disclaimer|cookie/i.test(ah)) return true;
+        if (/terms|conditions|privacy\s*policy/i.test(at) && tag !== "INPUT") return true;
+      }
+    } catch (e) {}
+    return false;
+  }
   function btns() {
-    return Array.from(document.querySelectorAll("button,a,div,span,[role=button]")).filter(isVis);
+    return Array.from(document.querySelectorAll("button,a,div,span,[role=button]")).filter(function (e) {
+      return isVis(e) && !isBlockedClick(e);
+    });
   }
   function syncUrlDeals() {
     var u = location.href;
@@ -141,7 +169,7 @@
     var hasNextStep = /next step:.{0,40}complete\s*\d+\s*deal/i.test(bt);
     var hasLevelDeals = /level\s*\d+\s*deals/i.test(bt);
     var hasCost = /your cost:\s*\$|minimum\s*deposit|free trial/i.test(bt);
-    var dealHost = /uplevelrewards|levelrewards|rewardsgiant|displayoptoffers|deals\.|getmy/i.test(host);
+    var dealHost = /uplevelrewards|levelrewards|rewardsgiant|displayoptoffers|eward4spot|deals\.|getmy/i.test(host);
     var contBtns = btns().filter(function (e) {
       var t = txt(e);
       return t === "CONTINUE" || t === "Continue";
@@ -154,13 +182,14 @@
     return false;
   }
   function handleDealPage(bt) {
+    if (window.__krxPythonDeals) return false;
     syncUrlDeals();
     var prevN = window.__krxLastUrlDeals || 0;
     if ((window.__krxDealsDone || 0) > prevN) {
       window.__krxDealKeys = {};
       window.__krxLastUrlDeals = window.__krxDealsDone;
     }
-    var minD = parseInt(window.__krxMinDeals, 10) || 3;
+    var minD = parseInt(window.__krxMinDeals, 10) || 2;
     try {
       window.scrollBy(0, 320);
     } catch (e) {}
@@ -178,6 +207,7 @@
       var t = txt(e);
       return t === "CONTINUE" || t === "Continue";
     });
+    var pool = [];
     for (var i = 0; i < dealBtns.length; i++) {
       var b = dealBtns[i];
       var card = "";
@@ -187,8 +217,17 @@
       } catch (e) {}
       var key = card + "|" + Math.round(b.getBoundingClientRect().top) + "|" + Math.round(b.getBoundingClientRect().left);
       if (window.__krxDealKeys[key]) continue;
-      window.__krxDealKeys[key] = 1;
-      rfFire(b);
+      pool.push({ btn: b, key: key });
+    }
+    if (pool.length) {
+      for (var j = pool.length - 1; j > 0; j--) {
+        var ri = Math.floor(Math.random() * (j + 1));
+        var tmp = pool[j];
+        pool[j] = pool[ri];
+        pool[ri] = tmp;
+      }
+      window.__krxDealKeys[pool[0].key] = 1;
+      rfFire(pool[0].btn);
       return true;
     }
     if ((window.__krxDealsDone || 0) < minD) {
@@ -238,7 +277,7 @@
   }
   function pickVisibleSurveyAnswer() {
     var ANSWER =
-      /^(often|rarely|never|sometimes|daily|weekly|monthly|today|past 2 weeks|this month|over a month ago|yes|no|yes!|no!|i'?m not|not on medicare|none of the above)$/i;
+      /^(often|rarely|never|sometimes|daily|weekly|monthly|today|past 2 weeks|this month|over a month ago|yes|no|yes!|no!|homeowner|renter|i'?m not|not on medicare|none of the above|full time|part time|unemployed|student|self employed|retired|on disability|other|excellent|good|some problems|major problems|i don't know)$/i;
     var LONG =
       /^(silent generation|baby boomer|gen x|millennial|gen z|puzzle|role playing|casino|classic \(board)/i;
     var seen = {};
@@ -246,7 +285,7 @@
       .filter(function (e) {
         var t = txt(e);
         if (!t || t.length > 90 || t.length < 2) return false;
-        if (/skip the survey|about the survey|privacy|terms|faq|member support|unsubscribe|program requirements/i.test(t)) return false;
+        if (/skip the survey|about the survey|privacy|terms|conditions|faq|member support|unsubscribe|program requirements|disclaimer|legal notice|cookie policy/i.test(t)) return false;
         var r = e.getBoundingClientRect();
         if (r.top < 40 || r.top > window.innerHeight * 0.92) return false;
         if (r.width < 55 || r.height < 28) return false;
@@ -306,33 +345,40 @@
   var bt = (document.body.innerText || "").toLowerCase();
   var host = (location.host || "").toLowerCase();
   var url = location.href || "";
-  var minDNeed = parseInt(window.__krxMinDeals, 10) || 3;
+  var minDNeed = parseInt(window.__krxMinDeals, 10) || 2;
   var needMoreDeals =
     (window.__krxDealsDone || 0) < minDNeed &&
     /BVA=True|BVB=True|BVC=True|BVD=True/i.test(url);
 
   var onActiveSurvey =
-    !needMoreDeals &&
-    /finish your survey|credit\/debit card|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner/.test(
+    /finish your survey|credit\/debit card|credit rating|describe your credit|what kind of debt|select all that apply|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner|employment status|current employment/.test(
       bt
     );
 
-  /* 0. Need more URL deal markers — never let survey steal focus */
-  if (needMoreDeals) {
-    if (isDealPage(bt, host) && handleDealPage(bt)) return;
+  /* 3. ACTIVE SURVEY — handled by Python native Playwright clicks (isTrusted=true) */
+  if (onActiveSurvey) {
+    return;
+  }
+
+  /* 0. Need more URL deal markers — never during active survey */
+  if (needMoreDeals && !onActiveSurvey) {
+    if (window.__krxPythonDeals !== 1 && isDealPage(bt, host) && handleDealPage(bt)) return;
     if (tryNavigateDealWall()) return;
-    var dealCont = btns().filter(function (e) {
-      var t = txt(e);
-      return t === "CONTINUE" || t === "Continue";
-    });
-    if (dealCont.length) {
-      rfFire(dealCont[0]);
-      return;
+    if (window.__krxPythonDeals !== 1) {
+      var dealCont = btns().filter(function (e) {
+        var t = txt(e);
+        return t === "CONTINUE" || t === "Continue";
+      });
+      if (dealCont.length) {
+        rfFire(dealCont[0]);
+        return;
+      }
     }
   }
 
   /* 1. DEAL PAGE */
   if (isDealPage(bt, host)) {
+    if (window.__krxPythonDeals === 1) return;
     if (handleDealPage(bt)) return;
   }
 
@@ -377,8 +423,8 @@
     }
   }
 
-  /* 2d. Credit/debit card survey (exact button match) */
-  if (/credit\/debit card|online purchase/i.test(bt)) {
+  /* 2d. Credit/debit card survey — handled by Python native clicks */
+  if (false && /credit\/debit card|online purchase/i.test(bt)) {
     var freqBtns = btns().filter(function (e) {
       var t = txt(e).toLowerCase();
       return t === "often" || t === "rarely" || t === "sometimes" || t === "never" || t === "daily" || t === "weekly";
@@ -389,8 +435,8 @@
     }
   }
 
-  /* 3. ACTIVE SURVEY */
-  if (onActiveSurvey) {
+  /* 3. ACTIVE SURVEY — moved above needMoreDeals block */
+  if (false && onActiveSurvey) {
     var surveyPick = pickVisibleSurveyAnswer();
     if (surveyPick) {
       rfFire(surveyPick);
@@ -626,11 +672,7 @@
 
   if (isDealPage(bt, host)) return;
 
-  var surveyPick2 = pickVisibleSurveyAnswer();
-  if (surveyPick2) {
-    rfFire(surveyPick2);
-    return;
-  }
+  /* Survey answer buttons — handled by Python native Playwright clicks (isTrusted=true) */
 
   var isBank = /active bank account|bank account/.test(bt);
   function visibleEl(e) {
@@ -641,26 +683,11 @@
     var t = txt(e);
     if (!t || t.length > 140 || t.length < 1) return false;
     var lc = t.toLowerCase();
-    var FILTER = ["skip the survey", "about the survey", "privacy policy", "terms & conditions", "faq", "member support", "unsubscribe", "sign up now", "get started now", "claim my $750"];
+    if (/terms\s*(and|&)\s*conditions?|terms\s*of\s*(service|use)|privacy\s*policy|cookie\s*policy|legal\s*notice|disclaimer|program\s*requirements|\bt\s*&\s*c\b/i.test(lc)) return false;
+    var FILTER = ["skip the survey", "about the survey", "privacy policy", "terms & conditions", "terms and conditions", "faq", "member support", "unsubscribe", "sign up now", "get started now", "claim my $750"];
     if (FILTER.indexOf(lc) >= 0) return false;
     return true;
   });
-  var surveyBtns = allClickable.filter(function (e) {
-    var t = txt(e);
-    return (
-      /^(yes|no|often|rarely|never|sometimes|today|weekly|monthly)$/i.test(t) ||
-      /^(i'?m not|medicare|medicaid|none of|other|no obligation)/i.test(t)
-    );
-  });
-  if (surveyBtns.length) {
-    var pick = isBank
-      ? surveyBtns.find(function (e) {
-          return /^yes$/i.test(txt(e));
-        }) || surveyBtns[0]
-      : surveyBtns[Math.floor(Math.random() * surveyBtns.length)];
-    rfFire(pick);
-    return;
-  }
   var noThx = allClickable.find(function (e) {
     return /^(no thanks|no, thanks|skip|cancel|maybe later|not now)$/i.test(txt(e).toLowerCase());
   });
