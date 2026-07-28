@@ -575,30 +575,64 @@ from playwright.async_api import async_playwright, Page, BrowserContext, Browser
 # isn't installed (e.g. on customer VPS that hasn't run the upgrade).
 # This keeps the codebase backwards-compatible.
 
-def _full_chromium_binary_path() -> Optional[Path]:
-    """Return the path to the full chromium binary if installed, else None.
-    Reads the expected revision from Playwright's browsers.json (same one
-    used for headless-shell) so the rev always stays in sync."""
-    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+# Native Windows Krexion installer bundles browsers here when PLAYWRIGHT_BROWSERS_PATH
+# is unset or points at a sandbox/temp dir (common in IDE test runners).
+_KREXION_BROWSERS_DEFAULT = Path(r"C:\Program Files\Krexion\browser-engine")
+
+
+def _browsers_search_roots() -> List[Path]:
+    """Ordered list of directories that may contain chromium-* / headless_shell-*."""
+    roots: List[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path) -> None:
+        key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        if p.is_dir():
+            roots.append(p)
+
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_root:
+        add(Path(env_root))
+    add(_KREXION_BROWSERS_DEFAULT)
+    add(Path("/pw-browsers"))
+    return roots
+
+
+def _chromium_revision_from_playwright() -> Optional[str]:
     try:
         import json as _json
         import playwright as _pw
+
         bj = Path(_pw.__file__).parent / "driver" / "package" / "browsers.json"
         if not bj.exists():
             return None
         with open(bj, "r") as fh:
             data = _json.load(fh)
-        rev = None
         for entry in data.get("browsers", []):
             if entry.get("name") == "chromium":
-                rev = str(entry.get("revision") or "").strip() or None
-                break
-        if not rev:
-            return None
-        bp = Path(browsers_root) / f"chromium-{rev}" / _pw_platform_dir() / _chrome_binary_name()
-        return bp if bp.exists() else None
+                rev = str(entry.get("revision") or "").strip()
+                return rev or None
     except Exception:
         return None
+    return None
+
+
+def _full_chromium_binary_path() -> Optional[Path]:
+    """Return the path to the full chromium binary if installed, else None.
+    Reads the expected revision from Playwright's browsers.json (same one
+    used for headless-shell) so the rev always stays in sync."""
+    rev = _chromium_revision_from_playwright()
+    if not rev:
+        return None
+    rel = Path(f"chromium-{rev}") / _pw_platform_dir() / _chrome_binary_name()
+    for root in _browsers_search_roots():
+        bp = root / rel
+        if bp.exists():
+            return bp
+    return None
 
 
 def _use_full_chromium() -> bool:
@@ -747,16 +781,21 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
             logger.debug(f"browser_variants import/use failed: {_v_err}")
 
     fc_exe = _full_chromium_binary_path()
-    if _use_full_chromium() and fc_exe is not None:
+    if fc_exe is not None and not os.environ.get("KREXION_FORCE_HEADLESS_SHELL", "").strip() in ("1", "true", "yes"):
         # Prefer the pinned full-chromium binary path over Playwright's
         # channel lookup — guarantees we launch the exact revision that
         # matches our installed build (stronger anti-detect than shell).
         try:
-            return await pw.chromium.launch(
+            browser = await pw.chromium.launch(
                 executable_path=str(fc_exe),
                 headless=False,
                 args=["--headless=new", *_BROWSER_LAUNCH_ARGS_BASE],
             )
+            logger.info(
+                "RUT browser engine: full-chromium --headless=new exe=%s",
+                fc_exe,
+            )
+            return browser
         except Exception as e:
             logger.warning(
                 f"Full chromium exe launch failed ({fc_exe}, {e}) — "
@@ -768,11 +807,13 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
         # (legacy mode) on top of our --headless=new. The two together
         # would force old headless and defeat the whole point.
         try:
-            return await pw.chromium.launch(
+            browser = await pw.chromium.launch(
                 channel="chromium",
                 headless=False,
                 args=["--headless=new", *_BROWSER_LAUNCH_ARGS_BASE],
             )
+            logger.info("RUT browser engine: full-chromium --headless=new via channel=chromium")
+            return browser
         except Exception as e:
             # Full chromium failed (missing system lib, GPU-init crash,
             # etc.) — fall back transparently to headless-shell so the
@@ -783,13 +824,16 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
                 f"`playwright install chromium --no-shell`)"
             )
     logger.warning(
-        "ANTI-DETECT: launching chromium-headless-shell fallback — "
-        "install full chromium for --headless=new stealth"
+        "RUT browser engine: chromium-headless-shell fallback — "
+        "full chromium not found (checked roots: %s)",
+        ", ".join(str(r) for r in _browsers_search_roots()),
     )
-    return await pw.chromium.launch(
+    browser = await pw.chromium.launch(
         headless=True,
         args=list(_BROWSER_LAUNCH_ARGS_BASE),
     )
+    logger.info("RUT browser engine: chromium-headless-shell (legacy headless=True)")
+    return browser
 
 
 from form_filler import (
@@ -3151,6 +3195,18 @@ async def _stuck_watchdog(page, job_id: str, visit_index: int,
             # iteration can detect deltas.
             last_progress = cur_progress
         elapsed = now - last_changed_at
+        # Smart Funnel / automation heartbeat — engine reports activity even
+        # when DOM hash is unchanged between deal-wall polls.
+        if state is not None:
+            try:
+                hb = float(state.get("heartbeat_at") or 0)
+            except (TypeError, ValueError):
+                hb = 0.0
+            if hb and (now - hb) < max(poll_s * 4, 20.0):
+                last_changed_at = now
+                recorded_this_period = False
+                state["progressed"] = True
+                continue
         if elapsed >= threshold_s and not recorded_this_period:
             # ── Capture debug artefacts BEFORE aborting ────────────────
             snapshot_name = ""
@@ -10838,8 +10894,16 @@ async def run_real_user_traffic_job(
                     if smart_funnel_enabled:
                         from smart_funnel import SmartFunnelConfig, execute_smart_funnel
 
+                        _sf_wd_state: Dict[str, Any] = {
+                            "progressed": False,
+                            "progression_count": 0,
+                            "heartbeat_at": 0.0,
+                        }
+
                         async def _sf_progress_cb(event: Dict[str, Any]) -> None:
                             try:
+                                _sf_wd_state["heartbeat_at"] = time.monotonic()
+                                _sf_wd_state["progressed"] = True
                                 j_state = RUT_JOBS.get(job_id)
                                 if j_state is None:
                                     return
@@ -10858,8 +10922,9 @@ async def run_real_user_traffic_job(
                                     k: ev_val for k, ev_val in event.items()
                                     if k != "screenshot_b64"
                                 }
-                                if event.get("page_url"):
-                                    v["page_url"] = event["page_url"]
+                                _ev_url = event.get("page_url") or event.get("url") or ""
+                                if _ev_url:
+                                    v["page_url"] = _ev_url
                                 v["events_count"] = int(v.get("events_count", 0)) + 1
                                 v["last_update"] = time.time()
                             except Exception:
@@ -10867,7 +10932,7 @@ async def run_real_user_traffic_job(
 
                         _sf_cfg = SmartFunnelConfig(
                             pattern=smart_funnel_pattern or "auto",
-                            min_deals=max(1, min(5, int(smart_funnel_min_deals or 2))),
+                            min_deals=max(1, min(5, int(smart_funnel_min_deals or 3))),
                             wait_until_conversion=bool(smart_funnel_wait_until_conversion),
                         )
                         push_live_step(
@@ -10893,7 +10958,9 @@ async def run_real_user_traffic_job(
                         _sf_wd_threshold = float(stuck_watchdog_seconds or 600.0)
                         if smart_funnel_wait_until_conversion:
                             _sf_wd_threshold = max(_sf_wd_threshold, 3600.0)
-                        _sf_wd_state: Dict[str, Any] = {"progressed": False, "progression_count": 0}
+                        _sf_wd_state.setdefault("progressed", False)
+                        _sf_wd_state.setdefault("progression_count", 0)
+                        _sf_wd_state.setdefault("heartbeat_at", 0.0)
                         _sf_watchdog = asyncio.create_task(
                             _stuck_watchdog(
                                 page, job_id, i + 1,
@@ -10914,13 +10981,14 @@ async def run_real_user_traffic_job(
                                     pass
                                 if bool(_sf_wd_state.get("progressed")):
                                     step_res = {
-                                        "status": "ok",
+                                        "status": "incomplete",
                                         "executed_steps": 0,
                                         "smart_funnel": True,
                                         "deals_done": 0,
+                                        "url_deals": 0,
                                         "conversion_signal": False,
                                         "error": (
-                                            f"Smart funnel idled after progress on {_stuck_url_sf[:160]}"
+                                            f"Smart funnel idle after partial progress on {_stuck_url_sf[:160]}"
                                         ),
                                     }
                                 else:
@@ -11331,11 +11399,17 @@ async def run_real_user_traffic_job(
                         entry["smart_funnel"] = True
                         entry["smart_funnel_pattern"] = step_res.get("pattern") or smart_funnel_pattern
                         entry["_smart_funnel_min_deals"] = max(
-                            1, min(5, int(smart_funnel_min_deals or 2))
+                            1, min(5, int(smart_funnel_min_deals or 3))
                         )
                     if step_res.get("deals_done") is not None:
                         entry["deals_completed"] = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
-                    if step_res.get("conversion_signal"):
+                    _sf_min_gate = max(1, min(5, int(smart_funnel_min_deals or 3)))
+                    _sf_url_deals_gate = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
+                    if (
+                        step_res.get("status") == "ok"
+                        and step_res.get("conversion_signal")
+                        and _sf_url_deals_gate >= _sf_min_gate
+                    ):
                         entry["_smart_funnel_conversion"] = True
                     if step_res.get("error"):
                         entry["error"] = step_res["error"]
@@ -11628,16 +11702,11 @@ async def run_real_user_traffic_job(
                     from smart_funnel import conversion_verified, url_deals_from_href
                     from urllib.parse import urlparse
 
-                    _sf_min = int(entry.get("_smart_funnel_min_deals") or 2)
+                    _sf_min = int(entry.get("_smart_funnel_min_deals") or 3)
                     _sf_url = entry.get("final_url") or ""
                     _sf_url_deals = url_deals_from_href(_sf_url)
                     entry["deals_completed"] = _sf_url_deals
-                    _sf_metrics = {
-                        "url": _sf_url,
-                        "host": (urlparse(_sf_url).netloc if _sf_url else ""),
-                        "conv": True,
-                        "url_deals": _sf_url_deals,
-                    }
+                    _sf_metrics = {"url": _sf_url, "host": (urlparse(_sf_url).netloc if _sf_url else "")}
                     if conversion_verified(_sf_metrics, _sf_min, True):
                         entry["thank_you_reached"] = True
                     else:
@@ -11647,9 +11716,12 @@ async def run_real_user_traffic_job(
                         entry["_conversion_suppressed_reason"] = (
                             f"smart_funnel: url_deals={_sf_url_deals}<{_sf_min} (need BVA/BVC/BVE in URL)"
                         )
-                        if entry.get("status") == "ok" and _sf_url_deals < _sf_min:
-                            entry["status"] = "incomplete"
-                            entry["error"] = entry["_conversion_suppressed_reason"]
+                        entry["status"] = "incomplete"
+                        entry["error"] = entry["_conversion_suppressed_reason"]
+                elif entry.get("smart_funnel") and (entry.get("automation_status") or "") == "incomplete":
+                    entry["thank_you_reached"] = False
+                    entry["conversion_page_reached"] = False
+                    entry["_smart_funnel_conversion"] = False
 
                 # ── 2026-06 — Customer ask: "jidar converstion show
                 # krna ho waha capture taran ka aik button lag jay

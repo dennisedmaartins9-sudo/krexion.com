@@ -84,6 +84,17 @@ async def _get(user_id: str, provider_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def _sanitize_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip whitespace from gateway credential fields before persisting."""
+    if not config:
+        return {}
+    cfg = dict(config)
+    for key in ("gateway_host", "gateway_port", "username", "password"):
+        if key in cfg and cfg[key] is not None:
+            cfg[key] = str(cfg[key]).strip()
+    return cfg
+
+
 async def _create(user_id: str, data: ProxyProviderCreate) -> Dict[str, Any]:
     if data.kind not in SUPPORTED_KINDS:
         raise HTTPException(400, f"kind must be one of {SUPPORTED_KINDS}")
@@ -98,7 +109,7 @@ async def _create(user_id: str, data: ProxyProviderCreate) -> Dict[str, Any]:
         "kind": data.kind,
         "proxy_type": data.proxy_type,
         "enabled": bool(data.enabled),
-        "config": data.config or {},
+        "config": _sanitize_provider_config(data.config or {}),
         "created_at": now,
         "last_used_at": None,
         "use_count": 0,
@@ -116,6 +127,8 @@ async def _update(user_id: str, provider_id: str, data: ProxyProviderUpdate) -> 
         raise HTTPException(400, f"kind must be one of {SUPPORTED_KINDS}")
     if "proxy_type" in updates and updates["proxy_type"] not in SUPPORTED_TYPES:
         raise HTTPException(400, f"proxy_type must be one of {SUPPORTED_TYPES}")
+    if "config" in updates:
+        updates["config"] = _sanitize_provider_config(updates["config"] or {})
     res = await _db.user_proxy_providers.update_one(
         {"id": provider_id, "user_id": user_id},
         {"$set": updates},

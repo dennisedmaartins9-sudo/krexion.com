@@ -47,7 +47,11 @@
     if (/BVC=True/i.test(u)) n++;
     if (/BVD=True/i.test(u)) n++;
     if (/BVE=True/i.test(u)) n++;
-    window.__krxDealsDone = Math.max(window.__krxDealsDone || 0, n);
+    window.__krxDealsDone = n;
+    var minD = parseInt(window.__krxMinDeals, 10);
+    if (isNaN(minD) || minD < 1) minD = 2;
+    window.__krxConversionSignal = n >= minD;
+    window.__krxDone = window.__krxConversionSignal;
   }
   function cleanNum(v, pad) {
     v = String(v == null ? "" : v).trim().replace(/\.0+$/, "");
@@ -135,20 +139,31 @@
     var hasBestMatch = /best match for you/i.test(bt);
     var hasMustComplete = /you must complete\s*\d+\s*deal/i.test(bt);
     var hasNextStep = /next step:.{0,40}complete\s*\d+\s*deal/i.test(bt);
+    var hasLevelDeals = /level\s*\d+\s*deals/i.test(bt);
     var hasCost = /your cost:\s*\$|minimum\s*deposit|free trial/i.test(bt);
-    var dealHost = /uplevelrewards|levelrewards|rewardsgiant|deals\.|getmy/i.test(host);
+    var dealHost = /uplevelrewards|levelrewards|rewardsgiant|displayoptoffers|deals\.|getmy/i.test(host);
     var contBtns = btns().filter(function (e) {
       var t = txt(e);
       return t === "CONTINUE" || t === "Continue";
     });
     if (visibleFormActive()) return false;
-    if (hasBestMatch || hasMustComplete || hasNextStep) return true;
+    if (hasBestMatch || hasMustComplete || hasNextStep || hasLevelDeals) return true;
     if (dealHost && (hasCost || contBtns.length >= 1)) return true;
     if (hasCost && contBtns.length >= 2) return true;
     if (/fillwords|justplay|bingo billions|reward offer/i.test(bt) && contBtns.length >= 1) return true;
     return false;
   }
   function handleDealPage(bt) {
+    syncUrlDeals();
+    var prevN = window.__krxLastUrlDeals || 0;
+    if ((window.__krxDealsDone || 0) > prevN) {
+      window.__krxDealKeys = {};
+      window.__krxLastUrlDeals = window.__krxDealsDone;
+    }
+    var minD = parseInt(window.__krxMinDeals, 10) || 3;
+    try {
+      window.scrollBy(0, 320);
+    } catch (e) {}
     if (/do you already have/i.test(bt)) {
       var modal = btns().find(function (e) {
         var t = txt(e).toUpperCase();
@@ -165,12 +180,37 @@
     });
     for (var i = 0; i < dealBtns.length; i++) {
       var b = dealBtns[i];
-      var key = (b.href || "") + "|" + txt(b) + "|" + Math.round(b.getBoundingClientRect().top);
+      var card = "";
+      try {
+        var p = b.closest("div,section,article,li");
+        if (p) card = (p.innerText || "").slice(0, 80);
+      } catch (e) {}
+      var key = card + "|" + Math.round(b.getBoundingClientRect().top) + "|" + Math.round(b.getBoundingClientRect().left);
       if (window.__krxDealKeys[key]) continue;
       window.__krxDealKeys[key] = 1;
-      window.__krxDealsDone = (window.__krxDealsDone || 0) + 1;
       rfFire(b);
       return true;
+    }
+    if ((window.__krxDealsDone || 0) < minD) {
+      var myDeals = btns().find(function (e) {
+        return /my deals|view deals|complete deals|see deals|reward status|start earning/i.test(txt(e));
+      });
+      if (myDeals) {
+        rfFire(myDeals);
+        return true;
+      }
+      var nextStep = btns().find(function (e) {
+        var t = txt(e).toLowerCase();
+        return /complete\s*1\s*deal|complete\s*deal|next step|level\s*1/i.test(t);
+      });
+      if (nextStep) {
+        rfFire(nextStep);
+        return true;
+      }
+      window.__krxDealKeys = {};
+      try {
+        window.scrollBy(0, 500);
+      } catch (e) {}
     }
     return false;
   }
@@ -180,7 +220,7 @@
     var anchors = Array.from(document.querySelectorAll("a[href]")).filter(function (a) {
       if (!isVis(a)) return false;
       var h = (a.href || "").toLowerCase();
-      return /uplevelrewards|levelrewards|rewardsgiant|getmy|deals\.|complete.*deal/i.test(h);
+      return /uplevelrewards|levelrewards|rewardsgiant|getmy|deals\.|complete.*deal|displayoptoffers/i.test(h);
     });
     if (anchors.length) {
       rfFire(anchors[0]);
@@ -188,8 +228,7 @@
     }
     var cta = btns().find(function (e) {
       var t = txt(e).toLowerCase();
-      return /start earning|view deal|complete deal|get my reward|claim reward|see offer|explore deal|reward status|member support/i.test(t) === false &&
-        /start earning|view deal|complete deal|get my reward|claim reward|see offer|explore deal|continue to deal|go to deal/i.test(t);
+      return /view deals|complete deals|start deal|go to deals|see deals|reward status|my deals|start earning/i.test(t);
     });
     if (cta) {
       rfFire(cta);
@@ -267,6 +306,30 @@
   var bt = (document.body.innerText || "").toLowerCase();
   var host = (location.host || "").toLowerCase();
   var url = location.href || "";
+  var minDNeed = parseInt(window.__krxMinDeals, 10) || 3;
+  var needMoreDeals =
+    (window.__krxDealsDone || 0) < minDNeed &&
+    /BVA=True|BVB=True|BVC=True|BVD=True/i.test(url);
+
+  var onActiveSurvey =
+    !needMoreDeals &&
+    /finish your survey|credit\/debit card|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner/.test(
+      bt
+    );
+
+  /* 0. Need more URL deal markers — never let survey steal focus */
+  if (needMoreDeals) {
+    if (isDealPage(bt, host) && handleDealPage(bt)) return;
+    if (tryNavigateDealWall()) return;
+    var dealCont = btns().filter(function (e) {
+      var t = txt(e);
+      return t === "CONTINUE" || t === "Continue";
+    });
+    if (dealCont.length) {
+      rfFire(dealCont[0]);
+      return;
+    }
+  }
 
   /* 1. DEAL PAGE */
   if (isDealPage(bt, host)) {
@@ -274,15 +337,59 @@
   }
 
   /* 2. Navigate to deal wall after form done */
-  if ((/isULUDone=True/i.test(url) || /isUserLookUp=True/i.test(url)) && (window.__krxDealsDone || 0) < 2) {
+  if ((/isULUDone=True/i.test(url) || /isUserLookUp=True/i.test(url)) && (window.__krxDealsDone || 0) < (parseInt(window.__krxMinDeals, 10) || 2)) {
     if (tryNavigateDealWall()) return;
   }
 
+  /* 2b. Reward progress CTAs — only after lookup, never during active survey */
+  if (
+    !onActiveSurvey &&
+    (/isULUDone=True/i.test(url) || /isUserLookUp=True/i.test(url)) &&
+    /towards target|towards amazon|reward progress|complete 20 deals|continue instructions below/i.test(bt)
+  ) {
+    var rewardCta = btns().find(function (e) {
+      var t = txt(e).toLowerCase();
+      return /view deals|complete deal|my deals|start earning|get started|see deals|reward status/i.test(t);
+    });
+    if (rewardCta) {
+      rfFire(rewardCta);
+      return;
+    }
+    if (tryNavigateDealWall()) return;
+  }
+
+  /* 2c. Verification / media code — skip when possible */
+  if (/verification code|send media code|track your reward progress|enter.*code|media code/i.test(bt)) {
+    var skipVerify = btns().find(function (e) {
+      var t = txt(e).toLowerCase();
+      return /skip|continue without|not now|maybe later|no thanks|view deals|my deals|complete deals|see deals/i.test(t);
+    });
+    if (skipVerify) {
+      rfFire(skipVerify);
+      return;
+    }
+    var myDealsNav = btns().find(function (e) {
+      return /my deals/i.test(txt(e));
+    });
+    if (myDealsNav) {
+      rfFire(myDealsNav);
+      return;
+    }
+  }
+
+  /* 2d. Credit/debit card survey (exact button match) */
+  if (/credit\/debit card|online purchase/i.test(bt)) {
+    var freqBtns = btns().filter(function (e) {
+      var t = txt(e).toLowerCase();
+      return t === "often" || t === "rarely" || t === "sometimes" || t === "never" || t === "daily" || t === "weekly";
+    });
+    if (freqBtns.length) {
+      rfFire(freqBtns[Math.floor(Math.random() * freqBtns.length)]);
+      return;
+    }
+  }
+
   /* 3. ACTIVE SURVEY */
-  var onActiveSurvey =
-    /finish your survey|credit\/debit card|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner/.test(
-      bt
-    );
   if (onActiveSurvey) {
     var surveyPick = pickVisibleSurveyAnswer();
     if (surveyPick) {
@@ -404,8 +511,20 @@
     }
   }
 
-  /* 6. RETAIL SURVEY */
-  if (/retailproductsusa/.test(host) || /question 1|do you shop at target|question 2|question 3|activating your reward/i.test(bt)) {
+  /* 6. RETAIL SURVEY (Q1–Q5 — skip when email popup is active) */
+  if (!/your reward is waiting|confirm your email|sign up or resume|ready to go/i.test(bt)) {
+  if (/retailproductsusa/.test(host) || /question [1-5]|do you shop at target|question 2|question 3|activating your reward/i.test(bt)) {
+    if (/bckmfr=1/i.test(url) || /default\.aspx/i.test(url)) {
+      var reentry = btns().find(function (e) {
+        var t = txt(e).toLowerCase();
+        return /get a quick start|get started|claim my|start earning|continue|next/i.test(t);
+      });
+      if (reentry) {
+        rfFire(reentry);
+        return;
+      }
+      if (tryNavigateDealWall()) return;
+    }
     if (/question 1|do you shop at target/.test(bt)) {
       var yn = btns().filter(function (e) {
         var t = txt(e).toLowerCase();
@@ -426,13 +545,39 @@
         return;
       }
     }
-    if (/question 3|weekly|monthly|activating your reward/.test(bt)) {
+    if (/question 3|weekly|monthly|how often|activating your reward/.test(bt)) {
       var q3 = btns().filter(function (e) {
         var t = txt(e).toLowerCase();
-        return t === "weekly" || t === "monthly";
+        return t === "weekly" || t === "monthly" || t === "daily" || t === "often" || t === "rarely";
       });
       if (q3.length) {
         rfFire(q3[Math.floor(Math.random() * q3.length)]);
+        return;
+      }
+    }
+    if (/question 4|question 5/.test(bt)) {
+      var q45 = btns().filter(function (e) {
+        var t = txt(e).toLowerCase();
+        var r = e.getBoundingClientRect();
+        if (r.top < 280 || r.top > window.innerHeight * 0.85) return false;
+        return (
+          t === "yes" ||
+          t === "no" ||
+          t === "weekly" ||
+          t === "monthly" ||
+          t.indexOf("use it myself") >= 0 ||
+          t.indexOf("share with family") >= 0 ||
+          t === "daily" ||
+          t === "often" ||
+          t === "rarely"
+        );
+      });
+      var q45pref = q45.filter(function (e) {
+        return e.tagName === "A" && e.getAttribute("role") === "button";
+      });
+      if (q45pref.length) q45 = q45pref;
+      if (q45.length) {
+        rfFire(q45[Math.floor(Math.random() * q45.length)]);
         return;
       }
     }
@@ -443,6 +588,18 @@
       rfFire(cta);
       return;
     }
+    if (/isprepop=true/i.test(url)) {
+      var prePop = btns().filter(function (e) {
+        var t = txt(e).toLowerCase();
+        var r = e.getBoundingClientRect();
+        return r.top > 40 && r.top < window.innerHeight * 0.85 && (t === "yes" || t === "no" || t === "weekly" || t === "monthly");
+      });
+      if (prePop.length) {
+        rfFire(prePop[Math.floor(Math.random() * prePop.length)]);
+        return;
+      }
+    }
+  }
   }
 
   /* 7. SMS / EMAIL popups */

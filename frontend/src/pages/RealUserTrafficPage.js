@@ -5606,7 +5606,7 @@ export default function RealUserTrafficPage() {
                       </label>
                     </div>
                     <p className="text-[11px] text-violet-300/70">
-                      Tip: Stuck Watchdog ≥ 1800s recommended for long survey offers when wait-until-conversion is ON.
+                      Tip: Amazon $750 deal wall (LEVEL 1 DEALS) needs Min deals = 3. Stuck Watchdog ≥ 1800s recommended for long survey offers when wait-until-conversion is ON.
                     </p>
                   </div>
                 )}
