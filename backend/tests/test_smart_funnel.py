@@ -50,15 +50,50 @@ def test_run_real_user_traffic_job_accepts_smart_funnel_kwargs():
         assert f"{name}:" in src or f"{name}=" in src, f"missing param {name} in run_real_user_traffic_job"
 
 
+def test_survey_tcpa_and_instant_helpers():
+    from smart_funnel import _body_on_survey, _is_agree_continue_body, _survey_instant_enabled
+
+    tcpa = "have you been in a car accident? yes maybe later no call finish your survey"
+    assert _body_on_survey(tcpa)
+    assert not _is_agree_continue_body(tcpa + " i agree phone number email address")
+    assert _is_agree_continue_body("i agree esign email address phone number continue")
+    assert isinstance(_survey_instant_enabled(), bool)
+
+
 def test_guess_phase_deals():
-    from smart_funnel import _guess_phase
+    from smart_funnel import _body_on_survey, _guess_phase
 
     assert _guess_phase("your cost: $1.00 complete 2 deals", "https://x.com") == "deals"
     assert _guess_phase("first name last name", "https://x.com") == "form"
     assert _guess_phase("how often do you shop", "https://survey.com") == "survey"
+    assert _body_on_survey("have you been in a car accident in the past year? skip the survey")
 
 
-def test_url_deals_from_href():
+def test_deals_required_for_wall():
+    from smart_funnel import _deals_required_for_wall
+
+    assert _deals_required_for_wall("level 1 deals") == 3
+    assert _deals_required_for_wall("you must complete 1 deal to continue") == 3
+
+
+def test_deal_wall_level_key():
+    from smart_funnel import _deal_wall_level_key, _is_level3_wall, _is_level1_wall
+
+    assert _deal_wall_level_key("level 1 deals best match") == "L1"
+    assert _deal_wall_level_key("next step: complete 3 more deals") == "L3"
+    assert _deal_wall_level_key("level 3 deals") == "L3"
+    assert _deal_wall_level_key("must complete 1 deal to continue") == "L1"
+    assert _is_level3_wall("NEXT STEP: Complete 3 More Deals to continue.")
+    assert _is_level3_wall("Keep Going & Qualify For $100 Cashout!")
+    assert not _is_level1_wall("complete 3 more deals level 3")
+
+
+def test_count_offer_tabs_is_sync():
+    import inspect
+
+    from smart_funnel import _count_offer_tabs
+
+    assert not inspect.iscoroutinefunction(_count_offer_tabs)
     from smart_funnel import conversion_verified, url_deals_from_href
 
     u = "https://x.com/?BVA=True&BVC=True&BVE=True"

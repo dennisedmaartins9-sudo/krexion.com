@@ -10934,6 +10934,12 @@ async def run_real_user_traffic_job(
                             pattern=smart_funnel_pattern or "auto",
                             min_deals=max(1, min(5, int(smart_funnel_min_deals or 3))),
                             wait_until_conversion=bool(smart_funnel_wait_until_conversion),
+                            fast_survey=True,
+                            survey_settle_ms=0,
+                            survey_loop_interval_ms=0,
+                            survey_idle_poll_ms=12,
+                            survey_burst_clicks=10,
+                            survey_skip_chance=0.35,
                         )
                         push_live_step(
                             job_id, i + 1, "smart_funnel", "info",

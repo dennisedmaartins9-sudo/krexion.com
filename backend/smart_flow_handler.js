@@ -100,6 +100,15 @@
   }
   function setVal(el, v) {
     if (!el || v == null || v === "") return;
+    var cur = String(el.value || "").trim();
+    var want = String(v).trim();
+    if (!want) return;
+    if (cur === want) return;
+    if (cur.toLowerCase() === want.toLowerCase()) return;
+    var curDigits = cur.replace(/\D/g, "");
+    var wantDigits = want.replace(/\D/g, "");
+    if (curDigits && wantDigits && curDigits === wantDigits) return;
+    if (wantDigits.length >= 10 && curDigits.endsWith(wantDigits.slice(-10))) return;
     try {
       el.focus();
     } catch (e) {}
@@ -351,7 +360,7 @@
     /BVA=True|BVB=True|BVC=True|BVD=True/i.test(url);
 
   var onActiveSurvey =
-    /finish your survey|credit\/debit card|credit rating|describe your credit|what kind of debt|select all that apply|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner|employment status|current employment/.test(
+    /finish your survey|sponsored ad|question is not required|credit\/debit card|credit rating|describe your credit|what kind of debt|select all that apply|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner|employment status|current employment/.test(
       bt
     );
 
@@ -458,10 +467,18 @@
     document.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio])")
   ).filter(visInput);
   var onLeadForm =
+    !window.__krxPythonForm &&
     fn &&
     visibleInputs.length >= 3 &&
     !/confirming your email|sign up or resume by confirming|your reward is waiting/i.test(bt) &&
     !onActiveSurvey;
+
+  if (!window.__krxPythonForm && !fn && visibleInputs.length >= 2) {
+    onLeadForm =
+      /street address|mobile phone|select gender|last few details|city\/town|date of birth/i.test(bt) &&
+      !/confirming your email|sign up or resume by confirming|your reward is waiting/i.test(bt) &&
+      !onActiveSurvey;
+  }
 
   if (onLeadForm) {
     var raw = {
