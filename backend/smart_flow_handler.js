@@ -264,11 +264,11 @@
   }
   function tryNavigateDealWall() {
     var host = (location.host || "").toLowerCase();
-    if (!/displayoptoffers|uplevelrewards|levelrewards|retailproductsusa/i.test(host)) return false;
+    if (!/displayoptoffers|uplevelrewards|levelrewards|retailproductsusa|eward4spot|reward4spot/i.test(host)) return false;
     var anchors = Array.from(document.querySelectorAll("a[href]")).filter(function (a) {
       if (!isVis(a)) return false;
       var h = (a.href || "").toLowerCase();
-      return /uplevelrewards|levelrewards|rewardsgiant|getmy|deals\.|complete.*deal|displayoptoffers/i.test(h);
+      return /uplevelrewards|levelrewards|rewardsgiant|getmy|deals\.|complete.*deal|displayoptoffers|eward4spot|reward4spot|mydeals|viewdeal/i.test(h);
     });
     if (anchors.length) {
       rfFire(anchors[0]);

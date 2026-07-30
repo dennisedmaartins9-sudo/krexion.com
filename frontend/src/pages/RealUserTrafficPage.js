@@ -562,6 +562,10 @@ export default function RealUserTrafficPage() {
   // ── 2026-07 — Native Smart Funnel (adaptive survey/form/deals) ──
   const [funnelMode, setFunnelMode] = useState("legacy"); // legacy | smart | custom
   const [smartFunnelPattern, setSmartFunnelPattern] = useState("auto");
+  const [smartFunnelPatterns, setSmartFunnelPatterns] = useState([
+    { id: "auto", label: "Auto Detect", description: "Detect retail → survey → form → deals automatically" },
+    { id: "reward", label: "Reward", description: "Reward offers — retail, survey, form, L1+L3 deal wall" },
+  ]);
   const [smartFunnelMinDeals, setSmartFunnelMinDeals] = useState(2);
   const [smartFunnelWaitUntilConversion, setSmartFunnelWaitUntilConversion] = useState(true);
   const [selectedUploadAjId, setSelectedUploadAjId] = useState("");
@@ -897,6 +901,37 @@ export default function RealUserTrafficPage() {
       .catch(() => { /* silent — UI keeps its hard-coded fallback */ });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Smart Funnel pattern list (Reward, Auto, etc.) from backend
+  useEffect(() => {
+    const token = localStorage.getItem("token");
+    fetch(`${API_URL}/api/real-user-traffic/smart-funnel/patterns`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && Array.isArray(d.patterns) && d.patterns.length) {
+          setSmartFunnelPatterns(d.patterns);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Reward pattern preset — min 3 deals, conversion wait, longer watchdog
+  useEffect(() => {
+    if (smartFunnelPattern === "reward") {
+      setSmartFunnelMinDeals((prev) => (prev < 3 ? 3 : prev));
+      setSmartFunnelWaitUntilConversion(true);
+      setStuckWatchdogSeconds((prev) => (prev < 1800 ? 1800 : prev));
+    }
+  }, [smartFunnelPattern]);
+
+  // Reward pattern — referer preset for realistic ad traffic (if user has not picked one)
+  useEffect(() => {
+    if (smartFunnelPattern === "reward" && trafficSourcePreset === "off") {
+      setTrafficSourcePreset("mixed_realistic");
+    }
+  }, [smartFunnelPattern]);
 
   // Fetch host capabilities ONCE so we render only what works here
   useEffect(() => {
@@ -1909,6 +1944,17 @@ export default function RealUserTrafficPage() {
     }
     if (!selectedUploadUaId && selectedUploadUaIds.length === 0 && !userAgents.trim()) {
       return toast.error("Paste at least one User Agent or select one-or-more uploaded UA batch(es)");
+    }
+    if (funnelMode === "smart") {
+      if (dataSource === "excel" && !file && !selectedUploadDataId) {
+        return toast.error("Smart Funnel requires lead data — upload Excel/CSV or pick a saved data file");
+      }
+      if (dataSource === "gsheet" && !gsheetUrl.trim()) {
+        return toast.error("Smart Funnel requires Google Sheet URL with lead data");
+      }
+      if (dataSource === "pending_from_job" && !importPendingJobId) {
+        return toast.error("Select a previous job to import pending leads");
+      }
     }
     if (formFillEnabled) {
       if (dataSource === "excel" && !file && !selectedUploadDataId) {
@@ -5556,7 +5602,11 @@ export default function RealUserTrafficPage() {
                     type="radio"
                     name="funnelMode"
                     checked={funnelMode === "smart"}
-                    onChange={() => { setFunnelMode("smart"); setUseCustomJson(false); }}
+                    onChange={() => {
+                      setFunnelMode("smart");
+                      setUseCustomJson(false);
+                      setFormFillEnabled(true);
+                    }}
                     className="mt-1 accent-violet-500"
                     data-testid="rut-funnel-smart"
                   />
@@ -5575,11 +5625,18 @@ export default function RealUserTrafficPage() {
                         className="w-full h-8 px-2 mt-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-100 text-xs"
                         data-testid="rut-smart-funnel-pattern"
                       >
-                        <option value="auto">Auto Detect</option>
-                        <option value="reward_survey_funnel">Reward Survey Funnel</option>
-                        <option value="survey_form_deals">Survey + Form + Deals</option>
-                        <option value="form_deals">Form + Deals</option>
+                        {smartFunnelPatterns.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
                       </select>
+                      {(() => {
+                        const meta = smartFunnelPatterns.find((p) => p.id === smartFunnelPattern);
+                        return meta?.description ? (
+                          <p className="text-[10px] text-zinc-500 mt-1">{meta.description}</p>
+                        ) : null;
+                      })()}
                     </div>
                     <div className="flex flex-wrap gap-4 items-center">
                       <div>
@@ -5606,7 +5663,7 @@ export default function RealUserTrafficPage() {
                       </label>
                     </div>
                     <p className="text-[11px] text-violet-300/70">
-                      Tip: Amazon $750 deal wall (LEVEL 1 DEALS) needs Min deals = 3. Stuck Watchdog ≥ 1800s recommended for long survey offers when wait-until-conversion is ON.
+                      Tip: <b>Reward</b> — LinkThem / reward4spot. Min deals = 3. Anti-detect (TLS, fingerprint, behavioral bio) + Referrer Pro run on every visit before Smart Funnel. Reward pattern auto-enables <b>Mixed Realistic</b> referer if none selected.
                     </p>
                   </div>
                 )}

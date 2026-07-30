@@ -90,9 +90,13 @@ SMART_FUNNEL_PATTERNS: Dict[str, Dict[str, str]] = {
         "label": "Auto Detect",
         "description": "Detect retail → survey → form → deals automatically",
     },
+    "reward": {
+        "label": "Reward",
+        "description": "Reward offers (LinkThem / reward4spot) — retail, survey, form, L1+L3 deal wall",
+    },
     "reward_survey_funnel": {
         "label": "Reward Survey Funnel",
-        "description": "Retail Q1–Q3 → email → surveys → form → 2–3 deals",
+        "description": "Legacy alias — same as Reward pattern",
     },
     "survey_form_deals": {
         "label": "Survey + Form + Deals",
@@ -102,6 +106,11 @@ SMART_FUNNEL_PATTERNS: Dict[str, Dict[str, str]] = {
         "label": "Form + Deals",
         "description": "Lead form then deal completion",
     },
+}
+
+# UI/API alias — old jobs may still send reward_survey_funnel
+PATTERN_ALIASES: Dict[str, str] = {
+    "reward_survey_funnel": "reward",
 }
 
 # Safety cap — ~25 min at 1.5s/action; conversion usually ~8–15 min
@@ -311,7 +320,61 @@ class SmartFunnelConfig:
 
     def normalized_pattern(self) -> str:
         p = (self.pattern or "auto").strip().lower()
+        p = PATTERN_ALIASES.get(p, p)
         return p if p in SMART_FUNNEL_PATTERNS else "auto"
+
+
+def rut_config_for_pattern(
+    pattern: str,
+    *,
+    min_deals: int = 2,
+    wait_until_conversion: bool = True,
+) -> SmartFunnelConfig:
+    """Build SmartFunnelConfig for RUT — pattern presets override defaults."""
+    p = (pattern or "auto").strip().lower()
+    p = PATTERN_ALIASES.get(p, p)
+    md = max(1, min(5, int(min_deals or 2)))
+    wait = bool(wait_until_conversion)
+    if p == "reward":
+        return SmartFunnelConfig(
+            pattern="reward",
+            min_deals=max(3, md),
+            wait_until_conversion=wait,
+            fast_survey=True,
+            survey_settle_ms=0,
+            survey_loop_interval_ms=0,
+            survey_idle_poll_ms=8,
+            survey_burst_clicks=6,
+            survey_skip_chance=0.0,
+            require_deal_wall_seen=True,
+            guided_deal_step=7,
+            guided_deal_cycles=3,
+            guided_deal_l3_cycles=3,
+        )
+    if p == "survey_form_deals":
+        return SmartFunnelConfig(
+            pattern=p,
+            min_deals=md,
+            wait_until_conversion=wait,
+            fast_survey=True,
+            survey_settle_ms=0,
+            survey_loop_interval_ms=0,
+        )
+    if p == "form_deals":
+        return SmartFunnelConfig(
+            pattern=p,
+            min_deals=md,
+            wait_until_conversion=wait,
+            fast_survey=False,
+        )
+    return SmartFunnelConfig(
+        pattern=p if p in SMART_FUNNEL_PATTERNS else "auto",
+        min_deals=md,
+        wait_until_conversion=wait,
+        fast_survey=True,
+        survey_settle_ms=0,
+        survey_loop_interval_ms=0,
+    )
 
 
 def _cfg_stop_at_deal_wall(cfg: SmartFunnelConfig) -> bool:
@@ -405,18 +468,18 @@ async def _survey_fingerprint(page) -> str:
 
 
 async def _survey_state_changed(page, before: str) -> bool:
-    wait_s = 0.09 if _survey_instant_enabled() else 0.035
+    wait_s = 0.04 if _survey_instant_enabled(page) else 0.035
     await asyncio.sleep(wait_s)
     return await _survey_fingerprint(page) != before
 
 
 async def _survey_click_ok(page, before: str, clicked: bool) -> bool:
-    """True when click succeeded; instant mode trusts click if page is slow to repaint."""
+    """True when click succeeded; instant mode trusts click to avoid slow repaints."""
     if not clicked:
         return False
-    if await _survey_state_changed(page, before):
+    if _survey_instant_enabled(page):
         return True
-    return _survey_instant_enabled()
+    return await _survey_state_changed(page, before)
 
 
 def _guided_pause_complete(cfg: SmartFunnelConfig, ctx: Any) -> bool:
@@ -478,6 +541,8 @@ def conversion_verified(metrics: Dict[str, Any], min_deals: int, wait_until_conv
 
 def _body_on_survey(body: str) -> bool:
     s = (body or "").lower()
+    if _body_on_offers_info(body):
+        return False
     if any(
         k in s
         for k in (
@@ -491,6 +556,11 @@ def _body_on_survey(body: str) -> bool:
             "start deal",
             "next step: complete",
             "continue instructions below",
+            "claim other rewards",
+            "get a quick start",
+            "reward progress",
+            "towards target",
+            "towards amazon",
         )
     ):
         return False
@@ -553,6 +623,12 @@ def _body_on_offers_info(body: str) -> bool:
             "reward value",
             "level 1 and one deal from level 2",
             "lesser value reward",
+            "towards target",
+            "towards amazon",
+            "reward progress",
+            "continue instructions below",
+            "track your reward",
+            "next step: complete",
         )
     )
 
@@ -674,10 +750,42 @@ def _metrics_with_url_deals(metrics: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def list_patterns() -> List[Dict[str, str]]:
+    """Pattern list for RUT dropdown — hides legacy alias ids."""
+    hide = {"reward_survey_funnel"}
     out = []
     for key, meta in SMART_FUNNEL_PATTERNS.items():
+        if key in hide:
+            continue
         out.append({"id": key, "label": meta["label"], "description": meta["description"]})
     return out
+
+
+def _visit_rng(page):
+    """Per-visit seeded RNG — unique mixed answers each visit, stable within visit."""
+    import random
+
+    ctx = page.context
+    if not hasattr(ctx, "_krx_visit_rng"):
+        seed = int(getattr(ctx, "_krx_visit_seed", 0) or 0)
+        ctx._krx_visit_rng = random.Random(seed if seed else None)
+    return ctx._krx_visit_rng
+
+
+def _seed_visit_context(page, row: Dict[str, Any], job_id: Optional[str], visit_idx: Optional[int]) -> None:
+    seed_src = "|".join(
+        [
+            str(job_id or ""),
+            str(visit_idx or 0),
+            str(row.get("email") or row.get("Email") or ""),
+            str(row.get("first_name") or row.get("first name") or ""),
+        ]
+    )
+    page.context._krx_visit_seed = int(
+        hashlib.md5(seed_src.encode("utf-8", errors="ignore")).hexdigest()[:8],
+        16,
+    )
+    if hasattr(page.context, "_krx_visit_rng"):
+        delattr(page.context, "_krx_visit_rng")
 
 
 async def _page_fingerprint(page) -> Dict[str, Any]:
@@ -802,13 +910,22 @@ RETAIL_Q3_FALLBACK_COORDS = (98, 520), (290, 520)  # Weekly (left), Monthly (rig
 RETAIL_Q5_FALLBACK_COORDS = (98, 560), (290, 560)
 
 
+def _click_use_fast_path(page) -> bool:
+    """Fast survey clicks only while survey is active; deal/form keep human motion when RUT anti-detect is on."""
+    if not _survey_instant_enabled(page):
+        return False
+    try:
+        if getattr(page.context, "_krx_behavioral_bio", False):
+            return bool(getattr(page.context, "_krx_on_survey_now", False))
+    except Exception:
+        pass
+    return True
+
+
 async def _human_page_click(page, x: float, y: float, *, fast: Optional[bool] = None) -> None:
     """Trusted mouse click at page coords (isTrusted=true). Fast path skips human motion delays."""
     if fast is None:
-        try:
-            fast = bool(getattr(page.context, "_krx_fast_survey", False))
-        except Exception:
-            fast = False
+        fast = _click_use_fast_path(page)
     if fast:
         try:
             await page.mouse.click(x, y)
@@ -856,18 +973,20 @@ async def _trusted_page_tap(page, x: float, y: float) -> None:
     await _human_page_click(page, x, y)
 
 
-async def _frame_mouse_click_at(page, frame, x: float, y: float) -> None:
+async def _frame_mouse_click_at(page, frame, x: float, y: float, *, fast: Optional[bool] = None) -> None:
     """Tap at coords relative to frame viewport (handles iframe offset)."""
+    if fast is None:
+        fast = _click_use_fast_path(page)
     try:
         if frame != page.main_frame:
             fe = await frame.frame_element()
             box = await fe.bounding_box()
             if box:
-                await _trusted_page_tap(page, box["x"] + x, box["y"] + y)
+                await _human_page_click(page, box["x"] + x, box["y"] + y, fast=fast)
                 return
     except Exception:
         pass
-    await _trusted_page_tap(page, x, y)
+    await _human_page_click(page, x, y, fast=fast)
 
 
 async def _survey_frames_ordered(page):
@@ -1147,7 +1266,7 @@ SURVEY_ZONE_ANSWER_JS = r"""() => {
     if (/policies|privacy|terms|flashrewards|contact\.|legal|program|member/i.test(href)) return true;
     return false;
   }
-  var ANSWER = /^(excellent|good|some problems|major problems|i don't know|full time|part time|unemployed|student|self employed|retired|on disability|other|yes|no|maybe later|no call|no thanks|not now|often|rarely|never|weekly|monthly|daily|today|homeowner|renter|tax\\/irs debt|credit card|student loan|medical|timeshare|prefer not to answer)$/i;
+  var ANSWER = /^(excellent|good|some problems|major problems|i don't know|full time|part time|unemployed|student|self employed|retired|on disability|other|yes|no|maybe later|no call|no thanks|not now|often|rarely|never|weekly|monthly|daily|today|past 2 weeks|this month|over a month ago|homeowner|renter|tax\\/irs debt|credit card|student loan|medical|timeshare|prefer not to answer|sometimes|male|female)$/i;
   var els = Array.from(document.querySelectorAll('button,a,div,span,[role=button],input[type=button],input[type=submit]')).filter(function (e) {
     if (!vis(e) || blocked(e)) return false;
     var t = txt(e);
@@ -1175,12 +1294,189 @@ async def _click_survey_zone_answer(page) -> bool:
                     x=float(target["x"]),
                     y=float(target["y"]),
                 ):
-                    await _survey_settle(page)
+                    if not _survey_instant_enabled(page):
+                        await _survey_settle(page)
                     logger.debug("survey zone click: %s", target.get("label"))
                     return True
         except Exception:
             continue
     return False
+
+
+INSTANT_SURVEY_TAP_JS = r"""() => {
+  var body = (document.body.innerText || '').toLowerCase();
+  if (/select all that apply/.test(body)) return null;
+  function vis(e) {
+    var s = getComputedStyle(e);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.pointerEvents === 'none') return false;
+    var r = e.getBoundingClientRect();
+    return r.width >= 55 && r.height >= 22 && r.top >= 40 && r.top <= innerHeight * 0.92;
+  }
+  function txt(e) { return ((e.innerText || e.textContent || e.value || '') + '').trim(); }
+  function blocked(e) {
+    var t = txt(e).toLowerCase();
+    if (/skip the survey|about the survey|program requirements|member support|privacy|terms|disclaimer|faq|reward status|unsubscribe|finish your survey/i.test(t)) return true;
+    if (t.indexOf('?') >= 0 && t.length > 40) return true;
+    var href = (e.href || e.getAttribute('href') || '').toLowerCase();
+    if (/policies|privacy|terms|flashrewards|contact\./.test(href)) return true;
+    return false;
+  }
+  var els = Array.from(document.querySelectorAll('button,div,span,a,[role=button],input[type=button],input[type=submit]')).filter(vis);
+  var opts = els.filter(function (e) {
+    if (blocked(e)) return false;
+    var t = txt(e);
+    if (!t || t.length < 2 || t.length > 45) return false;
+    if (/^(have you|do you|which|what|when|how|are you)\b/i.test(t) && t.length > 30) return false;
+    return true;
+  });
+  if (!opts.length) return null;
+  opts.sort(function (a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
+  var el = opts[0];
+  try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+  try { el.click(); } catch (e) {}
+  var r = el.getBoundingClientRect();
+  return { clicked: true, x: r.left + r.width / 2, y: r.top + r.height / 2, label: txt(el) };
+}"""
+
+
+async def _click_instant_survey_tap(page) -> bool:
+    """Fast path: click the first visible survey answer button (any question type)."""
+    for frame in await _survey_frames_ordered(page):
+        try:
+            target = await frame.evaluate(INSTANT_SURVEY_TAP_JS)
+            if target and (target.get("clicked") or target.get("x") is not None):
+                if target.get("x") is not None:
+                    await _frame_mouse_click_at(
+                        page, frame, float(target["x"]), float(target["y"])
+                    )
+                return True
+        except Exception:
+            continue
+    return False
+
+
+FAST_SURVEY_ANSWER_JS = r"""(labels) => {
+  var body = (document.body.innerText || '').toLowerCase();
+  if (/select all that apply/.test(body)) return null;
+  function vis(e) {
+    var s = getComputedStyle(e);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.pointerEvents === 'none') return false;
+    var r = e.getBoundingClientRect();
+    return r.width >= 55 && r.height >= 22 && r.top >= 40 && r.top <= innerHeight * 0.92;
+  }
+  function txt(e) { return ((e.innerText || e.textContent || e.value || '') + '').trim(); }
+  function blocked(e) {
+    var t = txt(e).toLowerCase();
+    if (/skip the survey|about the survey|program requirements|member support|privacy|terms|disclaimer|faq|reward status|unsubscribe|finish your survey/i.test(t)) return true;
+    if (t.indexOf('?') >= 0 && t.length > 40) return true;
+    var href = (e.href || e.getAttribute('href') || '').toLowerCase();
+    if (/policies|privacy|terms|flashrewards|contact\./.test(href)) return true;
+    return false;
+  }
+  function clickEl(el) {
+    try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+    try { el.click(); } catch (e) {}
+    var r = el.getBoundingClientRect();
+    return { clicked: true, label: txt(el), x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  var els = Array.from(document.querySelectorAll('button,a,div,span,[role=button],input[type=button],input[type=submit],label')).filter(vis);
+  var ANSWER = /^(excellent|good|some problems|major problems|i don't know|full time|part time|unemployed|student|self employed|retired|on disability|other|yes|no|maybe later|no call|no thanks|not now|often|rarely|never|weekly|monthly|daily|today|past 2 weeks|this month|over a month ago|homeowner|renter|sometimes|male|female|gen z|millennial|gen x|baby boomer|silent generation)$/i;
+  for (var li = 0; li < labels.length; li++) {
+    var want = (labels[li] || '').toLowerCase();
+    if (!want) continue;
+    var labelMatch = els.find(function (e) {
+      if (blocked(e)) return false;
+      var t = txt(e).toLowerCase();
+      return t === want || t.indexOf(want) === 0;
+    });
+    if (labelMatch) return clickEl(labelMatch);
+  }
+  var ans = els.find(function (e) {
+    if (blocked(e)) return false;
+    var t = txt(e);
+    return t.length >= 2 && t.length <= 45 && ANSWER.test(t);
+  });
+  if (ans) return clickEl(ans);
+  var opts = els.filter(function (e) {
+    if (blocked(e)) return false;
+    var t = txt(e);
+    if (!t || t.length < 2 || t.length > 45) return false;
+    if (/^(have you|do you|which|what|when|how|are you)\b/i.test(t) && t.length > 30) return false;
+    return true;
+  });
+  if (!opts.length) return null;
+  opts.sort(function (a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
+  var pick = opts[Math.floor(Math.random() * Math.min(opts.length, 4))];
+  return clickEl(pick);
+}"""
+
+
+async def _fast_survey_answer(
+    page, row: Optional[Dict[str, Any]] = None
+) -> bool:
+    """One-shot survey answer: labels + regex + first visible button."""
+    body = await _survey_body_text(page)
+    labels: List[str] = []
+    data_labels = _data_linked_survey_answer(body, row or {})
+    if data_labels:
+        labels.extend(list(data_labels))
+    labels.extend(list(_survey_labels_for_body(body)))
+    seen: set = set()
+    ordered: List[str] = []
+    for label in labels:
+        key = str(label or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(str(label))
+    try:
+        rng = _visit_rng(page)
+        rng.shuffle(ordered)
+    except Exception:
+        pass
+    for frame in await _survey_frames_ordered(page):
+        try:
+            result = await frame.evaluate(FAST_SURVEY_ANSWER_JS, ordered)
+            if result and result.get("clicked"):
+                if result.get("x") is not None:
+                    await _frame_mouse_click_at(
+                        page, frame, float(result["x"]), float(result["y"])
+                    )
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _survey_labels_for_body(body: str) -> tuple:
+    """Preferred answer labels for the current survey question."""
+    b = (body or "").lower()
+    if "when did you last make an online purchase" in b or (
+        "online purchase" in b and "when did you" in b
+    ):
+        return ("Today", "Past 2 weeks", "This month", "Over a month ago")
+    if any(k in b for k in ("car accident", "been in a car accident", "been in an accident")):
+        return ("Maybe Later", "No Call", "No", "Yes")
+    if "how often" in b and ("credit" in b or "card" in b):
+        return ("Often", "Rarely", "Never", "Weekly", "Monthly")
+    if "homeowner" in b:
+        return ("Yes", "No", "Homeowner", "Renter")
+    if "employment" in b or "employed" in b:
+        return ("Full Time", "Part Time", "Unemployed", "Student", "Retired", "Other")
+    if "credit rating" in b or "describe your credit" in b:
+        return ("Excellent", "Good", "Some Problems", "Major Problems", "I don't know")
+    if "generation" in b:
+        return ("Gen Z", "Millennial", "Gen X", "Baby Boomer", "Silent Generation")
+    return (
+        "Yes",
+        "No",
+        "Today",
+        "Often",
+        "Maybe Later",
+        "No Call",
+        "No Thanks",
+        "Not Now",
+    )
 
 
 async def _page_has_text(page, *needles: str) -> bool:
@@ -3036,25 +3332,27 @@ STANDARD_SURVEY_CLICK_JS = r"""(labels) => {
 
 
 async def _click_standard_survey_choice(page) -> bool:
-    """Click known single-choice survey answers (Yes / Maybe Later / No Call / No)."""
-    body = (await _survey_body_text(page) or "").lower()
-    legal_q = any(
-        k in body
-        for k in (
-            "car accident",
-            "been in an accident",
-            "been in a car accident",
-            "injured in",
-            "personal injury",
-            "attorney",
-            "legal claim",
-        )
-    )
-    if legal_q:
-        labels = ("Maybe Later", "No Call", "No", "Yes")
-    else:
-        labels = ("Yes", "Maybe Later", "No Call", "No", "No Thanks", "Not Now")
+    """Click known single-choice survey answers for the current question."""
+    body = await _survey_body_text(page)
+    body_l = (body or "").lower()
+    labels = _survey_labels_for_body(body_l)
     before = await _survey_fingerprint(page)
+
+    for frame in await _survey_frames_ordered(page):
+        try:
+            result = await frame.evaluate(STANDARD_SURVEY_CLICK_JS, list(labels))
+            if result and result.get("clicked"):
+                if result.get("x") is not None:
+                    await _frame_mouse_click_at(
+                        page, frame, float(result["x"]), float(result["y"])
+                    )
+                if await _survey_click_ok(page, before, True):
+                    return True
+        except Exception:
+            continue
+
+    if _survey_instant_enabled(page):
+        return False
 
     for label in labels:
         if await _click_survey_yes_no_label(page, label):
@@ -3068,21 +3366,6 @@ async def _click_standard_survey_choice(page) -> bool:
             if await _survey_click_ok(page, before, True):
                 return True
 
-    for frame in await _survey_frames_ordered(page):
-        try:
-            result = await frame.evaluate(STANDARD_SURVEY_CLICK_JS, list(labels))
-            if result and result.get("clicked"):
-                if result.get("x") is not None:
-                    await _frame_mouse_click_at(
-                        page, frame, float(result["x"]), float(result["y"])
-                    )
-                if not _survey_instant_enabled(page):
-                    await _survey_settle(page)
-                if await _survey_click_ok(page, before, True):
-                    return True
-        except Exception:
-            continue
-
     return False
 
 
@@ -3091,7 +3374,8 @@ async def _native_survey_pick(
 ) -> bool:
     """Fully automatic survey — no per-question config needed."""
     row = row or {}
-    before = await _survey_fingerprint(page)
+    instant = _survey_instant_enabled(page)
+    before = "" if instant else await _survey_fingerprint(page)
 
     if await _native_multiselect_step(page):
         return await _survey_click_ok(page, before, True)
@@ -3107,14 +3391,19 @@ async def _native_survey_pick(
     if not body.strip() and not await _survey_active_on_page(page):
         return False
 
+    if instant and await _fast_survey_answer(page, row):
+        return True
+
     data_labels = _data_linked_survey_answer(body, row)
     if data_labels and await _click_survey_labels(page, data_labels):
         return await _survey_click_ok(page, before, True)
 
-    if await _click_standard_survey_choice(page):
-        return True
+    if await _click_instant_survey_tap(page):
+        return await _survey_click_ok(page, before, True)
     if await _click_survey_zone_answer(page):
         return await _survey_click_ok(page, before, True)
+    if await _click_standard_survey_choice(page):
+        return True
     if await _click_largest_survey_button(page):
         return await _survey_click_ok(page, before, True)
     if await _click_random_visible_survey_option(page):
@@ -3137,45 +3426,42 @@ async def _native_survey_burst(
     row: Optional[Dict[str, Any]],
     cfg: SmartFunnelConfig,
 ) -> bool:
-    """Answer survey questions immediately — hammer until question advances or cap."""
+    """Answer survey questions immediately — one fast click per question when possible."""
     if await _is_multiselect_survey_page(page):
         return await _native_multiselect_step(page)
     if not cfg.fast_survey:
         return await _native_survey_pick(page, row, cfg)
 
     instant = _survey_instant_enabled(page)
-    max_rounds = min(8, max(3, int(cfg.survey_burst_clicks or 6)))
+    if instant and await _fast_survey_answer(page, row):
+        return True
+
+    max_rounds = 2 if instant else min(8, max(3, int(cfg.survey_burst_clicks or 6)))
     start_fp = await _survey_fingerprint(page)
-    clicked_any = False
 
     for rnd in range(max_rounds):
         try:
             if await _is_multiselect_survey_page(page):
                 ok = await _native_multiselect_step(page)
-                clicked_any = clicked_any or ok
-                if await _survey_fingerprint(page) != start_fp:
+                if ok and await _survey_fingerprint(page) != start_fp:
                     return True
-                await asyncio.sleep(0.03)
+                if not instant:
+                    break
+                await asyncio.sleep(0.008)
                 continue
 
-            before = await _survey_fingerprint(page)
             picked = await _native_survey_pick(page, row, cfg)
             if picked:
-                clicked_any = True
+                return True
             if await _survey_fingerprint(page) != start_fp:
                 return True
 
-            if await _click_standard_survey_choice(page):
-                clicked_any = True
-                if await _survey_fingerprint(page) != start_fp:
-                    return True
-
             if not instant:
                 break
-            await asyncio.sleep(0.025)
+            await asyncio.sleep(0.008)
         except Exception:
             break
-    return clicked_any
+    return False
 
 
 DEAL_BEST_MATCH_CONTINUE_JS = r"""() => {
@@ -5510,7 +5796,7 @@ async def _native_deal_continue_burst(
 OFFERS_NAV_JS = r"""() => {
   var host = (location.host || '').toLowerCase();
   var bt = (document.body.innerText || '').toLowerCase();
-  if (!/displayoptoffers|uplevelrewards|levelrewards|rewardsgiant|eward4spot|retailproductsusa/.test(host)) return null;
+  if (!/displayoptoffers|uplevelrewards|levelrewards|rewardsgiant|eward4spot|reward4spot|retailproductsusa/.test(host)) return null;
   if (/level 1 deals|level 2 deals|level 3 deals|best match for you|do you already have|how to complete/.test(bt)) return null;
   function vis(e) {
     var s = getComputedStyle(e);
@@ -5556,7 +5842,7 @@ OFFERS_NAV_JS = r"""() => {
   if (/towards target|towards amazon|reward progress|next step|complete 20 deals|continue instructions|track your reward/.test(bt)) {
     var cta = els.find(function (e) {
       if (blocked(e)) return false;
-      return /view deals|my deals|complete deal|see deals|start deal|reward status|continue/i.test(txt(e).toLowerCase());
+      return /view deals|my deals|complete deal|see deals|start deal|reward status|continue|get a quick start|get started/i.test(txt(e).toLowerCase());
     });
     if (cta) return coords(cta);
   }
@@ -5601,6 +5887,52 @@ OFFERS_NAV_JS = r"""() => {
   return null;
 }"""
 
+OFFERS_DEALS_HREF_JS = r"""() => {
+  function vis(e) {
+    var s = getComputedStyle(e);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    var r = e.getBoundingClientRect();
+    return r.width > 20 && r.height > 10;
+  }
+  var anchors = Array.from(document.querySelectorAll('a[href]')).filter(vis);
+  for (var i = 0; i < anchors.length; i++) {
+    var h = (anchors[i].href || '').toLowerCase();
+    if (/eward4spot|reward4spot|uplevelrewards|levelrewards|rewardsgiant|\/deals|mydeals|viewdeal|complete.*deal|displayoptoffers/i.test(h)) {
+      return anchors[i].href;
+    }
+  }
+  return null;
+}"""
+
+
+async def _native_offers_goto_deals(page) -> bool:
+    """Direct navigation when CTA clicks fail on reward-progress / offers screens."""
+    try:
+        cur = (page.url or "").strip().rstrip("/").lower()
+    except Exception:
+        cur = ""
+    for frame in page.frames:
+        try:
+            href = await frame.evaluate(OFFERS_DEALS_HREF_JS)
+            if not href:
+                continue
+            href_s = str(href).strip()
+            if not href_s or href_s.rstrip("/").lower() == cur:
+                continue
+            goto_kw: Dict[str, Any] = {}
+            try:
+                ref = str(getattr(page.context, "_krx_visit_referer", "") or "").strip()
+                if ref:
+                    goto_kw["referer"] = ref
+            except Exception:
+                pass
+            await page.goto(href_s, wait_until="commit", timeout=20000, **goto_kw)
+            await asyncio.sleep(0.4)
+            return True
+        except Exception:
+            continue
+    return False
+
 
 async def _native_offers_nav_step(page) -> bool:
     """Navigate post-survey / reward-progress screens to the deal wall."""
@@ -5615,15 +5947,11 @@ async def _native_offers_nav_step(page) -> bool:
         try:
             target = await frame.evaluate(OFFERS_NAV_JS)
             if target and target.get("x") is not None:
-                if await _trusted_survey_click(
-                    page,
-                    frame,
-                    label=str(target.get("label") or ""),
-                    x=float(target["x"]),
-                    y=float(target["y"]),
-                ):
-                    await asyncio.sleep(0.35)
-                    return True
+                await _frame_mouse_click_at(
+                    page, frame, float(target["x"]), float(target["y"])
+                )
+                await asyncio.sleep(0.35)
+                return True
         except Exception:
             continue
     for label in (
@@ -5652,6 +5980,8 @@ async def _native_offers_nav_step(page) -> bool:
                         return True
         except Exception:
             continue
+    if await _native_offers_goto_deals(page):
+        return True
     return False
 
 
@@ -5696,17 +6026,26 @@ async def _native_screen_nudge(page, metrics: Dict[str, Any]) -> bool:
         if await _native_retail_mouse_click(page):
             return True
         if "question 1" in body or "do you shop at target" in body:
-            if await _try(random.sample(["Yes", "No"], 2)):
+            rng = _visit_rng(page)
+            if await _try(rng.sample(["Yes", "No"], 2)):
                 return True
             return await _try_coord_yes_no()
         if "question 2" in body or "what would you do" in body:
-            return await _try(["Use it myself", "Share with family"])
+            rng = _visit_rng(page)
+            return await _try(rng.sample(["Use it myself", "Share with family"], 2))
         if "question 3" in body or "activating your reward" in body or "how often" in body:
-            return await _try(["Weekly", "Monthly", "Daily", "Often", "Rarely"])
+            rng = _visit_rng(page)
+            return await _try(rng.sample(["Weekly", "Monthly", "Daily", "Often", "Rarely"], 5))
         if "question 4" in body or "question 5" in body:
             if await _native_retail_mouse_click(page):
                 return True
-            return await _try(["Yes", "No", "Weekly", "Monthly", "Use it myself", "Share with family"])
+            rng = _visit_rng(page)
+            return await _try(
+                rng.sample(
+                    ["Yes", "No", "Weekly", "Monthly", "Use it myself", "Share with family"],
+                    6,
+                )
+            )
         return await _try(["Get a Quick Start", "Get Started Now", "Continue"])
 
     if any(x in body for x in ("best match", "your cost:", "level 1 deals")) or "displayoptoffers" in host:
@@ -5787,6 +6126,7 @@ async def execute_smart_funnel(
     """
     cfg = config or SmartFunnelConfig()
     try:
+        _seed_visit_context(page, row or {}, job_id, visit_idx)
         page.context._krx_fast_survey = bool(cfg.fast_survey)
         page.context._krx_survey_skip_chance = float(cfg.survey_skip_chance or 0.0)
         if cfg.fast_survey:
@@ -5809,6 +6149,7 @@ async def execute_smart_funnel(
     stuck_at_deals = 0
     stuck_on_survey = 0
     stuck_deal_wall = 0
+    stuck_offers = 0
     prev_url_deals = 0
     deal_wall_seen = False
     prev_fp = await _page_fingerprint(page)
@@ -5883,7 +6224,12 @@ async def execute_smart_funnel(
         url_early = str(metrics.get("url") or "").lower()
         on_deal_wall_early = _body_has_deal_wall(body_l, url_early) or await _deal_wall_on_page(page)
         survey_active = await _survey_active_on_page(page)
-        if (survey_active or _body_on_survey(body_l)) and not on_deal_wall_early:
+        on_offers_info = _body_on_offers_info(body_l)
+        if (
+            (survey_active or _body_on_survey(body_l))
+            and not on_deal_wall_early
+            and not on_offers_info
+        ):
             deal_wall_seen = False
             try:
                 if await _page_has_text(page, "what kind of debt", "select all that apply"):
@@ -6013,6 +6359,7 @@ async def execute_smart_funnel(
                 "deals_done": deals,
                 "url_deals": deals,
                 "conversion_signal": True,
+                "deal_flow_complete": True,
                 "final_url": final_url,
                 "pattern": cfg.normalized_pattern(),
             }
@@ -6145,6 +6492,7 @@ async def execute_smart_funnel(
                 "deals_done": deals,
                 "url_deals": deals,
                 "conversion_signal": True,
+                "deal_flow_complete": True,
                 "final_url": final_url,
                 "pattern": cfg.normalized_pattern(),
             }
@@ -6169,6 +6517,7 @@ async def execute_smart_funnel(
                 "levelrewards",
                 "rewardsgiant",
                 "eward4spot",
+                "reward4spot",
             )
         )
         has_deal_wall = (
@@ -6207,6 +6556,9 @@ async def execute_smart_funnel(
         if has_deal_wall:
             phase = "deals"
             on_form = False
+        elif _body_on_offers_info(body_l) and not has_deal_wall:
+            phase = "offers"
+            on_form = False
         elif survey_now and not has_deal_wall:
             phase = "survey"
             on_form = False
@@ -6216,6 +6568,10 @@ async def execute_smart_funnel(
         else:
             on_form = False
         on_survey = (phase == "survey" or survey_now) and not has_deal_wall and not on_form
+        try:
+            page.context._krx_on_survey_now = bool(on_survey)
+        except Exception:
+            pass
         if on_form:
             try:
                 await _native_form_step(page, row or {})
@@ -6252,22 +6608,15 @@ async def execute_smart_funnel(
                     await _native_multiselect_step(page)
                 else:
                     await _native_survey_burst(page, row, cfg)
-                if cfg.fast_survey and stuck_on_survey >= 1 and not await _is_multiselect_survey_page(page):
-                    await _click_standard_survey_choice(page)
-                if cfg.fast_survey:
-                    if stuck_on_survey >= 2 and not await _is_multiselect_survey_page(page):
-                        await _click_largest_survey_button(page)
-                    if stuck_on_survey >= 3 and not await _is_multiselect_survey_page(page):
-                        await _click_survey_zone_answer(page)
-                    if stuck_on_survey >= 6:
-                        await _try_skip_survey(page)
-                else:
+                if not cfg.fast_survey:
                     if stuck_on_survey >= 2 and _is_sponsored_ad_body(body_survey):
                         await _click_sponsored_ad_random(page)
                     elif stuck_on_survey >= 2:
                         await _click_largest_survey_button(page)
                     if stuck_on_survey >= 3:
                         await _click_survey_zone_answer(page)
+                elif stuck_on_survey >= 5 and not await _is_multiselect_survey_page(page):
+                    await _try_skip_survey(page)
             except Exception:
                 pass
         else:
@@ -6312,11 +6661,17 @@ async def execute_smart_funnel(
             if cur_sfp != getattr(page.context, "_krx_prev_survey_fp", ""):
                 screen_unchanged = False
                 page.context._krx_prev_survey_fp = cur_sfp
+        if phase == "offers":
+            stuck_offers = stuck_offers + 1 if screen_unchanged else 0
+        else:
+            stuck_offers = 0
         if screen_unchanged:
             stuck_same_screen += 1
             if phase == "offers" and stuck_same_screen >= 2:
                 try:
                     await page.evaluate("try { window.scrollTo(0, 0); } catch (e) {}")
+                    if stuck_offers >= 4:
+                        await _native_offers_goto_deals(page)
                     await _native_offers_nav_step(page)
                 except Exception:
                     pass
@@ -6384,9 +6739,9 @@ async def execute_smart_funnel(
         elif on_form:
             loop_ms = max(loop_ms, int(cfg.form_loop_interval_ms or 900))
         if on_survey and cfg.fast_survey and loop_ms <= 0:
-            await asyncio.sleep(0.028)
+            await asyncio.sleep(0.008)
         elif on_survey and cfg.fast_survey:
-            await asyncio.sleep(max(0.028, loop_ms / 1000.0))
+            await asyncio.sleep(max(0.008, loop_ms / 1000.0))
         else:
             deadline = time.monotonic() + max(loop_ms, 15) / 1000.0
             await _condition_wait(page, prev_fp, cfg, deadline, poll_ms=poll_ms)
@@ -6409,6 +6764,10 @@ async def execute_smart_funnel(
             try:
                 if on_survey:
                     await _click_largest_survey_button(page)
+                elif phase == "offers":
+                    if stuck_offers >= 3:
+                        await _native_offers_goto_deals(page)
+                    await _native_offers_nav_step(page)
                 elif await _deal_wall_on_page(page) and not cfg.pause_at_deal_wall:
                     await _native_deal_wall_step(page, cfg)
             except Exception:
@@ -6418,7 +6777,8 @@ async def execute_smart_funnel(
     # Safety cap reached — report URL-authoritative deal count only
     metrics = await _metrics_from_page(page)
     deals = int(metrics.get("url_deals") or 0)
-    verified = conversion_verified(metrics, cfg.min_deals, cfg.wait_until_conversion)
+    l3_complete = bool(getattr(page.context, "_krx_l3_complete", False))
+    verified = conversion_verified(metrics, cfg.min_deals, cfg.wait_until_conversion) or l3_complete
     try:
         final_url = page.url or metrics.get("url", "")
     except Exception:
@@ -6430,6 +6790,7 @@ async def execute_smart_funnel(
         "deals_done": deals,
         "url_deals": deals,
         "conversion_signal": verified,
+        "deal_flow_complete": l3_complete,
         "final_url": final_url,
         "pattern": cfg.normalized_pattern(),
         "error": None if verified else f"Max iterations ({cfg.max_iterations}) without {cfg.min_deals} URL deal markers",
@@ -6448,6 +6809,7 @@ def _guess_phase(snippet: str, url: str, body: str = "") -> str:
             "levelrewards",
             "rewardsgiant",
             "eward4spot",
+            "reward4spot",
         )
     )
 
@@ -6475,7 +6837,9 @@ def _guess_phase(snippet: str, url: str, body: str = "") -> str:
         return "form"
     if "date of birth" in s or "first name" in s or "lfirstname" in u:
         return "form"
-    if on_retail_host and "question" in s:
+    if _body_on_offers_info(s):
+        return "offers"
+    if on_retail_host and "question" in s and not _body_on_offers_info(s):
         return "retail"
     if _body_on_survey(s):
         return "survey"
@@ -6490,6 +6854,10 @@ def _guess_phase(snippet: str, url: str, body: str = "") -> str:
         or "next step: complete" in s
     ):
         return "deals"
+    if on_retail_host and any(
+        k in s for k in ("claim other rewards", "get a quick start", "reward progress", "towards target")
+    ):
+        return "offers"
     if "retailproductsusa" in u:
         return "retail"
     if on_deal_host:

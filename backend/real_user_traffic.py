@@ -10892,7 +10892,7 @@ async def run_real_user_traffic_job(
                     )
                     # Native Smart Funnel → custom JSON → legacy heuristic.
                     if smart_funnel_enabled:
-                        from smart_funnel import SmartFunnelConfig, execute_smart_funnel
+                        from smart_funnel import SmartFunnelConfig, execute_smart_funnel, rut_config_for_pattern
 
                         _sf_wd_state: Dict[str, Any] = {
                             "progressed": False,
@@ -10904,6 +10904,20 @@ async def run_real_user_traffic_job(
                             try:
                                 _sf_wd_state["heartbeat_at"] = time.monotonic()
                                 _sf_wd_state["progressed"] = True
+                                _sf_wd_state["progression_count"] = int(
+                                    _sf_wd_state.get("progression_count") or 0
+                                ) + 1
+                                _phase = str(event.get("phase") or "").strip().lower()
+                                if _phase and _phase != _sf_wd_state.get("last_phase"):
+                                    _sf_wd_state["last_phase"] = _phase
+                                    _deals_n = event.get("deals", event.get("url_deals", ""))
+                                    push_live_step(
+                                        job_id,
+                                        i + 1,
+                                        _phase or "smart_funnel",
+                                        str(event.get("status") or "running"),
+                                        f"Smart Funnel · {_phase} · deals={_deals_n}",
+                                    )
                                 j_state = RUT_JOBS.get(job_id)
                                 if j_state is None:
                                     return
@@ -10930,17 +10944,17 @@ async def run_real_user_traffic_job(
                             except Exception:
                                 pass
 
-                        _sf_cfg = SmartFunnelConfig(
-                            pattern=smart_funnel_pattern or "auto",
+                        _sf_cfg = rut_config_for_pattern(
+                            smart_funnel_pattern or "auto",
                             min_deals=max(1, min(5, int(smart_funnel_min_deals or 3))),
                             wait_until_conversion=bool(smart_funnel_wait_until_conversion),
-                            fast_survey=True,
-                            survey_settle_ms=0,
-                            survey_loop_interval_ms=0,
-                            survey_idle_poll_ms=12,
-                            survey_burst_clicks=10,
-                            survey_skip_chance=0.35,
                         )
+                        try:
+                            page.context._krx_behavioral_bio = bool(behavioral_bio_enabled)
+                            page.context._krx_visit_referer = str(_ua_referer or "")
+                            page.context._krx_on_survey_now = False
+                        except Exception:
+                            pass
                         push_live_step(
                             job_id, i + 1, "smart_funnel", "info",
                             f"Smart Funnel ({_sf_cfg.normalized_pattern()}) — adaptive survey/form/deals…",
@@ -11404,19 +11418,19 @@ async def run_real_user_traffic_job(
                     if step_res.get("smart_funnel"):
                         entry["smart_funnel"] = True
                         entry["smart_funnel_pattern"] = step_res.get("pattern") or smart_funnel_pattern
-                        entry["_smart_funnel_min_deals"] = max(
-                            1, min(5, int(smart_funnel_min_deals or 3))
-                        )
+                        entry["_smart_funnel_min_deals"] = int(_sf_cfg.min_deals)
+                        if step_res.get("deal_flow_complete"):
+                            entry["_smart_funnel_deal_flow_complete"] = True
                     if step_res.get("deals_done") is not None:
                         entry["deals_completed"] = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
-                    _sf_min_gate = max(1, min(5, int(smart_funnel_min_deals or 3)))
+                    _sf_min_gate = int(_sf_cfg.min_deals)
                     _sf_url_deals_gate = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
-                    if (
-                        step_res.get("status") == "ok"
-                        and step_res.get("conversion_signal")
-                        and _sf_url_deals_gate >= _sf_min_gate
-                    ):
-                        entry["_smart_funnel_conversion"] = True
+                    if step_res.get("status") == "ok" and step_res.get("conversion_signal"):
+                        if (
+                            _sf_url_deals_gate >= _sf_min_gate
+                            or step_res.get("deal_flow_complete")
+                        ):
+                            entry["_smart_funnel_conversion"] = True
                     if step_res.get("error"):
                         entry["error"] = step_res["error"]
                     # ── 2026-05: best-effort `screenshot` steps on failure ──
@@ -11713,7 +11727,9 @@ async def run_real_user_traffic_job(
                     _sf_url_deals = url_deals_from_href(_sf_url)
                     entry["deals_completed"] = _sf_url_deals
                     _sf_metrics = {"url": _sf_url, "host": (urlparse(_sf_url).netloc if _sf_url else "")}
-                    if conversion_verified(_sf_metrics, _sf_min, True):
+                    if conversion_verified(_sf_metrics, _sf_min, True) or entry.get(
+                        "_smart_funnel_deal_flow_complete"
+                    ):
                         entry["thank_you_reached"] = True
                     else:
                         entry["thank_you_reached"] = False
