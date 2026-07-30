@@ -298,7 +298,7 @@ class SmartFunnelConfig:
     survey_settle_ms: int = 0  # ms after each survey click (0 = instant in fast mode)
     survey_loop_interval_ms: int = 0  # no idle wait between survey answers
     survey_idle_poll_ms: int = 12  # DOM poll during survey
-    survey_burst_clicks: int = 10  # rapid answers per loop while question visible
+    survey_burst_clicks: int = 6  # rapid answers per loop while question visible
     survey_skip_chance: float = 0.0  # RUT jobs set 0.35 — once per visit roll
     form_type_delay_ms: int = 50  # character typing speed — keep human-normal
     form_loop_interval_ms: int = 900  # do not rush form phase like survey
@@ -3144,17 +3144,18 @@ async def _native_survey_burst(
         return await _native_survey_pick(page, row, cfg)
 
     instant = _survey_instant_enabled(page)
-    max_rounds = max(10, int(cfg.survey_burst_clicks or 10))
+    max_rounds = min(8, max(3, int(cfg.survey_burst_clicks or 6)))
     start_fp = await _survey_fingerprint(page)
     clicked_any = False
 
-    for _ in range(max_rounds):
+    for rnd in range(max_rounds):
         try:
             if await _is_multiselect_survey_page(page):
                 ok = await _native_multiselect_step(page)
                 clicked_any = clicked_any or ok
                 if await _survey_fingerprint(page) != start_fp:
                     return True
+                await asyncio.sleep(0.03)
                 continue
 
             before = await _survey_fingerprint(page)
@@ -3168,19 +3169,10 @@ async def _native_survey_burst(
                 clicked_any = True
                 if await _survey_fingerprint(page) != start_fp:
                     return True
-            if await _click_survey_zone_answer(page):
-                clicked_any = True
-                if await _survey_fingerprint(page) != start_fp:
-                    return True
-            if await _click_largest_survey_button(page):
-                clicked_any = True
-                if await _survey_fingerprint(page) != start_fp:
-                    return True
 
             if not instant:
                 break
-            if await _survey_fingerprint(page) == before:
-                continue
+            await asyncio.sleep(0.025)
         except Exception:
             break
     return clicked_any
@@ -6392,9 +6384,9 @@ async def execute_smart_funnel(
         elif on_form:
             loop_ms = max(loop_ms, int(cfg.form_loop_interval_ms or 900))
         if on_survey and cfg.fast_survey and loop_ms <= 0:
-            pass
+            await asyncio.sleep(0.028)
         elif on_survey and cfg.fast_survey:
-            await asyncio.sleep(max(0, loop_ms) / 1000.0)
+            await asyncio.sleep(max(0.028, loop_ms / 1000.0))
         else:
             deadline = time.monotonic() + max(loop_ms, 15) / 1000.0
             await _condition_wait(page, prev_fp, cfg, deadline, poll_ms=poll_ms)
