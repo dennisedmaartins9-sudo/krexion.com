@@ -24,6 +24,16 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# v2.6.49 Bug #8 fix: log env-override at import time so operators can see
+# in supervisor logs that KRX_SURVEY_INSTANT is globally forcing instant
+# survey mode across ALL patterns (not just Reward). Previously silent.
+if os.environ.get("KRX_SURVEY_INSTANT", "").strip().lower() in ("1", "true", "yes"):
+    logger.warning(
+        "smart_funnel: KRX_SURVEY_INSTANT=%s is set — instant survey mode "
+        "is FORCED globally for all patterns (overrides per-job cfg.fast_survey).",
+        os.environ.get("KRX_SURVEY_INSTANT"),
+    )
+
 _BLOCKED_CLICK_RE = re.compile(
     r"terms\s*(?:and|&)\s*conditions?|terms\s*of\s*(?:service|use)|"
     r"privacy\s*policy|cookie\s*policy|legal\s*notice|disclaimer|"
@@ -265,9 +275,19 @@ CONVERSION_SCRIPT = r"""(function(){var u=location.href;var n=0;if(/BVA=True/i.t
 
 THIRD_DEAL_RECOVERY = r"""(function(){var u=location.href;var n=0;if(/BVA=True/i.test(u))n++;if(/BVB=True/i.test(u))n++;if(/BVC=True/i.test(u))n++;if(/BVD=True/i.test(u))n++;if(/BVE=True/i.test(u))n++;var minD=parseInt(window.__krxMinDeals,10);if(isNaN(minD)||minD<1)minD=3;if(n>=minD)return;if(n<minD-1)return;window.__krxDealKeys={};function vis(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var r=e.getBoundingClientRect();return r.width>20&&r.height>10;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function btns(){return Array.from(document.querySelectorAll('button,a,div,span,[role=button]')).filter(vis);}function rf(el){if(!el)return;try{el.scrollIntoView({block:'center'});el.click();}catch(e){}}var nav=btns().find(function(e){return /my deals|view deals|complete deals|see deals|reward status|start earning|complete\s*1\s*deal/i.test(txt(e));});if(nav){rf(nav);return;}try{window.scrollTo(0,0);window.scrollBy(0,450);}catch(e){}var cont=btns().filter(function(e){return /^continue$/i.test(txt(e));});for(var i=0;i<cont.length;i++){rf(cont[i]);return;}var a=document.querySelector('a[href*="uplevelrewards"],a[href*="levelrewards"],a[href*="displayoptoffers"]');if(a&&vis(a)){rf(a);return;}})();"""
 
-RETAIL_REENTRY_SCRIPT = r"""(function(){if(!/retailproductsusa|bckmfr=1|default\.aspx/i.test(location.href))return;function vis(e){var s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&e.getBoundingClientRect().width>20;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function blocked(e){var t=txt(e).toLowerCase();if(/terms|conditions|privacy|disclaimer/i.test(t))return true;var h=(e.href||e.getAttribute('href')||'').toLowerCase();return/terms|privacy|legal|disclaimer/i.test(h);}var b=Array.from(document.querySelectorAll('button,a,div,span')).filter(vis);var c=b.find(function(e){if(blocked(e))return false;return /get a quick start|get started|claim my|start earning|continue|next/i.test(txt(e).toLowerCase());});if(c){try{c.click();}catch(e){}}})();"""
+RETAIL_REENTRY_SCRIPT = r"""(function(){if(!/retailproductsusa|bckmfr=1|default\.aspx/i.test(location.href))return;function vis(e){var s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&e.getBoundingClientRect().width>20;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function blocked(e){var t=txt(e).toLowerCase();if(/terms|conditions|privacy|disclaimer/i.test(t))return true;var h=(e.href||e.getAttribute('href')||'').toLowerCase();return/terms|privacy|legal|disclaimer/i.test(h);}
+/* v2.6.49 Bug #11 fix: never treat "Get a Quick Start" as a plain re-entry CTA when we are staring at the SMS opt-in modal — clicking it would opt the user INTO SMS collection. Prefer clicking "No thanks" instead, matching cfg.sms_answer. */
+var _bt=(document.body.innerText||'').toLowerCase();
+var _sms_optin=/(sign up for (?:text messages|sms|sms alerts)|text me reward updates|we'll text you at|explore offers from our sponsors|progress updates? (?:&|and) reminders)/i.test(_bt)||(/track your progress/i.test(_bt)&&/(reward status|deal credits|sms alerts|text alerts|text updates|keep you up to date)/i.test(_bt)&&/quick start/i.test(_bt));
+if(_sms_optin){var b0=Array.from(document.querySelectorAll('button,a,div,span,[role=button]')).filter(vis);var nt=b0.find(function(e){if(blocked(e))return false;return /^no thanks?$/i.test(txt(e));});if(nt){try{nt.click();}catch(e){}return;}}
+var b=Array.from(document.querySelectorAll('button,a,div,span')).filter(vis);var c=b.find(function(e){if(blocked(e))return false;return /get a quick start|get started|claim my|start earning|continue|next/i.test(txt(e).toLowerCase());});if(c){try{c.click();}catch(e){}}})();"""
 
-RETAIL_PROGRESS_SCRIPT = r"""(function(){if(!/retailproductsusa/i.test(location.host))return;function vis(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var r=e.getBoundingClientRect();return r.width>20&&r.height>10;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function blocked(e){var t=txt(e).toLowerCase();if(/terms|conditions|privacy|disclaimer|legal notice|cookie policy/i.test(t))return true;var h=(e.href||e.getAttribute('href')||'').toLowerCase();return/terms|privacy|legal|disclaimer|cookie/i.test(h);}function rf(el){if(!el||blocked(el))return;try{el.scrollIntoView({block:'center'});el.click();}catch(e){}}var b=Array.from(document.querySelectorAll('button,a,div,span,[role=button]')).filter(vis);var yn=b.filter(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return t==='yes'||t==='no';});if(yn.length){rf(yn[Math.floor(Math.random()*yn.length)]);return;}var wk=b.filter(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return t==='weekly'||t==='monthly';});if(wk.length){rf(wk[0]);return;}var cta=b.find(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return /get a quick start|get started|claim my|start earning|activating|continue|next|use it myself|share with family/i.test(t);});if(cta){rf(cta);return;}})();"""
+RETAIL_PROGRESS_SCRIPT = r"""(function(){if(!/retailproductsusa/i.test(location.host))return;function vis(e){var s=getComputedStyle(e);if(s.display==='none'||s.visibility==='hidden')return false;var r=e.getBoundingClientRect();return r.width>20&&r.height>10;}function txt(e){return ((e.innerText||e.textContent||'')+'').trim();}function blocked(e){var t=txt(e).toLowerCase();if(/terms|conditions|privacy|disclaimer|legal notice|cookie policy/i.test(t))return true;var h=(e.href||e.getAttribute('href')||'').toLowerCase();return/terms|privacy|legal|disclaimer|cookie/i.test(h);}function rf(el){if(!el||blocked(el))return;try{el.scrollIntoView({block:'center'});el.click();}catch(e){}}
+/* v2.6.49 Bug #11 fix: same SMS opt-in guard as RETAIL_REENTRY_SCRIPT. Prefer "No thanks" over "Get a Quick Start" when the SMS opt-in modal is visible. */
+var _bt2=(document.body.innerText||'').toLowerCase();
+var _sms2=/(sign up for (?:text messages|sms|sms alerts)|text me reward updates|we'll text you at|explore offers from our sponsors|progress updates? (?:&|and) reminders)/i.test(_bt2)||(/track your progress/i.test(_bt2)&&/(reward status|deal credits|sms alerts|text alerts|text updates|keep you up to date)/i.test(_bt2)&&/quick start/i.test(_bt2));
+if(_sms2){var b2=Array.from(document.querySelectorAll('button,a,div,span,[role=button]')).filter(vis);var nt2=b2.find(function(e){if(blocked(e))return false;return /^no thanks?$/i.test(txt(e));});if(nt2){rf(nt2);return;}}
+var b=Array.from(document.querySelectorAll('button,a,div,span,[role=button]')).filter(vis);var yn=b.filter(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return t==='yes'||t==='no';});if(yn.length){rf(yn[Math.floor(Math.random()*yn.length)]);return;}var wk=b.filter(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return t==='weekly'||t==='monthly';});if(wk.length){rf(wk[0]);return;}var cta=b.find(function(e){if(blocked(e))return false;var t=txt(e).toLowerCase();return /get a quick start|get started|claim my|start earning|activating|continue|next|use it myself|share with family/i.test(t);});if(cta){rf(cta);return;}})();"""
 
 PROGRESS_FINGERPRINT_JS = (
     "()=>{try{"
@@ -474,10 +494,33 @@ async def _survey_state_changed(page, before: str) -> bool:
 
 
 async def _survey_click_ok(page, before: str, clicked: bool) -> bool:
-    """True when click succeeded; instant mode trusts click to avoid slow repaints."""
+    """True when click succeeded.
+
+    2026-07 v2.6.49 — Bug #2 fix: instant mode no longer blindly trusts
+    every click. Instead it does a *zero-wait* fingerprint compare so we
+    catch clicks that landed on a policy/terms link or a visible-but-
+    non-answer element (which used to be silently reported as advance,
+    burning outer-loop iterations before stuck_on_survey recovery kicked
+    in). If the fingerprint hasn't changed yet (very common for React
+    apps that repaint in the next tick), we still trust the click in
+    instant mode — but a fresh `before` fingerprint MUST be present.
+    """
     if not clicked:
         return False
     if _survey_instant_enabled(page):
+        # Quick opportunistic check without blocking; still return True
+        # if we can't verify (React apps often repaint asynchronously)
+        # but this at least catches an instantly-detectable no-op click.
+        try:
+            now = await _survey_fingerprint(page)
+            if before and now == before:
+                # Give the app one tick to repaint before trusting the click
+                await asyncio.sleep(0.02)
+                now = await _survey_fingerprint(page)
+                if before and now == before:
+                    return False
+        except Exception:
+            pass
         return True
     return await _survey_state_changed(page, before)
 
@@ -1115,7 +1158,7 @@ async def _native_mouse_at_text(page, text: str) -> bool:
     for frame in page.frames:
         try:
             coords = await frame.evaluate(
-                """(label) => {
+                r"""(label) => {
                   function vis(e) {
                     var s = getComputedStyle(e);
                     if (s.display === 'none' || s.visibility === 'hidden') return false;
@@ -2675,16 +2718,49 @@ async def _native_form_step(page, row: Dict[str, Any]) -> bool:
 
 async def _body_on_sms_optin(body: str) -> bool:
     s = (body or "").lower()
-    return any(
+    # v2.6.49 Bug #11 fix: retailproductsusa's reward-target flow shows a
+    # variant SMS opt-in modal ("Want to track your progress? Sign up for
+    # SMS alerts to keep you up to date on your Reward status and Deal
+    # credits." + "Get a Quick Start" button) that the previous phrase
+    # list missed. Without detection, the outer retail-progress handler
+    # trusted "Get a Quick Start" as a normal CTA and clicked it, opting
+    # the user INTO SMS collection and stalling the visit on the phone
+    # form. Adding the new phrases lets _native_sms_optin_step catch the
+    # modal and click "No thanks" as intended by cfg.sms_answer.
+    if any(
         k in s
         for k in (
             "sign up for text messages",
+            "sign up for sms alerts",
+            "sign up for sms",
             "text me reward updates",
             "we'll text you at",
             "explore offers from our sponsors",
             "progress updates & reminders",
+            "progress updates and reminders",
         )
+    ):
+        return True
+    # Reward-flow SMS pitch usually combines "track your progress" +
+    # "reward status" + a "quick start" CTA. Require at least two of
+    # these to avoid false-positives on unrelated deal-wall progress
+    # bars that also mention "progress".
+    hits = sum(
+        1
+        for k in (
+            "track your progress",
+            "keep you up to date",
+            "reward status",
+            "deal credits",
+            "sms alerts",
+            "text alerts",
+            "text updates",
+        )
+        if k in s
     )
+    if hits >= 2 and ("quick start" in s or "get a quick start" in s):
+        return True
+    return False
 
 
 async def _native_sms_optin_step(page, cfg: SmartFunnelConfig) -> bool:
@@ -3436,7 +3512,16 @@ async def _native_survey_burst(
     if instant and await _fast_survey_answer(page, row):
         return True
 
-    max_rounds = 2 if instant else min(8, max(3, int(cfg.survey_burst_clicks or 6)))
+    # v2.6.49 Bug #3 fix: restore reasonable burst cap in instant mode.
+    # Previous 2-round cap combined with _click_standard_survey_choice
+    # early-return meant a single missed click stalled the funnel until
+    # outer-loop stuck detection (5+ iterations) kicked in. New cap:
+    # instant mode gets min(4, cfg.survey_burst_clicks) — enough to try
+    # alternative click strategies, still much faster than legacy 8.
+    if instant:
+        max_rounds = min(4, max(2, int(cfg.survey_burst_clicks or 4)))
+    else:
+        max_rounds = min(8, max(3, int(cfg.survey_burst_clicks or 6)))
     start_fp = await _survey_fingerprint(page)
 
     for rnd in range(max_rounds):
@@ -3455,6 +3540,17 @@ async def _native_survey_burst(
                 return True
             if await _survey_fingerprint(page) != start_fp:
                 return True
+
+            # v2.6.49 Bug #3 fix: in instant mode, if the fast-path click
+            # didn't advance the page, try the standard labeled-choice
+            # click as a fallback BEFORE giving up on this burst.
+            if instant and rnd >= 1:
+                try:
+                    if await _click_standard_survey_choice(page):
+                        if await _survey_fingerprint(page) != start_fp:
+                            return True
+                except Exception:
+                    pass
 
             if not instant:
                 break
@@ -6148,10 +6244,10 @@ async def execute_smart_funnel(
     stuck_same_screen = 0
     stuck_at_deals = 0
     stuck_on_survey = 0
-    stuck_deal_wall = 0
     stuck_offers = 0
     prev_url_deals = 0
     deal_wall_seen = False
+    on_deal_wall_early = False  # v2.6.49 Bug #9 fix: initialise before first iteration references it
     prev_fp = await _page_fingerprint(page)
 
     async def _emit(phase: str, status: str = "running", extra: Optional[Dict] = None) -> None:
@@ -6359,7 +6455,11 @@ async def execute_smart_funnel(
                 "deals_done": deals,
                 "url_deals": deals,
                 "conversion_signal": True,
-                "deal_flow_complete": True,
+                # v2.6.49 Bug #1 fix: reflect actual L3-complete state
+                # instead of hardcoding True. Prevents RUT from bypassing
+                # the final URL-deals check when a redirect chain strips
+                # BVA/BVC/BVE markers from final_url.
+                "deal_flow_complete": bool(getattr(page.context, "_krx_l3_complete", False)),
                 "final_url": final_url,
                 "pattern": cfg.normalized_pattern(),
             }
@@ -6492,7 +6592,9 @@ async def execute_smart_funnel(
                 "deals_done": deals,
                 "url_deals": deals,
                 "conversion_signal": True,
-                "deal_flow_complete": True,
+                # v2.6.49 Bug #1 fix: reflect actual L3-complete state
+                # (see matching branch above for rationale).
+                "deal_flow_complete": bool(getattr(page.context, "_krx_l3_complete", False)),
                 "final_url": final_url,
                 "pattern": cfg.normalized_pattern(),
             }
@@ -6646,8 +6748,6 @@ async def execute_smart_funnel(
                     await _native_offers_nav_step(page)
             except Exception:
                 pass
-        else:
-            stuck_deal_wall = 0
         if phase == "retail" and iteration == 1:
             last_phase = ""  # force emit retail on first pass
         await _emit(phase, "running", {"deals": metrics.get("url_deals", 0), "url": metrics.get("url", "")})

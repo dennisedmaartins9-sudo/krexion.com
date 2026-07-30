@@ -901,3 +901,8 @@ backend/real_user_traffic_results/
 backend/uploaded_resources/
 backend/visual_recorder_sessions/
 backend/.krexion/
+
+# v2.6.49 — testing agent output & local snapshots
+test_reports/
+.emergent/
+livetest_data/
