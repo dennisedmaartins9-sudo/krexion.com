@@ -537,6 +537,26 @@ def _body_on_survey(body: str) -> bool:
     )
 
 
+def _body_on_offers_info(body: str) -> bool:
+    """Post-survey reward tier / 'claim other Rewards' info page (not deal wall yet)."""
+    s = (body or "").lower()
+    if any(k in s for k in ("level 1 deals", "level 2 deals", "level 3 deals", "best match for you")):
+        return False
+    return any(
+        k in s
+        for k in (
+            "claim other rewards",
+            "check out ways to",
+            "complete 25 deals",
+            "complete 20 deals total",
+            "total deals required",
+            "reward value",
+            "level 1 and one deal from level 2",
+            "lesser value reward",
+        )
+    )
+
+
 def _body_on_form(body: str, url: str = "") -> bool:
     """Lead form (page 1 or page 2 — street/phone/DOB/gender)."""
     s = (body or "").lower()
@@ -5548,12 +5568,57 @@ OFFERS_NAV_JS = r"""() => {
     });
     if (cta) return coords(cta);
   }
+  if (/claim other rewards|check out ways to|complete 25 deals|total deals required|reward value|lesser value reward|level 1 and one deal from level 2/.test(bt)) {
+    try { window.scrollTo(0, 0); } catch (e) {}
+    var infoPatterns = [
+      /^view deals$/i, /^my deals$/i, /^complete deals$/i, /^see deals$/i,
+      /^reward status$/i, /^start earning$/i, /^get started$/i,
+      /^get a quick start$/i, /^continue$/i, /^continue →$/i
+    ];
+    for (var ip = 0; ip < infoPatterns.length; ip++) {
+      var infoMatch = els.find(function (e) {
+        if (blocked(e)) return false;
+        if (e.getBoundingClientRect().top > innerHeight * 0.72) return false;
+        return infoPatterns[ip].test(txt(e));
+      });
+      if (infoMatch) return coords(infoMatch);
+    }
+    for (var ai = 0; ai < anchors.length; ai++) {
+      var ax = anchors[ai];
+      if (blocked(ax)) continue;
+      if (ax.getBoundingClientRect().top > innerHeight * 0.75) continue;
+      var ah = (ax.href || '').toLowerCase();
+      if (/eward4spot|uplevelrewards|levelrewards|rewardsgiant|\/deals|mydeals|viewdeal|complete.*deal/i.test(ah)) {
+        return coords(ax);
+      }
+    }
+    var upperCta = els.filter(function (e) {
+      if (blocked(e)) return false;
+      var r = e.getBoundingClientRect();
+      if (r.top > innerHeight * 0.65 || r.width < 80 || r.height < 28) return false;
+      var t = txt(e).toLowerCase();
+      return /view deals|my deals|complete deal|see deals|start deal|reward status|get started|quick start/.test(t);
+    });
+    if (upperCta.length) {
+      upperCta.sort(function (a, b) {
+        return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+      });
+      return coords(upperCta[0]);
+    }
+  }
   return null;
 }"""
 
 
 async def _native_offers_nav_step(page) -> bool:
     """Navigate post-survey / reward-progress screens to the deal wall."""
+    body = await _survey_body_text(page)
+    if _body_on_offers_info(body):
+        try:
+            await page.evaluate("try { window.scrollTo(0, 0); } catch (e) {}")
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
     for frame in page.frames:
         try:
             target = await frame.evaluate(OFFERS_NAV_JS)
@@ -5577,12 +5642,24 @@ async def _native_offers_nav_step(page) -> bool:
         "Reward Status",
         "Start Earning",
         "Get Started",
+        "Get a Quick Start",
         "Continue",
         "CONTINUE",
     ):
         if await _native_click_text(page, label):
             await asyncio.sleep(0.35)
             return True
+    for sel in await _survey_frame_locator_selectors(page):
+        try:
+            fl = page.frame_locator(sel)
+            for label in ("View Deals", "My Deals", "Complete Deals", "See Deals"):
+                loc = fl.get_by_text(label, exact=False).first
+                if await loc.count() > 0:
+                    if await _human_click_locator(page, loc):
+                        await asyncio.sleep(0.35)
+                        return True
+        except Exception:
+            continue
     return False
 
 
@@ -6218,6 +6295,11 @@ async def execute_smart_funnel(
                 elif has_deal_wall or await _deal_wall_on_page(page):
                     await _native_deal_wall_step(page, cfg)
                 elif phase == "offers":
+                    if _body_on_offers_info(body_l):
+                        try:
+                            await page.evaluate("try { window.scrollTo(0, 0); } catch (e) {}")
+                        except Exception:
+                            pass
                     await _native_offers_nav_step(page)
                 else:
                     await _native_offers_nav_step(page)
@@ -6240,7 +6322,13 @@ async def execute_smart_funnel(
                 page.context._krx_prev_survey_fp = cur_sfp
         if screen_unchanged:
             stuck_same_screen += 1
-            if stuck_same_screen >= 3 and stuck_same_screen % 3 == 0:
+            if phase == "offers" and stuck_same_screen >= 2:
+                try:
+                    await page.evaluate("try { window.scrollTo(0, 0); } catch (e) {}")
+                    await _native_offers_nav_step(page)
+                except Exception:
+                    pass
+            elif stuck_same_screen >= 3 and stuck_same_screen % 3 == 0 and phase not in ("offers", "survey"):
                 try:
                     await page.evaluate("window.scrollBy(0, 350)")
                 except Exception:

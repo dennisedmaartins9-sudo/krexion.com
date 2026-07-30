@@ -88,6 +88,13 @@ def test_deal_wall_level_key():
     assert not _is_level1_wall("complete 3 more deals level 3")
 
 
+def test_body_on_offers_info():
+    from smart_funnel import _body_on_offers_info
+
+    assert _body_on_offers_info("check out ways to claim other rewards complete 25 deals")
+    assert not _body_on_offers_info("level 1 deals best match for you")
+
+
 def test_count_offer_tabs_is_sync():
     import inspect
 

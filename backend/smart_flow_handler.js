@@ -413,6 +413,26 @@
     if (tryNavigateDealWall()) return;
   }
 
+  /* 2b2. Claim-other-rewards info page — scroll top, click deals CTA (no URL flag required) */
+  if (
+    !onActiveSurvey &&
+    !/level 1 deals|level 2 deals|level 3 deals|best match for you/i.test(bt) &&
+    /claim other rewards|check out ways to|complete 25 deals|total deals required|reward value|lesser value reward/i.test(bt)
+  ) {
+    try { window.scrollTo(0, 0); } catch (e) {}
+    var infoCta = btns().find(function (e) {
+      var t = txt(e).toLowerCase();
+      if (/terms|privacy|disclaimer|program requirements|member support/i.test(t)) return false;
+      if (e.getBoundingClientRect().top > innerHeight * 0.72) return false;
+      return /view deals|my deals|complete deals|see deals|reward status|get started|quick start|start earning/i.test(t);
+    });
+    if (infoCta) {
+      rfFire(infoCta);
+      return;
+    }
+    if (tryNavigateDealWall()) return;
+  }
+
   /* 2c. Verification / media code — skip when possible */
   if (/verification code|send media code|track your reward progress|enter.*code|media code/i.test(bt)) {
     var skipVerify = btns().find(function (e) {
