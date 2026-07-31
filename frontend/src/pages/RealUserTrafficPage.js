@@ -956,19 +956,27 @@ export default function RealUserTrafficPage() {
   }, []);
 
   // Reward pattern preset — min 3 deals, conversion wait, longer watchdog
+  // v2.6.49 Bug #7 fix: also enforce the 3-deal minimum in the number
+  // input's min-attr so the user cannot type "2" and see it silently
+  // become "3" at run time.
   useEffect(() => {
     if (smartFunnelPattern === "reward") {
       setSmartFunnelMinDeals((prev) => (prev < 3 ? 3 : prev));
       setSmartFunnelWaitUntilConversion(true);
       setStuckWatchdogSeconds((prev) => (prev < 1800 ? 1800 : prev));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [smartFunnelPattern]);
 
   // Reward pattern — referer preset for realistic ad traffic (if user has not picked one)
+  // v2.6.49 Bug #6 fix: intentionally omit trafficSourcePreset from deps
+  // so a manual referer change by the user does NOT re-trigger this
+  // auto-preset. ESLint disable makes the intent explicit.
   useEffect(() => {
     if (smartFunnelPattern === "reward" && trafficSourcePreset === "off") {
       setTrafficSourcePreset("mixed_realistic");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [smartFunnelPattern]);
 
   // Fetch host capabilities ONCE so we render only what works here
@@ -5678,13 +5686,28 @@ export default function RealUserTrafficPage() {
                     </div>
                     <div className="flex flex-wrap gap-4 items-center">
                       <div>
-                        <Label className="text-violet-300 text-xs">Min deals</Label>
+                        <Label className="text-violet-300 text-xs">
+                          Min deals
+                          {smartFunnelPattern === "reward" && (
+                            <span
+                              className="ml-2 text-[10px] text-violet-400/80"
+                              data-testid="rut-smart-funnel-min-deals-badge"
+                            >
+                              (Reward = 3 minimum)
+                            </span>
+                          )}
+                        </Label>
                         <input
                           type="number"
-                          min={1}
+                          min={smartFunnelPattern === "reward" ? 3 : 1}
                           max={5}
                           value={smartFunnelMinDeals}
-                          onChange={(e) => setSmartFunnelMinDeals(Math.max(1, Math.min(5, parseInt(e.target.value, 10) || 2)))}
+                          onChange={(e) => {
+                            const lower = smartFunnelPattern === "reward" ? 3 : 1;
+                            setSmartFunnelMinDeals(
+                              Math.max(lower, Math.min(5, parseInt(e.target.value, 10) || lower))
+                            );
+                          }}
                           className="w-20 h-8 px-2 mt-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-100 text-xs"
                           data-testid="rut-smart-funnel-min-deals"
                         />

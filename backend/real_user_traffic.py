@@ -622,17 +622,58 @@ def _chromium_revision_from_playwright() -> Optional[str]:
 
 def _full_chromium_binary_path() -> Optional[Path]:
     """Return the path to the full chromium binary if installed, else None.
-    Reads the expected revision from Playwright's browsers.json (same one
-    used for headless-shell) so the rev always stays in sync."""
+
+    Detection strategy (v2.6.49 Bug #10 fix — was falling back to
+    headless-shell whenever Playwright's SDK-pinned revision in
+    browsers.json diverged from what `playwright install chromium` had
+    actually fetched on this host, e.g. SDK pinned rev 1148 but the CLI
+    installed rev 1208, leaving chromium-1208/ on disk and no
+    chromium-1148/ — the old code returned None and the RUT engine
+    silently ran every job on the weaker chromium-headless-shell,
+    hurting Smart Funnel stealth for every customer whose Playwright
+    got upgraded):
+
+      1. Prefer the exact revision that Playwright's SDK is pinned to
+         (matches driver expectations for CDP/browser protocols). This
+         is the pre-existing behaviour.
+      2. If that rev is missing on disk, scan every search root for
+         `chromium-*/chrome-linux/chrome` (or platform-specific binary)
+         and pick the highest-numbered rev found — a stale-but-present
+         full chromium beats fallback to headless-shell.
+      3. Only return None when NO full chromium binary exists at all.
+    """
     rev = _chromium_revision_from_playwright()
-    if not rev:
-        return None
-    rel = Path(f"chromium-{rev}") / _pw_platform_dir() / _chrome_binary_name()
+    if rev:
+        rel = Path(f"chromium-{rev}") / _pw_platform_dir() / _chrome_binary_name()
+        for root in _browsers_search_roots():
+            bp = root / rel
+            if bp.exists():
+                return bp
+    # ── v2.6.49 Bug #10 fallback: any chromium-<rev> that exists ──
+    best: Optional[Tuple[int, Path]] = None
     for root in _browsers_search_roots():
-        bp = root / rel
-        if bp.exists():
-            return bp
-    return None
+        try:
+            for child in root.iterdir():
+                name = child.name
+                if not name.startswith("chromium-"):
+                    continue
+                # Skip headless-shell dirs (chromium_headless_shell-*) —
+                # those are matched by a different helper. We only want
+                # full chromium here.
+                if "headless_shell" in name or "headless-shell" in name:
+                    continue
+                try:
+                    rev_num = int(name.split("-", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                bp = child / _pw_platform_dir() / _chrome_binary_name()
+                if not bp.exists():
+                    continue
+                if best is None or rev_num > best[0]:
+                    best = (rev_num, bp)
+        except (OSError, PermissionError):
+            continue
+    return best[1] if best else None
 
 
 def _use_full_chromium() -> bool:

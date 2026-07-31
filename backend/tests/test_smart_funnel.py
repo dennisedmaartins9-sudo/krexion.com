@@ -184,3 +184,156 @@ def test_effective_url_deals_ignores_early_markers_during_survey():
 
     deal_body = "level 1 deals best match for you continue"
     assert _effective_url_deals(3, deal_body, url) == 3
+
+
+# ---------------------------------------------------------------------------
+# v2.6.49 regression tests for reward-pattern bug fixes
+# ---------------------------------------------------------------------------
+
+
+def test_v2_6_49_stuck_deal_wall_dead_code_removed():
+    """Bug #4: `stuck_deal_wall` variable removed from execute_smart_funnel."""
+    import inspect
+
+    from smart_funnel import execute_smart_funnel
+
+    src = inspect.getsource(execute_smart_funnel)
+    assert "stuck_deal_wall" not in src, (
+        "stuck_deal_wall dead code should be removed"
+    )
+
+
+def test_v2_6_49_on_deal_wall_early_initialised_before_use():
+    """Bug #9: `on_deal_wall_early` must be initialised before the loop reads it."""
+    import inspect
+
+    from smart_funnel import execute_smart_funnel
+
+    src = inspect.getsource(execute_smart_funnel)
+    init_pos = src.find("on_deal_wall_early = False")
+    first_use_pos = src.find("and not on_deal_wall_early")
+    assert init_pos != -1, "on_deal_wall_early not initialised"
+    assert first_use_pos != -1
+    assert init_pos < first_use_pos, (
+        "on_deal_wall_early must be initialised before its first use"
+    )
+
+
+def test_v2_6_49_deal_flow_complete_not_hardcoded():
+    """Bug #1: `deal_flow_complete` must not be hardcoded to literal True.
+
+    Both conversion-return branches should reflect the actual
+    ``_krx_l3_complete`` context flag.
+    """
+    import inspect
+
+    from smart_funnel import execute_smart_funnel
+
+    src = inspect.getsource(execute_smart_funnel)
+    # No literal `"deal_flow_complete": True,` allowed in the return dicts
+    assert '"deal_flow_complete": True' not in src, (
+        "deal_flow_complete must be sourced from _krx_l3_complete, not hardcoded"
+    )
+    assert '"deal_flow_complete": bool(getattr(page.context, "_krx_l3_complete"' in src
+
+
+def test_v2_6_49_survey_click_verifies_in_instant_mode():
+    """Bug #2: instant mode must at least do a zero-wait fingerprint compare."""
+    import inspect
+
+    from smart_funnel import _survey_click_ok
+
+    src = inspect.getsource(_survey_click_ok)
+    # Old behaviour: bare `return True` when instant enabled — no verification
+    assert "_survey_fingerprint" in src, (
+        "_survey_click_ok must verify fingerprint even in instant mode"
+    )
+
+
+def test_v2_6_49_force_survey_answer_has_fallback_strategies():
+    """Bug #3: instant/fast survey uses _force_survey_answer with retries + fallbacks."""
+    import inspect
+
+    from smart_funnel import _force_survey_answer, _native_survey_burst
+
+    burst_src = inspect.getsource(_native_survey_burst)
+    assert "_force_survey_answer" in burst_src, (
+        "_native_survey_burst must delegate instant/fast path to _force_survey_answer"
+    )
+    force_src = inspect.getsource(_force_survey_answer)
+    assert "_click_standard_survey_choice" in force_src, (
+        "instant burst must fall back to labeled-choice click when fast click fails"
+    )
+    assert "_click_income_range_survey" in force_src, (
+        "income-range survey must be handled in force-answer path"
+    )
+    assert "for _ in range(3)" in force_src, (
+        "force-answer must retry strategies across multiple rounds"
+    )
+
+
+def test_v2_6_49_reward_pattern_config_still_enforces_min_3():
+    """Bug #7: backend still forces min-deals 3 for reward pattern."""
+    from smart_funnel import rut_config_for_pattern
+
+    cfg = rut_config_for_pattern("reward", min_deals=1, wait_until_conversion=True)
+    assert cfg.min_deals == 3
+    cfg2 = rut_config_for_pattern("reward", min_deals=4, wait_until_conversion=True)
+    assert cfg2.min_deals == 4  # user-picked higher value must be respected
+
+
+def test_v2_6_49_sms_optin_detects_reward_variant():
+    """Bug #11: retailproductsusa reward-flow SMS variant must be detected.
+
+    Screen text observed live: "Want to track your progress? Sign up for
+    SMS alerts to keep you up to date on your Reward status and Deal
+    credits." + "Get a Quick Start" button. Before fix, _body_on_sms_optin
+    only matched "sign up for text messages" / "text me reward updates"
+    so this variant was silently ignored and the outer retail handler
+    treated "Get a Quick Start" as a plain CTA — opting the user INTO
+    SMS collection and stalling the visit.
+    """
+    import asyncio
+
+    from smart_funnel import _body_on_sms_optin
+
+    variant = (
+        "Want to track your progress? Sign up for SMS alerts to keep you "
+        "up to date on your Reward status and Deal credits. Get a Quick Start"
+    )
+    assert asyncio.run(_body_on_sms_optin(variant)), (
+        "reward-flow SMS opt-in variant must be detected"
+    )
+    # Backwards-compat: the original phrases must still match
+    for legacy in (
+        "Sign up for text messages",
+        "text me reward updates",
+        "We'll text you at",
+        "explore offers from our sponsors",
+    ):
+        assert asyncio.run(_body_on_sms_optin(legacy)), (
+            f"legacy SMS-optin phrase '{legacy}' regressed"
+        )
+    # Deal-wall page must NOT trip the SMS detector — it also mentions
+    # "progress" but never in the SMS-opt-in sense.
+    assert not asyncio.run(
+        _body_on_sms_optin(
+            "Level 1 deals — complete 3 more deals · Your progress: 0/3"
+        )
+    )
+
+
+def test_v2_6_49_retail_scripts_guard_sms_optin():
+    """Bug #11: RETAIL_REENTRY_SCRIPT + RETAIL_PROGRESS_SCRIPT must contain
+    an inline SMS opt-in guard so JS-level fallback clicks never target
+    "Get a Quick Start" when the modal is present."""
+    from smart_funnel import RETAIL_PROGRESS_SCRIPT, RETAIL_REENTRY_SCRIPT
+
+    for src in (RETAIL_REENTRY_SCRIPT, RETAIL_PROGRESS_SCRIPT):
+        assert "sms" in src.lower() and "no thanks" in src.lower(), (
+            "retail JS script missing SMS opt-in guard"
+        )
+        assert "track your progress" in src.lower(), (
+            "retail JS script missing reward-variant SMS check"
+        )
+
