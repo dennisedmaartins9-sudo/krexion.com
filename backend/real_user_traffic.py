@@ -10952,7 +10952,6 @@ async def run_real_user_traffic_job(
                         try:
                             page.context._krx_behavioral_bio = bool(behavioral_bio_enabled)
                             page.context._krx_visit_referer = str(_ua_referer or "")
-                            page.context._krx_on_survey_now = False
                         except Exception:
                             pass
                         push_live_step(
@@ -11142,6 +11141,7 @@ async def run_real_user_traffic_job(
                                 job_id=job_id,           # 2026-06: manual takeover pause hook
                                 visit_idx=i + 1,         # 2026-06: manual takeover pause hook
                                 step_timeout_multiplier=step_timeout_multiplier,  # 2026-06: user-configurable slow-step wait
+                                skip_missing_steps=True,
                             )
                         )
 
@@ -14229,6 +14229,71 @@ async def _smart_select_with_fallback(page, selector: str, value: Any,
 #      surface).
 #   4. JS set + dispatch `change`+`input`+jQuery('.trigger') as last
 #      resort.
+def _step_iframe_path(step: Any) -> List[str]:
+    """Return iframe selector chain from step.fallbacks.iframe_path or top-level iframe_path."""
+    if not isinstance(step, dict):
+        return []
+    top = step.get("iframe_path")
+    if isinstance(top, list) and top:
+        return [s.strip() for s in top if isinstance(s, str) and s.strip()]
+    fb = step.get("fallbacks")
+    if isinstance(fb, dict):
+        ip = fb.get("iframe_path")
+        if isinstance(ip, list):
+            return [s.strip() for s in ip if isinstance(s, str) and s.strip()][:5]
+    return []
+
+
+def _frame_locator_for_step(page: Page, step: Any):
+    """Build Playwright frame_locator chain for nested iframes (cross-origin safe)."""
+    path = _step_iframe_path(step)
+    if not path:
+        return None
+    fl = page
+    for sel in path:
+        fl = fl.frame_locator(sel)
+    return fl
+
+
+async def _robust_click_scoped(page: Page, step: Any, selector: str, timeout: int = 25000) -> None:
+    """Click via frame_locator when step carries iframe_path, else top-level _robust_click."""
+    fl = _frame_locator_for_step(page, step)
+    if fl is not None and selector:
+        loc = fl.locator(selector).first
+        try:
+            await loc.click(timeout=timeout)
+            return
+        except Exception:
+            await loc.click(force=True, timeout=max(2000, int(timeout * 0.35)))
+            return
+    await _robust_click(page, selector, timeout=timeout)
+
+
+async def _fill_scoped(page: Page, step: Any, selector: str, value: str, timeout: int,
+                       humanize: bool = True) -> None:
+    """Fill via frame_locator when iframe_path present."""
+    fl = _frame_locator_for_step(page, step)
+    if fl is not None and selector:
+        await fl.locator(selector).first.fill(str(value), timeout=timeout)
+        return
+    if not humanize:
+        await page.fill(selector, str(value), timeout=timeout)
+        return
+    try:
+        from form_filler import _human_type_field as _htf, _human_tab_or_pause as _htp
+        el_h = await page.query_selector(selector)
+        if el_h is not None:
+            ok_h = await _htf(page, el_h, str(value))
+            if ok_h:
+                await _htp(page)
+            else:
+                await page.fill(selector, str(value), timeout=timeout)
+        else:
+            await page.fill(selector, str(value), timeout=timeout)
+    except Exception:
+        await page.fill(selector, str(value), timeout=timeout)
+
+
 # Returns silently on success; raises last exception on total failure.
 async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
     """Click that survives "intercepted by another element" and "not in
@@ -14392,6 +14457,29 @@ async def _smart_check_with_fallback(page, selector: str, want_checked: bool = T
         raise last_err
 
 
+def _is_step_miss_error(err: Any) -> bool:
+    """True when a step failed because its target was absent / not ready in time."""
+    msg = str(err or "").lower()
+    return any(
+        k in msg
+        for k in (
+            "timeout",
+            "timed out",
+            "not found",
+            "wait_for_selector exhausted",
+            "waiting for selector",
+            "no element",
+            "strict mode violation",
+            "element is not visible",
+            "element is not attached",
+            "element is not enabled",
+            "element is not interactable",
+            "intercepts pointer events",
+            "exceeded",
+        )
+    )
+
+
 async def _execute_automation_steps(
     page: Page,
     row: Dict[str, Any],
@@ -14405,6 +14493,7 @@ async def _execute_automation_steps(
     job_id: Optional[str] = None,
     visit_idx: Optional[int] = None,
     step_timeout_multiplier: float = 1.0,  # 2026-06 — stretch per-step ceilings
+    skip_missing_steps: bool = True,  # 2026-07 — skip absent steps, try next
 ) -> Dict[str, Any]:
     """Execute a user-provided automation script step-by-step. Returns
     {status, error?, executed_steps, step_results?}.  Each step format:
@@ -14565,8 +14654,24 @@ async def _execute_automation_steps(
         return asyncio.create_task(_beat())
 
     try:
+        _conditional_skip_remaining = 0
         for idx, step in enumerate(steps or []):
             if not isinstance(step, dict):
+                continue
+            if _conditional_skip_remaining > 0:
+                _conditional_skip_remaining -= 1
+                executed += 1
+                if collect_timings:
+                    step_results.append({
+                        "idx": idx,
+                        "action": (step.get("action") or "skip").strip().lower(),
+                        "selector": (step.get("selector") or "")[:200],
+                        "ok": True,
+                        "error": "(skipped — conditional_skip)",
+                        "ms": 0,
+                        "optional": True,
+                        "conditional_skipped": True,
+                    })
                 continue
             # 2026-06 — Manual takeover: pause-and-hold hook for the
             # Live Visual Grid. Customer ask:
@@ -14668,8 +14773,9 @@ async def _execute_automation_steps(
                 # state-changing and must complete strictly.
                 "switch_tab", "close_tab",
             }
-            if optional and action in _STRICT_ACTIONS and not bool(step.get("never_strict")):
-                optional = False
+            if not skip_missing_steps:
+                if optional and action in _STRICT_ACTIONS and not bool(step.get("never_strict")):
+                    optional = False
             wait_nav = bool(step.get("wait_nav") or False)
 
             # 2026-01 (additive): real-time step progress callback. When
@@ -14785,20 +14891,11 @@ async def _execute_automation_steps(
                     await page.goto(value or selector, timeout=timeout, wait_until="domcontentloaded")
                 elif action == "click":
                     if wait_nav:
-                        # Expect navigation to fire as a result of the click.
-                        # Many modern lead-gen pages attach JS handlers to the
-                        # submit button that fire analytics/tracking but DO NOT
-                        # actually submit the form — so a bare `page.click` +
-                        # wait_for_load_state("networkidle") misses the fact
-                        # that the form never POSTed. We use expect_navigation
-                        # to detect this explicitly, and fall back to calling
-                        # form.submit() on the button's parent form if nothing
-                        # navigated within the timeout.
                         nav_timeout = min(timeout, 30000)
                         navigated = False
                         try:
                             async with page.expect_navigation(timeout=nav_timeout, wait_until="load"):
-                                await _robust_click(page, selector, timeout=timeout)
+                                await _robust_click_scoped(page, step, selector, timeout=timeout)
                             navigated = True
                         except Exception:
                             navigated = False
@@ -14834,33 +14931,12 @@ async def _execute_automation_steps(
                         except Exception:
                             pass
                     else:
-                        await _robust_click(page, selector, timeout=timeout)
+                        await _robust_click_scoped(page, step, selector, timeout=timeout)
                 elif action == "fill":
-                    # 2026-01 Anti-detect: humanise the fill (see notes
-                    # at the second fill handler ~4675 for the rationale).
-                    # NEW (2026-01) — per-step opt-out: if user set
-                    # `humanize: false` via the Edit-step UI (Visual
-                    # Recorder), skip slow per-char typing and use
-                    # page.fill() directly. Useful for live-test
-                    # debugging or internal forms where stealth doesn't
-                    # matter. Defaults to True (humanised) so existing
-                    # recorded steps keep their anti-detect behaviour.
-                    if step.get("humanize") is False:
-                        await page.fill(selector, str(value), timeout=timeout)
-                    else:
-                        try:
-                            from form_filler import _human_type_field as _htf, _human_tab_or_pause as _htp
-                            el_h = await page.query_selector(selector)
-                            if el_h is not None:
-                                ok_h = await _htf(page, el_h, str(value))
-                                if ok_h:
-                                    await _htp(page)
-                                else:
-                                    await page.fill(selector, str(value), timeout=timeout)
-                            else:
-                                await page.fill(selector, str(value), timeout=timeout)
-                        except Exception:
-                            await page.fill(selector, str(value), timeout=timeout)
+                    await _fill_scoped(
+                        page, step, selector, str(value), timeout,
+                        humanize=step.get("humanize") is not False,
+                    )
                 elif action == "type":
                     # Slower per-char typing (more human) — now with
                     # variable delay + thinking pauses via the helper.
@@ -14882,23 +14958,36 @@ async def _execute_automation_steps(
                         except Exception:
                             await page.type(selector, str(value), delay=int(step.get("delay") or 50), timeout=timeout)
                 elif action == "select":
-                    # 2026-05: robust select with match-strategy + selector
-                    # fallbacks (see _smart_select_with_fallback docstring).
-                    await _smart_select_with_fallback(
-                        page, selector, value,
-                        match_by=str(step.get("match_by") or "label"),
-                        timeout=timeout,
-                    )
+                    _fl_sel = _frame_locator_for_step(page, step)
+                    if _fl_sel is not None and selector:
+                        mb = str(step.get("match_by") or "label")
+                        loc = _fl_sel.locator(selector).first
+                        if mb == "value":
+                            await loc.select_option(value=str(value), timeout=timeout)
+                        else:
+                            await loc.select_option(label=str(value), timeout=timeout)
+                    else:
+                        await _smart_select_with_fallback(
+                            page, selector, value,
+                            match_by=str(step.get("match_by") or "label"),
+                            timeout=timeout,
+                        )
                 elif action == "check":
-                    # 2026-05: handles CSS-styled hidden checkboxes via
-                    # label-click / sibling-click / JS-set fallbacks.
-                    await _smart_check_with_fallback(
-                        page, selector, want_checked=True, timeout=timeout,
-                    )
+                    _fl_chk = _frame_locator_for_step(page, step)
+                    if _fl_chk is not None and selector:
+                        await _fl_chk.locator(selector).first.check(timeout=timeout)
+                    else:
+                        await _smart_check_with_fallback(
+                            page, selector, want_checked=True, timeout=timeout,
+                        )
                 elif action == "uncheck":
-                    await _smart_check_with_fallback(
-                        page, selector, want_checked=False, timeout=timeout,
-                    )
+                    _fl_unchk = _frame_locator_for_step(page, step)
+                    if _fl_unchk is not None and selector:
+                        await _fl_unchk.locator(selector).first.uncheck(timeout=timeout)
+                    else:
+                        await _smart_check_with_fallback(
+                            page, selector, want_checked=False, timeout=timeout,
+                        )
                 elif action == "press":
                     await page.press(selector or "body", value or "Enter", timeout=timeout)
                 elif action == "wait":
@@ -15750,6 +15839,136 @@ async def _execute_automation_steps(
                         f"[close_tab] step #{idx+1} closed tab idx={_close_idx_in_list} "
                         f"now {len(_all_pages) - 1} tab(s) open"
                     )
+                elif action == "iframe_click":
+                    _fs = (step.get("frame_selector") or "").strip()
+                    if not _fs:
+                        raise Exception("iframe_click: frame_selector required")
+                    _fl_ic = page.frame_locator(_fs)
+                    _inner_sel = (selector or "").strip()
+                    _inner_text = _substitute(step.get("text") or "", row)
+                    if _inner_sel:
+                        await _fl_ic.locator(_inner_sel).first.click(timeout=timeout)
+                    elif _inner_text:
+                        await _fl_ic.get_by_text(_inner_text).first.click(timeout=timeout)
+                    else:
+                        raise Exception("iframe_click: selector or text required")
+                elif action == "iframe_fill":
+                    _fs = (step.get("frame_selector") or "").strip()
+                    if not _fs or not selector:
+                        raise Exception("iframe_fill: frame_selector and selector required")
+                    await page.frame_locator(_fs).locator(selector).first.fill(
+                        str(value), timeout=timeout,
+                    )
+                elif action in ("shadow_click",) or (
+                    action == "evaluate" and step.get("shadow_chain")
+                ):
+                    _chain = step.get("shadow_chain") or step.get("chain") or []
+                    if not isinstance(_chain, list) or len(_chain) < 2:
+                        raise Exception("shadow_click: shadow_chain required (2+ selectors)")
+                    _js_chain = "[" + ",".join(
+                        "'" + str(c).replace("'", "\\'") + "'" for c in _chain
+                    ) + "]"
+                    _shadow_js = (
+                        "(function(){"
+                        f"var chain={_js_chain};"
+                        "var root=document;"
+                        "for(var i=0;i<chain.length-1;i++){"
+                        "var el=root.querySelector(chain[i]);"
+                        "if(!el)return;"
+                        "if(el.shadowRoot)root=el.shadowRoot;else root=el;"
+                        "}"
+                        "var target=root.querySelector(chain[chain.length-1]);"
+                        "if(!target)return;"
+                        "target.scrollIntoView({block:'center'});target.click();"
+                        "})();"
+                    )
+                    await page.evaluate(_shadow_js)
+                    _step_note = f"shadow_click chain={' >> '.join(str(c) for c in _chain[-2:])}"
+                elif action == "accept_dialog":
+                    _prompt_val = _substitute(step.get("prompt_text") or step.get("value") or "", row)
+
+                    async def _accept_dialog_cb(dialog) -> None:
+                        try:
+                            if dialog.type == "prompt" and _prompt_val:
+                                await dialog.accept(_prompt_val)
+                            else:
+                                await dialog.accept()
+                        except Exception:
+                            pass
+
+                    def _accept_dialog_sync(dialog) -> None:
+                        asyncio.create_task(_accept_dialog_cb(dialog))
+
+                    page.once("dialog", _accept_dialog_sync)
+                elif action == "dismiss_dialog":
+
+                    async def _dismiss_dialog_cb(dialog) -> None:
+                        try:
+                            await dialog.dismiss()
+                        except Exception:
+                            pass
+
+                    page.once("dialog", lambda d: asyncio.create_task(_dismiss_dialog_cb(d)))
+                elif action in ("set_input_files", "file_upload"):
+                    _files_raw = _substitute(
+                        step.get("files") or step.get("path") or step.get("value") or "", row,
+                    ).strip()
+                    if not _files_raw or not selector:
+                        raise Exception("set_input_files: files path and selector required")
+                    _file_list = [p.strip() for p in _files_raw.split(",") if p.strip()]
+                    _fl_up = _frame_locator_for_step(page, step)
+                    if _fl_up is not None:
+                        await _fl_up.locator(selector).set_input_files(_file_list, timeout=timeout)
+                    else:
+                        await page.set_input_files(selector, _file_list, timeout=timeout)
+                elif action in ("pause_for_human", "captcha_pause", "human_pause"):
+                    _pause_reason = step.get("reason") or action
+                    logger.info(
+                        f"[pause_for_human] step #{idx+1} skipped ({_pause_reason}) — "
+                        "manual pause not automated in headless RUT"
+                    )
+                    _step_note = "manual pause not automated (skipped)"
+                    try:
+                        await page.wait_for_timeout(min(int(step.get("timeout") or 2000), 3000))
+                    except Exception:
+                        pass
+                elif action in ("otp_wait", "wait_for_otp"):
+                    logger.warning(
+                        f"[otp_wait] step #{idx+1} skipped — OTP polling not automated in headless RUT"
+                    )
+                    _step_note = "OTP wait not automated (skipped)"
+                elif action == "conditional_skip":
+                    _if_type = (step.get("if_type") or "visible").strip().lower()
+                    _matched = False
+                    if _if_type in ("visible", "not_visible") and selector:
+                        try:
+                            await page.wait_for_selector(
+                                selector, timeout=int(step.get("if_exists_timeout") or 2000),
+                                state="visible" if _if_type == "visible" else "hidden",
+                            )
+                            _matched = _if_type == "visible"
+                        except Exception:
+                            _matched = _if_type == "not_visible"
+                    elif _if_type == "text":
+                        _txt = _substitute(step.get("text") or "", row)
+                        if _txt:
+                            try:
+                                _body = await page.inner_text("body", timeout=3000)
+                                _matched = _txt.lower() in (_body or "").lower()
+                            except Exception:
+                                _matched = False
+                    if _matched:
+                        _conditional_skip_remaining = max(0, int(step.get("skip_count") or 1))
+                        _step_note = f"conditional_skip matched — skipping next {_conditional_skip_remaining} step(s)"
+                    else:
+                        _step_note = "conditional_skip condition not met"
+                elif action == "set_zoom":
+                    _zoom = float(step.get("level") or step.get("zoom") or 1.0)
+                    await page.evaluate(
+                        "(z) => { try { document.body.style.zoom = String(z); } catch(e) {} }",
+                        _zoom,
+                    )
+                    _step_note = f"zoom={_zoom}"
                 elif action == "branch":
                     # ── 2026-02: Conditional branching ─────────────────
                     # User-facing JSON shape:
@@ -15935,6 +16154,26 @@ async def _execute_automation_steps(
                         if collect_timings:
                             _step_note = "branch matched: none (skipped)"
                 else:
+                    _headless_skip_actions = frozenset({
+                        "pause_for_human", "captcha_pause", "human_pause",
+                        "otp_wait", "wait_for_otp",
+                    })
+                    if action in _headless_skip_actions or optional:
+                        logger.warning(
+                            f"[step #{idx+1}] unknown/headless-only action '{action}' skipped"
+                        )
+                        executed += 1
+                        if collect_timings:
+                            step_results.append({
+                                "idx": idx, "action": action,
+                                "selector": (selector or "")[:200],
+                                "ok": True,
+                                "error": f"(skipped — {action} not supported headless)",
+                                "ms": int((_time_mod.perf_counter() - _t_step_start) * 1000),
+                                "optional": True,
+                                "skipped_unsupported": True,
+                            })
+                        continue
                     if not optional:
                         if collect_timings:
                             _step_ok = False
@@ -16261,6 +16500,7 @@ async def _execute_automation_steps(
                                 skip_captcha=skip_captcha,
                                 self_heal=False,
                                 user_id=alias_user_id,
+                                skip_missing_steps=skip_missing_steps,
                             )
                             if _sub.get("status") == "ok":
                                 _retry_recovered = True
@@ -16287,16 +16527,38 @@ async def _execute_automation_steps(
                     # All retries exhausted — fall through with the last
                     # error so optional / self-heal still get a chance.
                     e = _retry_last_err
-                if optional:
+                _should_skip = optional or (skip_missing_steps and _is_step_miss_error(e))
+                if _should_skip:
                     executed += 1
+                    _skip_tag = (
+                        "(skipped — optional)"
+                        if optional
+                        else "(skipped — step not found)"
+                    )
                     if collect_timings:
                         step_results.append({
                             "idx": idx, "action": action,
                             "selector": (selector or "")[:200],
-                            "ok": True, "error": f"(skipped — optional) {str(e)[:140]}",
+                            "ok": True, "error": f"{_skip_tag} {str(e)[:140]}",
                             "ms": int((_time_mod.perf_counter() - _t_step_start) * 1000),
-                            "optional": True,
+                            "optional": bool(optional),
+                            "skipped_missing": bool(skip_missing_steps and not optional),
                         })
+                    if on_step_progress is not None:
+                        try:
+                            await on_step_progress({
+                                "idx": idx,
+                                "action": action,
+                                "selector": (selector or "")[:200],
+                                "total_steps": len(steps or []),
+                                "status": "skipped",
+                                "error": f"{_skip_tag} {str(e)[:140]}",
+                                "ms": int((_time_mod.perf_counter() - _t_step_start) * 1000),
+                                "timestamp_ms": int(_time_mod.time() * 1000),
+                                "page_url": (page.url or "")[:300] if hasattr(page, "url") else "",
+                            })
+                        except Exception:
+                            pass
                     continue
                 # ── Self-heal: ask AI to propose a recovery action ──────
                 if self_heal and heal_used < MAX_HEAL:

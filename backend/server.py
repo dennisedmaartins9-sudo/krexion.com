@@ -21636,6 +21636,10 @@ async def vr_diagnostics(user: dict = Depends(get_current_user)):
 class VRStartReq(BaseModel):
     url: str
     proxy: Optional[str] = None
+    # v2.6.2 — Optional proxy provider from Settings › Proxy Providers.
+    # When proxy is empty but this is set, the backend resolves one
+    # fresh line from the provider before launching Chromium.
+    proxy_provider_id: Optional[str] = None
     user_agent: Optional[str] = None
     headers: Optional[List[str]] = None  # excel column names
     # 2026-05: One sample data row used DURING recording so form
@@ -21656,6 +21660,11 @@ class VRStartReq(BaseModel):
     viewport_w: Optional[int] = 0
     viewport_h: Optional[int] = 0
     device_scale_factor: Optional[float] = 0.0
+    auto_insert_waits: Optional[bool] = False
+
+
+class VRSettingsReq(BaseModel):
+    auto_insert_waits: bool
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -21744,6 +21753,21 @@ async def vr_ai_generate_steps(
             description=(description or None),
             excel_columns=cols,
         )
+        try:
+            from automation_extensions import lint_steps as _lint_steps
+            _steps = result.get("steps") if isinstance(result, dict) else None
+            if isinstance(_steps, list):
+                _issues = _lint_steps(_steps)
+                _errors = [i for i in _issues if i.get("level") == "error"]
+                result = dict(result)
+                result["lint_issues"] = _issues
+                result["lint_ok"] = not bool(_errors)
+                if _errors:
+                    result["lint_error_summary"] = "; ".join(
+                        (e.get("message") or "")[:120] for e in _errors[:5]
+                    )
+        except Exception:
+            pass
         return result
     finally:
         try:
@@ -21811,11 +21835,44 @@ async def vr_start(
     check_user_feature(user, "real_user_traffic")
     if vr is None:
         raise HTTPException(status_code=500, detail="Visual recorder module not available")
+    # Resolve proxy from provider when caller selected one but did not paste a line.
+    resolved_proxy = (req.proxy or "").strip() or None
+    pp_id = (req.proxy_provider_id or "").strip()
+    if not resolved_proxy and pp_id:
+        _pp_resolver = globals().get("get_proxy_from_provider")
+        _pp_bulk = globals().get("get_proxy_lines_from_provider")
+        try:
+            if _pp_resolver is not None:
+                _pp_res = await _pp_resolver(user["id"], pp_id)
+                if _pp_res.get("use_proxyjet") and _pp_bulk is not None:
+                    _pp_res = await _pp_bulk(user["id"], pp_id, 1)
+                    if _pp_res.get("lines"):
+                        resolved_proxy = _pp_res["lines"][0]
+                    elif _pp_res.get("error"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Proxy provider failed: {_pp_res['error']}",
+                        )
+                elif _pp_res.get("proxy"):
+                    resolved_proxy = _pp_res["proxy"]
+                elif _pp_res.get("error"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Proxy provider failed: {_pp_res['error']}",
+                    )
+        except HTTPException:
+            raise
+        except Exception as _pp_err:
+            logger.warning(f"[vr] proxy provider {pp_id} resolution failed: {_pp_err}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not resolve proxy from provider: {_pp_err}",
+            )
     try:
         sess = await vr.start_session(
             user_id=user["id"],
             url=req.url,
-            proxy=req.proxy,
+            proxy=resolved_proxy,
             user_agent=req.user_agent,
             headers=req.headers or [],
             sample_row=req.sample_row or None,
@@ -21827,6 +21884,8 @@ async def vr_start(
             viewport_w=int(req.viewport_w or 0),
             viewport_h=int(req.viewport_h or 0),
             device_scale_factor=float(req.device_scale_factor or 0.0),
+            auto_insert_waits=bool(req.auto_insert_waits),
+            proxy_provider_id=pp_id,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=429, detail=str(e))
@@ -21841,6 +21900,7 @@ async def vr_start(
         "step_count": len(sess.steps),
         "state": sess.state,
         "error_message": sess.error_message or "",
+        "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
     }
 
 
@@ -22448,10 +22508,22 @@ async def vr_state(session_id: str, user: dict = Depends(get_current_user)):
         "steps": sess.steps,
         "step_count": len(sess.steps),
         "headers": sess.headers,
+        "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
         "target_screenshot_set": bool(sess.target_screenshot_path),
         "final_url": sess.final_url,
         "idle_seconds": int(time.time() - sess.last_activity),
     }
+
+
+@api_router.post("/visual-recorder/{session_id}/settings")
+async def vr_settings(session_id: str, req: VRSettingsReq, user: dict = Depends(get_current_user)):
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return vr.set_session_settings(sess, auto_insert_waits=req.auto_insert_waits)
 
 
 class VRClickReq(BaseModel):
@@ -22712,6 +22784,10 @@ class _VRLiveTestReq(BaseModel):
     # 2026-01 "Replay from here" — skip the first N steps and pick up
     # replay on the current browser state. Forces fresh_page=False.
     start_index: int = 0
+    # Test like RUT: self_heal on, skip_captcha off, strict step failures
+    rut_parity: bool = False
+    self_heal: Optional[bool] = None
+    skip_captcha: Optional[bool] = None
 
 class _VRAutoFixReq(BaseModel):
     # Apply EITHER a single fix (kind + at_step) OR every auto_fixable
@@ -22738,6 +22814,9 @@ async def vr_live_test(session_id: str, req: _VRLiveTestReq, user: dict = Depend
         sample_row=req.sample_row,
         fresh_page=req.fresh_page,
         start_index=max(0, int(req.start_index or 0)),
+        rut_parity=bool(req.rut_parity),
+        self_heal=req.self_heal,
+        skip_captcha=req.skip_captcha,
     )
 
 

@@ -70,6 +70,10 @@ const authH = () => ({
 function getStepDisplayName(s) {
   if (s?.name) return s.name;
   const a = (s?.action || "").toLowerCase();
+  if (s?.source === "auto_wait") {
+    if (a === "wait") return `Auto wait ${s.ms || 0}ms`;
+    if (a === "wait_for_load") return "Auto wait for load";
+  }
   // Short, value-aware preview helpers
   const _val = (v, n = 24) => {
     const x = (v == null ? "" : String(v)).trim();
@@ -227,6 +231,10 @@ const DEVICE_PRESETS = [
 const LS_RECENT_KEY = "vr_recent_v1";
 const LS_DRAFT_KEY = "vr_draft_v1";
 const LS_VR_RUT_HANDOFF = "vr_automation_handoff";
+const LS_VR_AUTO_WAITS = "vr_auto_insert_waits";
+const LS_VR_PROXY_PROVIDER = "vr_proxy_provider_id";
+const LS_RUT_SELF_HEAL = "rut_self_heal";
+const LS_RUT_SKIP_CAPTCHA = "rut_skip_captcha";
 
 function stashVrAutomationForRut(bundle) {
   if (!bundle) return;
@@ -237,8 +245,21 @@ function stashVrAutomationForRut(bundle) {
         automation_json: bundle.automation_json || bundle.steps || [],
         url: bundle.url || "",
         headers: bundle.headers || [],
+        proxy: bundle.proxy || "",
+        proxy_provider_id: bundle.proxy_provider_id || "",
+        country: bundle.country || "",
+        device_preset: bundle.device_preset || "",
+        user_agent: bundle.user_agent || "",
+        auto_insert_waits: !!bundle.auto_insert_waits,
+        target_screenshot_path: bundle.target_screenshot_path || "",
+        session_id: bundle.session_id || "",
       }),
     );
+    localStorage.setItem(LS_RUT_SELF_HEAL, "1");
+    localStorage.setItem(LS_RUT_SKIP_CAPTCHA, "0");
+    if (bundle.proxy_provider_id) {
+      localStorage.setItem(LS_VR_PROXY_PROVIDER, bundle.proxy_provider_id);
+    }
   } catch { /* quota / private mode */ }
 }
 
@@ -386,8 +407,16 @@ export default function VisualRecorderPage() {
   const [scanResult, setScanResult] = useState(null); // {text, selector, xpath, xpath_stable, xpath_abs, tag, attrs, bbox}
   const [navUrl, setNavUrl] = useState("");
   const [waitMs, setWaitMs] = useState(2000);
+  const [autoInsertWaits, setAutoInsertWaits] = useState(() => {
+    try {
+      return localStorage.getItem(LS_VR_AUTO_WAITS) === "1";
+    } catch {
+      return false;
+    }
+  });
   const [busy, setBusy] = useState(false);
   const [finalBundle, setFinalBundle] = useState(null);
+  const [finalizeChecklistOpen, setFinalizeChecklistOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [recentRecordings, setRecentRecordings] = useState([]);
@@ -405,8 +434,14 @@ export default function VisualRecorderPage() {
   // Defaults to US — user picks via the country dropdown in setup.
   const [country, setCountry] = useState("US");
   const [pjAvailable, setPjAvailable] = useState(false);
-  const [defaultProviderId, setDefaultProviderId] = useState("");
-  const [pjCountry, setPjCountry] = useState("US");
+  const [proxyProviders, setProxyProviders] = useState([]);
+  const [proxyProviderId, setProxyProviderId] = useState(() => {
+    try {
+      return localStorage.getItem(LS_VR_PROXY_PROVIDER) || "";
+    } catch {
+      return "";
+    }
+  });
   const [saving, setSaving] = useState(false);
   const [savedToLibraryId, setSavedToLibraryId] = useState(null);
 
@@ -439,6 +474,7 @@ export default function VisualRecorderPage() {
   // ── 2026-05: Live Test + Smart Diagnostics ──
   const [liveTestResult, setLiveTestResult] = useState(null); // {ok, total_ms, step_results, diagnostics, ...}
   const [liveTesting, setLiveTesting] = useState(false);
+  const [liveTestRutParity, setLiveTestRutParity] = useState(false);
   // 2026-01: Real-time step-by-step progress feed during live test.
   // Populated by polling /live-progress endpoint every ~400ms while
   // a test is running. Cleared at the start of each run.
@@ -617,10 +653,8 @@ export default function VisualRecorderPage() {
     } catch {}
   };
 
-  // v2.6.2 — Refactored: ProxyJet-specific fetch removed. This helper
-  // now uses the user's default Proxy Provider (Settings › Proxy
-  // Providers) via /api/proxy-providers/{id}/generate-batch. If the
-  // user has no provider yet, we prompt them to add one.
+  // v2.6.2 — Load enabled Proxy Providers (Settings › Proxy Providers)
+  // for the provider dropdown + one-click "From Provider" fetch.
   useEffect(() => {
     (async () => {
       try {
@@ -628,14 +662,20 @@ export default function VisualRecorderPage() {
         if (r.ok) {
           const list = await r.json();
           const enabled = Array.isArray(list) ? list.filter(p => p.enabled !== false) : [];
+          setProxyProviders(enabled);
           setPjAvailable(enabled.length > 0);
-          if (enabled.length > 0 && !defaultProviderId) {
-            setDefaultProviderId(enabled[0].id);
-          }
         }
       } catch {}
     })();
   }, []);
+
+  const onProxyProviderChange = (id) => {
+    setProxyProviderId(id);
+    try {
+      if (id) localStorage.setItem(LS_VR_PROXY_PROVIDER, id);
+      else localStorage.removeItem(LS_VR_PROXY_PROVIDER);
+    } catch {}
+  };
 
   // ── Live recording-elapsed counter ─────────────────────────────────
   useEffect(() => {
@@ -653,19 +693,19 @@ export default function VisualRecorderPage() {
     return () => clearInterval(t);
   }, [setupStage, sessionState]);
 
-  // v2.6.2 — Fetch ONE fresh proxy from the user's default provider
+  // v2.6.2 — Fetch ONE fresh proxy from the selected provider
   // (generic — works for any provider kind).
   const useProxyJetProxy = async () => {
-    if (!defaultProviderId) {
-      toast.error("Add a Proxy Provider first (Settings › Proxy Providers)");
+    if (!proxyProviderId) {
+      toast.error("Select a Proxy Provider above, or add one in Settings › Proxy Providers");
       return;
     }
     setBusy(true);
     try {
-      const r = await fetch(`${API_URL}/api/proxy-providers/${defaultProviderId}/generate-batch`, {
+      const r = await fetch(`${API_URL}/api/proxy-providers/${proxyProviderId}/generate-batch`, {
         method: "POST",
         headers: authH(),
-        body: JSON.stringify({ count: 1, country: pjCountry }),
+        body: JSON.stringify({ count: 1, country }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
@@ -770,16 +810,16 @@ export default function VisualRecorderPage() {
   // v2.6.2 — Fetch a fresh proxy from the user's default Proxy
   // Provider directly into the AI dialog's local proxy field.
   const aiUseProxyJet = async () => {
-    if (!defaultProviderId) {
-      toast.error("Add a Proxy Provider first (Settings › Proxy Providers)");
+    if (!proxyProviderId) {
+      toast.error("Select a Proxy Provider above, or add one in Settings › Proxy Providers");
       return;
     }
     setAiProxyJetBusy(true);
     try {
-      const r = await fetch(`${API_URL}/api/proxy-providers/${defaultProviderId}/generate-batch`, {
+      const r = await fetch(`${API_URL}/api/proxy-providers/${proxyProviderId}/generate-batch`, {
         method: "POST",
         headers: authH(),
-        body: JSON.stringify({ count: 1, country: pjCountry }),
+        body: JSON.stringify({ count: 1, country }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
@@ -954,6 +994,10 @@ export default function VisualRecorderPage() {
         setAiError("AI returned an empty step list. Try a more detailed description or clearer screenshots.");
         return;
       }
+      if (data.lint_ok === false && data.lint_error_summary) {
+        setAiError(`AI steps generated but lint found issues: ${data.lint_error_summary}`);
+        toast.warning("Generated steps have lint errors — review before recording.");
+      }
       setAiProviderUsed(data.provider_display || data.provider || "");
       // Replace the current draft with the AI-generated steps. The
       // user can still Start Recording on top and edit each step.
@@ -1015,6 +1059,7 @@ export default function VisualRecorderPage() {
         body: JSON.stringify({
           url: effectiveUrl,
           proxy: proxy.trim() || null,
+          proxy_provider_id: proxyProviderId || null,
           user_agent: ua.trim() || null,
           headers: headers,
           // 2026-05: pass first data row so form inputs auto-fill
@@ -1030,6 +1075,7 @@ export default function VisualRecorderPage() {
             ? devicePreset
             : (devicePreset === "desktop" ? "desktop" : "auto"),
           country: (country || "").toLowerCase(),
+          auto_insert_waits: !!autoInsertWaits,
         }),
       });
       const d = await r.json();
@@ -1117,8 +1163,29 @@ export default function VisualRecorderPage() {
       if (d.state) setSessionState(d.state);
       if (d.state === "error") setSessionError(d.error_message || "Unknown error");
       if (typeof d.elapsed_seconds === "number") setConnectElapsed(d.elapsed_seconds);
+      if (typeof d.auto_insert_waits === "boolean") {
+        setAutoInsertWaits(d.auto_insert_waits);
+        try {
+          localStorage.setItem(LS_VR_AUTO_WAITS, d.auto_insert_waits ? "1" : "0");
+        } catch { /* quota / private mode */ }
+      }
     } catch {}
   }, [sessionId]);
+
+  const setAutoInsertWaitsPref = async (enabled) => {
+    setAutoInsertWaits(enabled);
+    try {
+      localStorage.setItem(LS_VR_AUTO_WAITS, enabled ? "1" : "0");
+    } catch { /* quota / private mode */ }
+    if (!sessionId) return;
+    try {
+      await fetch(`${API_URL}/api/visual-recorder/${sessionId}/settings`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({ auto_insert_waits: !!enabled }),
+      });
+    } catch { /* best effort */ }
+  };
 
   const refreshScreenshot = useCallback(() => {
     if (!sessionId) return;
@@ -1301,7 +1368,7 @@ export default function VisualRecorderPage() {
       // Ctrl+Enter — finalize
       if (!editable && ctrl && e.key === "Enter") {
         e.preventDefault();
-        if (steps.length >= 2 && !busy) finalize();
+        if (steps.length >= 2 && !busy) requestFinalize();
         return;
       }
       // Esc — cancel pending bindings
@@ -1629,6 +1696,9 @@ export default function VisualRecorderPage() {
         }
       } else if (tool === "default") {
         const txt = (d.element?.text || "").slice(0, 30);
+        if (d.cross_origin_iframe || d.warning) {
+          toast.warning(d.warning || "Cross-origin iframe — use ⋯ More → iframe click for reliable RUT replay.", { duration: 6000 });
+        }
         toast.success(txt ? `Click recorded: "${txt}"` : "Click recorded");
       }
       refreshState();
@@ -2063,6 +2133,34 @@ export default function VisualRecorderPage() {
       });
       toast.success("Wait-for-load added");
       refreshState();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addAutoContinueSurvey = async () => {
+    if (!sessionId) return;
+    const newStep = {
+      action: "auto_continue_survey",
+      max_iterations: 15,
+      iteration_wait_ms: 1500,
+      optional: false,
+      name: "Auto-continue survey / deal wall (same as RUT Smart Funnel tail)",
+    };
+    const merged = [...(steps || []), newStep];
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/import-steps`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({ steps: merged }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      setSteps(merged);
+      toast.success("auto_continue_survey step added — RUT will drive Yes/No + deal cards after your form steps");
+    } catch (e) {
+      toast.error(e.message || "Failed to add step");
     } finally {
       setBusy(false);
     }
@@ -2752,6 +2850,8 @@ export default function VisualRecorderPage() {
           return [];
         })(),
         pickOptionsEdited: false,
+        optional: !!s.optional,
+        never_strict: !!s.never_strict,
       },
     });
   };
@@ -3139,6 +3239,8 @@ export default function VisualRecorderPage() {
         .filter(o => o.text || o.selector || o.xpath);
       patch.pick_options = cleaned;
     }
+    patch.optional = !!draft.optional;
+    patch.never_strict = !!draft.never_strict;
 
     try {
       const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/step/${index}`, {
@@ -3222,6 +3324,7 @@ export default function VisualRecorderPage() {
     // current state (post-previous-failure page).
     const startIndex = Math.max(0, Number(opts.startIndex || 0));
     const freshPage = startIndex > 0 ? false : true;
+    const rutParity = opts.rutParity != null ? !!opts.rutParity : !!liveTestRutParity;
     // 2026-06 — Make "Run Live Test from Start" visibly behave like a
     // brand-new RUT job: clear ALL prior live-frame / progress state,
     // show a clear "starting fresh from step 1" toast so the operator
@@ -3230,10 +3333,12 @@ export default function VisualRecorderPage() {
     // This addresses the customer ask "jab live run test krte hein to
     // start se show ho jese aik new job chalate hein".
     if (startIndex === 0) {
-      toast(`▶ Starting fresh live run — ${steps.length} step${steps.length === 1 ? "" : "s"} from #1 (job-style replay)`, {
-        icon: "🚀",
-        duration: 3500,
-      });
+      toast(
+        rutParity
+          ? `▶ RUT parity test — self-heal ON, captcha NOT skipped, strict steps (${steps.length} total)`
+          : `▶ Live Test (lenient) — ${steps.length} step${steps.length === 1 ? "" : "s"} from #1`,
+        { icon: rutParity ? "🎯" : "🚀", duration: 3500 },
+      );
     }
     setLiveTesting(true);
     setLiveTestResult(null);
@@ -3299,7 +3404,12 @@ export default function VisualRecorderPage() {
       const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/live-test`, {
         method: "POST",
         headers: { ...authH(), "Content-Type": "application/json" },
-        body: JSON.stringify({ fresh_page: freshPage, start_index: startIndex }),
+        body: JSON.stringify({
+          fresh_page: freshPage,
+          start_index: startIndex,
+          rut_parity: rutParity,
+          sample_row: Object.keys(sampleRow || {}).length ? sampleRow : null,
+        }),
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
@@ -3468,7 +3578,7 @@ export default function VisualRecorderPage() {
       const fd = new FormData();
       fd.append("name", name);
       fd.append("automation_json", JSON.stringify(finalBundle.automation_json));
-      fd.append("description", `Recorded on ${new Date().toLocaleString()} · ${finalBundle.step_count} steps`);
+      fd.append("description", `Recorded on ${new Date().toLocaleString()} · ${finalBundle.step_count} steps · VR session ${finalBundle.session_id?.slice(0, 8) || ""}${finalBundle.target_screenshot_path ? " · target screenshot ✓" : ""}${finalBundle.proxy_provider_id ? ` · provider ${finalBundle.proxy_provider_id}` : ""}`);
       const r = await fetch(`${API_URL}/api/uploads/automation-json`, {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
@@ -3568,6 +3678,7 @@ export default function VisualRecorderPage() {
         body: JSON.stringify({
           url: finalBundle.url,
           proxy: finalBundle.proxy || null,
+          proxy_provider_id: proxyProviderId || null,
           user_agent: finalBundle.user_agent || null,
           headers: finalBundle.headers || [],
           sample_row: Object.keys(sampleRow || {}).length ? sampleRow : null,
@@ -3641,12 +3752,18 @@ export default function VisualRecorderPage() {
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       setFinalBundle(d);
       setSetupStage("done");
+      setFinalizeChecklistOpen(false);
       toast.success(`Recording complete — ${d.step_count} steps`);
     } catch (err) {
       toast.error(err.message || String(err));
     } finally {
       setBusy(false);
     }
+  };
+
+  const requestFinalize = () => {
+    if (steps.length < 2) return;
+    setFinalizeChecklistOpen(true);
   };
 
   const stopAndDiscard = async () => {
@@ -3707,7 +3824,11 @@ export default function VisualRecorderPage() {
   // ── UI ────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-zinc-950 to-black text-zinc-100" data-testid="visual-recorder-page">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+        <div className="mb-4 p-3 rounded-lg bg-amber-950/30 border border-amber-700/40 text-sm text-amber-100" data-testid="vr-desktop-banner">
+          Visual Recorder live browser recording requires <strong>Krexion Desktop</strong> (local mode).
+          Cloud par aap JSON edit / Live Test kar sakte hain; recording ke liye desktop app kholein.
+        </div>
         {/* ─── Header (pro-grade, with live session badge) ─── */}
         <div className="flex flex-wrap items-center justify-between mb-5 gap-3">
           <div className="flex items-center gap-3 min-w-0">
@@ -4096,6 +4217,28 @@ export default function VisualRecorderPage() {
                   <option value="NZ">New Zealand (en-NZ, Pacific/Auckland)</option>
                 </select>
 
+                <label className="block text-sm font-medium text-zinc-300 mb-1 mt-3">
+                  Proxy Provider <span className="text-zinc-500 font-normal text-xs">(optional — from Settings › Proxy Providers)</span>
+                </label>
+                <select
+                  value={proxyProviderId}
+                  onChange={(e) => onProxyProviderChange(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-zinc-100 focus:border-emerald-500 focus:outline-none transition-colors"
+                  data-testid="vr-proxy-provider"
+                >
+                  <option value="">(none — paste proxy manually)</option>
+                  {proxyProviders.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} · {(p.kind || "").replace(/_/g, " ")}
+                    </option>
+                  ))}
+                </select>
+                {!pjAvailable && (
+                  <p className="text-[10px] text-zinc-500 mt-1">
+                    Tip: add a Proxy Provider in Settings › Proxy Providers to fetch fresh proxies here.
+                  </p>
+                )}
+
                 <div className="mt-3 flex items-center justify-between">
                   <label className="block text-sm font-medium text-zinc-300 mb-1">
                     Proxy <span className="text-zinc-500 font-normal">(optional)</span>
@@ -4103,10 +4246,10 @@ export default function VisualRecorderPage() {
                   {pjAvailable && (
                     <button
                       onClick={useProxyJetProxy}
-                      disabled={busy}
+                      disabled={busy || !proxyProviderId}
                       className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-md bg-indigo-600/30 hover:bg-indigo-600/60 border border-indigo-500/40 text-indigo-200 disabled:opacity-50"
                       data-testid="vr-use-provider-proxy"
-                      title="Fetch a fresh proxy from your default Proxy Provider"
+                      title="Fetch a fresh proxy from the selected Proxy Provider"
                     >
                       <Zap className="w-3 h-3" /> From Provider
                     </button>
@@ -4120,12 +4263,6 @@ export default function VisualRecorderPage() {
                   className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-zinc-100 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none font-mono text-xs transition-colors"
                   data-testid="vr-proxy-input"
                 />
-                {!pjAvailable && (
-                  <p className="text-[10px] text-zinc-500 mt-1">
-                    Tip: add a Proxy Provider in Settings › Proxy Providers for one-click fresh proxies here.
-                  </p>
-                )}
-
                 <label className="block text-sm font-medium text-zinc-300 mb-1 mt-3">User Agent <span className="text-zinc-500 font-normal">(optional)</span></label>
                 <input
                   type="text"
@@ -4330,6 +4467,11 @@ export default function VisualRecorderPage() {
                   )}
 
                   {/* Existing inline tab strip (kept for quick clicks). */}
+                  {tabs.length > 1 && (
+                    <p className="w-full text-[10px] text-zinc-500 px-1 mb-0.5">
+                      💡 Naya tab khule to yahan click karein — <code className="text-zinc-400">switch_tab</code> step auto record hota hai.
+                    </p>
+                  )}
                   {tabs.length > 1 && tabs.map((t) => {
                     const isActive = t.is_active || t.index === activeTabIndex;
                     let domain = "";
@@ -5079,6 +5221,31 @@ export default function VisualRecorderPage() {
                 <button onClick={addWaitLoad} className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs">
                   <Clock className="w-3.5 h-3.5" /> Wait for Load
                 </button>
+                <label
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs cursor-pointer select-none"
+                  title="When ON, each recorded click/fill/type automatically adds wait steps after it. When OFF, add waits manually."
+                  data-testid="vr-auto-wait-toggle-label"
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoInsertWaits}
+                    onChange={(e) => setAutoInsertWaitsPref(e.target.checked)}
+                    data-testid="vr-auto-wait-toggle"
+                  />
+                  Auto waits after steps
+                </label>
+                <p className="w-full text-[10px] text-amber-600/90 -mt-1">
+                  Optional auto-waits can mask missing selectors — prefer explicit wait_for_selector when debugging failures.
+                </p>
+                <button
+                  onClick={addAutoContinueSurvey}
+                  disabled={sessionState !== "ready" || busy}
+                  title="Append RUT auto_continue_survey — drives Yes/No survey + deal cards after your form (deal-wall offers)"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-violet-900/40 hover:bg-violet-800/50 border border-violet-600/40 text-violet-200 text-xs disabled:opacity-40"
+                  data-testid="vr-auto-continue-survey-btn"
+                >
+                  🔄 Auto-continue survey
+                </button>
                 <div className="inline-flex items-center gap-1">
                   <input
                     type="number"
@@ -5190,12 +5357,12 @@ export default function VisualRecorderPage() {
                   </button>
                   <button
                     onClick={addCaptchaPause}
-                    disabled={sessionState !== "ready"}
-                    title="Detect CAPTCHA + insert pause-for-human (Electron app pops up for manual solve at replay time)"
-                    className="px-2 py-1 rounded bg-zinc-800 hover:bg-rose-700/40 border border-zinc-700 hover:border-rose-500/40 text-zinc-300 text-[10px] disabled:opacity-40"
+                    disabled
+                    title="Coming soon — use RUT Skip Captcha for headless runs. CAPTCHA needs manual solve in desktop app."
+                    className="px-2 py-1 rounded bg-zinc-800/50 border border-zinc-700 text-zinc-500 text-[10px] cursor-not-allowed opacity-60"
                     data-testid="vr-captcha-pause-btn"
                   >
-                    🛡️ Captcha pause
+                    🛡️ Captcha pause (soon)
                   </button>
                   <button
                     onClick={addFileUpload}
@@ -5701,21 +5868,41 @@ export default function VisualRecorderPage() {
 
               {/* Action buttons */}
               <div className="mt-3 pt-3 border-t border-zinc-800 space-y-2">
+                <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                  <label className="inline-flex items-center gap-1 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={liveTestRutParity}
+                      onChange={(e) => setLiveTestRutParity(e.target.checked)}
+                      data-testid="vr-live-test-rut-parity"
+                    />
+                    Test like RUT (self-heal ON, captcha NOT skipped, strict steps)
+                  </label>
+                </div>
+                {!liveTestRutParity && (
+                  <p className="text-[10px] text-amber-600/90" data-testid="vr-live-test-lenient-warn">
+                    Live Test uses lenient defaults (skip missing steps, skip captcha) — enable “Test like RUT” before Finalize.
+                  </p>
+                )}
                 <button
-                  onClick={runLiveTest}
+                  onClick={() => runLiveTest({ rutParity: liveTestRutParity })}
                   disabled={steps.length === 0 || liveTesting || busy}
                   data-testid="vr-live-test-btn"
                   className="w-full inline-flex items-center justify-center gap-1.5 py-2 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-sm font-medium transition-colors"
-                  title="Opens a FRESH page and runs all recorded steps end-to-end from the start — exactly like a real RUT visit. See per-step pass/fail + suggested fixes for any failures before you Finalize."
+                  title={liveTestRutParity
+                    ? "RUT parity — matches production job settings"
+                    : "Lenient Live Test — may pass steps that fail in RUT"}
                 >
                   {liveTesting ? (
-                    <><Loader2 className="w-4 h-4 animate-spin" /> Running from start…</>
+                    <><Loader2 className="w-4 h-4 animate-spin" /> Running…</>
+                  ) : liveTestRutParity ? (
+                    <><Zap className="w-4 h-4" /> Test like RUT ({steps.length} steps)</>
                   ) : (
-                    <><Zap className="w-4 h-4" /> Run Live Test from Start ({steps.length} step{steps.length === 1 ? "" : "s"})</>
+                    <><Zap className="w-4 h-4" /> Run Live Test ({steps.length} step{steps.length === 1 ? "" : "s"})</>
                   )}
                 </button>
                 <div className="text-[10px] text-zinc-500 text-center -mt-1">
-                  Opens a fresh browser tab and replays your steps from step 0
+                  {liveTestRutParity ? "Stricter replay — closer to real RUT visits" : "Opens a fresh browser tab from step 0"}
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <button
@@ -5726,7 +5913,7 @@ export default function VisualRecorderPage() {
                     <Square className="w-4 h-4" /> Discard
                   </button>
                   <button
-                    onClick={finalize}
+                    onClick={requestFinalize}
                     disabled={steps.length < 2 || busy}
                     className="inline-flex items-center justify-center gap-1.5 py-2 rounded bg-emerald-600 hover:bg-emerald-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-sm font-medium transition-colors"
                     data-testid="vr-finalize-btn"
@@ -6286,6 +6473,15 @@ export default function VisualRecorderPage() {
                 <div className="text-xs text-zinc-500">Final Page</div>
                 <div className="text-2xl font-semibold text-emerald-400">{finalBundle.target_screenshot_path ? "✓" : "—"}</div>
               </div>
+            </div>
+
+            <div className="mb-4 p-3 rounded-lg bg-indigo-950/40 border border-indigo-600/30 text-sm text-indigo-100">
+              <strong className="text-indigo-200">Deal-wall / reward offers?</strong>{" "}
+              Har deal click record karne ki bajaye RUT{" "}
+              <Link to="/real-user-traffic" className="underline text-indigo-300 hover:text-indigo-100">
+                Smart Funnel
+              </Link>{" "}
+              use karein — retail → survey → form → deals automatically handle hota hai.
             </div>
 
             <div className="flex flex-wrap gap-2 mb-4">
@@ -6956,6 +7152,22 @@ export default function VisualRecorderPage() {
                   AI generates steps, this proxy is auto-copied into the
                   main setup screen so Start Recording uses it. */}
               <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                  Proxy Provider <span className="text-zinc-500 font-normal">(optional)</span>
+                </label>
+                <select
+                  value={proxyProviderId}
+                  onChange={(e) => onProxyProviderChange(e.target.value)}
+                  className="w-full px-3 py-2 rounded-md border border-zinc-700 bg-zinc-900 text-zinc-100 focus:border-purple-500 focus:outline-none transition-colors text-sm mb-2"
+                  data-testid="vr-ai-proxy-provider"
+                >
+                  <option value="">(none — paste proxy manually)</option>
+                  {proxyProviders.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} · {(p.kind || "").replace(/_/g, " ")}
+                    </option>
+                  ))}
+                </select>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="block text-xs font-medium text-zinc-300">
                     Proxy <span className="text-zinc-500 font-normal">(optional — for geo-restricted offers like US-only)</span>
@@ -6964,10 +7176,10 @@ export default function VisualRecorderPage() {
                     <button
                       type="button"
                       onClick={aiUseProxyJet}
-                      disabled={aiProxyJetBusy || aiBusy}
+                      disabled={aiProxyJetBusy || aiBusy || !proxyProviderId}
                       className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-md bg-indigo-600/30 hover:bg-indigo-600/60 border border-indigo-500/40 text-indigo-200 disabled:opacity-50"
                       data-testid="vr-ai-use-provider-proxy"
-                      title="Fetch a fresh proxy from your default Proxy Provider"
+                      title="Fetch a fresh proxy from the selected Proxy Provider"
                     >
                       {aiProxyJetBusy
                         ? <Loader2 className="w-3 h-3 animate-spin" />
@@ -7727,6 +7939,37 @@ export default function VisualRecorderPage() {
                   </div>
                 </details>
               )}
+
+              <div className="flex flex-wrap gap-4 pt-3 mt-2 border-t border-zinc-800/80">
+                <label className="inline-flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!editingStep.draft.optional}
+                    onChange={(e) =>
+                      setEditingStep({
+                        ...editingStep,
+                        draft: { ...editingStep.draft, optional: e.target.checked },
+                      })
+                    }
+                    data-testid="vr-edit-optional"
+                  />
+                  optional (RUT skip on failure)
+                </label>
+                <label className="inline-flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!editingStep.draft.never_strict}
+                    onChange={(e) =>
+                      setEditingStep({
+                        ...editingStep,
+                        draft: { ...editingStep.draft, never_strict: e.target.checked },
+                      })
+                    }
+                    data-testid="vr-edit-never-strict"
+                  />
+                  never_strict (keep optional in strict mode)
+                </label>
+              </div>
             </div>
             <div className="flex items-center justify-end gap-2 p-4 border-t border-zinc-800">
               <button
@@ -7742,6 +7985,58 @@ export default function VisualRecorderPage() {
                 data-testid="vr-edit-save"
               >
                 <Save className="w-3.5 h-3.5" /> Save Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {finalizeChecklistOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setFinalizeChecklistOpen(false)}
+          data-testid="vr-finalize-checklist-backdrop"
+        >
+          <div
+            className="w-full max-w-md bg-zinc-950 border border-zinc-700 rounded-xl shadow-2xl p-5"
+            onClick={(e) => e.stopPropagation()}
+            data-testid="vr-finalize-checklist"
+          >
+            <h3 className="text-lg font-semibold text-zinc-100 mb-3">Finalize checklist</h3>
+            <ul className="text-sm text-zinc-300 space-y-2 mb-4 list-disc list-inside">
+              <li>{steps.length} steps recorded</li>
+              <li>Live Test (RUT parity) run kiya? {liveTestResult?.ok && liveTestResult?.rut_parity ? "✓" : "—"}</li>
+              <li>
+                Unsupported steps:{" "}
+                {steps.filter((s) =>
+                  ["pause_for_human", "otp_wait", "wait_for_otp", "captcha_pause"].includes(
+                    (s?.action || "").toLowerCase(),
+                  ),
+                ).length || "none"}
+              </li>
+            </ul>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setFinalizeChecklistOpen(false)}
+                className="px-3 py-1.5 rounded bg-zinc-800 text-zinc-300 text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => runLiveTest({ rutParity: true })}
+                className="px-3 py-1.5 rounded bg-blue-700 text-white text-sm"
+              >
+                Run RUT test first
+              </button>
+              <button
+                type="button"
+                onClick={finalize}
+                className="px-3 py-1.5 rounded bg-emerald-600 text-white text-sm font-medium"
+                data-testid="vr-finalize-confirm"
+              >
+                Mark Final
               </button>
             </div>
           </div>

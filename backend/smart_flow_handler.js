@@ -286,19 +286,20 @@
   }
   function pickVisibleSurveyAnswer() {
     var ANSWER =
-      /^(often|rarely|never|sometimes|daily|weekly|monthly|today|past 2 weeks|this month|over a month ago|yes|no|yes!|no!|homeowner|renter|i'?m not|not on medicare|none of the above|full time|part time|unemployed|student|self employed|retired|on disability|other|excellent|good|some problems|major problems|i don't know)$/i;
+      /^(often|rarely|never|sometimes|daily|weekly|monthly|today|past 2 weeks|this month|over a month ago|yes|no|yes!|no!|homeowner|renter|i'?m not|not on medicare|none of the above|full time|part time|unemployed|student|self employed|retired|on disability|other|excellent|good|some problems|major problems|i don't know|skip question)$/i;
     var LONG =
       /^(silent generation|baby boomer|gen x|millennial|gen z|puzzle|role playing|casino|classic \(board)/i;
+    var INCOME = /^\$?\d|under \$|\d+k|\$?\d+\s*to\s*\$?\d+|or more|\(\$?\d+|\/hr\)/i;
     var seen = {};
     var candidates = btns()
       .filter(function (e) {
         var t = txt(e);
-        if (!t || t.length > 90 || t.length < 2) return false;
+        if (!t || t.length > 100 || t.length < 2) return false;
         if (/skip the survey|about the survey|privacy|terms|conditions|faq|member support|unsubscribe|program requirements|disclaimer|legal notice|cookie policy/i.test(t)) return false;
         var r = e.getBoundingClientRect();
         if (r.top < 40 || r.top > window.innerHeight * 0.92) return false;
         if (r.width < 55 || r.height < 28) return false;
-        if (!ANSWER.test(t) && !LONG.test(t) && !/born 19|born 20|\(born/i.test(t)) return false;
+        if (!ANSWER.test(t) && !LONG.test(t) && !INCOME.test(t) && !/born 19|born 20|\(born/i.test(t)) return false;
         var key = t.toLowerCase();
         if (seen[key]) return false;
         seen[key] = 1;
@@ -360,12 +361,16 @@
     /BVA=True|BVB=True|BVC=True|BVD=True/i.test(url);
 
   var onActiveSurvey =
-    /finish your survey|sponsored ad|question is not required|credit\/debit card|credit rating|describe your credit|what kind of debt|select all that apply|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner|employment status|current employment/.test(
+    /finish your survey|sponsored ad|question is not required|credit\/debit card|credit rating|describe your credit|what kind of debt|select all that apply|how often do you|homeowner|online purchase|when did you last|generation do you|games do you like|survey to proceed|are you a homeowner|employment status|current employment|household income|combined household income|before tax/.test(
       bt
     );
 
-  /* 3. ACTIVE SURVEY — handled by Python native Playwright clicks (isTrusted=true) */
+  /* 3. ACTIVE SURVEY — rfFire + Python trusted clicks (dual path) */
   if (onActiveSurvey) {
+    var surveyPick = pickVisibleSurveyAnswer();
+    if (surveyPick) {
+      rfFire(surveyPick);
+    }
     return;
   }
 

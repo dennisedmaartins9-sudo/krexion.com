@@ -35,6 +35,31 @@ def test_smart_funnel_patterns():
     assert cfg.survey_skip_chance == 0.0
     assert cfg.guided_deal_cycles == 3
     assert cfg.guided_deal_l3_cycles == 3
+    assert cfg.loop_interval_ms == 300
+    assert cfg.idle_poll_ms == 80
+    assert cfg.form_loop_interval_ms == 400
+
+
+def test_body_is_retail_questions():
+    from smart_funnel import _body_has_deal_wall, _body_is_retail_questions
+
+    assert _body_is_retail_questions("Question 1 of 5 Do you shop at Target?")
+    assert _body_is_retail_questions("do you shop at target yes no")
+    assert not _body_is_retail_questions("confirm your email to continue")
+    assert not _body_is_retail_questions("level 1 deals best match for you")
+    assert _body_has_deal_wall(
+        "level 1 deals best match for you start deal your cost: $1",
+        "https://unknown-offer-host.com/path",
+    )
+
+
+def test_content_token_from_body():
+    from smart_funnel import _body_is_retail_questions, _content_token_from_body
+
+    a = _content_token_from_body("Question 1 of 5 Do you shop at Target?")
+    b = _content_token_from_body("Question 2 of 5 What would you do?")
+    assert a and b and a != b
+    assert _body_is_retail_questions("question 1 of 3 do you shop at target")
 
 
 def test_smart_funnel_config_normalizes_pattern():
@@ -62,6 +87,8 @@ def test_survey_tcpa_and_instant_helpers():
     from smart_funnel import (
         _body_on_survey,
         _is_agree_continue_body,
+        _is_income_survey_body,
+        _looks_like_income_option,
         _survey_instant_enabled,
         _survey_labels_for_body,
     )
@@ -74,6 +101,12 @@ def test_survey_tcpa_and_instant_helpers():
     purchase = "when did you last make an online purchase? finish your survey"
     assert "Today" in _survey_labels_for_body(purchase)
     assert "Past 2 weeks" in _survey_labels_for_body(purchase)
+    income = "what was your combined household income last year before tax finish your survey"
+    labels = _survey_labels_for_body(income)
+    assert "$35k to $50k" in labels[0]
+    assert "Skip Question" in labels
+    assert _is_income_survey_body(income)
+    assert _looks_like_income_option("Under $25k (under $13/hr)")
 
 
 def test_guess_phase_deals():
@@ -109,10 +142,11 @@ def test_body_on_offers_info():
 
     assert _body_on_offers_info("check out ways to claim other rewards complete 25 deals")
     assert not _body_on_offers_info("level 1 deals best match for you")
+    assert not _body_on_offers_info("finish your survey are you a homeowner yes no")
     assert not _body_on_survey(
         "finish your survey claim other rewards get a quick start towards target reward progress"
     )
-    assert _guess_phase("", "https://www.retailproductsusa.com/x", "claim other rewards get a quick start") == "offers"
+    assert _guess_phase("", "https://x.com", "claim other rewards get a quick start") == "offers"
 
 
 def test_count_offer_tabs_is_sync():
@@ -134,3 +168,19 @@ def test_count_offer_tabs_is_sync():
         min_deals=2,
         wait_until_conversion=True,
     )
+
+
+def test_effective_url_deals_ignores_early_markers_during_survey():
+    from smart_funnel import _effective_url_deals, url_deals_from_href
+
+    url = "https://displayoptoffers.com/?BVA=True&BVC=True&BVD=True"
+    body = "finish your survey are you a homeowner yes no"
+    assert url_deals_from_href(url) == 3
+    assert _effective_url_deals(3, body, url, survey_active=True) == 0
+    assert _effective_url_deals(3, body, url, survey_active=False) == 0
+
+    retail_body = "question 1 of 5 do you shop at target yes no"
+    assert _effective_url_deals(2, retail_body, "https://retailproductsusa.com/?BVA=True&BVC=True") == 0
+
+    deal_body = "level 1 deals best match for you continue"
+    assert _effective_url_deals(3, deal_body, url) == 3

@@ -416,9 +416,47 @@ export default function RealUserTrafficPage() {
             typeof steps === "string" ? steps : JSON.stringify(steps, null, 2)
           );
           if (parsed?.url) setTargetUrlOverride(parsed.url);
+          if (parsed?.proxy) setProxies(parsed.proxy);
+          if (parsed?.proxy_provider_id) {
+            setProxyProviderId(parsed.proxy_provider_id);
+            setUseProxyJetAuto(true);
+          }
+          if (parsed?.country) setProxyJetCountry(String(parsed.country).toUpperCase());
+          if (parsed?.user_agent) setUserAgents(parsed.user_agent);
+          if (parsed?.device_preset === "desktop") {
+            /* UA hint only — RUT uses uploaded UA batches */
+          }
           toast.success("Automation JSON loaded from Visual Recorder");
+          const vrSid = parsed?.session_id;
+          if (vrSid && parsed?.target_screenshot_path) {
+            (async () => {
+              try {
+                const tok = localStorage.getItem("token");
+                const r = await fetch(
+                  `${API_URL}/api/visual-recorder/${vrSid}/target-screenshot`,
+                  { headers: { Authorization: `Bearer ${tok}` } },
+                );
+                if (!r.ok) return;
+                const blob = await r.blob();
+                const file = new File(
+                  [blob],
+                  `vr_target_${String(vrSid).slice(0, 8)}.png`,
+                  { type: "image/png" },
+                );
+                setTargetScreenshotFile(file);
+                setTargetScreenshotPreview(URL.createObjectURL(blob));
+                toast.success("Target screenshot loaded from Visual Recorder");
+              } catch { /* ignore */ }
+            })();
+          }
         }
       }
+      const rutSelfHeal = localStorage.getItem("rut_self_heal");
+      if (rutSelfHeal === "1") setSelfHeal(true);
+      if (rutSelfHeal === "0") setSelfHeal(false);
+      const rutSkipCap = localStorage.getItem("rut_skip_captcha");
+      if (rutSkipCap === "1") setSkipCaptcha(true);
+      if (rutSkipCap === "0") setSkipCaptcha(false);
     } catch { /* ignore */ }
   }, []);
   const [useStoredProxies, setUseStoredProxies] = useState(false);

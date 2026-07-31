@@ -488,10 +488,21 @@ _KNOWN_ACTIONS = {
     "wait_for_load", "wait_for_networkidle", "wait_for_text",
     "wait_for_url", "scroll", "evaluate", "screenshot",
     "auto_continue", "auto_continue_survey", "extract",
-    "dismiss_popups", "hover",
+    "dismiss_popups", "hover", "right_click", "drag", "drag_drop",
+    "switch_tab", "close_tab", "close", "close_browser", "browser_close",
+    "branch", "iframe_click", "iframe_fill", "shadow_click",
+    "accept_dialog", "dismiss_dialog", "set_input_files", "file_upload",
+    "pause_for_human", "captcha_pause", "human_pause",
+    "otp_wait", "wait_for_otp", "conditional_skip", "set_zoom",
+    "save_storage", "restore_storage", "go_back", "go_forward",
 }
+# Actions that only skip gracefully when optional=True (headless RUT cannot run them fully).
+_HEADLESS_ONLY_ACTIONS = frozenset({
+    "pause_for_human", "captcha_pause", "human_pause", "otp_wait", "wait_for_otp",
+})
 _ACTIONS_REQUIRING_SELECTOR = {
     "click", "fill", "type", "select", "check", "uncheck", "hover",
+    "iframe_click", "iframe_fill", "set_input_files", "file_upload",
 }
 
 
@@ -517,8 +528,11 @@ def lint_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                            "message": f"Step #{i+1} ka action missing hai."})
             continue
         if action not in _KNOWN_ACTIONS:
-            issues.append({"level": "warn", "at_step": i, "code": "unknown_action",
-                           "message": f"Step #{i+1} ka action '{action}' standard list mein nahi — replay ignore kar sakti hai."})
+            issues.append({"level": "error", "at_step": i, "code": "unknown_action",
+                           "message": f"Step #{i+1} ka action '{action}' RUT executor mein nahi — replay fail ya skip hoga."})
+        elif action in _HEADLESS_ONLY_ACTIONS and not s.get("optional"):
+            issues.append({"level": "error", "at_step": i, "code": "headless_only",
+                           "message": f"Step #{i+1} ({action}) headless RUT mein auto-run nahi hota — Edit Step se optional=true mark karein ya step hata dein."})
         if action in _ACTIONS_REQUIRING_SELECTOR and not s.get("selector"):
             issues.append({"level": "error", "at_step": i, "code": "missing_selector",
                            "message": f"Step #{i+1} ({action}) ke liye selector zaroori hai."})

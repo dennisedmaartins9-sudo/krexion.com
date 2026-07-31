@@ -902,6 +902,62 @@ def _build_wait_load(timeout_ms: int = 60000) -> Dict[str, Any]:
     return {"action": "wait_for_load", "timeout": int(timeout_ms)}
 
 
+_SKIP_AUTO_WAIT_AFTER = frozenset({
+    "wait",
+    "wait_for_load",
+    "wait_for_selector",
+    "wait_for_text",
+    "wait_for_url",
+    "wait_for_network_idle",
+    "screenshot",
+    "close",
+    "branch",
+    "conditional_skip",
+    "accept_dialog",
+    "dismiss_dialog",
+    "extract",
+    "save_storage",
+    "restore_storage",
+})
+
+
+def _auto_waits_after_action(action: str) -> List[Dict[str, Any]]:
+    """Default auto-wait bundle appended after recorded actions when enabled."""
+    a = (action or "").strip().lower()
+    if a in _SKIP_AUTO_WAIT_AFTER:
+        return []
+    if a == "scroll":
+        return [_build_wait(500)]
+    if a in (
+        "click",
+        "fill",
+        "type",
+        "select",
+        "check",
+        "uncheck",
+        "press",
+        "hover",
+        "evaluate",
+        "right_click",
+        "drag",
+        "drag_drop",
+        "switch_tab",
+        "close_tab",
+        "iframe_click",
+        "iframe_fill",
+        "shadow_click",
+        "random_pick",
+        "random_pick_advanced",
+        "nav_click",
+        "file_upload",
+        "otp_wait",
+        "captcha_pause",
+        "human_pause",
+    ):
+        return [_build_wait(1500), _build_wait_load(60000), _build_wait(2000)]
+    return [_build_wait(800)]
+
+
 def _build_scroll(y: int) -> Dict[str, Any]:
     return {"action": "scroll", "y": int(y)}
 
@@ -1173,6 +1229,9 @@ class RecorderSession:
     user_id: str
     url: str
     proxy: Optional[str]
+    proxy_provider_id: str = ""
+    country: str = ""
+    device_type: str = "auto"
     user_agent: Optional[str]
     headers: List[str]                          # Excel column names for form-fill binding
     # ── 2026-05 ──
@@ -1262,9 +1321,26 @@ class RecorderSession:
     # was applied. Capped at 20 entries (LRU) so memory stays bounded
     # even for sessions where the user spams Auto-fix-all repeatedly.
     fix_history: List[Dict[str, Any]] = field(default_factory=list)
+    # When True, append short settle waits after each recorded action step.
+    auto_insert_waits: bool = False
 
     def touch(self):
         self.last_activity = time.time()
+
+    def append_step(self, step: Optional[Dict[str, Any]], *, allow_auto_waits: bool = True) -> None:
+        """Append a recorded step and optionally auto-insert settle waits."""
+        if not step:
+            return
+        self.steps.append(step)
+        if not allow_auto_waits or not self.auto_insert_waits:
+            return
+        if step.get("source") == "auto_wait":
+            return
+        for wait_step in _auto_waits_after_action(str(step.get("action") or "")):
+            auto = dict(wait_step)
+            auto["source"] = "auto_wait"
+            auto.setdefault("optional", True)
+            self.steps.append(auto)
 
 
 # Global registry
@@ -1293,6 +1369,8 @@ async def start_session(
     viewport_w: int = 0,
     viewport_h: int = 0,
     device_scale_factor: float = 0.0,
+    auto_insert_waits: bool = False,
+    proxy_provider_id: str = "",
 ) -> RecorderSession:
     """Create a session and kick off browser launch in the background.
 
@@ -1377,6 +1455,10 @@ async def start_session(
         os_kind=os_kind,
         geo_lat=geo_lat,
         geo_lon=geo_lon,
+        auto_insert_waits=bool(auto_insert_waits),
+        proxy_provider_id=(proxy_provider_id or "").strip(),
+        country=(country or "").strip().lower()[:2],
+        device_type=(device_type or "auto").strip().lower(),
     )
     sess.lock = asyncio.Lock()
     sess.state = "starting"
@@ -1667,7 +1749,7 @@ async def switch_tab(sess: "RecorderSession", index: int) -> Dict[str, Any]:
             if not (isinstance(last, dict)
                     and last.get("action") == "switch_tab"
                     and int(last.get("index") or -1) == int(index)):
-                sess.steps.append({
+                sess.append_step({
                     "action": "switch_tab",
                     "index": int(index),
                     # URL kept for human-readable diagnostics + a safer
@@ -2628,7 +2710,7 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         except Exception:
             # Never let selector enrichment break recording.
             pass
-        sess.steps.append(step)
+        sess.append_step(step)
         # 2026-01 — auto waits removed per user request. Earlier this added
         # wait(1500) + wait_for_load(60000) + wait(2000) after every click,
         # which combined with the stuck-watchdog (60s URL-change threshold)
@@ -2640,7 +2722,14 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         # user can manually add a wait step from the recorder UI
         # (Insert → Wait / Wait for page load).
 
-    return {"recorded": step is not None, "step": step, "element": info, "mode": mode, **{k: v for k, v in extra.items() if k != "element"}}
+    return {"recorded": step is not None, "step": step, "element": info, "mode": mode,
+            **{k: v for k, v in extra.items() if k != "element"},
+            **({"cross_origin_iframe": True,
+                "warning": "Cross-origin iframe click — RUT replay uses frame_locator. "
+                "Use ⋯ More → iframe click for reliable replay."}
+               if isinstance(info, dict) and (info.get("tag") or "").upper() in ("IFRAME", "FRAME")
+               and not (info.get("iframe_path") or [])
+               else {})}
 
 
 async def add_screenshot_marker(sess: RecorderSession, name: Optional[str] = None) -> Dict[str, Any]:
@@ -2661,7 +2750,7 @@ async def add_screenshot_marker(sess: RecorderSession, name: Optional[str] = Non
         # execution (e.g. a closed page) doesn't fail the whole visit.
         "optional": True,
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -2696,7 +2785,7 @@ async def add_close_browser_step(sess: RecorderSession) -> Dict[str, Any]:
         # it in the diagnostics report (silently skipping a close would
         # leak the very resource this step exists to free).
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -2705,6 +2794,9 @@ async def live_test(
     sample_row: Optional[Dict[str, Any]] = None,
     fresh_page: bool = False,
     start_index: int = 0,
+    rut_parity: bool = False,
+    self_heal: Optional[bool] = None,
+    skip_captcha: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Run the current recorded steps end-to-end against the live page,
     returning per-step timing + ok/error + a static-analysis diagnostic
@@ -2841,15 +2933,18 @@ async def live_test(
                 logger.warning(f"[live-test] fresh-page setup failed, using recorder page: {e}")
 
         try:
+            _use_self_heal = bool(self_heal) if self_heal is not None else bool(rut_parity)
+            _use_skip_captcha = bool(skip_captcha) if skip_captcha is not None else (not rut_parity)
             res = await _execute_automation_steps(
                 page=page,
                 row=row,
                 steps=steps_to_run,
-                skip_captcha=True,
-                self_heal=False,  # IMPORTANT: no AI healing during test — user wants to see RAW failures
+                skip_captcha=_use_skip_captcha,
+                self_heal=_use_self_heal,
                 collect_timings=True,
                 user_id=sess.user_id,   # enable self-healing aliases (2026-01)
                 on_step_progress=_progress_cb,  # 2026-01: real-time step feed
+                skip_missing_steps=not rut_parity,
             )
         except Exception as e:
             res = {"status": "failed", "error": f"Live test crashed: {e}", "executed_steps": 0, "step_results": []}
@@ -2908,6 +3003,9 @@ async def live_test(
         "total_steps": len(sess.steps),
         "fresh_page": bool(fresh_page),
         "start_index": start_index,
+        "rut_parity": bool(rut_parity),
+        "self_heal": bool(_use_self_heal),
+        "skip_captcha": bool(_use_skip_captcha),
     }
 
 
@@ -3305,7 +3403,7 @@ async def bind_dropdown(
             delattr(sess, "_pending_dropdown_meta")
         except Exception:
             pass
-    sess.steps.append(step)
+    sess.append_step(step)
     # 2026-01 — auto wait(500) removed per user request.
     # Brief settle wait so subsequent steps see the post-change DOM
     # is no longer auto-appended. User can insert a wait manually if needed.
@@ -3627,7 +3725,7 @@ async def type_text(sess: RecorderSession, selector: str, value: str, header_nam
                 step["fallbacks"] = _fb_sel
     except Exception:
         pass
-    sess.steps.append(step)
+    sess.append_step(step)
     # 2026-01 — auto wait removed per user request (was wait(800) here).
     return {"recorded": True, "step": step, "header_name": header_name, **extra}
 
@@ -3635,14 +3733,14 @@ async def type_text(sess: RecorderSession, selector: str, value: str, header_nam
 async def add_wait_step(sess: RecorderSession, ms: int) -> Dict[str, Any]:
     sess.touch()
     step = _build_wait(ms)
-    sess.steps.append(step)
+    sess.append_step(step, allow_auto_waits=False)
     return {"recorded": True, "step": step}
 
 
 async def add_wait_load_step(sess: RecorderSession, timeout_ms: int = 60000) -> Dict[str, Any]:
     sess.touch()
     step = _build_wait_load(timeout_ms)
-    sess.steps.append(step)
+    sess.append_step(step, allow_auto_waits=False)
     return {"recorded": True, "step": step}
 
 
@@ -3654,7 +3752,7 @@ async def add_scroll_step(sess: RecorderSession, y: int) -> Dict[str, Any]:
         except Exception:
             pass
     step = _build_scroll(y)
-    sess.steps.append(step)
+    sess.append_step(step)
     # 2026-01 — auto wait(500) after scroll removed per user request.
     return {"recorded": True, "step": step}
 
@@ -3736,7 +3834,7 @@ async def group_last_as_random(
             return {"recorded": False, "error": "No pending random elements — use mode=random click first OR pass texts directly"}
         take = pending[-int(count):]
     step = _build_random_pick_evaluate(take)
-    sess.steps.append(step)
+    sess.append_step(step)
     # 2026-01 — auto wait(2000) + wait_for_load(60000) + wait(2500) after
     # random-pick removed per user request. The random-pick JS itself
     # navigates the page when it clicks an <a> with href; subsequent
@@ -4514,7 +4612,7 @@ async def press_key(sess: RecorderSession, key: str) -> Dict[str, Any]:
     except Exception as e:
         return {"recorded": False, "error": f"Key press failed: {e}"}
     step = {"action": "press", "key": safe_key}
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -4538,7 +4636,7 @@ async def hover_at(sess: RecorderSession, x: int, y: int) -> Dict[str, Any]:
         ),
         "name": f"Hover @ ({int(x)},{int(y)})",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -4560,7 +4658,7 @@ async def wait_for_selector(
     except Exception as e:
         return {"recorded": False, "error": f"Selector did not appear within {timeout_ms}ms: {e}"}
     step = {"action": "wait_for_selector", "selector": sel, "timeout": timeout_ms}
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -4610,7 +4708,7 @@ async def wait_for_xpath(
         "xpath": xp,
         "timeout": timeout_ms,
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -4753,7 +4851,7 @@ async def add_wait_for_button_at(
     if text:
         step["hint_text"] = text
     # Record the step. NO click is fired.
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5200,7 +5298,7 @@ def add_wait_for_text_step(sess: RecorderSession, text: str,
     }
     if optional:
         step["optional"] = True
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5222,7 +5320,7 @@ def add_wait_for_url_step(sess: RecorderSession,
     if equals:   step["equals"]   = str(equals)
     if pattern:  step["pattern"]  = str(pattern)
     if optional: step["optional"] = True
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5246,7 +5344,7 @@ def add_extract_step(sess: RecorderSession,
     if attribute: step["attribute"] = str(attribute)
     if regex:     step["regex"]     = str(regex)
     if optional:  step["optional"]  = True
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5254,7 +5352,7 @@ def add_dismiss_popups_step(sess: RecorderSession) -> Dict[str, Any]:
     """Append a `dismiss_popups` step (auto-clicks cookie/GDPR banners)."""
     sess.touch()
     step = {"action": "dismiss_popups", "optional": True}
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5287,6 +5385,18 @@ def get_live_progress(sess: RecorderSession, since_idx: int = 0) -> Dict[str, An
     }
 
 
+def set_session_settings(
+    sess: RecorderSession,
+    *,
+    auto_insert_waits: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Update live recorder preferences (e.g. auto wait insertion)."""
+    sess.touch()
+    if auto_insert_waits is not None:
+        sess.auto_insert_waits = bool(auto_insert_waits)
+    return {"auto_insert_waits": sess.auto_insert_waits}
+
+
 async def finalize(sess: RecorderSession) -> Dict[str, Any]:
     """Stop the session and return the recording bundle."""
     sess.touch()
@@ -5294,6 +5404,9 @@ async def finalize(sess: RecorderSession) -> Dict[str, Any]:
         "session_id": sess.session_id,
         "url": sess.url,
         "proxy": sess.proxy,
+        "proxy_provider_id": getattr(sess, "proxy_provider_id", "") or "",
+        "country": getattr(sess, "country", "") or "",
+        "device_preset": getattr(sess, "device_type", "auto") or "auto",
         "user_agent": sess.user_agent,
         "headers": sess.headers,
         "automation_json": sess.steps,
@@ -5301,6 +5414,7 @@ async def finalize(sess: RecorderSession) -> Dict[str, Any]:
         "final_url": sess.final_url,
         "final_text_snippet": sess.final_text_snippet,
         "step_count": len(sess.steps),
+        "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
     }
     # Persist to disk before stopping
     try:
@@ -5344,7 +5458,7 @@ async def add_wait_network_idle(sess: RecorderSession, timeout_ms: int = 30000) 
         "timeout": int(timeout_ms),
         "name": f"Wait for network idle ({timeout_ms}ms)",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5436,7 +5550,7 @@ async def add_file_upload(
         "timeout": 15000,
         "name": label or f"Upload file → {selector[:40]}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5481,7 +5595,7 @@ async def add_otp_wait(
         "digits": n,
         "name": label or f"Wait & fill OTP ({n} digits)",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5553,9 +5667,10 @@ async def add_captcha_pause(sess: RecorderSession, label: str = "") -> Dict[str,
         "action": "pause_for_human",
         "reason": "captcha",
         "timeout": 300000,  # 5 min — generous for human solve
+        "optional": True,
         "name": label or "⏸ Pause for human (CAPTCHA)",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5588,9 +5703,10 @@ async def add_human_pause(
         "action": "pause_for_human",
         "reason": reason or "manual_step",
         "timeout": int(timeout_ms),
+        "optional": True,
         "name": label or f"⏸ Pause for human ({reason})",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5630,7 +5746,7 @@ async def iframe_click(
         "timeout": int(timeout_ms),
         "name": f"iframe click → {(inner_selector or inner_text or '')[:40]}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5660,7 +5776,7 @@ async def iframe_fill(
         "timeout": int(timeout_ms),
         "name": f"iframe fill → {inner_selector[:40]}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5702,7 +5818,7 @@ async def shadow_click(
         "name": f"shadow-DOM click → {' >> '.join(chain[-2:])}",
         "shadow_chain": chain,
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5763,7 +5879,7 @@ async def drag_drop(
         "steps": int(steps),
         "name": f"drag {source_selector or '(x,y)'} → {target_selector or 'destination'}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5775,7 +5891,7 @@ async def browser_back(sess: RecorderSession) -> Dict[str, Any]:
         except Exception:
             pass
     step = {"action": "go_back", "name": "← Browser back"}
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5787,7 +5903,7 @@ async def browser_forward(sess: RecorderSession) -> Dict[str, Any]:
         except Exception:
             pass
     step = {"action": "go_forward", "name": "→ Browser forward"}
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5814,7 +5930,7 @@ async def right_click(
         "y": int(y) if not selector else None,
         "name": f"Right-click → {selector or f'({x},{y})'}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5839,7 +5955,7 @@ async def clipboard_write(
         "text": text,
         "name": f"Clipboard ← {live[:30]}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5856,7 +5972,7 @@ async def clipboard_read_into_var(
         "var": var,
         "name": f"Read clipboard → {{{{{var}}}}}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5890,7 +6006,7 @@ async def add_conditional_skip(
         "optional": True,
         "name": label or f"⏭ If {typ}: {selector or text[:30]} — skip next {skip_count}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5919,7 +6035,7 @@ async def add_save_storage_step(
         "var": v,
         "name": f"💾 Save cookies+storage → {{{{{v}}}}}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5934,7 +6050,7 @@ async def add_restore_storage_step(
         "var": v,
         "name": f"📂 Restore cookies+storage from {{{{{v}}}}}",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
@@ -5955,7 +6071,7 @@ async def set_zoom(
         "level": lvl,
         "name": f"🔍 Zoom = {int(lvl * 100)}%",
     }
-    sess.steps.append(step)
+    sess.append_step(step)
     return {"recorded": True, "step": step}
 
 
