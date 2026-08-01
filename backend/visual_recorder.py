@@ -213,8 +213,138 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
     return 'iframe:nth-of-type(' + idx + ')';
   }
 
+  // v2.6.50 — Modal-aware hit testing. A single elementFromPoint(x,y)
+  // often returns the full-screen backdrop or modal wrapper instead of
+  // the BUTTON the user actually clicked (e.g. "START DEAL" inside a
+  // popup). We stack-scan with elementsFromPoint when available and
+  // prefer interactive targets inside the visible modal container.
+  function isVisibleEl(el) {
+    try {
+      var cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      if (parseFloat(cs.opacity || '1') < 0.05) return false;
+      if (cs.pointerEvents === 'none') return false;
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return false;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function isInteractive(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = el.tagName;
+    if (/^(A|BUTTON|INPUT|SELECT|TEXTAREA|LABEL)$/.test(tag)) return true;
+    var role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+    if (role === 'button' || role === 'link' || role === 'checkbox' || role === 'radio') return true;
+    if (el.hasAttribute && el.hasAttribute('onclick')) return true;
+    return false;
+  }
+
+  function isBackdropOrOverlay(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = el.tagName;
+    if (tag !== 'DIV' && tag !== 'SPAN' && tag !== 'SECTION') return false;
+    var cls = ((el.className || '') + '').toLowerCase();
+    if (/backdrop|overlay|modal-backdrop|modal-overlay|scrim|mask|underlay/.test(cls)) return true;
+    try {
+      var cs = window.getComputedStyle(el);
+      var pos = cs.position;
+      if ((pos === 'fixed' || pos === 'absolute') && !isInteractive(el)) {
+        var r = el.getBoundingClientRect();
+        var vw = window.innerWidth || 1;
+        var vh = window.innerHeight || 1;
+        var area = r.width * r.height;
+        var vwvh = vw * vh;
+        if (area / vwvh > 0.85 && parseFloat(cs.opacity || '1') < 0.95) return true;
+        var bg = cs.backgroundColor || '';
+        if (/rgba?\(\s*0,\s*0,\s*0/.test(bg) && area / vwvh > 0.45) return true;
+      }
+    } catch (e) { /* skip */ }
+    return false;
+  }
+
+  function findModalContainer(doc, px, py) {
+    var popupSel = [
+      '[role="dialog"]', '[role="alertdialog"]', '[aria-modal="true"]',
+      '.modal', '.popup', '.dialog', '.overlay', '.lightbox', '.drawer',
+      '.MuiDialog-root', '.ant-modal', '.ReactModal__Content',
+      '.chakra-modal__content', '.swal2-container', '.sweet-alert', '.fancybox-container'
+    ].join(', ');
+    var candidates = [];
+    try {
+      candidates = Array.from(doc.querySelectorAll(popupSel)).filter(function(el) {
+        try {
+          var cs = window.getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+          if (parseFloat(cs.opacity || '1') < 0.05) return false;
+          var r = el.getBoundingClientRect();
+          if (r.width < 20 || r.height < 20) return false;
+          return px >= r.left && px <= r.right && py >= r.top && py <= r.bottom;
+        } catch (e) { return false; }
+      });
+    } catch (e) { candidates = []; }
+    // Prefer innermost (leaf) modal when nested.
+    for (var i = 0; i < candidates.length; i++) {
+      for (var j = i + 1; j < candidates.length; j++) {
+        if (candidates[i].contains(candidates[j])) {
+          candidates.splice(i, 1);
+          i--;
+          break;
+        } else if (candidates[j].contains(candidates[i])) {
+          candidates.splice(j, 1);
+          j--;
+        }
+      }
+    }
+    return candidates.length ? candidates[candidates.length - 1] : null;
+  }
+
+  function scoreElement(el, modalContainer) {
+    if (!el || !isVisibleEl(el)) return -1000;
+    var score = 0;
+    if (isInteractive(el)) score += 100;
+    if (modalContainer) {
+      if (modalContainer.contains(el)) score += 50;
+      else score -= 200;
+    }
+    if (isBackdropOrOverlay(el)) score -= 500;
+    var tag = el.tagName;
+    if (tag === 'IFRAME' || tag === 'FRAME') score += 10;
+    try {
+      var r = el.getBoundingClientRect();
+      var area = r.width * r.height;
+      if (area < 50000) score += 5;
+      if (area > 200000 && !isInteractive(el)) score -= 20;
+    } catch (e) { /* skip */ }
+    return score;
+  }
+
+  function bestElementAtPoint(doc, px, py) {
+    var modalContainer = findModalContainer(doc, px, py);
+    var stack = [];
+    if (doc.elementsFromPoint) {
+      try { stack = doc.elementsFromPoint(px, py) || []; } catch (e) { stack = []; }
+    }
+    if (!stack.length) {
+      var one = doc.elementFromPoint(px, py);
+      if (one) stack = [one];
+    }
+    var best = null;
+    var bestScore = -9999;
+    for (var si = 0; si < stack.length; si++) {
+      var cand = stack[si];
+      if (!cand || cand.nodeType !== 1) continue;
+      var sc = scoreElement(cand, modalContainer);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = cand;
+      }
+    }
+    return best;
+  }
+
   function findInDoc(doc, px, py, framePath) {
-    var el = doc.elementFromPoint(px, py);
+    var el = bestElementAtPoint(doc, px, py);
     if (!el) return null;
     // If the point resolves to an iframe/frame, drill in when same-origin.
     if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
@@ -664,6 +794,110 @@ def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None)
         "}})();"
     )
     return {"action": "evaluate", "script": script}
+
+
+def _locator_candidates_from_info(info: Dict[str, Any]) -> List[str]:
+    """Build CSS selector candidates from rich element-capture metadata."""
+    if not isinstance(info, dict):
+        return []
+    cands: List[str] = []
+    attrs = info.get("attrs") or {}
+    for k in ("data-testid", "data-test", "data-cy", "data-qa", "data-id"):
+        v = attrs.get(k)
+        if isinstance(v, str) and v:
+            cands.append(f'[{k}="{v}"]')
+    _id = (info.get("id") or "").strip()
+    if _id and not re.match(r"^[\d_-]", _id) and len(_id) < 60 and ":" not in _id:
+        cands.append(f"#{_id}")
+    _name = attrs.get("name") if isinstance(attrs.get("name"), str) else ""
+    if _name:
+        tag = (info.get("tag") or "").lower()
+        if tag:
+            cands.append(f'{tag}[name="{_name}"]')
+        else:
+            cands.append(f'[name="{_name}"]')
+    _aria = attrs.get("aria-label") if isinstance(attrs.get("aria-label"), str) else ""
+    if _aria and len(_aria) <= 80:
+        cands.append(f'[aria-label="{_aria}"]')
+    return cands
+
+
+async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
+    """Perform a live click using captured element metadata (modal/iframe aware).
+
+    Tries, in order: frame_locator chain + CSS locators, top-level locators,
+    the same selector-priority JS as replay (_build_text_click_evaluate), then
+    coordinate mouse.click as last resort.
+    """
+    if not info or not isinstance(info, dict):
+        return False
+
+    text = (info.get("text") or "").strip()
+    iframe_path = info.get("iframe_path") or []
+    if not isinstance(iframe_path, list):
+        iframe_path = []
+    locators = _locator_candidates_from_info(info)
+
+    async def _try_locator_clicks(root: Any) -> bool:
+        for sel in locators:
+            try:
+                await root.locator(sel).first.click(timeout=3000)
+                return True
+            except Exception:
+                continue
+        if text:
+            try:
+                await root.get_by_text(text, exact=False).first.click(timeout=3000)
+                return True
+            except Exception:
+                pass
+        return False
+
+    # 1. iframe_path chain (cross-origin safe via frame_locator)
+    if iframe_path:
+        try:
+            fl: Any = page
+            for seg in iframe_path:
+                if not isinstance(seg, str) or not seg.strip():
+                    continue
+                fl = fl.frame_locator(seg.strip())
+            if await _try_locator_clicks(fl):
+                return True
+            # JS fallback scoped to the iframe document
+            if locators or text:
+                live_js = _build_text_click_evaluate(text or "", info)
+                try:
+                    await fl.locator("html").first.evaluate(live_js["script"])
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 2. Top-level Playwright locators
+    if await _try_locator_clicks(page):
+        return True
+
+    # 3. Top-level JS (selector-priority + text match — same as replay)
+    if locators or text:
+        try:
+            live_js = _build_text_click_evaluate(text or "", info)
+            await page.evaluate(live_js["script"])
+            return True
+        except Exception:
+            pass
+
+    # 4. Coordinate fallback
+    try:
+        x = float(info.get("x", 0))
+        y = float(info.get("y", 0))
+        if x > 0 and y > 0:
+            await page.mouse.click(x, y)
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _classify_gender_side(label: str) -> Optional[str]:
@@ -2524,7 +2758,7 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         # land on a hidden input and do nothing.
         if mode not in ("random", "random_click", "check", "gender_pick"):
             try:
-                await sess.page.mouse.click(info["x"], info["y"])
+                await _live_click_captured(sess.page, info)
             except Exception:
                 pass
 
