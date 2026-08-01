@@ -233,6 +233,7 @@ const LS_DRAFT_KEY = "vr_draft_v1";
 const LS_VR_RUT_HANDOFF = "vr_automation_handoff";
 const LS_VR_AUTO_WAITS = "vr_auto_insert_waits";
 const LS_VR_PROXY_PROVIDER = "vr_proxy_provider_id";
+const LS_VR_WAIT_AUTO_DETECT = "vr_wait_auto_detect";
 const LS_RUT_SELF_HEAL = "rut_self_heal";
 const LS_RUT_SKIP_CAPTCHA = "rut_skip_captcha";
 
@@ -414,6 +415,15 @@ export default function VisualRecorderPage() {
       return false;
     }
   });
+  const [waitAutoDetect, setWaitAutoDetect] = useState(() => {
+    try {
+      const v = localStorage.getItem(LS_VR_WAIT_AUTO_DETECT);
+      return v === null ? true : v === "1";
+    } catch {
+      return true;
+    }
+  });
+  const [waitPickTimeoutMs, setWaitPickTimeoutMs] = useState(15000);
   const [busy, setBusy] = useState(false);
   const [finalBundle, setFinalBundle] = useState(null);
   const [finalizeChecklistOpen, setFinalizeChecklistOpen] = useState(false);
@@ -1187,6 +1197,54 @@ export default function VisualRecorderPage() {
     } catch { /* best effort */ }
   };
 
+  const setWaitAutoDetectPref = (enabled) => {
+    setWaitAutoDetect(enabled);
+    try {
+      localStorage.setItem(LS_VR_WAIT_AUTO_DETECT, enabled ? "1" : "0");
+    } catch { /* quota / private mode */ }
+    if (!enabled && ["wait_for_text_pick", "wait_for_selector_pick", "wait_for_xpath_pick", "extract_pick"].includes(tool)) {
+      setTool("default");
+    }
+  };
+
+  const startWaitPick = (pickTool, label) => {
+    if (!sessionId || sessionState !== "ready") {
+      toast.error("Start a recording session first");
+      return;
+    }
+    setTool(pickTool);
+    toast.info(`${label} — page par element/text par click karein (Esc cancel)`);
+  };
+
+  const postWaitPickAt = async (endpoint, x, y, successLabel) => {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/${endpoint}`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({
+          x: Math.round(x),
+          y: Math.round(y),
+          timeout_ms: Math.max(500, Number(waitPickTimeoutMs) || 15000),
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.recorded === false) {
+        toast.error(d.error || d.detail || "Could not add wait step");
+        return false;
+      }
+      const hint = d.step?.text || d.step?.hint_text || d.step?.selector || "";
+      toast.success(`${successLabel}${hint ? ` — "${String(hint).slice(0, 40)}"` : ""}`);
+      refreshState();
+      return true;
+    } catch (err) {
+      toast.error(err.message || "Wait pick failed");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const refreshScreenshot = useCallback(() => {
     if (!sessionId) return;
     // Just bump the tick → <img> re-fetches via cache-busting URL.
@@ -1376,6 +1434,12 @@ export default function VisualRecorderPage() {
         if (pendingFormFill) { setPendingFormFill(null); e.preventDefault(); return; }
         if (pendingDropdown) { setPendingDropdownQueue([]); e.preventDefault(); return; }
         if (pendingRandom.length) { setPendingRandom([]); e.preventDefault(); return; }
+        if (["wait_for_text_pick", "wait_for_selector_pick", "wait_for_xpath_pick", "extract_pick"].includes(tool)) {
+          setTool("default");
+          toast.info("Auto-detect wait cancelled");
+          e.preventDefault();
+          return;
+        }
         if (detectedClickables.length || selectedRandomKeys.size) {
           setDetectedClickables([]);
           setSelectedRandomKeys(new Set());
@@ -1542,7 +1606,7 @@ export default function VisualRecorderPage() {
         const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/wait-for-button`, {
           method: "POST",
           headers: authH(),
-          body: JSON.stringify({ x: Math.round(x), y: Math.round(y), timeout_ms: 30000 }),
+          body: JSON.stringify({ x: Math.round(x), y: Math.round(y), timeout_ms: Math.max(500, Number(waitPickTimeoutMs) || 30000) }),
         });
         const d = await r.json();
         if (!r.ok || d.recorded === false) {
@@ -1554,6 +1618,74 @@ export default function VisualRecorderPage() {
         }
       } catch (err) {
         toast.error(`Wait-for-button failed: ${err.message || err}`);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    if (tool === "wait_for_text_pick") {
+      const ok = await postWaitPickAt("wait-for-text-at", x, y, "Wait for text added");
+      if (ok) setTool("default");
+      return;
+    }
+
+    if (tool === "wait_for_selector_pick") {
+      const ok = await postWaitPickAt("wait-for-selector-at", x, y, "Wait for selector added");
+      if (ok) setTool("default");
+      return;
+    }
+
+    if (tool === "wait_for_xpath_pick") {
+      const ok = await postWaitPickAt("wait-for-xpath-at", x, y, "Wait for xpath added");
+      if (ok) setTool("default");
+      return;
+    }
+
+    if (tool === "extract_pick") {
+      setBusy(true);
+      try {
+        const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/scan`, {
+          method: "POST",
+          headers: authH(),
+          body: JSON.stringify({ x: Math.round(x), y: Math.round(y) }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.ok) {
+          toast.error(d.error || d.detail || "Scan failed");
+          return;
+        }
+        const sel = (d.selector || "").trim();
+        if (!sel) {
+          toast.error("Could not detect selector — turn off auto-detect and type manually");
+          return;
+        }
+        const key = await vrPrompt(
+          `Selector detected: ${sel.slice(0, 60)}\nVariable name (e.g. order_id) — use later as {{order_id}}:`,
+          "",
+        );
+        if (!key || !key.trim()) return;
+        const er = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/add-extract`, {
+          method: "POST",
+          headers: authH(),
+          body: JSON.stringify({
+            selector: sel,
+            store_key: key.trim(),
+            attribute: null,
+            timeout: 10000,
+            optional: false,
+          }),
+        });
+        const ed = await er.json();
+        if (!er.ok || !ed.recorded) {
+          toast.error(ed.error || ed.detail || "Extract failed");
+          return;
+        }
+        toast.success(`Extract → {{${key.trim()}}} added`);
+        refreshState();
+        setTool("default");
+      } catch (err) {
+        toast.error(err.message || "Extract pick failed");
       } finally {
         setBusy(false);
       }
@@ -2037,6 +2169,10 @@ export default function VisualRecorderPage() {
   // ── 2026-01 v2.4.2 — Wait for XPath (sibling of Wait for selector) ─
   const waitForXpathAction = async () => {
     if (!sessionId) return;
+    if (waitAutoDetect) {
+      startWaitPick("wait_for_xpath_pick", "Wait for xpath (auto-detect)");
+      return;
+    }
     const xp = await vrPrompt(
       "XPath expression to wait for (e.g. //button[contains(text(),'Continue')] or //div[@id='thank-you']):",
       ""
@@ -2224,6 +2360,10 @@ export default function VisualRecorderPage() {
 
   // Wait for a CSS selector (recorded as step too)
   const waitForSelectorAction = async () => {
+    if (waitAutoDetect) {
+      startWaitPick("wait_for_selector_pick", "Wait for selector (auto-detect)");
+      return;
+    }
     const sel = await vrPrompt("CSS selector to wait for (e.g. 'button.cta' or '#thank-you-msg'):", "");
     if (!sel) return;
     const t = await vrPrompt("Max wait time in ms (default 15000):", "15000");
@@ -2249,6 +2389,10 @@ export default function VisualRecorderPage() {
   // 2026-01: New step types — Wait for Text / Wait for URL / Extract / Dismiss Popups
   const addWaitForText = async () => {
     if (!sessionId) return;
+    if (waitAutoDetect) {
+      startWaitPick("wait_for_text_pick", "Wait for text (auto-detect)");
+      return;
+    }
     const text = await vrPrompt("Wait until this text appears on the page (e.g. 'Thank you', 'Order confirmed'):", "");
     if (!text || !text.trim()) return;
     const tout = await vrPrompt("Max wait time in ms (default 15000):", "15000");
@@ -2292,6 +2436,10 @@ export default function VisualRecorderPage() {
 
   const addExtract = async () => {
     if (!sessionId) return;
+    if (waitAutoDetect) {
+      startWaitPick("extract_pick", "Extract var (auto-detect selector)");
+      return;
+    }
     const sel = await vrPrompt("CSS selector to extract text from (e.g. '#order-id', '.confirmation .code'):", "");
     if (!sel || !sel.trim()) return;
     const key = await vrPrompt("Variable name to store the value (e.g. 'order_id'). Use later as {{order_id}}:", "");
@@ -5082,6 +5230,22 @@ export default function VisualRecorderPage() {
                 </div>
               )}
 
+              {["wait_for_text_pick", "wait_for_selector_pick", "wait_for_xpath_pick", "extract_pick"].includes(tool) && (
+                <div
+                  className="mt-3 p-3 rounded-lg bg-emerald-950/40 border border-emerald-700/40"
+                  data-testid="vr-wait-pick-hint-panel"
+                >
+                  <div className="text-xs text-emerald-200 leading-snug">
+                    <b>🎯 Auto-detect wait mode.</b>{" "}
+                    {tool === "wait_for_text_pick" && "Page par jis text ka wait chahiye us par click karein — text khud detect ho jayega."}
+                    {tool === "wait_for_selector_pick" && "Element par click karein — CSS selector auto detect ho jayega."}
+                    {tool === "wait_for_xpath_pick" && "Element par click karein — XPath auto detect ho jayega."}
+                    {tool === "extract_pick" && "Element par click karein — selector detect hoga, phir variable name poochega."}
+                    {" "}Esc se cancel.
+                  </div>
+                </div>
+              )}
+
 
               {pendingFormFill && (
                 <div className="mt-3 p-3 rounded-lg bg-blue-950/40 border border-blue-700/40">
@@ -5237,6 +5401,30 @@ export default function VisualRecorderPage() {
                 <p className="w-full text-[10px] text-amber-600/90 -mt-1">
                   Optional auto-waits can mask missing selectors — prefer explicit wait_for_selector when debugging failures.
                 </p>
+                <label
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs cursor-pointer select-none"
+                  title="When ON, Wait for text/selector/xpath buttons let you click the page to auto-fill — no manual scan/copy."
+                  data-testid="vr-wait-auto-detect-toggle-label"
+                >
+                  <input
+                    type="checkbox"
+                    checked={waitAutoDetect}
+                    onChange={(e) => setWaitAutoDetectPref(e.target.checked)}
+                    data-testid="vr-wait-auto-detect-toggle"
+                  />
+                  Auto-detect waits (click page)
+                </label>
+                <div className="inline-flex items-center gap-1">
+                  <span className="text-[10px] text-zinc-500">Pick timeout</span>
+                  <input
+                    type="number"
+                    value={waitPickTimeoutMs}
+                    onChange={(e) => setWaitPickTimeoutMs(e.target.value)}
+                    className="w-16 px-1.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-100 text-xs"
+                    data-testid="vr-wait-pick-timeout"
+                  />
+                  <span className="text-[10px] text-zinc-500">ms</span>
+                </div>
                 <button
                   onClick={addAutoContinueSurvey}
                   disabled={sessionState !== "ready" || busy}

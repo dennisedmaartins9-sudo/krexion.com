@@ -23334,6 +23334,45 @@ async def vr_wait_for_button(session_id: str, req: _VRWaitButtonReq, user: dict 
     return await vr.add_wait_for_button_at(sess, req.x, req.y, req.timeout_ms)
 
 
+@api_router.post("/visual-recorder/{session_id}/wait-for-text-at")
+async def vr_wait_for_text_at(session_id: str, req: _VRWaitButtonReq, user: dict = Depends(get_current_user)):
+    """Point-and-click wait_for_text — auto-detect text at (x, y)."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.add_wait_for_text_at(sess, req.x, req.y, req.timeout_ms)
+
+
+@api_router.post("/visual-recorder/{session_id}/wait-for-xpath-at")
+async def vr_wait_for_xpath_at(session_id: str, req: _VRWaitButtonReq, user: dict = Depends(get_current_user)):
+    """Point-and-click xpath wait — auto-detect xpath at (x, y)."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.add_wait_for_xpath_at(sess, req.x, req.y, req.timeout_ms)
+
+
+@api_router.post("/visual-recorder/{session_id}/wait-for-selector-at")
+async def vr_wait_for_selector_at(session_id: str, req: _VRWaitButtonReq, user: dict = Depends(get_current_user)):
+    """Point-and-click CSS selector wait — auto-detect selector at (x, y)."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.add_wait_for_selector_at(sess, req.x, req.y, req.timeout_ms)
+
+
 @api_router.get("/visual-recorder/{session_id}/detect-popup-buttons")
 async def vr_detect_popup_buttons(session_id: str, user: dict = Depends(get_current_user)):
     """Scan the page for currently-visible popups / modals / dialogs

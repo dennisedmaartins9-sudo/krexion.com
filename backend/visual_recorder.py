@@ -4804,34 +4804,13 @@ async def add_wait_for_button_at(
     sess: RecorderSession, x: int, y: int, timeout_ms: int = 30000,
 ) -> Dict[str, Any]:
     sess.touch()
-    async with sess.lock:
-        if sess.state != "ready" or not sess.page:
-            return {"recorded": False, "error": f"Session not ready ({sess.state})"}
-        try:
-            info = await sess.page.evaluate(
-                _RICH_ELEMENT_CAPTURE_JS,
-                [int(x), int(y)],
-            )
-        except Exception as e:
-            return {"recorded": False, "error": f"Could not read element: {e}"}
-        if not info:
-            return {"recorded": False, "error": "No element at that point"}
+    cap = await _capture_element_locators(sess, x, y)
+    if not cap.get("ok"):
+        return {"recorded": False, "error": cap.get("error", "Could not read element")}
+    selector = cap.get("selector") or ""
+    xpath = cap.get("xpath") or ""
+    text = cap.get("text") or ""
 
-    # Reuse scan's selector-composition ladder outside the lock.
-    _tmp_step: Dict[str, Any] = {}
-    try:
-        _attach_selector_and_xpath(_tmp_step, info)
-    except Exception:
-        pass
-    selector = _tmp_step.get("selector", "") or ""
-    xpath = _tmp_step.get("xpath", "") or ""
-    text = ((info.get("text") or "").strip())[:120]
-
-    # If NEITHER a css selector nor an xpath was derived, fall back to
-    # matching the button by its text content — Playwright's
-    # `text=` engine handles both partial and exact match.
-    if not selector and not xpath and text:
-        selector = f'text="{text}"'
     if not selector and not xpath:
         return {"recorded": False, "error": "Could not derive a selector/xpath for this element — try clicking a different part of the button."}
 
@@ -4839,9 +4818,6 @@ async def add_wait_for_button_at(
     step: Dict[str, Any] = {
         "action": "wait_for_selector",
         "timeout": timeout_ms,
-        # `origin` field lets the UI distinguish "wait for a button
-        # the user pointed at" from a hand-typed wait_for_selector.
-        # RUT engine ignores unknown fields.
         "origin": "wait_for_button",
     }
     if selector:
@@ -4850,9 +4826,113 @@ async def add_wait_for_button_at(
         step["xpath"] = xpath
     if text:
         step["hint_text"] = text
-    # Record the step. NO click is fired.
     sess.append_step(step)
     return {"recorded": True, "step": step}
+
+
+async def _capture_element_locators(
+    sess: RecorderSession, x: int, y: int,
+) -> Dict[str, Any]:
+    """Read element under (x,y) and derive text / CSS selector / xpath."""
+    async with sess.lock:
+        if sess.state != "ready" or not sess.page:
+            return {"ok": False, "error": f"Session not ready ({sess.state})"}
+        try:
+            info = await sess.page.evaluate(
+                _RICH_ELEMENT_CAPTURE_JS,
+                [int(x), int(y)],
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"Could not read element: {e}"}
+        if not info:
+            return {"ok": False, "error": "No element at that point"}
+
+    _tmp_step: Dict[str, Any] = {}
+    try:
+        _attach_selector_and_xpath(_tmp_step, info)
+    except Exception:
+        pass
+    selector = (_tmp_step.get("selector") or "").strip()
+    xpath = (
+        (_tmp_step.get("xpath") or "")
+        or (info.get("xpath_stable") or info.get("xpath_abs") or "")
+    ).strip()
+    text = ((info.get("text") or "").strip())[:120]
+    attrs = info.get("attrs") or {}
+    if not text and isinstance(attrs, dict):
+        for key in ("aria-label", "placeholder", "title", "value", "alt"):
+            val = attrs.get(key)
+            if isinstance(val, str) and val.strip():
+                text = val.strip()[:120]
+                break
+    if not selector and not xpath and text:
+        esc = text.replace('"', '\\"')[:80]
+        selector = f'text="{esc}"'
+    return {"ok": True, "selector": selector, "xpath": xpath, "text": text, "info": info}
+
+
+async def add_wait_for_text_at(
+    sess: RecorderSession, x: int, y: int, timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """Point-and-click wait_for_text — auto-detect visible text at (x,y)."""
+    sess.touch()
+    cap = await _capture_element_locators(sess, x, y)
+    if not cap.get("ok"):
+        return {"recorded": False, "error": cap.get("error", "Could not read element")}
+    text = (cap.get("text") or "").strip()
+    if len(text) < 2:
+        return {
+            "recorded": False,
+            "error": "No readable text on this element — click the visible label or button text.",
+        }
+    timeout_ms = max(500, min(int(timeout_ms or 15000), 300000))
+    step: Dict[str, Any] = {
+        "action": "wait_for_text",
+        "text": text,
+        "timeout": timeout_ms,
+        "case_insensitive": True,
+        "origin": "wait_for_text_pick",
+    }
+    if cap.get("selector"):
+        step["hint_selector"] = cap["selector"]
+    sess.append_step(step)
+    return {"recorded": True, "step": step}
+
+
+async def add_wait_for_xpath_at(
+    sess: RecorderSession, x: int, y: int, timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """Point-and-click xpath wait — records step without live wait."""
+    sess.touch()
+    cap = await _capture_element_locators(sess, x, y)
+    if not cap.get("ok"):
+        return {"recorded": False, "error": cap.get("error", "Could not read element")}
+    xpath = (cap.get("xpath") or "").strip()
+    if not xpath:
+        return {"recorded": False, "error": "Could not derive xpath — try Wait for selector or Scan."}
+    timeout_ms = max(500, min(int(timeout_ms or 15000), 300000))
+    engine_sel = xpath if xpath.startswith("xpath=") else f"xpath={xpath}"
+    step: Dict[str, Any] = {
+        "action": "wait_for_selector",
+        "selector": engine_sel,
+        "xpath": xpath,
+        "timeout": timeout_ms,
+        "origin": "wait_for_xpath_pick",
+    }
+    if cap.get("text"):
+        step["hint_text"] = cap["text"]
+    sess.append_step(step)
+    return {"recorded": True, "step": step}
+
+
+async def add_wait_for_selector_at(
+    sess: RecorderSession, x: int, y: int, timeout_ms: int = 15000,
+) -> Dict[str, Any]:
+    """Point-and-click CSS selector wait — same as wait-for-button."""
+    result = await add_wait_for_button_at(sess, x, y, timeout_ms)
+    if result.get("recorded") and isinstance(result.get("step"), dict):
+        result["step"]["origin"] = "wait_for_selector_pick"
+    return result
 
 
 # JS run by detect_popup_buttons — finds visible popup / dialog / modal
