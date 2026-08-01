@@ -561,9 +561,21 @@
     var sel = document.querySelector("select[name*='state' i],select[id*='state' i],select#lstate");
     if (sel && isVis(sel)) setSelect(sel, data.state);
     fillDob(data);
+    function genderBtnMatch(btnText, g) {
+      var b = btnText.toLowerCase().replace(/\s+/g, " ").trim();
+      var raw = g.toLowerCase().replace(/\s+/g, " ").trim();
+      if (!raw) return false;
+      if (raw === "m" || raw === "male" || raw === "man") {
+        return b === "male" || b === "m" || b.indexOf("male") === 0;
+      }
+      if (raw === "f" || raw === "female" || raw === "woman") {
+        return b === "female" || b === "f" || b.indexOf("female") === 0;
+      }
+      return b === raw;
+    }
     if (data.gender) {
       var gBtn = btns().find(function (e) {
-        return txt(e).toLowerCase() === data.gender;
+        return genderBtnMatch(txt(e), data.gender);
       });
       if (gBtn) rfFire(gBtn);
     }

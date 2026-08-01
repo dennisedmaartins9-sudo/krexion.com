@@ -666,6 +666,185 @@ def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None)
     return {"action": "evaluate", "script": script}
 
 
+def _classify_gender_side(label: str) -> Optional[str]:
+    """Return ``male`` / ``female`` for a captured button label, else None."""
+    t = (label or "").strip().lower()
+    if not t:
+        return None
+    if t in ("m", "male", "man") or t.startswith("male"):
+        return "male"
+    if t in ("f", "female", "woman") or t.startswith("female"):
+        return "female"
+    return None
+
+
+def _split_gender_button_labels(labels: List[str]) -> Tuple[List[str], List[str]]:
+    """Partition recorded button texts into male-side and female-side pools."""
+    male: List[str] = []
+    female: List[str] = []
+    unknown: List[str] = []
+    seen: set = set()
+    for raw in labels or []:
+        lb = (raw or "").strip()
+        if not lb:
+            continue
+        key = lb.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        side = _classify_gender_side(lb)
+        if side == "male":
+            male.append(lb)
+        elif side == "female":
+            female.append(lb)
+        else:
+            unknown.append(lb)
+    if not male and not female and len(unknown) >= 2:
+        male = [unknown[0]]
+        female = [unknown[1]]
+    elif unknown:
+        for lb in unknown:
+            (male if len(male) <= len(female) else female).append(lb)
+    return male, female
+
+
+def _js_str_list(items: List[str]) -> str:
+    safe = []
+    for it in items:
+        s = (it or "").replace("\\", "\\\\").replace("'", "\\'")
+        if s:
+            safe.append("'" + s + "'")
+    return "[" + ",".join(safe) + "]"
+
+
+def _build_gender_pick_evaluate(
+    header_name: str,
+    male_labels: List[str],
+    female_labels: List[str],
+) -> Dict[str, Any]:
+    """Sheet-driven gender button click using recorded Male/Female labels."""
+    hn = (header_name or "").strip()
+    if not hn:
+        raise ValueError("header_name required for gender_pick")
+    safe_tpl = ("{{" + hn + "}}").replace("\\", "\\\\").replace("'", "\\'")
+    male_js = _js_str_list(male_labels or ["Male", "M", "male", "m"])
+    female_js = _js_str_list(female_labels or ["Female", "F", "female", "f"])
+    script = (
+        "(function(){"
+        "var raw='" + safe_tpl + "'.replace(/\\s+/g,' ').trim().toLowerCase();"
+        "var wantMale=raw==='m'||raw==='male'||raw==='man';"
+        "var wantFemale=raw==='f'||raw==='female'||raw==='woman';"
+        "var maleLabels=" + male_js + ";"
+        "var femaleLabels=" + female_js + ";"
+        "var targets=wantMale?maleLabels:(wantFemale?femaleLabels:[raw]);"
+        "if(!targets||!targets.length)targets=[raw];"
+        "var norm=function(s){return String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();};"
+        "var match=function(e){var s=window.getComputedStyle(e);"
+        "if(s.display==='none'||s.visibility==='hidden')return false;"
+        "var x=norm((e.innerText||e.textContent||e.value||''));"
+        "if(!x)return false;"
+        "for(var i=0;i<targets.length;i++){"
+        "var t=norm(targets[i]);if(!t)continue;"
+        "if(x===t)return true;"
+        "if(t.length>=2&&x.indexOf(t)!==-1)return true;"
+        "if(x.length>=2&&t.indexOf(x)!==-1)return true;"
+        "if(t==='male'&&(x==='m'||x.indexOf('male')===0))return true;"
+        "if(t==='female'&&(x==='f'||x.indexOf('female')===0))return true;"
+        "}"
+        "return false;};"
+        "var anchors=Array.from(document.querySelectorAll('a')).filter(match);"
+        "if(anchors.length){var a=anchors[0];a.scrollIntoView({block:'center'});"
+        "if(a.href&&!a.target){window.location.assign(a.href);}else{a.click();}return;}"
+        "var els=Array.from(document.querySelectorAll('button,div,span,label,input,[role=button],[role=radio]')).filter(match);"
+        "if(els.length){var el=els[0];el.scrollIntoView({block:'center'});"
+        "if(el.tagName==='LABEL'&&el.htmlFor){var ctl=document.getElementById(el.htmlFor);if(ctl){ctl.scrollIntoView({block:'center'});ctl.click();return;}}"
+        "var inner=el.querySelector&&el.querySelector('a[href]');"
+        "if(inner&&inner.href&&!inner.target){window.location.assign(inner.href);return;}"
+        "var box=el.querySelector&&el.querySelector('input[type=checkbox],input[type=radio]');"
+        "if(box&&!box.checked){box.click();return;}"
+        "el.click();"
+        "var isSubmit=(el.tagName==='INPUT'||el.tagName==='BUTTON')&&(el.type==='submit'||el.getAttribute&&el.getAttribute('type')==='submit');"
+        "if(isSubmit){var f=el.form||(el.closest&&el.closest('form'));"
+        "if(f){setTimeout(function(){try{if(!f._krx_submitted){f._krx_submitted=true;f.submit();}}catch(e){}},150);}}"
+        "}})();"
+    )
+    return {
+        "action": "evaluate",
+        "script": script,
+        "origin": "gender_pick",
+        "header_name": hn,
+        "gender_labels": {"male": male_labels, "female": female_labels},
+    }
+
+
+def _build_sheet_pick_evaluate(header_name: str) -> Dict[str, Any]:
+    """Text-based button click driven by an Excel column at replay time.
+
+    Unlike ``_build_text_click_evaluate(text, info)`` this deliberately
+    omits CSS/XPath selector priority so we never lock to whichever
+    button (e.g. Male) the user clicked during recording.  The emitted
+    script uses ``var t='{{header}}'`` and normalises common gender
+    shorthands (M/F → male/female) before text matching.
+    """
+    hn = (header_name or "").strip()
+    if not hn:
+        raise ValueError("header_name required for sheet_pick")
+    safe_tpl = ("{{" + hn + "}}").replace("\\", "\\\\").replace("'", "\\'")
+    script = (
+        "(function(){"
+        "var raw='" + safe_tpl + "'.replace(/\\s+/g,' ').trim().toLowerCase();"
+        "var t=raw;"
+        "if(raw==='m'||raw==='male'||raw==='man')t='male';"
+        "else if(raw==='f'||raw==='female'||raw==='woman')t='female';"
+        "var match=function(e){var s=window.getComputedStyle(e);"
+        "if(s.display==='none'||s.visibility==='hidden')return false;"
+        "var x=((e.innerText||e.textContent||e.value||'')+'').replace(/\\s+/g,' ').trim().toLowerCase();"
+        "if(!x)return false;"
+        "if(x===t)return true;"
+        "if(t.length>=12&&x.indexOf(t)!==-1)return true;"
+        "if(t.length>=12&&x.length>=8&&t.indexOf(x)!==-1)return true;"
+        "if(t==='male'&&(x==='m'||x.indexOf('male')===0))return true;"
+        "if(t==='female'&&(x==='f'||x.indexOf('female')===0))return true;"
+        "return false;};"
+        "var anchors=Array.from(document.querySelectorAll('a')).filter(match);"
+        "if(anchors.length){var a=anchors[0];a.scrollIntoView({block:'center'});"
+        "if(a.href&&!a.target){window.location.assign(a.href);}else{a.click();}return;}"
+        "var els=Array.from(document.querySelectorAll('button,div,span,label,input,[role=button],[role=radio]')).filter(match);"
+        "if(els.length){var el=els[0];el.scrollIntoView({block:'center'});"
+        "if(el.tagName==='LABEL'&&el.htmlFor){var ctl=document.getElementById(el.htmlFor);if(ctl){ctl.scrollIntoView({block:'center'});ctl.click();return;}}"
+        "var inner=el.querySelector&&el.querySelector('a[href]');"
+        "if(inner&&inner.href&&!inner.target){window.location.assign(inner.href);return;}"
+        "var box=el.querySelector&&el.querySelector('input[type=checkbox],input[type=radio]');"
+        "if(box&&!box.checked){box.click();return;}"
+        "el.click();"
+        "var isSubmit=(el.tagName==='INPUT'||el.tagName==='BUTTON')&&(el.type==='submit'||el.getAttribute&&el.getAttribute('type')==='submit');"
+        "if(isSubmit){var f=el.form||(el.closest&&el.closest('form'));"
+        "if(f){setTimeout(function(){try{if(!f._krx_submitted){f._krx_submitted=true;f.submit();}}catch(e){}},150);}}"
+        "}})();"
+    )
+    return {
+        "action": "evaluate",
+        "script": script,
+        "origin": "sheet_pick",
+        "header_name": hn,
+    }
+
+
+def _is_gender_header(header_name: Optional[str]) -> bool:
+    key = (header_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return key in ("gender", "sex") or "gender" in key or key.endswith("_sex")
+
+
+def _normalize_gender_click_label(value: str) -> str:
+    """Map M/F shorthands to button-visible labels for live recording clicks."""
+    g = (value or "").strip().lower()
+    if g in ("m", "male", "man"):
+        return "Male"
+    if g in ("f", "female", "woman"):
+        return "Female"
+    return (value or "").strip()
+
+
 def _build_random_pick_advanced(options: List[Dict[str, str]]) -> Dict[str, Any]:
     """2026-05 — Random-pick with PER-OPTION fallback strategies.
 
@@ -877,6 +1056,70 @@ def _get_fallback_sample_value(header_name: str) -> Optional[str]:
     return None
 
 
+def _is_postal_header(header_name: str) -> bool:
+    key = (header_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return any(p in key for p in ("zip", "postal", "postcode"))
+
+
+# Case-insensitive sample_row column aliases (mirrors RUT _PLACEHOLDER_SYNONYMS).
+_SAMPLE_ROW_SYNONYMS: Dict[str, List[str]] = {
+    "zip": ["zip_code", "zipcode", "postal", "postal_code", "postalcode", "postcode"],
+    "zip_code": ["zip", "zipcode", "postal", "postal_code", "postalcode", "postcode"],
+    "gender": ["sex"],
+    "sex": ["gender"],
+}
+
+
+def _format_sample_cell_value(header_name: str, raw: Any) -> str:
+    """Normalise an Excel cell for live browser fill during recording."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bool):
+        return str(raw)
+    key = (header_name or "").strip().lower()
+    if _is_postal_header(key):
+        if isinstance(raw, (int, float)):
+            try:
+                n = int(round(float(raw)))
+                return str(n).zfill(5) if n < 100000 else str(n)
+            except (ValueError, OverflowError):
+                pass
+        s = str(raw).strip()
+        if s.replace(".", "", 1).isdigit() and "." in s:
+            try:
+                n = int(round(float(s)))
+                return str(n).zfill(5) if n < 100000 else str(n)
+            except ValueError:
+                pass
+        digits = "".join(c for c in s if c.isdigit())
+        if len(digits) >= 5:
+            return digits[:5]
+        if digits:
+            return digits.zfill(5)
+    if isinstance(raw, float) and raw == int(raw):
+        return str(int(raw))
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return str(raw)
+    return str(raw).strip()
+
+
+def _lookup_sample_row(sess: "RecorderSession", header_name: str) -> Optional[Any]:
+    """Case-insensitive sample_row lookup with common column synonyms."""
+    key = str(header_name or "").strip().lower()
+    if not key or not sess.sample_row:
+        return None
+    if key in sess.sample_row:
+        return sess.sample_row[key]
+    for syn in _SAMPLE_ROW_SYNONYMS.get(key, []):
+        if syn in sess.sample_row:
+            return sess.sample_row[syn]
+    collapsed = key.replace("_", "")
+    for k, v in sess.sample_row.items():
+        if str(k).replace("_", "") == collapsed:
+            return v
+    return None
+
+
 def _resolve_live_value(sess: "RecorderSession", header_name: str) -> Optional[str]:
     """Resolve the value to fill into the live browser for a header.
 
@@ -886,11 +1129,9 @@ def _resolve_live_value(sess: "RecorderSession", header_name: str) -> Optional[s
     """
     if not header_name:
         return None
-    key = str(header_name).strip().lower()
-    if key in sess.sample_row:
-        raw = sess.sample_row[key]
-        if raw is not None and str(raw).strip() != "":
-            return str(raw)
+    raw = _lookup_sample_row(sess, header_name)
+    if raw is not None and str(raw).strip() != "":
+        return _format_sample_cell_value(header_name, raw)
     return _get_fallback_sample_value(header_name)
 
 
@@ -2243,6 +2484,8 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
     appends a step. Modes:
       - default:    normal text-based click
       - form_fill:  click + remember field for next /type call (Excel header binding)
+      - sheet_pick: click a button (Male/Female etc.) + bind to Excel column via
+                    /sheet-pick-bind (text match at replay — no fixed Male selector)
       - random:     add this element to a "random pick" group (group_id required)
       - dropdown:   click a <select> element, return its <option> list so the
                     caller can bind an option (literal value/label) OR an
@@ -2279,7 +2522,7 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         # JS below (label→checkbox walk) so the live page reflects the
         # actual toggled state — a blind mouse.click() at coords could
         # land on a hidden input and do nothing.
-        if mode not in ("random", "random_click", "check"):
+        if mode not in ("random", "random_click", "check", "gender_pick"):
             try:
                 await sess.page.mouse.click(info["x"], info["y"])
             except Exception:
@@ -2608,6 +2851,32 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
                 )
         else:
             step = {"action": "wait_for_selector", "selector": sel, "timeout": 8000, "optional": True}
+    elif mode == "sheet_pick":
+        # Two-step flow (like dropdown): click captures the element, bind
+        # records the per-row text-click evaluate step.
+        step = None
+        extra["pending_sheet_pick"] = True
+        extra["clicked_text"] = text
+        tag_u = (info.get("tag") or "").upper()
+        if tag_u in ("INPUT", "TEXTAREA", "SELECT"):
+            extra["warning"] = (
+                "That looks like a form input — use Form Fill for text fields "
+                "or Dropdown for <select> elements."
+            )
+        elif not text:
+            extra["warning"] = (
+                "No visible text on this element — Sheet Pick works best on "
+                "labelled buttons (Male / Female / Yes / No)."
+            )
+    elif mode == "gender_pick":
+        # Collect Male + Female button labels (no step yet) — bind via
+        # /gender-pick-bind once both sides are captured.
+        step = None
+        extra["gender_pick_text"] = text
+        if not text:
+            extra["warning"] = (
+                "No visible text — click the Male or Female button label."
+            )
     elif mode in ("random", "random_click"):
         # Don't add a step — caller will batch via /group-random
         extra["pending_random_text"] = text
@@ -3437,6 +3706,113 @@ async def bind_dropdown(
     return {"recorded": True, "step": step, **extra}
 
 
+async def bind_sheet_pick(
+    sess: RecorderSession,
+    header_name: str,
+    clicked_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Finalise a sheet-pick binding started by a ``mode='sheet_pick'`` click."""
+    sess.touch()
+    hn = (header_name or "").strip()
+    if not hn:
+        return {"recorded": False, "error": "header_name required"}
+    try:
+        step = _build_sheet_pick_evaluate(hn)
+    except ValueError as e:
+        return {"recorded": False, "error": str(e)}
+    sess.append_step(step)
+
+    extra: Dict[str, Any] = {}
+    live_val = _resolve_live_value(sess, hn)
+    if live_val:
+        click_label = (
+            _normalize_gender_click_label(live_val)
+            if _is_gender_header(hn)
+            else str(live_val).strip()
+        )
+        clicked_norm = (clicked_text or "").strip().lower()
+        target_norm = click_label.strip().lower()
+        if not clicked_norm or clicked_norm != target_norm:
+            try:
+                live_js = _build_text_click_evaluate(click_label)
+                async with sess.lock:
+                    await sess.page.evaluate(live_js["script"])
+                extra["clicked_sample"] = click_label[:40]
+            except Exception as e:  # noqa: BLE001
+                extra["click_warning"] = (
+                    f"Live page could not click '{click_label}' ({type(e).__name__}). "
+                    "Step recorded anyway — verify the column value matches a button label."
+                )
+        else:
+            extra["clicked_sample"] = click_label[:40]
+    else:
+        extra["sample_hint"] = (
+            f"No sample data for column '{hn}'. Upload Excel before recording "
+            "so the live page selects the correct button during recording."
+        )
+    return {"recorded": True, "step": step, "header_name": hn, **extra}
+
+
+async def bind_gender_pick(
+    sess: RecorderSession,
+    header_name: str,
+    button_labels: List[str],
+) -> Dict[str, Any]:
+    """Record a gender step after the user clicked Male + Female buttons."""
+    sess.touch()
+    hn = (header_name or "").strip()
+    if not hn:
+        return {"recorded": False, "error": "header_name required"}
+    labels = [(lb or "").strip() for lb in (button_labels or []) if (lb or "").strip()]
+    if len(labels) < 2:
+        return {
+            "recorded": False,
+            "error": "Add at least 2 gender buttons (Male and Female) before binding",
+        }
+    male_labels, female_labels = _split_gender_button_labels(labels)
+    if not male_labels or not female_labels:
+        return {
+            "recorded": False,
+            "error": (
+                "Could not tell which button is Male vs Female — use labels like "
+                "Male/Female or M/F"
+            ),
+        }
+    try:
+        step = _build_gender_pick_evaluate(hn, male_labels, female_labels)
+    except ValueError as e:
+        return {"recorded": False, "error": str(e)}
+    sess.append_step(step)
+
+    extra: Dict[str, Any] = {
+        "male_labels": male_labels,
+        "female_labels": female_labels,
+    }
+    live_val = _resolve_live_value(sess, hn)
+    if live_val:
+        side = _classify_gender_side(str(live_val)) or _classify_gender_side(
+            _normalize_gender_click_label(str(live_val))
+        )
+        pick_pool = male_labels if side == "male" else female_labels if side == "female" else []
+        click_label = pick_pool[0] if pick_pool else _normalize_gender_click_label(str(live_val))
+        try:
+            live_js = _build_text_click_evaluate(click_label)
+            async with sess.lock:
+                await sess.page.evaluate(live_js["script"])
+            extra["clicked_sample"] = click_label[:40]
+        except Exception as e:  # noqa: BLE001
+            extra["click_warning"] = (
+                f"Live page could not click '{click_label}' ({type(e).__name__}). "
+                "Step recorded anyway."
+            )
+    else:
+        extra["sample_hint"] = (
+            f"No sample data for column '{hn}'. Upload Excel before recording "
+            "so the live page selects the correct gender during recording."
+        )
+    return {"recorded": True, "step": step, "header_name": hn, **extra}
+
+
 _MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -3629,81 +4005,12 @@ async def type_text(sess: RecorderSession, selector: str, value: str, header_nam
     extra: Dict[str, Any] = {}
     async with sess.lock:
         if live_val:
-            # ── 2026-06 — multi-strategy fill ──────────────────────────
-            # Customer report: "likhne wale jo box hai jahan numeric ye
-            # kuch type krna hota aksar button mein likha ni jata".
-            # Some inputs (custom React/Vue controlled inputs, masked
-            # phone/zip fields, contenteditable divs) silently reject
-            # `page.fill()` — the value is set on the DOM node but the
-            # framework's controlled-state never updates so the page
-            # treats the field as still-empty when the user clicks
-            # "Continue". We now try three strategies in order, each
-            # verifies the input actually contains the typed text
-            # before declaring success.
-            fill_ok = False
-            fill_err: Optional[str] = None
-            # Strategy 1: native page.fill (fastest, works for 95% of inputs)
-            try:
-                await sess.page.fill(selector, live_val, timeout=6000)
-                # Verify the value actually stuck (React controlled
-                # inputs sometimes accept fill() but revert).
-                _got = await sess.page.evaluate(
-                    "(s) => { var e = document.querySelector(s); return e ? (e.value != null ? e.value : (e.innerText || '')) : ''; }",
-                    selector,
+            fill_ok, fill_extra = await _fill_live_input(sess.page, selector, live_val)
+            extra.update(fill_extra)
+            if not fill_ok:
+                logger.warning(
+                    f"type fill failed selector={selector}: {extra.get('fill_warning', '')}"
                 )
-                if isinstance(_got, str) and _got.strip() == live_val.strip():
-                    fill_ok = True
-                    extra["filled_sample"] = live_val[:30]
-            except Exception as e:
-                fill_err = f"fill: {type(e).__name__}: {str(e)[:80]}"
-            # Strategy 2: click + keyboard.type (humanised) — handles
-            # masked inputs, contenteditable, and React onChange-only
-            # fields. Clears first via triple-click + Backspace.
-            if not fill_ok:
-                try:
-                    await sess.page.click(selector, timeout=4000)
-                    try:
-                        await sess.page.click(selector, click_count=3, timeout=1500)
-                        await sess.page.keyboard.press("Backspace")
-                    except Exception:
-                        pass
-                    await sess.page.keyboard.type(live_val, delay=25)
-                    _got2 = await sess.page.evaluate(
-                        "(s) => { var e = document.querySelector(s); return e ? (e.value != null ? e.value : (e.innerText || '')) : ''; }",
-                        selector,
-                    )
-                    if isinstance(_got2, str) and live_val.strip() in _got2:
-                        fill_ok = True
-                        extra["filled_sample"] = live_val[:30]
-                        extra["fill_strategy"] = "keyboard"
-                except Exception as e:
-                    fill_err = (fill_err or "") + f" | keyboard: {type(e).__name__}: {str(e)[:80]}"
-            # Strategy 3: brute-force JS set + dispatch input/change so
-            # any framework listening for onChange picks it up.
-            if not fill_ok:
-                try:
-                    await sess.page.evaluate(
-                        """([s, v]) => {
-                            var e = document.querySelector(s);
-                            if (!e) return;
-                            try {
-                                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
-                                if (setter && setter.set) { setter.set.call(e, v); }
-                                else { e.value = v; }
-                            } catch(_) { try { e.value = v; } catch(__){} }
-                            try { e.dispatchEvent(new Event('input', {bubbles:true})); } catch(_){}
-                            try { e.dispatchEvent(new Event('change', {bubbles:true})); } catch(_){}
-                        }""",
-                        [selector, live_val],
-                    )
-                    fill_ok = True
-                    extra["filled_sample"] = live_val[:30]
-                    extra["fill_strategy"] = "js_set"
-                except Exception as e:
-                    fill_err = (fill_err or "") + f" | js: {type(e).__name__}: {str(e)[:80]}"
-            if not fill_ok:
-                logger.warning(f"type fill failed selector={selector}: {fill_err}")
-                extra["fill_warning"] = (fill_err or "all strategies failed")[:200]
         elif header_name:
             extra["sample_hint"] = (
                 f"No sample value for column '{header_name}'. Upload an "
@@ -3861,6 +4168,123 @@ async def navigate_only_click(sess: RecorderSession, x: int, y: int) -> Dict[str
         except Exception as e:  # noqa: BLE001
             return {"clicked": False, "error": f"{type(e).__name__}: {e}"}
     return {"clicked": True, "recorded": False}
+
+
+async def _fill_live_input(page: Any, selector: str, live_val: str) -> Tuple[bool, Dict[str, Any]]:
+    """Fill a live input during recording (no step appended).
+
+    Shared by ``type_text`` (recorded fill steps) and ``manual_type_at``
+    (Fix Type tool — correction only, zero JSON steps).
+    """
+    extra: Dict[str, Any] = {}
+    fill_ok = False
+    fill_err: Optional[str] = None
+    if not live_val:
+        return False, extra
+    try:
+        await page.fill(selector, live_val, timeout=6000)
+        _got = await page.evaluate(
+            "(s) => { var e = document.querySelector(s); return e ? (e.value != null ? e.value : (e.innerText || '')) : ''; }",
+            selector,
+        )
+        if isinstance(_got, str) and _got.strip() == live_val.strip():
+            fill_ok = True
+            extra["filled_sample"] = live_val[:30]
+    except Exception as e:
+        fill_err = f"fill: {type(e).__name__}: {str(e)[:80]}"
+    if not fill_ok:
+        try:
+            await page.click(selector, timeout=4000)
+            try:
+                await page.click(selector, click_count=3, timeout=1500)
+                await page.keyboard.press("Backspace")
+            except Exception:
+                pass
+            await page.keyboard.type(live_val, delay=25)
+            _got2 = await page.evaluate(
+                "(s) => { var e = document.querySelector(s); return e ? (e.value != null ? e.value : (e.innerText || '')) : ''; }",
+                selector,
+            )
+            if isinstance(_got2, str) and live_val.strip() in _got2:
+                fill_ok = True
+                extra["filled_sample"] = live_val[:30]
+                extra["fill_strategy"] = "keyboard"
+        except Exception as e:
+            fill_err = (fill_err or "") + f" | keyboard: {type(e).__name__}: {str(e)[:80]}"
+    if not fill_ok:
+        try:
+            await page.evaluate(
+                """([s, v]) => {
+                    var e = document.querySelector(s);
+                    if (!e) return;
+                    try {
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+                        if (setter && setter.set) { setter.set.call(e, v); }
+                        else { e.value = v; }
+                    } catch(_) { try { e.value = v; } catch(__){} }
+                    try { e.dispatchEvent(new Event('input', {bubbles:true})); } catch(_){}
+                    try { e.dispatchEvent(new Event('change', {bubbles:true})); } catch(_){}
+                }""",
+                [selector, live_val],
+            )
+            fill_ok = True
+            extra["filled_sample"] = live_val[:30]
+            extra["fill_strategy"] = "js_set"
+        except Exception as e:
+            fill_err = (fill_err or "") + f" | js: {type(e).__name__}: {str(e)[:80]}"
+    if not fill_ok:
+        extra["fill_warning"] = (fill_err or "all strategies failed")[:200]
+    return fill_ok, extra
+
+
+async def manual_type_at(sess: RecorderSession, x: int, y: int, value: str) -> Dict[str, Any]:
+    """Type into an input at (x, y) WITHOUT recording a step.
+
+    Use case (2026-07): Form Fill may auto-type a wrong sample value
+    during recording (e.g. zip typo). The operator fixes the live field
+    with this tool — same idea as Move / nav_only for clicks.
+    """
+    sess.touch()
+    live_val = str(value or "").strip()
+    if not live_val:
+        return {"typed": False, "recorded": False, "error": "value required"}
+    async with sess.lock:
+        info = await sess.page.evaluate(_RICH_ELEMENT_CAPTURE_JS, [int(x), int(y)])
+        if not info:
+            return {"typed": False, "recorded": False, "error": "No element at that point"}
+        tag = (info.get("tag") or "").upper()
+        attrs = info.get("attrs") or {}
+        type_attr = (attrs.get("type") or info.get("type") or "").lower()
+        is_editable = (
+            tag in ("INPUT", "TEXTAREA")
+            or bool(info.get("contenteditable"))
+            or type_attr in ("text", "email", "tel", "number", "search", "password", "")
+        )
+        if not is_editable:
+            return {
+                "typed": False,
+                "recorded": False,
+                "error": "That is not a text field — click an input/textarea to fix its value.",
+            }
+        selector = _make_selector_for_input(info)
+        try:
+            await sess.page.mouse.click(info.get("x") or int(x), info.get("y") or int(y))
+        except Exception:
+            pass
+        fill_ok, extra = await _fill_live_input(sess.page, selector, live_val)
+    if not fill_ok:
+        return {
+            "typed": False,
+            "recorded": False,
+            "selector": selector,
+            **extra,
+        }
+    return {
+        "typed": True,
+        "recorded": False,
+        "selector": selector,
+        **extra,
+    }
 
 
 async def detect_clickables(sess: RecorderSession) -> Dict[str, Any]:

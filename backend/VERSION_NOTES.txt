@@ -1,3 +1,11 @@
+# v2.6.53 — 2026-08 — Visual Recorder: Gender, Fix Type, Sheet Pick, zip fix
+#
+# - Gender tool: click Male + Female pool, bind {{gender}} — M/F/male/female auto-detect.
+# - Fix Type tool: correct live input without adding a JSON step (Move-style).
+# - Sheet Pick: bind any button group to an Excel column for per-row text click.
+# - Excel sample_row column-index fix + zip/postal normalisation (92335.0 → 92335).
+# - RUT + Smart Flow: gender label normalisation (M/F → Male/Female button match).
+#
 # v2.6.37 — 2026-07 — Smart Funnel: conversion only after URL deal markers
 #
 # - Deal count is URL-authoritative (BVA/BVC/BVE=True), not CONTINUE click inflation.

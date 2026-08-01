@@ -22698,6 +22698,25 @@ async def vr_nav_click(session_id: str, req: VRNavClickReq, user: dict = Depends
     return await vr.navigate_only_click(sess, req.x, req.y)
 
 
+class VRManualTypeReq(BaseModel):
+    x: int
+    y: int
+    value: str
+
+
+@api_router.post("/visual-recorder/{session_id}/manual-type")
+async def vr_manual_type(session_id: str, req: VRManualTypeReq, user: dict = Depends(get_current_user)):
+    """Type into an input at (x, y) WITHOUT recording a step (Fix Type tool)."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.manual_type_at(sess, req.x, req.y, req.value)
+
+
 @api_router.post("/visual-recorder/{session_id}/mark-final")
 async def vr_mark_final(session_id: str, user: dict = Depends(get_current_user)):
     if vr is None:
@@ -22774,6 +22793,50 @@ async def vr_dropdown_bind(session_id: str, req: VRDropdownBindReq, user: dict =
         value=req.value,
         header_name=req.header_name,
         match_by=req.match_by,
+    )
+
+
+class VRSheetPickBindReq(BaseModel):
+    header_name: str
+    clicked_text: Optional[str] = None
+
+
+class VRGenderPickBindReq(BaseModel):
+    header_name: str
+    button_labels: List[str] = []
+
+
+@api_router.post("/visual-recorder/{session_id}/sheet-pick-bind")
+async def vr_sheet_pick_bind(session_id: str, req: VRSheetPickBindReq, user: dict = Depends(get_current_user)):
+    """Finalise a sheet-pick binding started by a click in sheet_pick mode."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.bind_sheet_pick(
+        sess,
+        header_name=req.header_name,
+        clicked_text=req.clicked_text,
+    )
+
+
+@api_router.post("/visual-recorder/{session_id}/gender-pick-bind")
+async def vr_gender_pick_bind(session_id: str, req: VRGenderPickBindReq, user: dict = Depends(get_current_user)):
+    """Record gender button step after Male + Female labels were captured."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _vr_require_ready(sess)
+    return await vr.bind_gender_pick(
+        sess,
+        header_name=req.header_name,
+        button_labels=req.button_labels or [],
     )
 
 

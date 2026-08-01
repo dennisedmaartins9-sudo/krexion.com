@@ -13120,6 +13120,16 @@ def _extract_random_pick_labels(script: Any) -> Optional[List[str]]:
     return out or None
 
 
+def _normalize_gender_click_label(label: str) -> str:
+    """Map M/F shorthands to button-visible labels for native text-click."""
+    g = (label or "").strip().lower()
+    if g in ("m", "male", "man"):
+        return "Male"
+    if g in ("f", "female", "woman"):
+        return "Female"
+    return (label or "").strip()
+
+
 def _extract_text_click_label(script: Any) -> Optional[str]:
     """Parse `var t='Continue'` from a legacy text-click evaluate
     script. Returns the label or None. Only matches the simple
@@ -15247,9 +15257,9 @@ async def _execute_automation_steps(
                         else:
                             _tc_label = _extract_text_click_label(js)
                             if _tc_label:
-                                _native_picked = _tc_label
+                                _native_picked = _normalize_gender_click_label(_tc_label)
                                 _ok_n, _frame_url_n, _err_n = await _native_click_by_text(
-                                    page, _tc_label, timeout_ms=8000
+                                    page, _native_picked, timeout_ms=8000
                                 )
                                 if _ok_n:
                                     logger.info(
