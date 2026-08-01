@@ -25,10 +25,13 @@ on:
     branches: [main]
     paths:
       - 'backend/VERSION'
+      - '.github/workflows/build-electron-desktop.yml'
 
 permissions:
   contents: write
 
+# v2.6.52 consolidated release — cancel-in-progress ensures only the
+# latest VERSION bump builds (no stale 2.6.50/51 desktop installers).
 concurrency:
   group: krexion-electron-${{ github.ref }}
   cancel-in-progress: true

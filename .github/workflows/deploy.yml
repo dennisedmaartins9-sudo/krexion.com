@@ -25,11 +25,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Only one deploy at a time — new pushes cancel any in-flight run.
+# Only one deploy at a time — latest push wins so stacked 2.6.50/51/52
+# deploys don't race; customer always gets the newest main.
 concurrency:
   group: krexion-vps-deploy
-  cancel-in-progress: false  # let in-flight deploys finish so we don't
-                             # break a mid-container-rebuild step
+  cancel-in-progress: true
 
 jobs:
   deploy:

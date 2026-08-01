@@ -29,7 +29,10 @@ on:
     branches: [main]
     paths:
       - 'backend/VERSION'
+      - '.github/workflows/build-windows-release.yml'
 
+# v2.6.52 consolidated release — cancel-in-progress ensures only the
+# latest VERSION bump builds (no stale 2.6.50/51 installers).
 concurrency:
   group: krexion-native-build-${{ github.ref }}
   cancel-in-progress: true
