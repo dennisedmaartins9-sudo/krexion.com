@@ -1228,12 +1228,12 @@ class RecorderSession:
     session_id: str
     user_id: str
     url: str
-    proxy: Optional[str]
+    proxy: Optional[str] = None
+    user_agent: Optional[str] = None
+    headers: List[str] = field(default_factory=list)  # Excel column names for form-fill binding
     proxy_provider_id: str = ""
     country: str = ""
     device_type: str = "auto"
-    user_agent: Optional[str]
-    headers: List[str]                          # Excel column names for form-fill binding
     # ── 2026-05 ──
     # Sample data row used DURING recording so the form fills with
     # realistic values (lets the user proceed past form validation
