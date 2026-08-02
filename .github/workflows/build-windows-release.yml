@@ -59,7 +59,10 @@ jobs:
     # comes back — it will NOT fall back to `windows-latest` (that's a
     # cost-of-doing-business decision, not a runtime one).
     runs-on: [self-hosted, windows, krexion-windows]
-    timeout-minutes: 30
+    # v2.6.55 — raised 30 -> 60 min: embedded-Python bundle (pip +
+    # Playwright browser download) routinely exceeds 30 min when the
+    # Windows runner is busy or Electron is queued on the same host.
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.version.outputs.version }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
