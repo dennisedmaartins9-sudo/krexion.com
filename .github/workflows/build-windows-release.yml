@@ -63,7 +63,7 @@ jobs:
     # v2.6.55 — backend bundle (pip install all wheels) takes 90+ min
     # on the self-hosted Windows runner; #191/#192 cancelled at 30/60m,
     # #193 at 90m ceiling.
-    timeout-minutes: 120
+    timeout-minutes: 180
     outputs:
       version: ${{ steps.version.outputs.version }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
@@ -224,17 +224,10 @@ jobs:
           retention-days: 3
           if-no-files-found: warn
 
-      # ── 2026-01 (artifact-quota workaround) ──
-      # Save the backend build to the actions/cache store too. Cache
-      # has a SEPARATE 10 GB quota from artifacts, so even if artifact
-      # upload fails the installer job can still pull it from cache.
-      # Key includes the commit SHA so each push gets a fresh cache.
-      - name: Cache backend build for installer job
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: build/dist/krexion-backend.dist
-          key: krexion-backend-${{ github.sha }}-${{ github.run_id }}
+      # v2.6.55 — removed per-run SHA cache save here; uploading the
+      # multi-GB backend bundle to actions/cache added 20+ min AFTER a
+      # successful build and caused #194 to hit the job timeout anyway.
+      # Installer job falls back to the artifact uploaded above.
 
   build-frontend:
     name: Build React frontend
