@@ -31,11 +31,12 @@ on:
       - 'backend/VERSION'
       - '.github/workflows/build-windows-release.yml'
 
-# v2.6.52 consolidated release — cancel-in-progress ensures only the
-# latest VERSION bump builds (no stale 2.6.50/51 installers).
+# v2.6.52 consolidated release — do NOT cancel a running native build
+# when a CI-only push lands; the backend bundle routinely takes 90+
+# minutes on the self-hosted Windows runner (#191/#192/#193 timeouts).
 concurrency:
   group: krexion-native-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # ----------------------------------------------------------------------
 # `contents: write` is required by softprops/action-gh-release@v2 in the
@@ -59,10 +60,10 @@ jobs:
     # comes back — it will NOT fall back to `windows-latest` (that's a
     # cost-of-doing-business decision, not a runtime one).
     runs-on: [self-hosted, windows, krexion-windows]
-    # v2.6.55 — raised 30 -> 90 min: embedded-Python bundle (pip +
-    # Playwright browser download) hit the 60 min ceiling twice on
-    # the self-hosted Windows runner (#191, #192 cancelled).
-    timeout-minutes: 90
+    # v2.6.55 — backend bundle (pip install all wheels) takes 90+ min
+    # on the self-hosted Windows runner; #191/#192 cancelled at 30/60m,
+    # #193 at 90m ceiling.
+    timeout-minutes: 120
     outputs:
       version: ${{ steps.version.outputs.version }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
@@ -144,6 +145,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Restore pip wheel cache
+        uses: actions/cache/restore@v4
+        id: pip-cache
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
+          restore-keys: |
+            krexion-pip-win-
+
       - name: Run embedded-Python build
         shell: powershell
         env:
@@ -155,6 +166,14 @@ jobs:
             Write-Host "::error::Build script returned exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
+
+      - name: Save pip wheel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
 
       - name: Show build output (diagnostic)
         if: always()
