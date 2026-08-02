@@ -2180,6 +2180,12 @@ class AdminToken(BaseModel):
     token_type: str
     is_admin: bool = True
 
+
+class AdminChangePasswordReq(BaseModel):
+    current_password: str
+    new_password: str
+
+
 class UserFeatures(BaseModel):
     # Allow the admin UI to send granular feature keys (import_traffic,
     # real_traffic, ua_generator, email_checker, separate_data, etc.)
@@ -2250,6 +2256,8 @@ class UserResponse(BaseModel):
     parent_user_id: Optional[str] = None  # For sub-users
     sub_user_count: int = 0  # Number of sub-users this user has
     created_at: str
+    # v2.6.1 — per-customer VPS heavy override (Admin › Users toggle)
+    allow_cloud_heavy: bool = False
 
 class SubUserResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -5115,6 +5123,31 @@ async def get_sub_users_stats(user: dict = Depends(get_current_user_with_fresh_d
 
 # ==================== ADMIN ROUTES ====================
 
+async def _admin_password_matches(plain_password: str) -> bool:
+    """True when `plain_password` matches the effective admin password.
+
+    Prefers the DB-stored hash (post-reset / admin-panel change); falls
+    back to the env ADMIN_PASSWORD with constant-time compare.
+    """
+    import hmac as _hmac
+
+    try:
+        override = await main_db.admin_config.find_one(
+            {"key": "admin_password"}, {"_id": 0, "value": 1}
+        )
+    except Exception:
+        override = None
+    if override and override.get("value"):
+        try:
+            return verify_password(plain_password, override["value"])
+        except Exception:
+            return False
+    return _hmac.compare_digest(
+        (plain_password or "").encode("utf-8"),
+        (ADMIN_PASSWORD or "").encode("utf-8"),
+    )
+
+
 async def get_current_admin(request: Request):
     """Verify admin token"""
     auth_header = request.headers.get("Authorization")
@@ -5147,7 +5180,6 @@ async def admin_login(credentials: AdminLogin):
     #     eliminated.
     #   • Rate-limiting (Fix #5) is applied via `_check_login_rate_limit`
     #     below — 8 failed attempts per IP per 15 min → 429.
-    import hmac as _hmac
     _rl_key = f"admin:{credentials.email}:{_client_ip_for_rl()}"
     _check_login_rate_limit(_rl_key)
 
@@ -5155,26 +5187,7 @@ async def admin_login(credentials: AdminLogin):
         _record_login_failure(_rl_key)
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
-    # Password verification — prefer DB-stored hash (post-reset),
-    # else the env plaintext default.
-    password_ok = False
-    try:
-        override = await main_db.admin_config.find_one(
-            {"key": "admin_password"}, {"_id": 0, "value": 1}
-        )
-    except Exception:
-        override = None
-    if override and override.get("value"):
-        try:
-            password_ok = verify_password(credentials.password, override["value"])
-        except Exception:
-            password_ok = False
-    else:
-        # Constant-time comparison against env plaintext
-        password_ok = _hmac.compare_digest(
-            (credentials.password or "").encode("utf-8"),
-            (ADMIN_PASSWORD or "").encode("utf-8"),
-        )
+    password_ok = await _admin_password_matches(credentials.password)
 
     if not password_ok:
         _record_login_failure(_rl_key)
@@ -5356,6 +5369,7 @@ async def get_all_users(admin: dict = Depends(get_current_admin)):
                 "subscription_expires": sub_exp,
                 "created_at": created_at,
                 "sub_user_count": sub_count,
+                "allow_cloud_heavy": bool(user.get("allow_cloud_heavy")),
             }))
         except Exception as e:
             logger.error(f"Failed to serialize user {user.get('email')}: {e}")
@@ -5689,7 +5703,8 @@ async def get_user(user_id: str, admin: dict = Depends(get_current_admin)):
     return UserResponse(**{
         **user,
         "status": user.get("status", "pending"),
-        "features": user.get("features", DEFAULT_FEATURES)
+        "features": user.get("features", DEFAULT_FEATURES),
+        "allow_cloud_heavy": bool(user.get("allow_cloud_heavy")),
     })
 
 
@@ -5889,6 +5904,66 @@ async def admin_set_strict_mode(
             f"Strict mode {'ENABLED' if req.enabled else 'DISABLED'} — "
             "takes effect on the next request (no restart needed)."
         ),
+    }
+
+
+@api_router.get("/admin/account")
+async def admin_get_account(admin: dict = Depends(get_current_admin)):
+    """Logged-in admin profile — email + whether password was customized."""
+    override = None
+    try:
+        override = await main_db.admin_config.find_one(
+            {"key": "admin_password"}, {"_id": 0, "updated_at": 1, "value": 1}
+        )
+    except Exception:
+        pass
+    customized = bool(override and override.get("value"))
+    return {
+        "email": ADMIN_EMAIL,
+        "password_customized": customized,
+        "password_updated_at": override.get("updated_at") if override else None,
+        "login_url": "/admin",
+        "forgot_password_url": "/forgot-password",
+    }
+
+
+@api_router.post("/admin/account/change-password")
+async def admin_change_password(
+    req: AdminChangePasswordReq,
+    admin: dict = Depends(get_current_admin),
+):
+    """Change admin password while logged in (stored hashed in admin_config)."""
+    new_pw = (req.new_password or "").strip()
+    if len(new_pw) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be at least 8 characters",
+        )
+    if new_pw == (req.current_password or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from current password",
+        )
+    if not await _admin_password_matches(req.current_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    new_hash = get_password_hash(new_pw)
+    now = datetime.now(timezone.utc)
+    await main_db.admin_config.update_one(
+        {"key": "admin_password"},
+        {
+            "$set": {
+                "value": new_hash,
+                "updated_at": now.isoformat(),
+                "updated_by": admin.get("email") or "admin",
+            }
+        },
+        upsert=True,
+    )
+    logger.info(f"[admin-account] password changed by {admin.get('email')}")
+    return {
+        "ok": True,
+        "message": "Admin password updated successfully. Use the new password on next login.",
     }
 
 

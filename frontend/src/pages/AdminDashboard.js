@@ -21,7 +21,7 @@ import {
   LogOut, Settings, Trash2, CheckCircle, XCircle, 
   Clock, Search, RefreshCw, Eye, EyeOff, UserPlus,
   Palette, Image, Type, RotateCcw, Save, Server, Key, Plus, TestTube, Globe,
-  Activity, Mail, Send, ExternalLink, AlertCircle, Menu, Cpu, ShieldCheck, Cloud
+  Activity, Mail, Send, ExternalLink, AlertCircle, Menu, Cpu, ShieldCheck, Cloud, Lock
 } from "lucide-react";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "../components/ui/dropdown-menu";
 
@@ -55,6 +55,14 @@ export default function AdminDashboard() {
   const [activeTab, setActiveTab] = useState("users");
   // Heavy-features VPS protection badge (cloud+strict block status)
   const [heavyStatus, setHeavyStatus] = useState(null);
+  const [togglingStrict, setTogglingStrict] = useState(false);
+  const [adminAccount, setAdminAccount] = useState(null);
+  const [adminCurrentPassword, setAdminCurrentPassword] = useState("");
+  const [adminNewPassword, setAdminNewPassword] = useState("");
+  const [adminConfirmPassword, setAdminConfirmPassword] = useState("");
+  const [adminPasswordSaving, setAdminPasswordSaving] = useState(false);
+  const [showAdminCurrentPassword, setShowAdminCurrentPassword] = useState(false);
+  const [showAdminNewPassword, setShowAdminNewPassword] = useState(false);
 
   // ── Email settings (admin-managed SMTP / Resend) ──
   const [emailCfg, setEmailCfg] = useState({
@@ -225,7 +233,7 @@ export default function AdminDashboard() {
       };
       
       // Fetch all data with individual error handling
-      const [statsData, usersData, brandingData, subUsersData, userStatsData, apiSettingsData, apiStatusData, heavyData] = await Promise.all([
+      const [statsData, usersData, brandingData, subUsersData, userStatsData, apiSettingsData, apiStatusData, heavyData, accountData] = await Promise.all([
         fetchWithFallback(`${API}/admin/stats`, { total_users: 0, active_users: 0, pending_users: 0, blocked_users: 0, total_links: 0, total_clicks: 0, total_conversions: 0, total_sub_users: 0, users_with_sub_users: 0 }),
         fetchWithFallback(`${API}/admin/users`, []),
         fetchWithFallback(`${API}/admin/branding`, {}),
@@ -233,11 +241,13 @@ export default function AdminDashboard() {
         fetchWithFallback(`${API}/admin/users/stats/all`, []),
         fetchWithFallback(`${API}/admin/api-settings`, {}),
         fetchWithFallback(`${API}/admin/api-settings/status`, { apis: [], total_enabled: 0, total_rate_limited: 0 }),
-        fetchWithFallback(`${API}/admin/heavy-features-status`, null)
+        fetchWithFallback(`${API}/admin/heavy-features-status`, null),
+        fetchWithFallback(`${API}/admin/account`, null),
       ]);
       
       setStats(statsData);
       setHeavyStatus(heavyData);
+      setAdminAccount(accountData && accountData.email ? accountData : null);
       
       // Merge user stats with user data
       const usersWithStats = usersData.map(user => {
@@ -388,6 +398,9 @@ export default function AdminDashboard() {
   // even while global strict_heavy_block stays ON for everyone else.
   const toggleCloudHeavy = async (user) => {
     const nextValue = !user.allow_cloud_heavy;
+    setUsers((prev) =>
+      prev.map((u) => (u.id === user.id ? { ...u, allow_cloud_heavy: nextValue } : u))
+    );
     try {
       await axios.put(
         `${API}/admin/users/${user.id}`,
@@ -396,12 +409,74 @@ export default function AdminDashboard() {
       );
       toast.success(
         nextValue
-          ? `${user.email} can now run heavy features on the VPS`
-          : `${user.email} is back to strict (desktop-only) mode`
+          ? `${user.email} — VPS Heavy ON (can run RUT/VR on VPS)`
+          : `${user.email} — VPS Heavy OFF (desktop-only when strict is on)`
       );
       fetchData();
     } catch (error) {
+      setUsers((prev) =>
+        prev.map((u) => (u.id === user.id ? { ...u, allow_cloud_heavy: !nextValue } : u))
+      );
       toast.error("Failed to update VPS heavy override");
+    }
+  };
+
+  const toggleStrictMode = async () => {
+    const dep = heavyStatus?.deployment;
+    if (!dep?.is_cloud) return;
+    const next = !dep.strict_heavy_block;
+    const confirmMsg = next
+      ? "Enable Strict Mode? Heavy features (RUT, Form Filler, Visual Recorder, bulk proxy tests) will REFUSE to run on this VPS unless the user has VPS Heavy enabled."
+      : "Disable Strict Mode? Heavy features may run on this VPS when customer PCs are offline — VPS load may spike.";
+    if (!window.confirm(confirmMsg)) return;
+    setTogglingStrict(true);
+    try {
+      const r = await axios.post(
+        `${API}/admin/system/strict-mode`,
+        { enabled: next },
+        { headers: { Authorization: `Bearer ${getAdminToken()}` } }
+      );
+      toast.success(r.data?.message || `Strict mode ${next ? "ON" : "OFF"}`);
+      fetchData();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Failed to toggle strict mode");
+    } finally {
+      setTogglingStrict(false);
+    }
+  };
+
+  const changeAdminPassword = async () => {
+    if (!adminCurrentPassword || !adminNewPassword) {
+      toast.error("Current and new password are required");
+      return;
+    }
+    if (adminNewPassword.length < 8) {
+      toast.error("New password must be at least 8 characters");
+      return;
+    }
+    if (adminNewPassword !== adminConfirmPassword) {
+      toast.error("New passwords do not match");
+      return;
+    }
+    setAdminPasswordSaving(true);
+    try {
+      const r = await axios.post(
+        `${API}/admin/account/change-password`,
+        {
+          current_password: adminCurrentPassword,
+          new_password: adminNewPassword,
+        },
+        { headers: { Authorization: `Bearer ${getAdminToken()}` } }
+      );
+      toast.success(r.data?.message || "Admin password updated");
+      setAdminCurrentPassword("");
+      setAdminNewPassword("");
+      setAdminConfirmPassword("");
+      fetchData();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Failed to change admin password");
+    } finally {
+      setAdminPasswordSaving(false);
     }
   };
 
@@ -921,6 +996,30 @@ export default function AdminDashboard() {
                         <p className="text-sm text-[#A1A1AA] mt-1 max-w-2xl" data-testid="heavy-status-note">
                           {dep.note || ""}
                         </p>
+                        {dep.is_cloud && (
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={toggleStrictMode}
+                              disabled={togglingStrict}
+                              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
+                                dep.strict_heavy_block
+                                  ? "bg-yellow-600 hover:bg-yellow-500 text-black"
+                                  : "bg-emerald-600 hover:bg-emerald-500 text-white"
+                              } ${togglingStrict ? "opacity-50 cursor-not-allowed" : ""}`}
+                              data-testid="admin-strict-mode-toggle"
+                            >
+                              {togglingStrict
+                                ? "Updating…"
+                                : dep.strict_heavy_block
+                                ? "Strict ON — click to turn OFF"
+                                : "Strict OFF — click to turn ON"}
+                            </button>
+                            <span className="text-[11px] text-[#71717A]">
+                              Instant — no VPS restart needed
+                            </span>
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -1115,6 +1214,14 @@ export default function AdminDashboard() {
               IP Isolation
             </TabsTrigger>
             <TabsTrigger 
+              value="admin-settings" 
+              className="data-[state=active]:bg-[#27272A] data-[state=active]:text-white"
+              data-testid="admin-settings-tab"
+            >
+              <Lock size={16} className="mr-2" />
+              Admin Settings
+            </TabsTrigger>
+            <TabsTrigger 
               value="system" 
               className="data-[state=active]:bg-[#27272A] data-[state=active]:text-white"
               data-testid="system-tab"
@@ -1276,18 +1383,22 @@ export default function AdminDashboard() {
                             )}
                             <Button 
                               size="sm" 
-                              variant="outline"
+                              variant={user.allow_cloud_heavy ? "default" : "outline"}
                               className={user.allow_cloud_heavy 
-                                ? "border-[#F59E0B] text-[#F59E0B] hover:bg-[#F59E0B]/10" 
+                                ? "bg-[#F59E0B] hover:bg-[#D97706] text-black border-[#F59E0B] font-semibold" 
                                 : "border-[var(--brand-border)] text-[#94A3B8] hover:bg-white/5"}
                               onClick={() => toggleCloudHeavy(user)}
                               data-testid={`cloud-heavy-user-${user.id}`}
                               title={user.allow_cloud_heavy 
-                                ? "VPS heavy features ENABLED for this user — click to disable" 
-                                : "Click to allow this user to run heavy features on the VPS (bypasses strict mode)"}
+                                ? "VPS Heavy ON — click to turn OFF" 
+                                : "VPS Heavy OFF — click to allow heavy features on VPS"}
                             >
-                              <Cloud size={14} className="mr-1" />
-                              {user.allow_cloud_heavy ? "VPS Heavy ✓" : "VPS Heavy"}
+                              {user.allow_cloud_heavy ? (
+                                <CheckCircle size={14} className="mr-1" />
+                              ) : (
+                                <Cloud size={14} className="mr-1" />
+                              )}
+                              {user.allow_cloud_heavy ? "VPS Heavy ON" : "VPS Heavy OFF"}
                             </Button>
                             <Button 
                               size="sm" 
@@ -2465,6 +2576,120 @@ export default function AdminDashboard() {
           {/* ── System Check tab ─────────────────────────── */}
           <TabsContent value="system" className="mt-6">
             <SystemCheckPanel api={API} />
+          </TabsContent>
+
+          <TabsContent value="admin-settings" className="mt-6 space-y-6">
+            <Card className="bg-[var(--brand-card)] border-[var(--brand-border)]">
+              <CardHeader>
+                <CardTitle className="text-white flex items-center gap-2">
+                  <Lock size={20} className="text-[#F59E0B]" />
+                  Admin Account
+                </CardTitle>
+                <CardDescription>
+                  Change your admin login password. Email is configured on the VPS (.env ADMIN_EMAIL).
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-6">
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="p-4 rounded-lg bg-black/30 border border-[var(--brand-border)]">
+                    <p className="text-xs uppercase tracking-wide text-[#71717A] mb-1">Login email</p>
+                    <p className="text-white font-mono text-sm" data-testid="admin-account-email">
+                      {adminAccount?.email || "—"}
+                    </p>
+                  </div>
+                  <div className="p-4 rounded-lg bg-black/30 border border-[var(--brand-border)]">
+                    <p className="text-xs uppercase tracking-wide text-[#71717A] mb-1">Password status</p>
+                    <p className={`text-sm font-medium ${adminAccount?.password_customized ? "text-[#34D399]" : "text-[#FBBF24]"}`}>
+                      {adminAccount?.password_customized ? "Custom password set" : "Using default / .env password"}
+                    </p>
+                    {adminAccount?.password_updated_at && (
+                      <p className="text-xs text-[#71717A] mt-1">
+                        Last changed: {format(new Date(adminAccount.password_updated_at), "PPp")}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-4 max-w-xl">
+                  <div className="space-y-2">
+                    <Label htmlFor="admin-current-password">Current password</Label>
+                    <div className="relative">
+                      <Input
+                        id="admin-current-password"
+                        type={showAdminCurrentPassword ? "text" : "password"}
+                        value={adminCurrentPassword}
+                        onChange={(e) => setAdminCurrentPassword(e.target.value)}
+                        className="bg-[var(--brand-card)] border-[var(--brand-border)] pr-10"
+                        data-testid="admin-current-password"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowAdminCurrentPassword((v) => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[#A1A1AA] hover:text-white"
+                      >
+                        {showAdminCurrentPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="admin-new-password">New password</Label>
+                    <div className="relative">
+                      <Input
+                        id="admin-new-password"
+                        type={showAdminNewPassword ? "text" : "password"}
+                        value={adminNewPassword}
+                        onChange={(e) => setAdminNewPassword(e.target.value)}
+                        className="bg-[var(--brand-card)] border-[var(--brand-border)] pr-10"
+                        data-testid="admin-new-password"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowAdminNewPassword((v) => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[#A1A1AA] hover:text-white"
+                      >
+                        {showAdminNewPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                    <p className="text-xs text-[#71717A]">Minimum 8 characters</p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="admin-confirm-password">Confirm new password</Label>
+                    <Input
+                      id="admin-confirm-password"
+                      type="password"
+                      value={adminConfirmPassword}
+                      onChange={(e) => setAdminConfirmPassword(e.target.value)}
+                      className="bg-[var(--brand-card)] border-[var(--brand-border)]"
+                      data-testid="admin-confirm-password"
+                    />
+                  </div>
+                  <Button
+                    onClick={changeAdminPassword}
+                    disabled={adminPasswordSaving}
+                    className="bg-[#F59E0B] hover:bg-[#D97706] text-black font-semibold"
+                    data-testid="admin-change-password-btn"
+                  >
+                    {adminPasswordSaving ? "Saving…" : "Change Admin Password"}
+                  </Button>
+                </div>
+
+                <div className="p-4 rounded-lg border border-[var(--brand-border)] bg-black/20 text-sm text-[#A1A1AA]">
+                  <p className="text-white font-medium mb-2">Forgot your password?</p>
+                  <p className="mb-3">
+                    Use the password reset page with your admin email. Email must be configured under the Email Settings tab first.
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="border-[var(--brand-border)]"
+                    onClick={() => window.open("/forgot-password", "_blank")}
+                    data-testid="admin-forgot-password-link"
+                  >
+                    Open Forgot Password Page
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
           </TabsContent>
         </Tabs>
       </main>

@@ -106,10 +106,17 @@ export default function AdminLoginPage() {
               </button>
             </form>
 
-            <div className="mt-6 text-center">
+            <div className="mt-6 text-center space-y-2">
               <p className="text-xs text-gray-500">
                 🔒 Secure admin authentication
               </p>
+              <Link
+                to="/forgot-password"
+                className="text-xs text-[#4F7FFF] hover:underline"
+                data-testid="admin-forgot-password-link"
+              >
+                Forgot admin password?
+              </Link>
             </div>
           </div>
         </div>
