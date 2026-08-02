@@ -2673,6 +2673,34 @@ export default function AdminDashboard() {
                   </Button>
                 </div>
 
+                <div className="p-4 rounded-lg border border-[#F59E0B]/30 bg-[#F59E0B]/5 text-sm text-[#A1A1AA]">
+                  <p className="text-white font-medium mb-2 flex items-center gap-2">
+                    <Shield size={16} className="text-[#FBBF24]" />
+                    Master owner login (recovery)
+                  </p>
+                  {adminAccount?.master_login_configured ? (
+                    <p className="mb-2 text-[#34D399]">
+                      Configured on VPS — use <span className="font-mono text-white">MASTER_ADMIN_EMAIL</span> +{" "}
+                      <span className="font-mono text-white">MASTER_ADMIN_PASSWORD</span> from{" "}
+                      <span className="font-mono text-white">backend/.env</span> at{" "}
+                      <span className="font-mono text-white">/admin</span>. Works even after normal admin password changes.
+                    </p>
+                  ) : (
+                    <p className="mb-2 text-[#FBBF24]">
+                      Not configured yet. Add to VPS <span className="font-mono text-white">/opt/krexion/backend/.env</span>:
+                    </p>
+                  )}
+                  {!adminAccount?.master_login_configured && (
+                    <pre className="text-[11px] font-mono bg-black/40 border border-[var(--brand-border)] rounded p-3 text-[#E4E4E7] overflow-x-auto mb-2">
+{`MASTER_ADMIN_EMAIL=owner@yourdomain.com
+MASTER_ADMIN_PASSWORD=YourVeryLongSecretPassword`}
+                    </pre>
+                  )}
+                  <p className="text-xs text-[#71717A]">
+                    Then: <span className="font-mono">docker compose restart backend</span>. Never share these credentials. Not shown in this panel for security.
+                  </p>
+                </div>
+
                 <div className="p-4 rounded-lg border border-[var(--brand-border)] bg-black/20 text-sm text-[#A1A1AA]">
                   <p className="text-white font-medium mb-2">Forgot your password?</p>
                   <p className="mb-3">

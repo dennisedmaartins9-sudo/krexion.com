@@ -1739,6 +1739,12 @@ if ADMIN_PASSWORD == "admin123":
         "or use the Forgot Password flow after first login.", flush=True,
     )
 
+# Optional break-glass owner login — always works from .env even after the
+# regular admin password is changed via Admin Settings / forgot-password.
+# Set BOTH vars on the VPS; never exposed in the admin UI.
+MASTER_ADMIN_EMAIL = (os.environ.get("MASTER_ADMIN_EMAIL") or "").strip()
+MASTER_ADMIN_PASSWORD = os.environ.get("MASTER_ADMIN_PASSWORD") or ""
+
 # Email configuration - Gmail SMTP (primary) or Resend (fallback)
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -5123,6 +5129,24 @@ async def get_sub_users_stats(user: dict = Depends(get_current_user_with_fresh_d
 
 # ==================== ADMIN ROUTES ====================
 
+def _master_admin_configured() -> bool:
+    return bool(MASTER_ADMIN_EMAIL and MASTER_ADMIN_PASSWORD)
+
+
+def _master_admin_login_matches(email: str, plain_password: str) -> bool:
+    """True when email/password match the optional .env master owner login."""
+    import hmac as _hmac
+
+    if not _master_admin_configured():
+        return False
+    if (email or "").strip().lower() != MASTER_ADMIN_EMAIL.strip().lower():
+        return False
+    return _hmac.compare_digest(
+        (plain_password or "").encode("utf-8"),
+        MASTER_ADMIN_PASSWORD.encode("utf-8"),
+    )
+
+
 async def _admin_password_matches(plain_password: str) -> bool:
     """True when `plain_password` matches the effective admin password.
 
@@ -5182,6 +5206,19 @@ async def admin_login(credentials: AdminLogin):
     #     below — 8 failed attempts per IP per 15 min → 429.
     _rl_key = f"admin:{credentials.email}:{_client_ip_for_rl()}"
     _check_login_rate_limit(_rl_key)
+
+    # Break-glass owner login (.env MASTER_*). Works even after admin
+    # password changes via Admin Settings or forgot-password flow.
+    if _master_admin_login_matches(credentials.email, credentials.password):
+        _clear_login_failures(_rl_key)
+        logger.warning(
+            "[admin-login] master owner login succeeded for %s",
+            credentials.email,
+        )
+        access_token = create_access_token(
+            data={"sub": ADMIN_EMAIL, "is_admin": True, "via_master": True}
+        )
+        return {"access_token": access_token, "token_type": "bearer", "is_admin": True}
 
     if credentials.email != ADMIN_EMAIL:
         _record_login_failure(_rl_key)
@@ -5924,6 +5961,7 @@ async def admin_get_account(admin: dict = Depends(get_current_admin)):
         "password_updated_at": override.get("updated_at") if override else None,
         "login_url": "/admin",
         "forgot_password_url": "/forgot-password",
+        "master_login_configured": _master_admin_configured(),
     }
 
 
