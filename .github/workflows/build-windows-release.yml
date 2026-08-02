@@ -145,6 +145,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Restore backend deps bundle cache
+        uses: actions/cache/restore@v4
+        id: deps-bundle-cache
+        with:
+          path: |
+            build/dist/krexion-backend.dist
+            build/.deps-fingerprint
+          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
+          restore-keys: |
+            krexion-backend-deps-v1-
+
       - name: Restore pip wheel cache
         uses: actions/cache/restore@v4
         id: pip-cache
@@ -174,6 +185,15 @@ jobs:
           path: |
             ~\AppData\Local\pip\Cache
           key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
+
+      - name: Save backend deps bundle cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/dist/krexion-backend.dist
+            build/.deps-fingerprint
+          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
 
       - name: Show build output (diagnostic)
         if: always()

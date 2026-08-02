@@ -36,6 +36,7 @@ have resolved Linux wheels.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import shutil
@@ -58,6 +59,7 @@ BACKEND_DIR = REPO_ROOT / "backend"
 PAYLOAD_DIR = REPO_ROOT / "Krexion-User-Package"
 BUILD_DIR = REPO_ROOT / "build"
 DIST_DIR = BUILD_DIR / "dist" / "krexion-backend.dist"
+FINGERPRINT_FILE = BUILD_DIR / ".deps-fingerprint"
 
 # Packages we explicitly EXCLUDE from the native Windows bundle. Each
 # entry is here for a concrete reason — see the trailing comment. The
@@ -152,6 +154,92 @@ EXCLUDE_PACKAGES = {
 
 def log(msg: str, prefix: str = "==>") -> None:
     print(f"{prefix} {msg}", flush=True)
+
+
+def requirements_fingerprint(req_file: Path) -> str:
+    """Stable hash — when this matches, pip/site-packages can be reused."""
+    h = hashlib.sha256()
+    h.update(req_file.read_bytes())
+    h.update(PY_VERSION.encode("utf-8"))
+    h.update(b"|".join(sorted(p.encode("utf-8") for p in EXCLUDE_PACKAGES)))
+    return h.hexdigest()
+
+
+def deps_cache_valid(req_file: Path) -> bool:
+    """True when a prior build left a complete embed Python + wheels."""
+    site_pkg = DIST_DIR / "Lib" / "site-packages"
+    python_exe = DIST_DIR / ("python.exe" if os.name == "nt" else "python")
+    if not site_pkg.is_dir() or not python_exe.exists():
+        return False
+    if not FINGERPRINT_FILE.exists():
+        return False
+    try:
+        return FINGERPRINT_FILE.read_text(encoding="utf-8").strip() == requirements_fingerprint(req_file)
+    except OSError:
+        return False
+
+
+def write_deps_fingerprint(req_file: Path) -> None:
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    FINGERPRINT_FILE.write_text(requirements_fingerprint(req_file), encoding="utf-8")
+
+
+def _python_exe() -> Path:
+    return DIST_DIR / ("python.exe" if os.name == "nt" else "python")
+
+
+def _pip_base_args(python_exe: Path) -> list[str]:
+    return [
+        str(python_exe), "-m", "pip", "install",
+        "--no-warn-script-location",
+        "--no-compile",
+        "--prefer-binary",
+        "--disable-pip-version-check",
+    ]
+
+
+def _install_desktop_packages(python_exe: Path) -> None:
+    """Desktop dashboard packages — allow sdist for pure-Python deps."""
+    desktop_pkgs = [
+        "pywebview==5.4",
+        "pystray==0.19.5",
+        "Pillow==10.4.0",
+        "pythonnet==3.0.3",
+        "psutil==6.1.0",
+        "proxy-tools==0.1.0",
+        "bottle>=0.12.25",
+        "typing_extensions>=4.0",
+    ]
+    log("Installing desktop dashboard packages (allow sdist fallback)")
+    r = subprocess.run(
+        [*_pip_base_args(python_exe), "--upgrade", *desktop_pkgs],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        tail = (r.stdout + r.stderr).strip().splitlines()[-15:]
+        log("  desktop package install non-zero exit:", prefix="!!!")
+        for line in tail:
+            log(f"    {line}")
+    else:
+        log("  desktop packages OK")
+
+
+def fast_rebuild_from_cached_deps(req_file: Path) -> None:
+    """Reuse cached site-packages when requirements unchanged (~3-8 min)."""
+    log("FAST BUILD — requirements unchanged, reusing cached site-packages")
+    python_exe = _python_exe()
+    enable_site_packages()
+    _install_desktop_packages(python_exe)
+    verify_core_packages(python_exe)
+    # Refresh source layers only — deps stay cached.
+    app_dir = DIST_DIR / "app"
+    if app_dir.exists():
+        shutil.rmtree(app_dir, ignore_errors=True)
+    copy_backend_source()
+    copy_desktop_package()
+    rebrand_python_exe()
+    write_build_manifest()
+    write_deps_fingerprint(req_file)
 
 
 def ensure_clean_dist() -> None:
@@ -270,11 +358,8 @@ def pip_install_requirements(req_file: Path) -> None:
     log("Pass 1: bulk install -r " + req_file.name)
     r = subprocess.run(
         [
-            str(python_exe), "-m", "pip", "install",
-            "--no-warn-script-location",
-            "--no-compile",
-            "--prefer-binary",
-            "--only-binary", ":all:",   # never try to compile from source
+            *_pip_base_args(python_exe),
+            "--only-binary", ":all:",
             "-r", str(req_file),
         ],
         check=False,
@@ -286,34 +371,41 @@ def pip_install_requirements(req_file: Path) -> None:
 
     log(f"  bulk install returned exit {r.returncode} — falling back to per-package", prefix="!!!")
 
-    # ── Pass 2: per-package, skip-on-failure ─────────────────────────
+    # ── Pass 2: batched install, skip-on-failure ─────────────────────
     failed: list[str] = []
     succeeded = 0
     lines = [
         l.strip() for l in req_file.read_text(encoding="utf-8").splitlines()
         if l.strip() and not l.strip().startswith("#")
     ]
-    log(f"Pass 2: installing {len(lines)} packages individually")
-    for line in lines:
-        pkg = line.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
+    batch_size = 30
+    log(f"Pass 2: installing {len(lines)} packages in batches of {batch_size}")
+    for start in range(0, len(lines), batch_size):
+        batch = lines[start:start + batch_size]
         r = subprocess.run(
             [
-                str(python_exe), "-m", "pip", "install",
-                "--no-warn-script-location",
-                "--no-compile",
-                "--prefer-binary",
+                *_pip_base_args(python_exe),
                 "--only-binary", ":all:",
-                line,
+                *batch,
             ],
             capture_output=True, text=True,
         )
         if r.returncode == 0:
-            succeeded += 1
-        else:
-            failed.append(pkg)
-            # Truncate pip's stderr — full text spam-floods CI logs
-            tail = (r.stderr or "").strip().splitlines()[-3:]
-            log(f"  skip {pkg}: " + " | ".join(tail), prefix="  ⚠")
+            succeeded += len(batch)
+            continue
+        # Fall back to singles only for this batch.
+        for line in batch:
+            pkg = line.split("==")[0].split(">=")[0].split("<=")[0].split("[")[0].strip()
+            r1 = subprocess.run(
+                [*_pip_base_args(python_exe), "--only-binary", ":all:", line],
+                capture_output=True, text=True,
+            )
+            if r1.returncode == 0:
+                succeeded += 1
+            else:
+                failed.append(pkg)
+                tail = (r1.stderr or "").strip().splitlines()[-3:]
+                log(f"  skip {pkg}: " + " | ".join(tail), prefix="  ⚠")
 
     log(f"Pass 2 done: {succeeded} installed, {len(failed)} skipped")
     if failed:
@@ -340,38 +432,7 @@ def pip_install_requirements(req_file: Path) -> None:
     # pure-Python source distributions that build instantly without a
     # C compiler, so allowing sdist here is safe and adds ~5 s to the
     # build.
-    desktop_pkgs = [
-        "pywebview==5.4",
-        "pystray==0.19.5",
-        "Pillow==10.4.0",
-        "pythonnet==3.0.3",
-        "psutil==6.1.0",
-        "proxy-tools==0.1.0",
-        "bottle>=0.12.25",
-        "typing_extensions>=4.0",
-    ]
-    log("Pass 3: forced-install desktop dashboard packages (allow sdist fallback)")
-    r = subprocess.run(
-        [
-            str(python_exe), "-m", "pip", "install",
-            "--no-warn-script-location",
-            "--no-compile",
-            "--prefer-binary",
-            "--upgrade",          # overwrite any partial install from passes 1/2
-            *desktop_pkgs,
-        ],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        # Don't hard-fail yet - the verify step below will say exactly
-        # which import is broken. But log the install output for CI.
-        tail = (r.stdout + r.stderr).strip().splitlines()[-15:]
-        log("  Pass 3 install non-zero exit:", prefix="!!!")
-        for line in tail:
-            log(f"    {line}")
-    else:
-        log("  Pass 3 install OK")
-
+    _install_desktop_packages(python_exe)
     verify_core_packages(python_exe)
 
 
@@ -584,16 +645,20 @@ def main() -> int:
         return 1
 
     try:
-        ensure_clean_dist()
-        extract_embed_python()
-        enable_site_packages()
-        install_pip()
         req = filtered_requirements()
-        pip_install_requirements(req)
-        copy_backend_source()
-        copy_desktop_package()
-        rebrand_python_exe()
-        write_build_manifest()
+        if deps_cache_valid(req):
+            fast_rebuild_from_cached_deps(req)
+        else:
+            ensure_clean_dist()
+            extract_embed_python()
+            enable_site_packages()
+            install_pip()
+            pip_install_requirements(req)
+            copy_backend_source()
+            copy_desktop_package()
+            rebrand_python_exe()
+            write_build_manifest()
+            write_deps_fingerprint(req)
     except subprocess.CalledProcessError as e:
         log(f"ERROR: subprocess failed: {e}", prefix="!!!")
         return 2
