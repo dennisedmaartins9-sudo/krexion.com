@@ -13,6 +13,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from visual_recorder import (  # noqa: E402
+    _DETECT_POPUP_BUTTONS_JS,
     _RICH_ELEMENT_CAPTURE_JS,
     _build_text_click_evaluate,
     _live_click_captured,
@@ -59,19 +60,25 @@ def test_build_text_click_evaluate_includes_id_selector():
 
 
 class _StubLocator:
-    def __init__(self, label: str, click_ok: bool = True):
+    def __init__(self, label: str, click_ok: bool = True, force_ok: bool = True):
         self._label = label
         self._click_ok = click_ok
+        self._force_ok = force_ok
         self.clicked = False
+        self.force = False
 
     @property
     def first(self):
         return self
 
-    async def click(self, timeout=3000):
-        if not self._click_ok:
+    async def click(self, timeout=3000, force=False):
+        if force:
+            if not self._force_ok:
+                raise RuntimeError(f"force click failed: {self._label}")
+        elif not self._click_ok:
             raise RuntimeError(f"click failed: {self._label}")
         self.clicked = True
+        self.force = force
 
     async def evaluate(self, script: str):
         if not self._click_ok:
@@ -113,6 +120,32 @@ class _StubPage:
     def get_by_text(self, text: str, exact=False):
         key = f"page|text|{text}|{exact}"
         return self._locator_map.setdefault(key, _StubLocator(key))
+
+
+def test_detect_popup_buttons_js_scans_top_popup_only():
+    assert "findPopupAtViewportCenter" in _DETECT_POPUP_BUTTONS_JS
+    assert "scanPopups" in _DETECT_POPUP_BUTTONS_JS
+    assert "isTopHit" in _DETECT_POPUP_BUTTONS_JS
+    assert "top_popup_only" in _DETECT_POPUP_BUTTONS_JS
+
+
+def test_live_click_captured_force_fallback_after_normal_fails():
+    page = _StubPage()
+    info = {
+        "id": "cpa_linkout_btn",
+        "tag": "BUTTON",
+        "text": "",
+        "x": 200,
+        "y": 400,
+        "attrs": {"id": "cpa_linkout_btn"},
+    }
+    loc = page.locator("#cpa_linkout_btn")
+    loc._click_ok = False
+    loc._force_ok = True
+    page.evaluate = AsyncMock(side_effect=RuntimeError("js failed"))
+    ok = asyncio.run(_live_click_captured(page, info))
+    assert ok is True
+    assert loc.force is True
 
 
 def test_live_click_captured_uses_id_locator():

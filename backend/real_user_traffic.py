@@ -3617,6 +3617,78 @@ def _detect_rotating_gateway(host: str, username: str) -> bool:
     return False
 
 
+def _host_from_proxy_server(server: str) -> str:
+    """Extract hostname from a proxy server URL (http://user:pass@host:port)."""
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(server or "").hostname or "").strip()
+    except Exception:
+        return ""
+
+
+def _build_state_targeted_proxy(
+    base: Dict[str, Any],
+    state_code: str,
+    country: str = "US",
+) -> Dict[str, Any]:
+    """Return a rotating-gateway proxy with state/country targeting and a
+    fresh session id in the username (Smartproxy, Bright Data, etc.)."""
+    if not base or not state_code:
+        return dict(base) if base else {}
+    try:
+        from proxy_provider_module import (  # noqa: WPS433
+            _apply_targeting_to_username,
+            _rotate_session_in_username,
+        )
+    except Exception:
+        return dict(base)
+
+    server = base.get("server") or ""
+    scheme = "http"
+    if server.startswith("https://"):
+        scheme = "https"
+    elif server.startswith("http://"):
+        scheme = "http"
+
+    username = (base.get("username") or "").strip()
+    password = base.get("password") or ""
+    if not username:
+        raw = (base.get("raw") or "").strip()
+        if "@" in raw:
+            auth = raw.split("@", 1)[0]
+            if "://" in auth:
+                auth = auth.split("://", 1)[1]
+            if ":" in auth:
+                username, _, password = auth.partition(":")
+
+    host = _host_from_proxy_server(server)
+    targeted_user = _apply_targeting_to_username(
+        username,
+        host,
+        {"country": country or "US", "state": state_code, "_want_sid": True},
+    )
+    targeted_user = _rotate_session_in_username(targeted_user)
+
+    port_part = server.split("@")[-1] if "@" in server else server.split("://", 1)[-1]
+    if not port_part and host:
+        port_part = f"{host}:80"
+
+    new_server = (
+        f"{scheme}://{targeted_user}:{password}@{port_part}"
+        if targeted_user
+        else server
+    )
+    raw_line = new_server
+
+    out = dict(base)
+    out["server"] = new_server
+    out["username"] = targeted_user
+    out["password"] = password
+    out["raw"] = raw_line
+    out["is_rotating_gateway"] = True
+    return out
+
+
 _DATACENTER_ISP_KEYWORDS: Tuple[str, ...] = (
     "amazon", "aws", "google cloud", "gcp", "microsoft azure", "azure",
     "digitalocean", "ovh", "hetzner", "linode", "vultr", "choopa",
@@ -7675,11 +7747,29 @@ async def run_real_user_traffic_job(
     _has_rotating_gateway = any(
         bool(p.get("is_rotating_gateway")) for p in parsed_proxies
     )
-    _can_retry_offer_block = bool(proxyjet_on_demand) or _has_rotating_gateway
+    # 2026-08 — ROW-FIRST state match for ANY rotating gateway (Smartproxy,
+    # Bright Data, DataImpulse, …) when the operator enabled
+    # "Match lead state to proxy IP state". Previously this only ran for
+    # native ProxyJet on-demand mode; non-ProxyJet Auto Mode pre-generated
+    # random-state gateway lines → proxy picked first → endless
+    # skipped_state_mismatch loops (Omaha/NE, Springdale/AR, …).
+    _row_first_state_match = bool(
+        state_match_enabled
+        and rows
+        and _has_rotating_gateway
+        and not proxyjet_on_demand
+    )
+    _use_row_first = bool(proxyjet_on_demand or _row_first_state_match)
+    _can_retry_offer_block = bool(_use_row_first) or _has_rotating_gateway
     if _has_rotating_gateway:
         logger.info(
             f"[RUT job={job_id}] Rotating-gateway mode ACTIVE — offer-block "
             f"retry enabled (cap={proxyjet_unique_retry_cap or 50}/visit)"
+        )
+    if _row_first_state_match:
+        logger.info(
+            f"[RUT job={job_id}] ROW-FIRST state match ACTIVE — lead row "
+            f"picked before gateway dial (state injected into proxy username)"
         )
 
     uas = [u.strip() for u in user_agents if u and u.strip()]
@@ -7779,7 +7869,7 @@ async def run_real_user_traffic_job(
         # HARD_CAP-bounded while-loop so the user gets exactly
         # `total_clicks` VISIBLE visits even if 90 % of ProxyJet
         # IPs hit the tracker's duplicate filter.
-        "silent_skip_burnt_ip": bool(proxyjet_on_demand),
+        "silent_skip_burnt_ip": bool(_use_row_first),
         "silent_skip_count": 0,
         "silent_skip_breakdown": {},
     })
@@ -7816,11 +7906,11 @@ async def run_real_user_traffic_job(
     # Only require the data file when form_fill is enabled OR
     # state-match was explicitly requested.
     proxyjet_needs_data_file = bool(form_fill_enabled or state_match_enabled)
-    if proxyjet_on_demand and proxyjet_needs_data_file:
+    if _use_row_first and proxyjet_needs_data_file:
         if not rows:
             await _finalise_and_persist(
                 db, job_id, "failed",
-                "ProxyJet on-demand mode requires a data file with rows. "
+                "ROW-FIRST state-match mode requires a data file with rows. "
                 "Upload a data file (Excel/CSV/Google Sheet) and try again."
             )
             return
@@ -7831,7 +7921,7 @@ async def run_real_user_traffic_job(
         if not state_col:
             await _finalise_and_persist(
                 db, job_id, "failed",
-                "ProxyJet on-demand mode requires a STATE column in your data "
+                "ROW-FIRST state-match mode requires a STATE column in your data "
                 "file (column named 'state', 'State', 'STATE', 'region', 'st', "
                 "or 'state_code'). None was detected. Add a state column and try again."
             )
@@ -7859,7 +7949,7 @@ async def run_real_user_traffic_job(
                 bits.append(f"{len(invalid_state_rows)} row(s) have an UNRECOGNISED state value — {sample}{more}")
             await _finalise_and_persist(
                 db, job_id, "failed",
-                "ProxyJet on-demand mode: every row must have a valid US state. "
+                "ROW-FIRST state-match mode: every row must have a valid US state. "
                 + " · ".join(bits)
                 + ". Fix the data file (state column: '" + str(state_col) + "') and resubmit."
             )
@@ -7871,11 +7961,15 @@ async def run_real_user_traffic_job(
             if code:
                 state_index.setdefault(code, []).append(idx)
         RUT_JOBS[job_id]["state_match_column"] = state_col
-        RUT_JOBS[job_id]["proxyjet_on_demand"] = True
+        if proxyjet_on_demand:
+            RUT_JOBS[job_id]["proxyjet_on_demand"] = True
+        if _row_first_state_match:
+            RUT_JOBS[job_id]["row_first_state_match"] = True
+        _rf_label = "ProxyJet" if proxyjet_on_demand else "Gateway"
         try:
             push_live_step(
                 job_id, 0, "preflight", "ok",
-                f"ProxyJet ROW-FIRST mode: {len(rows)} rows across {len(state_index)} states verified. "
+                f"{_rf_label} ROW-FIRST mode: {len(rows)} rows across {len(state_index)} states verified. "
                 f"IPs will be fetched on-demand (≤{int(proxyjet_unique_retry_cap)} retries for uniqueness)."
             )
         except Exception:
@@ -8497,7 +8591,7 @@ async def run_real_user_traffic_job(
         on_demand_row_pick: Optional[Tuple[int, Dict[str, Any]]] = None
         on_demand_proxy: Optional[Dict[str, Any]] = None
         on_demand_geo: Optional[Dict[str, Any]] = None
-        if proxyjet_on_demand:
+        if _use_row_first:
             # 2026-02 — when neither form-fill nor state-match is on, we
             # don't actually need a per-row pick: it's a click-only visit
             # and ProxyJet just needs to fetch ONE random unique IP. The
@@ -8590,20 +8684,21 @@ async def run_real_user_traffic_job(
                 )
 
             # Step 2-5: loop until we get a non-duplicate exit IP.
-            try:
-                from proxyjet_module import generate_unique_proxies as _pj_gen  # noqa: WPS433
-            except Exception as _imp_e:
-                entry["status"] = "failed"
-                entry["error"] = f"proxyjet_module unavailable: {_imp_e}"
-                push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
-                await _record(job_id, entry, report, report_lock, db)
-                return
-
             attempt = 0
             cap = max(1, int(proxyjet_unique_retry_cap or 50))
             chosen_proxy: Optional[Dict[str, Any]] = None
             chosen_geo: Optional[Dict[str, Any]] = None
             last_reason = ""
+            if proxyjet_on_demand:
+                try:
+                    from proxyjet_module import generate_unique_proxies as _pj_gen  # noqa: WPS433
+                except Exception as _imp_e:
+                    entry["status"] = "failed"
+                    entry["error"] = f"proxyjet_module unavailable: {_imp_e}"
+                    push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
+                    await _record(job_id, entry, report, report_lock, db)
+                    return
+
             # ── 2026-06-11: Multi-geo MIX pick for THIS visit ─────
             # Country: if pool has 2+ entries, pick one at random for
             # this visit. Otherwise fall back to scalar `proxyjet_country`.
@@ -8621,35 +8716,65 @@ async def run_real_user_traffic_job(
             _visit_pj_state = row_state_code
             if not _visit_pj_state and len(_pj_states_pool) >= 2:
                 _visit_pj_state = random.choice(_pj_states_pool)
+
+            # Rotating-gateway ROW-FIRST: one template line — state is
+            # injected per attempt via `_build_state_targeted_proxy`.
+            _gw_template: Optional[Dict[str, Any]] = None
+            if _row_first_state_match:
+                _gw_template = next(
+                    (p for p in parsed_proxies if p.get("is_rotating_gateway")),
+                    parsed_proxies[0] if parsed_proxies else None,
+                )
+                if not _gw_template:
+                    entry["status"] = "failed"
+                    entry["error"] = "ROW-FIRST state match requires at least one valid proxy/gateway line"
+                    push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
+                    await _record(job_id, entry, report, report_lock, db)
+                    return
+
             while attempt < cap:
                 attempt += 1
                 if cancel_event.is_set():
                     return
-                try:
-                    pj_lines = await _pj_gen(
-                        db,
-                        engine_user_id or "",
-                        count=1,
-                        country=_visit_pj_country,
-                        state=_visit_pj_state,
-                        job_id=job_id,
+                parsed: Optional[Dict[str, Any]] = None
+                if proxyjet_on_demand:
+                    try:
+                        pj_lines = await _pj_gen(
+                            db,
+                            engine_user_id or "",
+                            count=1,
+                            country=_visit_pj_country,
+                            state=_visit_pj_state,
+                            job_id=job_id,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        last_reason = f"ProxyJet generate failed: {type(e).__name__}: {e}"
+                        push_live_step(job_id, i + 1, "proxy", "failed",
+                                       f"Attempt {attempt}/{cap}: {last_reason}")
+                        await asyncio.sleep(0.5)
+                        continue
+                    if not pj_lines:
+                        last_reason = "ProxyJet returned zero proxies"
+                        push_live_step(job_id, i + 1, "proxy", "failed",
+                                       f"Attempt {attempt}/{cap}: {last_reason}")
+                        await asyncio.sleep(0.3)
+                        continue
+                    parsed = _parse_proxy_line(pj_lines[0])
+                    if not parsed:
+                        last_reason = "ProxyJet line failed to parse"
+                        continue
+                elif _row_first_state_match and _gw_template:
+                    parsed = _build_state_targeted_proxy(
+                        _gw_template,
+                        row_state_code or "",
+                        _visit_pj_country,
                     )
-                except Exception as e:  # noqa: BLE001
-                    last_reason = f"ProxyJet generate failed: {type(e).__name__}: {e}"
-                    push_live_step(job_id, i + 1, "proxy", "failed",
-                                   f"Attempt {attempt}/{cap}: {last_reason}")
-                    await asyncio.sleep(0.5)
-                    continue
-                if not pj_lines:
-                    last_reason = "ProxyJet returned zero proxies"
-                    push_live_step(job_id, i + 1, "proxy", "failed",
-                                   f"Attempt {attempt}/{cap}: {last_reason}")
-                    await asyncio.sleep(0.3)
-                    continue
-                parsed = _parse_proxy_line(pj_lines[0])
-                if not parsed:
-                    last_reason = "ProxyJet line failed to parse"
-                    continue
+                    if not parsed or not parsed.get("server"):
+                        last_reason = "state-targeted gateway build failed"
+                        continue
+                else:
+                    last_reason = "ROW-FIRST proxy source unavailable"
+                    break
                 # Probe geo to learn the actual exit-IP — the only way to
                 # check uniqueness against the duplicate_ip_set.
                 _probe_ua = pick_next_ua()
@@ -8661,6 +8786,20 @@ async def run_real_user_traffic_job(
                     push_live_step(job_id, i + 1, "proxy", "failed",
                                    f"Attempt {attempt}/{cap}: probe failed, retrying")
                     continue
+                # Gateway ROW-FIRST: confirm exit-IP state matches the lead.
+                if _row_first_state_match and row_state_code:
+                    _exit_st = (
+                        _normalize_state(_geo.get("region"))
+                        or _normalize_state(_geo.get("region_name"))
+                    )
+                    if _exit_st and _exit_st != row_state_code:
+                        last_reason = f"exit state {_exit_st} != lead {row_state_code}"
+                        if attempt % 5 == 0 or attempt == 1:
+                            push_live_step(
+                                job_id, i + 1, "proxy", "info",
+                                f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying",
+                            )
+                        continue
                 exit_ip = _geo["exit_ip"]
                 if skip_duplicate_ip and duplicate_ip_set and exit_ip in duplicate_ip_set:
                     last_reason = f"duplicate IP {exit_ip}"
@@ -8705,8 +8844,9 @@ async def run_real_user_traffic_job(
 
             if not chosen_proxy or not chosen_geo:
                 entry["status"] = "skipped_no_unique_ip"
+                _rf_src = "ProxyJet" if proxyjet_on_demand else "gateway"
                 entry["error"] = (
-                    f"No unique ProxyJet IP found for state {row_state_code} "
+                    f"No unique {_rf_src} IP found for state {row_state_code} "
                     f"after {cap} attempts (last: {last_reason or 'unknown'})."
                 )
                 push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
@@ -8727,8 +8867,8 @@ async def run_real_user_traffic_job(
                 f"· state {row_state_code}",
             )
 
-        # ── Legacy proxy picker (skipped in on-demand mode) ──────────
-        if proxyjet_on_demand:
+        # ── Legacy proxy picker (skipped in ROW-FIRST mode) ──────────
+        if _use_row_first:
             proxy = on_demand_proxy
         else:
             proxy = pick_next_proxy()
@@ -8794,7 +8934,7 @@ async def run_real_user_traffic_job(
         # Probe geo (also gives VPN flag) — REUSE the probe already
         # done during the on-demand row-first loop so we don't pay the
         # ip-api round-trip twice per visit (huge speed win).
-        if proxyjet_on_demand and on_demand_geo is not None:
+        if _use_row_first and on_demand_geo is not None:
             geo = on_demand_geo
         else:
             geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
@@ -8865,7 +9005,7 @@ async def run_real_user_traffic_job(
 
         # Pre-filter: duplicate IP — already enforced inside the
         # on-demand loop above, so skip the redundant check.
-        if not proxyjet_on_demand and skip_duplicate_ip and duplicate_ip_set and geo["exit_ip"] and geo["exit_ip"] in duplicate_ip_set:
+        if not _use_row_first and skip_duplicate_ip and duplicate_ip_set and geo["exit_ip"] and geo["exit_ip"] in duplicate_ip_set:
             entry["status"] = "skipped_duplicate_ip"
             entry["error"] = "Exit IP already clicked this link before"
             push_live_step(job_id, i + 1, "filter", "skipped", f"Duplicate IP {geo['exit_ip']}")
@@ -9081,15 +9221,73 @@ async def run_real_user_traffic_job(
         # top of process_one (we needed its state to fetch a matching
         # ProxyJet IP). Reuse that pick here.
         row_pick = None
-        if proxyjet_on_demand and on_demand_row_pick is not None:
+        if _use_row_first and on_demand_row_pick is not None:
             row_pick = on_demand_row_pick
         elif form_fill_enabled:
             if state_match_enabled and state_col:
-                # Match lead state to this proxy's exit-IP state.
-                proxy_state_code = _normalize_state(geo.get("region")) or _normalize_state(geo.get("region_name"))
-                entry["proxy_state"] = proxy_state_code or ""
-                if proxy_state_code:
-                    row_pick = pick_next_row_for_state(proxy_state_code)
+                proxy_state_code = ""
+                # Automode OFF + pinned provider state: pick the lead for
+                # the configured state BEFORE matching to proxy geo.
+                if not _use_row_first and proxyjet_default_state:
+                    _pinned_st = _normalize_state(proxyjet_default_state)
+                    if _pinned_st:
+                        row_pick = pick_next_row_for_state(_pinned_st)
+                        if row_pick:
+                            entry["lead_state"] = _pinned_st
+                            push_live_step(
+                                job_id, i + 1, "row", "ok",
+                                f"Lead row for configured state {_pinned_st} · matching proxy…",
+                            )
+                if not row_pick:
+                    # Match lead state to this proxy's exit-IP state.
+                    proxy_state_code = _normalize_state(geo.get("region")) or _normalize_state(geo.get("region_name"))
+                    entry["proxy_state"] = proxy_state_code or ""
+                    if proxy_state_code:
+                        row_pick = pick_next_row_for_state(proxy_state_code)
+                if not row_pick and not _use_row_first and state_match_enabled and state_col:
+                    # Static proxy list: retry other proxies until we find
+                    # one whose exit state has an unused lead.
+                    _sm_cap = min(max(len(parsed_proxies), 1), 15)
+                    for _sm_try in range(1, _sm_cap):
+                        _next_px = pick_next_proxy()
+                        if not _next_px:
+                            break
+                        proxy = _next_px
+                        entry["proxy"] = proxy.get("server", "")
+                        _sm_geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
+                        if not _sm_geo.get("ok") or not (_sm_geo.get("exit_ip") or "").strip():
+                            continue
+                        if allowed_countries_lc and _sm_geo["country_name"].lower() not in allowed_countries_lc:
+                            continue
+                        if skip_vpn and _sm_geo.get("is_vpn"):
+                            continue
+                        if (
+                            skip_duplicate_ip
+                            and duplicate_ip_set
+                            and _sm_geo.get("exit_ip")
+                            and _sm_geo["exit_ip"] in duplicate_ip_set
+                        ):
+                            continue
+                        geo = _sm_geo
+                        entry["exit_ip"] = geo["exit_ip"] or ""
+                        entry["country"] = geo["country_name"]
+                        entry["city"] = geo["city"]
+                        entry["timezone"] = geo["timezone"]
+                        entry["locale"] = geo["locale"]
+                        proxy_state_code = (
+                            _normalize_state(geo.get("region"))
+                            or _normalize_state(geo.get("region_name"))
+                        )
+                        entry["proxy_state"] = proxy_state_code or ""
+                        if proxy_state_code:
+                            row_pick = pick_next_row_for_state(proxy_state_code)
+                        if row_pick:
+                            push_live_step(
+                                job_id, i + 1, "filter", "ok",
+                                f"State match on proxy try {_sm_try + 1}: "
+                                f"{proxy_state_code} · {entry['exit_ip']}",
+                            )
+                            break
                 if not row_pick:
                     # No lead available for this proxy's state → skip this visit
                     entry["status"] = "skipped_state_mismatch"

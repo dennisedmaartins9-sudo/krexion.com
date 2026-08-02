@@ -838,16 +838,16 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
         iframe_path = []
     locators = _locator_candidates_from_info(info)
 
-    async def _try_locator_clicks(root: Any) -> bool:
+    async def _try_locator_clicks(root: Any, *, force: bool = False) -> bool:
         for sel in locators:
             try:
-                await root.locator(sel).first.click(timeout=3000)
+                await root.locator(sel).first.click(timeout=3000, force=force)
                 return True
             except Exception:
                 continue
         if text:
             try:
-                await root.get_by_text(text, exact=False).first.click(timeout=3000)
+                await root.get_by_text(text, exact=False).first.click(timeout=3000, force=force)
                 return True
             except Exception:
                 pass
@@ -863,6 +863,8 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
                 fl = fl.frame_locator(seg.strip())
             if await _try_locator_clicks(fl):
                 return True
+            if await _try_locator_clicks(fl, force=True):
+                return True
             # JS fallback scoped to the iframe document
             if locators or text:
                 live_js = _build_text_click_evaluate(text or "", info)
@@ -874,8 +876,10 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
         except Exception:
             pass
 
-    # 2. Top-level Playwright locators
+    # 2. Top-level Playwright locators (normal then force — modal overlays)
     if await _try_locator_clicks(page):
+        return True
+    if await _try_locator_clicks(page, force=True):
         return True
 
     # 3. Top-level JS (selector-priority + text match — same as replay)
@@ -3070,8 +3074,13 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
             # sample value so the page sees a populated field.
             if sample_val is not None:
                 try:
-                    await sess.page.fill(sel, sample_val, timeout=4000)
-                    extra["filled_sample"] = sample_val[:30]
+                    fill_ok, fill_extra = await _fill_live_input(sess.page, sel, sample_val)
+                    extra.update(fill_extra)
+                    if not fill_ok:
+                        extra["fill_warning"] = fill_extra.get(
+                            "fill_warning",
+                            "Live fill failed — use Fix Type (T) on the email field, then Continue.",
+                        )
                 except Exception as e:  # noqa: BLE001
                     extra["fill_warning"] = (
                         f"Selector did not match in the live page ({type(e).__name__}). "
@@ -4468,6 +4477,20 @@ async def _fill_live_input(page: Any, selector: str, live_val: str) -> Tuple[boo
             fill_err = (fill_err or "") + f" | js: {type(e).__name__}: {str(e)[:80]}"
     if not fill_ok:
         extra["fill_warning"] = (fill_err or "all strategies failed")[:200]
+    elif fill_ok and selector:
+        # Blur so React / TrustedForm / Jornaya validators see a
+        # "finished typing" event before the next Continue click.
+        try:
+            await page.evaluate(
+                """(s) => {
+                    var e = document.querySelector(s);
+                    if (!e) return;
+                    try { e.dispatchEvent(new Event('blur', {bubbles:true})); } catch(_){}
+                }""",
+                selector,
+            )
+        except Exception:
+            pass
     return fill_ok, extra
 
 
@@ -5690,6 +5713,10 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     '.swal2-container',
     '.sweet-alert',
     '.fancybox-container',
+    '[class*="alert" i]',
+    '[class*="modal-content" i]',
+    '[class*="modal-dialog" i]',
+    '[class*="popup-content" i]',
   ].join(', ');
 
   const popupEntries = [];
@@ -5748,7 +5775,139 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     )
   );
 
-  // ── Step 2: enumerate clickables inside each popup ────────────────
+  // v2.6.55 — TOP POPUP ONLY: enumerate buttons inside the modal the
+  // user actually sees at the viewport center — NOT every high-z layer,
+  // backdrop, or hidden template still sitting in the DOM.
+  function effectiveZ(el) {
+    var z = 0;
+    var n = el;
+    var win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    while (n && n.nodeType === 1 && n !== (el.ownerDocument && el.ownerDocument.documentElement)) {
+      try {
+        var cs = win.getComputedStyle(n);
+        if (cs.position && cs.position !== 'static') {
+          var zi = parseInt(cs.zIndex, 10);
+          if (!isNaN(zi)) z = Math.max(z, zi);
+        }
+      } catch (e) { /* skip */ }
+      n = n.parentElement;
+    }
+    return z;
+  }
+
+  function coversCenter(el) {
+    var r = el.getBoundingClientRect();
+    var cx = (window.innerWidth || 0) / 2;
+    var cy = (window.innerHeight || 0) / 2;
+    return cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+  }
+
+  function isTopHit(el, doc) {
+    try {
+      var r = el.getBoundingClientRect();
+      var cx = r.left + r.width / 2;
+      var cy = r.top + r.height / 2;
+      var d = doc || document;
+      var stack = [];
+      if (d.elementsFromPoint) {
+        try { stack = d.elementsFromPoint(cx, cy) || []; } catch (e) { stack = []; }
+      }
+      if (!stack.length) {
+        var one = d.elementFromPoint(cx, cy);
+        if (one) stack = [one];
+      }
+      for (var i = 0; i < stack.length; i++) {
+        var h = stack[i];
+        if (h === el || (el.contains && el.contains(h))) return true;
+      }
+    } catch (e) { /* skip */ }
+    return false;
+  }
+
+  function isPopupLikeNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    try {
+      if (node.matches) {
+        var parts = popupSel.split(',');
+        for (var pi = 0; pi < parts.length; pi++) {
+          var sel = parts[pi].trim();
+          if (sel && node.matches(sel) && isVisibleInDoc(node)) return true;
+        }
+      }
+      var cs = window.getComputedStyle(node);
+      var pos = cs.position;
+      if (pos === 'fixed' || pos === 'absolute') {
+        var zi = parseFloat(cs.zIndex || '0');
+        var r = node.getBoundingClientRect();
+        if (zi >= 50 && r.width >= 80 && r.height >= 80 && isVisibleInDoc(node)) return true;
+      }
+    } catch (e) { /* skip */ }
+    return false;
+  }
+
+  function findPopupAtViewportCenter() {
+    var cx = (window.innerWidth || 0) / 2;
+    var cy = (window.innerHeight || 0) / 2;
+    return findPopupAtPoint(document, cx, cy, 0, 0, []);
+  }
+
+  function findPopupAtPoint(doc, px, py, ox, oy, iframePath) {
+    var stack = [];
+    try {
+      stack = doc.elementsFromPoint ? doc.elementsFromPoint(px, py) : [];
+    } catch (e) { stack = []; }
+    if (!stack.length) {
+      var one = doc.elementFromPoint(px, py);
+      if (one) stack = [one];
+    }
+    for (var si = 0; si < stack.length; si++) {
+      var node = stack[si];
+      if (!node || node.nodeType !== 1) continue;
+      if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+        try {
+          var idoc = node.contentDocument;
+          if (idoc) {
+            var ir = node.getBoundingClientRect();
+            var innerHit = findPopupAtPoint(
+              idoc, px - ir.left, py - ir.top,
+              ox + ir.left, oy + ir.top,
+              iframePath.concat([iframeSelector(node)])
+            );
+            if (innerHit) return innerHit;
+          }
+        } catch (e) { /* cross-origin */ }
+      }
+      var walk = node;
+      while (walk && walk !== doc.body) {
+        if (isPopupLikeNode(walk)) {
+          var best = null;
+          for (var ki = 0; ki < kept.length; ki++) {
+            var ent = kept[ki];
+            if (ent.el === walk || (ent.el.contains && ent.el.contains(walk))) {
+              if (!best || effectiveZ(ent.el) >= effectiveZ(best.el)) best = ent;
+            }
+          }
+          if (best) return best;
+          return { el: walk, ox: ox, oy: oy, iframePath: iframePath.slice() };
+        }
+        walk = walk.parentElement;
+      }
+    }
+    return null;
+  }
+
+  var centerPopup = findPopupAtViewportCenter();
+  var scanPopups = [];
+  if (centerPopup) {
+    scanPopups = [centerPopup];
+  } else if (kept.length) {
+    var pool = kept.filter(function(e) { return coversCenter(e.el); });
+    if (!pool.length) pool = kept.slice();
+    pool.sort(function(a, b) { return effectiveZ(b.el) - effectiveZ(a.el); });
+    scanPopups = [pool[0]];
+  }
+
+  // ── Step 2: enumerate clickables inside the TOP popup only ────────
   // v2.6.28 — Widened selector so form fields (text inputs, textareas,
   //           <select>) are also detected. The front-end will route
   //           them to Form Fill / Dropdown / Check Box tools instead
@@ -5853,11 +6012,12 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     return '';
   };
 
-  kept.forEach((entry, popupIdx) => {
+  scanPopups.forEach((entry, popupIdx) => {
     const popup = entry.el;
     const ox = entry.ox || 0;
     const oy = entry.oy || 0;
     const iframePath = entry.iframePath || [];
+    const ownerDoc = popup.ownerDocument || document;
     const rectP = popup.getBoundingClientRect();
     if (rectP.width < 20 || rectP.height < 20) return;
     const inside = Array.from(popup.querySelectorAll(BTN_SEL));
@@ -5878,8 +6038,12 @@ _DETECT_POPUP_BUTTONS_JS = r"""
       try {
         const cs = window.getComputedStyle(el);
         if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05) continue;
+        if (cs.pointerEvents === 'none') continue;
+        if (el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true')) continue;
         const r = el.getBoundingClientRect();
         if (r.width < 4 || r.height < 4) continue;
+        // Skip buttons hidden behind the modal backdrop / another layer.
+        if (!isTopHit(el, ownerDoc)) continue;
         // v2.6.28 — Skip hidden form inputs like <input type="hidden">
         // and off-screen fields (Firebase reCAPTCHA hidden inputs, etc)
         const tagUp = (el.tagName || '').toUpperCase();
@@ -5948,7 +6112,9 @@ _DETECT_POPUP_BUTTONS_JS = r"""
   });
 
   return {
-    popup_count: kept.length,
+    popup_count: scanPopups.length,
+    total_popups_found: kept.length,
+    top_popup_only: true,
     items: out,
   };
 }
@@ -5981,6 +6147,8 @@ async def detect_popup_buttons(sess: RecorderSession) -> Dict[str, Any]:
             items = items[:300]
         return {
             "popup_count": int(result.get("popup_count") or 0),
+            "total_popups_found": int(result.get("total_popups_found") or 0),
+            "top_popup_only": bool(result.get("top_popup_only")),
             "items": items,
         }
 

@@ -2237,7 +2237,7 @@ export default function VisualRecorderPage() {
           ? `Found ${d.popup_count} popup(s) but no clickable buttons inside.`
           : "No popup/modal/dialog is currently visible on the page.");
       } else {
-        toast.success(`Detected ${items.length} item(s) across ${d.popup_count} popup(s) — pick action per item (click / form-fill / dropdown / check) then Add as steps.`);
+        toast.success(`Detected ${items.length} item(s) in top popup (screen center)${d.total_popups_found > 1 ? ` — ${d.total_popups_found} popups on page, showing topmost only` : ''} — pick action per item then Add as steps.`);
       }
     } catch (err) {
       toast.error(`Popup scan failed: ${err.message || err}`);
@@ -5296,7 +5296,7 @@ export default function VisualRecorderPage() {
                         </span>
                       ) : (
                         <>
-                          🪟 Popup Work — {popupContainerCount} popup{popupContainerCount === 1 ? "" : "s"} · {detectedPopupItems.length} item{detectedPopupItems.length === 1 ? "" : "s"} · tick items & pick action per item ({selectedPopupKeys.size}/{detectedPopupItems.length})
+                          🪟 Popup Work — top popup · {detectedPopupItems.length} item{detectedPopupItems.length === 1 ? "" : "s"} · tick items & pick action per item ({selectedPopupKeys.size}/{detectedPopupItems.length})
                         </>
                       )}
                     </div>
