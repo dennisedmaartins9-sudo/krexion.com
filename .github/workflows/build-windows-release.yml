@@ -31,12 +31,12 @@ on:
       - 'backend/VERSION'
       - '.github/workflows/build-windows-release.yml'
 
-# v2.6.52 consolidated release — do NOT cancel a running native build
-# when a CI-only push lands; the backend bundle routinely takes 90+
-# minutes on the self-hosted Windows runner (#191/#192/#193 timeouts).
+# v2.6.55 — one native build at a time; cancel stale runs when a new
+# perfect build is dispatched so the Windows runner isn't stuck behind
+# doomed #194/#195 queue entries.
 concurrency:
   group: krexion-native-build-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 # ----------------------------------------------------------------------
 # `contents: write` is required by softprops/action-gh-release@v2 in the
@@ -178,22 +178,17 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Save pip wheel cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~\AppData\Local\pip\Cache
-          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
-
-      - name: Save backend deps bundle cache
+      - name: Upload backend artifact
         if: success()
-        uses: actions/cache/save@v4
+        # v2.6.55 — upload FIRST so job success isn't blocked by slow
+        # cache saves (#194 cancelled after pip OK but cache hung).
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
-          path: |
-            build/dist/krexion-backend.dist
-            build/.deps-fingerprint
-          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
+          name: krexion-backend-bundle
+          path: build/dist/krexion-backend.dist/**
+          retention-days: 3
+          if-no-files-found: error
 
       - name: Show build output (diagnostic)
         if: always()
@@ -211,18 +206,24 @@ jobs:
             Write-Host "No build/dist directory was produced."
           }
 
-      - name: Upload backend artifact (cache mirror)
+      - name: Save pip wheel cache
         if: always()
-        # 2026-01: continue-on-error so quota-hit doesn't kill the
-        # whole workflow. Build still succeeds; downstream installer
-        # job will use the cache below (artifact is optional mirror).
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: krexion-backend-bundle
-          path: build/dist/krexion-backend.dist/**
-          retention-days: 3
-          if-no-files-found: warn
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
+
+      - name: Save backend deps bundle cache
+        if: success()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/dist/krexion-backend.dist
+            build/.deps-fingerprint
+          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
 
       # v2.6.55 — removed per-run SHA cache save here; uploading the
       # multi-GB backend bundle to actions/cache added 20+ min AFTER a
@@ -296,7 +297,7 @@ jobs:
     # still inside the silent ISCC compile (12+ min on the chromium
     # folder alone). 75 min gives ~25-30 min of headroom even with
     # slow GitHub-hosted Windows runners.
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
