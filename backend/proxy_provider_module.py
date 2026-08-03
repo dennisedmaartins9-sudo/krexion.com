@@ -167,6 +167,106 @@ _SESSION_TOKEN_RE = re.compile(
     r"(-(?:session(?:id)?|sessid|sess)-)([A-Za-z0-9]+)",
     re.IGNORECASE,
 )
+# Smartproxy Smart Region panel (proxy.smartproxy.net) — underscore DSL:
+#   smart-{subid}_area-US_state-california_life-120_session-{id}
+_SMARTPROXY_SMART_SESSION_RE = re.compile(r"(_session-)([A-Za-z0-9]+)", re.IGNORECASE)
+_SMARTPROXY_SMART_PARAM_RES = (
+    ("area", re.compile(r"_area-[A-Za-z0-9]+", re.IGNORECASE)),
+    ("state", re.compile(r"_state-[a-z0-9]+(?:_[a-z0-9]+)*", re.IGNORECASE)),
+    ("city", re.compile(r"_city-[a-z0-9]+(?:_[a-z0-9]+)*", re.IGNORECASE)),
+    ("asn", re.compile(r"_asn-[A-Za-z0-9]+", re.IGNORECASE)),
+    ("life", re.compile(r"_life-[0-9]+", re.IGNORECASE)),
+    ("session", _SMARTPROXY_SMART_SESSION_RE),
+)
+
+# Smartproxy Smart Region — panel string from proxy.smartproxy.net:3120
+_SMARTPROXY_SMART_PROFILE: Dict[str, Any] = {
+    "name": "Smartproxy Smart Region",
+    "hosts": ["smartproxy.net", "smartproxy.com"],
+    "dsl": "smart_underscore",
+    "state_fmt": "{slug}",
+    "default_life_minutes": 120,
+}
+
+
+def _is_smartproxy_smart_username(username: str) -> bool:
+    u = (username or "").lower()
+    return u.startswith("smart-") or "_area-" in u or "_state-" in u
+
+
+def _strip_smartproxy_smart_params(username: str, *, keep_life: bool = False) -> str:
+    """Strip Smart Region geo/session tokens from a smart-* username."""
+    if not username:
+        return username
+    out = username
+    # Strip session + life BEFORE state so `_state-california_life` is never matched.
+    out = _SMARTPROXY_SMART_SESSION_RE.sub("", out, count=1)
+    if not keep_life:
+        out = re.sub(r"_life-[0-9]+", "", out, flags=re.IGNORECASE)
+    for pat in (
+        re.compile(r"_city-[a-z0-9]+(?:_[a-z0-9]+)*", re.IGNORECASE),
+        re.compile(r"_state-[a-z0-9]+(?:_[a-z0-9]+)*", re.IGNORECASE),
+        re.compile(r"_area-[A-Za-z0-9]+", re.IGNORECASE),
+        re.compile(r"_asn-[A-Za-z0-9]+", re.IGNORECASE),
+    ):
+        out = pat.sub("", out)
+    return out
+
+
+def _extract_smartproxy_life_minutes(username: str) -> int:
+    m = re.search(r"_life-([0-9]+)", username or "", re.IGNORECASE)
+    if m:
+        try:
+            return max(1, int(m.group(1)))
+        except ValueError:
+            pass
+    return int(_SMARTPROXY_SMART_PROFILE.get("default_life_minutes") or 120)
+
+
+def _make_smart_session_id() -> str:
+    """Alphanumeric session id matching Smartproxy panel (e.g. vMPdPfj97)."""
+    import string
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choice(chars) for _ in range(9))
+
+
+def _smartproxy_smart_base(username: str) -> str:
+    """Account id only: smart-u0h51gc8hmdw (no _area/_state/_life/_session suffix)."""
+    u = username or ""
+    for marker in ("_area-", "_state-", "_city-", "_life-", "_session-"):
+        idx = u.lower().find(marker)
+        if idx > 0:
+            return u[:idx]
+    return u
+
+
+def _apply_smartproxy_smart_targeting(
+    username_base: str,
+    targeting: Dict[str, Any],
+    *,
+    original_username: str = "",
+) -> str:
+    """Build smart-u0h51gc8hmdw_area-US_state-california_life-120_session-{sid}."""
+    profile = _SMARTPROXY_SMART_PROFILE
+    base = _smartproxy_smart_base(_strip_smartproxy_smart_params(username_base))
+    parts: List[str] = []
+    country = str(targeting.get("country") or "US").strip().upper() or "US"
+    parts.append(f"_area-{country}")
+    state_val = targeting.get("state")
+    if state_val:
+        slug = _format_state_for_profile(profile, str(state_val))
+        if slug:
+            parts.append(f"_state-{slug}")
+    city_val = targeting.get("city")
+    if city_val:
+        parts.append(f"_city-{str(city_val).lower().replace(' ', '')}")
+    life = targeting.get("sticky_minutes")
+    if not life:
+        life = _extract_smartproxy_life_minutes(original_username or username_base)
+    parts.append(f"_life-{int(life)}")
+    if targeting.get("_want_sid") or targeting.get("session_mode", "sticky") == "sticky":
+        parts.append("_session-{sid}")
+    return base + "".join(parts)
 
 
 def _make_session_id() -> str:
@@ -175,21 +275,28 @@ def _make_session_id() -> str:
     return str(random.randint(10**7, 10**9 - 1))
 
 
-def _strip_provider_session(username: str) -> str:
+def _strip_provider_session(username: str, profile: Optional[Dict[str, Any]] = None) -> str:
     """Remove embedded session tokens so ROW-FIRST can inject a fresh one."""
     if not username:
         return username
     out = username.replace("{sid}", "")
+    if (profile or {}).get("dsl") == "smart_underscore" or _is_smartproxy_smart_username(out):
+        out = _SMARTPROXY_SMART_SESSION_RE.sub("", out, count=1)
     if _SESSION_TOKEN_RE.search(out):
         out = _SESSION_TOKEN_RE.sub("", out, count=1)
-    # Collapse duplicate delimiters left after stripping (e.g. "--" → "-").
     out = re.sub(r"-{2,}", "-", out).strip("-")
     return out
 
 
 def _strip_provider_geo_params(username: str, profile: Optional[Dict[str, Any]]) -> str:
     """Strip country/state/city/zip/asn tokens from a gateway username."""
-    if not username or not profile:
+    if not username:
+        return username
+    if (profile or {}).get("dsl") == "smart_underscore" or (
+        not profile and _is_smartproxy_smart_username(username)
+    ):
+        return _strip_smartproxy_smart_params(username, keep_life=False)
+    if not profile:
         return username
     out = username
     prefix = profile.get("prefix") or ""
@@ -212,8 +319,10 @@ def _strip_provider_geo_params(username: str, profile: Optional[Dict[str, Any]])
 
 
 def _ensure_provider_user_prefix(username: str, profile: Optional[Dict[str, Any]]) -> str:
-    """Decodo/Smartproxy require usernames to start with user-."""
+    """Decodo legacy gate usernames start with user-; Smart Region uses smart-."""
     if not username or not profile:
+        return username
+    if profile.get("dsl") == "smart_underscore" or username.lower().startswith("smart-"):
         return username
     if profile.get("name") != "Smartproxy / Decodo":
         return username
@@ -229,9 +338,12 @@ def _gateway_base_username(
     provider_name: str = "",
 ) -> str:
     """Return a clean gateway username (no geo/session) for ROW-FIRST rebuilds."""
-    profile = _detect_profile(gateway_host or "", provider_name)
-    out = _strip_provider_session(username)
-    out = _strip_provider_geo_params(out, profile)
+    profile = _detect_profile(gateway_host or "", provider_name, username)
+    if profile and profile.get("dsl") == "smart_underscore":
+        out = _strip_smartproxy_smart_params(username)
+    else:
+        out = _strip_provider_session(username, profile)
+        out = _strip_provider_geo_params(out, profile)
     out = _ensure_provider_user_prefix(out, profile)
     return out
 
@@ -247,7 +359,14 @@ def _rotate_session_in_username(username: str) -> str:
     if not username:
         return username
     if "{sid}" in username:
-        return username.replace("{sid}", _make_session_id())
+        sid = _make_smart_session_id() if _is_smartproxy_smart_username(username) else _make_session_id()
+        return username.replace("{sid}", sid)
+    if _SMARTPROXY_SMART_SESSION_RE.search(username):
+        return _SMARTPROXY_SMART_SESSION_RE.sub(
+            lambda m: f"{m.group(1)}{_make_smart_session_id()}",
+            username,
+            count=1,
+        )
     if _SESSION_TOKEN_RE.search(username):
         return _SESSION_TOKEN_RE.sub(
             lambda m: f"{m.group(1)}{_make_session_id()}",
@@ -416,9 +535,18 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
 _TARGETING_PLACEHOLDER_KEYS = ("country", "state", "city", "zip", "asn", "ttl", "sid")
 
 
-def _detect_profile(host: str, provider_name: str = "") -> Optional[Dict[str, Any]]:
+def _detect_profile(
+    host: str,
+    provider_name: str = "",
+    username: str = "",
+) -> Optional[Dict[str, Any]]:
     h = (host or "").lower().strip()
     n = (provider_name or "").lower().strip()
+    u = (username or "").lower().strip()
+    # Smartproxy Smart Region panel (proxy.smartproxy.net:3120) — underscore DSL
+    if any(needle in h for needle in ("smartproxy.net", "smartproxy.com")):
+        if _is_smartproxy_smart_username(u) or u.startswith("smart-"):
+            return dict(_SMARTPROXY_SMART_PROFILE)
     for prof in _PROVIDER_PROFILES:
         for needle in prof["hosts"]:
             if needle in h:
@@ -545,16 +673,29 @@ def _apply_targeting_to_username(
     if not targeting:
         return username_tpl
 
-    profile = _detect_profile(gateway_host or "", provider_name)
+    profile = _detect_profile(gateway_host or "", provider_name, username_tpl)
     force_replace = bool(targeting.get("force_replace"))
 
     out = username_tpl
+    original_username = username_tpl
     if force_replace and profile:
-        out = _strip_provider_geo_params(out, profile)
-        out = _strip_provider_session(out)
+        if profile.get("dsl") == "smart_underscore":
+            out = _strip_smartproxy_smart_params(out)
+        else:
+            out = _strip_provider_geo_params(out, profile)
+            out = _strip_provider_session(out, profile)
         out = _ensure_provider_user_prefix(out, profile)
     elif force_replace:
         out = _strip_provider_session(out)
+
+    # Smartproxy Smart Region — rebuild _area/_state/_life/_session suffix.
+    if profile and profile.get("dsl") == "smart_underscore":
+        if force_replace or any(
+            targeting.get(k) for k in ("country", "state", "city", "zip", "asn")
+        ):
+            return _apply_smartproxy_smart_targeting(
+                out, targeting, original_username=original_username,
+            )
 
     # 1. Placeholder substitution — universal, provider-agnostic.
     for key in ("country", "state", "city", "zip", "asn"):

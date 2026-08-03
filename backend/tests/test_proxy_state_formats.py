@@ -47,7 +47,7 @@ def test_dataimpulse_lower_code():
 
 def test_unknown_provider_defaults_slug():
     assert _format_state_for_profile(None, "CA") == "california"
-    assert _detect_profile("custom-proxy.example.com", "My Residential")
+    assert _detect_profile("custom-proxy.example.com", "My Residential") is None
 
 
 def test_all_profiles_have_state_fmt():
@@ -68,6 +68,28 @@ def test_force_replace_strips_stale_state_and_reapplies():
     assert "us_california" in low
     assert "us_texas" not in low
     assert low.startswith("user-")
+
+
+def test_smartproxy_smart_region_ca_panel_string():
+    """Exact string from Smartproxy panel for California."""
+    raw_user = "smart-u0h51gc8hmdw_area-US_state-california_life-120_session-vMPdPfj97"
+    host = "proxy.smartproxy.net"
+    out = _apply_targeting_to_username(
+        raw_user,
+        host,
+        {"country": "US", "state": "CA", "_want_sid": True, "force_replace": True},
+    )
+    low = out.lower()
+    assert low.startswith("smart-u0h51gc8hmdw"), out
+    assert "_area-us" in low, out
+    assert "_state-california" in low, out
+    assert "_life-120" in low, out
+    assert "_session-" in low, out
+    assert "-country-us" not in low, out
+    assert "us_california" not in low, out
+    assert not low.startswith("user-"), out
+    assert "_life-120_area" not in low, out
+    assert low.startswith("smart-u0h51gc8hmdw_area"), out
 
 
 def test_gateway_base_username_strips_geo_and_session():

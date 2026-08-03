@@ -89,6 +89,7 @@ def run_tests() -> None:
         "http://user-sp123:secret@gate.decodo.com:7000",
         "http://user-sp123-country-us-state-us_nebraska-session-111:pass@gate.decodo.com:7000",
         "http://sp456:pass@us.smartproxy.net:3128",
+        "http://smart-u0h51gc8hmdw_area-US_state-california_life-120_session-vMPdPfj97:bsNDKlwpUV4DpIDP@proxy.smartproxy.net:3120",
     ]
     failures = 0
     for line in cases:
@@ -100,11 +101,26 @@ def run_tests() -> None:
         checks = [
             ("@" not in out["server"], f"server must be host:port only, got {out['server']!r}"),
             (url.count("@") == 1, f"proxy URL must have exactly one @, got {url!r}"),
-            ("us_california" in un, f"username missing us_california: {un!r}"),
-            (un.startswith("user-"), f"Decodo username must start with user-: {un!r}"),
-            ("nebraska" not in un, f"stale nebraska in username: {un!r}"),
+            ("us_california" in un or "_state-california" in un,
+             f"username missing CA state encoding: {un!r}"),
             (not re.search(r"user:[^@]+@user:", url), f"double-auth in URL: {url!r}"),
         ]
+        if "smart-" in line or "_area-" in line:
+            checks.extend([
+                (un.startswith("smart-"), f"Smart Region must keep smart- prefix: {un!r}"),
+                ("_area-us" in un, f"missing _area-US: {un!r}"),
+                ("_state-california" in un, f"missing _state-california: {un!r}"),
+                ("-country-us" not in un, f"legacy DSL appended: {un!r}"),
+                (not un.startswith("user-"), f"must not add user- prefix: {un!r}"),
+                ("_life-" in un and "-120" not in un.split("_area-")[0], f"bad base before _area: {un!r}"),
+                (re.search(r"smart-u0h51gc8hmdw_area-us_state-california_life-[0-9]+_session-", un),
+                 f"expected panel-shaped username: {un!r}"),
+            ])
+        else:
+            checks.extend([
+                (un.startswith("user-"), f"Decodo username must start with user-: {un!r}"),
+                ("nebraska" not in un, f"stale nebraska in username: {un!r}"),
+            ])
         for ok, msg in checks:
             if not ok:
                 print(f"FAIL [{line[:50]}...]: {msg}")
