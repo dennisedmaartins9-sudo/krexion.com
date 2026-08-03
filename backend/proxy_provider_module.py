@@ -222,6 +222,10 @@ def _rotate_session_in_username(username: str) -> str:
 # Each profile is a dict: sep=(prefix, kv_sep), keys={country:'cr',...}
 # meaning: prefix param starts with '__' or '-', each key is joined
 # using kv_sep. Session id key + session ttl key differ per provider.
+#
+# `state_fmt` controls how a sheet STATE value (CA / California) is
+# encoded in the gateway username. Tokens: {slug}=california/new_york,
+# {code}=CA, {code_lower}=ca. Special: us_{slug}=us_california (Decodo).
 
 _PROVIDER_PROFILES: List[Dict[str, Any]] = [
     {
@@ -234,6 +238,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "cr", "state": "st", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{code_lower}",
         "sid_key": "sessid",
         "ttl_key": "sessttl",     # minutes
         "ttl_unit": "min",
@@ -248,6 +253,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "state", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{slug}",
         "sid_key": "session",
         "ttl_key": None,          # Bright Data configures TTL in dashboard, not URL
         "ttl_unit": None,
@@ -262,6 +268,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "cc", "state": "st", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{slug}",
         "sid_key": "sessid",
         "ttl_key": "sesstime",    # minutes
         "ttl_unit": "min",
@@ -276,6 +283,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "state", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "us_{slug}",
         "sid_key": "session",
         "ttl_key": "sessionduration",   # minutes
         "ttl_unit": "min",
@@ -290,6 +298,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "state", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{slug}",
         "sid_key": "session",
         "ttl_key": "lifetime",     # minutes
         "ttl_unit": "min",
@@ -304,6 +313,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "region", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{code_lower}",
         "sid_key": "session",
         "ttl_key": "lifetime",
         "ttl_unit": "min",
@@ -318,6 +328,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "region", "city": "city",
             "zip": "zip", "asn": "isp",
         },
+        "state_fmt": "{slug}",
         "sid_key": "sessionid",
         "ttl_key": "sessionlength",
         "ttl_unit": "sec",         # Soax uses seconds — will multiply by 60
@@ -332,6 +343,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
             "country": "country", "state": "state", "city": "city",
             "zip": "zip", "asn": "asn",
         },
+        "state_fmt": "{code}",
         "sid_key": "session",
         "ttl_key": None,
         "ttl_unit": None,
@@ -373,19 +385,68 @@ def _detect_profile(host: str, provider_name: str = "") -> Optional[Dict[str, An
     return None
 
 
+def _state_slug(val: str) -> str:
+    """Normalise a US state code or name to a lowercase underscore slug."""
+    v = str(val or "").strip()
+    if not v:
+        return ""
+    try:
+        from value_normalizer import US_STATES  # noqa: WPS433
+    except Exception:
+        US_STATES = {}
+    if len(v) == 2 and v.upper() in US_STATES:
+        return US_STATES[v.upper()].lower().replace(" ", "_")
+    return v.lower().replace(" ", "_")
+
+
+def _state_code(val: str) -> str:
+    """Resolve CA / California / california → CA."""
+    v = str(val or "").strip()
+    if not v:
+        return ""
+    try:
+        from value_normalizer import US_STATES  # noqa: WPS433
+    except Exception:
+        US_STATES = {}
+    if len(v) == 2 and v.upper() in US_STATES:
+        return v.upper()
+    slug = v.lower().replace(" ", "_")
+    for code, name in US_STATES.items():
+        if name.lower() == v.lower() or name.lower().replace(" ", "_") == slug:
+            return code
+    return v.upper()[:2] if len(v) >= 2 else v.upper()
+
+
+def _format_state_for_profile(profile: Optional[Dict[str, Any]], val: str) -> str:
+    """Encode sheet STATE for a provider gateway username (permanent DSL map)."""
+    slug = _state_slug(val)
+    code = _state_code(val)
+    fmt = (profile or {}).get("state_fmt") or "{slug}"
+    if fmt == "us_{slug}":
+        if slug.startswith("us_"):
+            return slug
+        return f"us_{slug}" if slug else ""
+    if fmt == "{slug}":
+        return slug
+    if fmt == "{code}":
+        return code
+    if fmt == "{code_lower}":
+        return code.lower()
+    try:
+        return fmt.format(slug=slug, code=code, code_lower=code.lower())
+    except Exception:
+        return slug
+
+
 def _norm_target_val(profile: Dict[str, Any], key: str, val: str) -> str:
-    """Normalise a targeting value for the given provider.
-    Country codes → lowercase 2-letter (dataimpulse expects `us`, so
-    does Bright Data). State abbreviations kept as-is (some providers
-    want full names, some abbreviations — we pass through and let the
-    provider validate). Cities/ISPs lower-cased and stripped."""
+    """Normalise a targeting value for the given provider."""
     v = str(val or "").strip()
     if not v:
         return ""
     if key == "country":
         return v.lower()[:3]
     if key == "state":
-        return v.lower().replace(" ", "")
+        return _format_state_for_profile(profile, v)
     if key == "city":
         return v.lower().replace(" ", "")
     if key == "zip":

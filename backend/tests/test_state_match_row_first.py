@@ -27,9 +27,21 @@ class TestBuildStateTargetedProxy:
         assert base and base.get("is_rotating_gateway")
         out = _build_state_targeted_proxy(base, "NE", "US")
         assert out["username"]
-        assert "state" in out["username"].lower() or "ne" in out["username"].lower()
+        un = out["username"].lower()
+        assert "state" in un
+        assert "us_nebraska" in un or "nebraska" in un
         assert out["server"].startswith("http://")
         assert out["username"] != base.get("username")
+
+    def test_smartproxy_california_format(self):
+        from proxy_provider_module import _apply_targeting_to_username
+
+        user = _apply_targeting_to_username(
+            "user-sp123",
+            "gate.smartproxy.com",
+            {"country": "US", "state": "CA", "_want_sid": True},
+        )
+        assert "us_california" in user.lower()
 
     def test_session_rotates_between_calls(self):
         base = _parse_proxy_line("http://user-session-abc:pass@gate.smartproxy.com:7000")

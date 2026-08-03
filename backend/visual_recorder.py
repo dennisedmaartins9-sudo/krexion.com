@@ -237,6 +237,10 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
     var role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
     if (role === 'button' || role === 'link' || role === 'checkbox' || role === 'radio') return true;
     if (el.hasAttribute && el.hasAttribute('onclick')) return true;
+    try {
+      var cs = window.getComputedStyle(el);
+      if (cs && cs.cursor === 'pointer') return true;
+    } catch (e) { /* skip */ }
     return false;
   }
 
@@ -268,7 +272,8 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
       '[role="dialog"]', '[role="alertdialog"]', '[aria-modal="true"]',
       '.modal', '.popup', '.dialog', '.overlay', '.lightbox', '.drawer',
       '.MuiDialog-root', '.ant-modal', '.ReactModal__Content',
-      '.chakra-modal__content', '.swal2-container', '.sweet-alert', '.fancybox-container'
+      '.chakra-modal__content', '.swal2-container', '.sweet-alert', '.fancybox-container',
+      '[class*="alert" i]'
     ].join(', ');
     var candidates = [];
     try {
@@ -331,6 +336,8 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
     }
     var best = null;
     var bestScore = -9999;
+    var bestInteractive = null;
+    var bestInteractiveScore = -9999;
     for (var si = 0; si < stack.length; si++) {
       var cand = stack[si];
       if (!cand || cand.nodeType !== 1) continue;
@@ -339,7 +346,13 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
         bestScore = sc;
         best = cand;
       }
+      if (isInteractive(cand) && sc > bestInteractiveScore) {
+        bestInteractiveScore = sc;
+        bestInteractive = cand;
+      }
     }
+    // Inside a modal prefer the Continue / Go back link over the alert text wrapper.
+    if (modalContainer && bestInteractive) return bestInteractive;
     return best;
   }
 
@@ -373,13 +386,11 @@ _RICH_ELEMENT_CAPTURE_JS = r"""
   var ownerDoc = found.ownerDoc || document;
   var iframePath = found.framePath || [];
 
-  // Walk up to find a meaningful clickable ancestor (same heuristic
-  // as the legacy capture so behavior is identical to before).
+  // Walk up only to reach an interactive ancestor — do NOT stop at a
+  // text DIV (alert body) when the user clicked Continue / Go back.
   var depth = 0;
-  while (el && el.parentElement && el.parentElement.tagName !== 'BODY' && depth < 5) {
-    var txt = ((el.innerText || el.textContent || el.value || '') + '').trim();
-    var isInteractive = /^(A|BUTTON|INPUT|SELECT|TEXTAREA|LABEL)$/.test(el.tagName);
-    if (isInteractive || (txt.length > 0 && txt.length < 400)) break;
+  while (el && el.parentElement && el.parentElement.tagName !== 'BODY' && depth < 6) {
+    if (isInteractive(el)) break;
     el = el.parentElement;
     depth++;
   }
@@ -5824,6 +5835,28 @@ _DETECT_POPUP_BUTTONS_JS = r"""
     return false;
   }
 
+  function isClickableInPopup(el, popup, doc) {
+    if (isTopHit(el, doc)) return true;
+    try {
+      if (!popup || !popup.contains(el)) return false;
+      var r = el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      var cx = r.left + r.width / 2;
+      var cy = r.top + r.height / 2;
+      var stack = [];
+      if (doc.elementsFromPoint) {
+        try { stack = doc.elementsFromPoint(cx, cy) || []; } catch (e) { stack = []; }
+      }
+      for (var i = 0; i < stack.length; i++) {
+        var h = stack[i];
+        if (h === el || (el.contains && el.contains(h)) || (h.contains && h.contains(el))) {
+          if (popup.contains(h)) return true;
+        }
+      }
+    } catch (e) { /* skip */ }
+    return false;
+  }
+
   function isPopupLikeNode(node) {
     if (!node || node.nodeType !== 1) return false;
     try {
@@ -6043,7 +6076,7 @@ _DETECT_POPUP_BUTTONS_JS = r"""
         const r = el.getBoundingClientRect();
         if (r.width < 4 || r.height < 4) continue;
         // Skip buttons hidden behind the modal backdrop / another layer.
-        if (!isTopHit(el, ownerDoc)) continue;
+        if (!isClickableInPopup(el, popup, ownerDoc)) continue;
         // v2.6.28 — Skip hidden form inputs like <input type="hidden">
         // and off-screen fields (Firebase reCAPTCHA hidden inputs, etc)
         const tagUp = (el.tagName || '').toUpperCase();

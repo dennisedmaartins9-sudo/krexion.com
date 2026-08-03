@@ -126,7 +126,13 @@ def test_detect_popup_buttons_js_scans_top_popup_only():
     assert "findPopupAtViewportCenter" in _DETECT_POPUP_BUTTONS_JS
     assert "scanPopups" in _DETECT_POPUP_BUTTONS_JS
     assert "isTopHit" in _DETECT_POPUP_BUTTONS_JS
+    assert "isClickableInPopup" in _DETECT_POPUP_BUTTONS_JS
     assert "top_popup_only" in _DETECT_POPUP_BUTTONS_JS
+
+
+def test_rich_capture_prefers_interactive_in_modal():
+    assert "bestInteractive" in _RICH_ELEMENT_CAPTURE_JS
+    assert "cursor === 'pointer'" in _RICH_ELEMENT_CAPTURE_JS
 
 
 def test_live_click_captured_force_fallback_after_normal_fails():
