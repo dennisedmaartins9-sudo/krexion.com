@@ -51,6 +51,21 @@ class TestBuildStateTargetedProxy:
         un = out["username"].lower()
         assert "us_california" in un
         assert "nebraska" not in un
+        # server must be host:port only — credentials separate (probe-safe)
+        assert "@" not in out["server"]
+        assert "gate.decodo.com:7000" in out["server"]
+
+    def test_proxy_url_for_http_no_double_auth(self):
+        from real_user_traffic import _proxy_url_for_http
+
+        p = _build_state_targeted_proxy(
+            _parse_proxy_line("http://user-sp:pass@gate.decodo.com:7000"),
+            "CA",
+            "US",
+        )
+        url = _proxy_url_for_http(p)
+        assert url.count("@") == 1
+        assert "us_california" in url.lower()
 
     def test_session_rotates_between_calls(self):
         base = _parse_proxy_line("http://user-session-abc:pass@gate.smartproxy.com:7000")

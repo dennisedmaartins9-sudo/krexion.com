@@ -230,7 +230,10 @@ def _build_proxy_uri(proxy: Dict[str, Any]) -> Optional[str]:
         return server
     try:
         prefix, rest = server.split("://", 1)
-        return f"{prefix}://{user}:{pwd}@{rest}"
+        if "@" in rest:
+            return server
+        from urllib.parse import quote
+        return f"{prefix}://{quote(str(user), safe='')}:{quote(str(pwd), safe='')}@{rest}"
     except ValueError:
         return None
 

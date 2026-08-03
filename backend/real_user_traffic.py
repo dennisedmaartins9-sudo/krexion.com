@@ -3626,6 +3626,31 @@ def _host_from_proxy_server(server: str) -> str:
         return ""
 
 
+def _proxy_url_for_http(proxy: Dict[str, Any]) -> str:
+    """Build a single proxy URL for httpx/curl from a Krexion proxy dict.
+
+    Accepts the canonical shape from `_parse_proxy_line`:
+      server=http://host:port, username=..., password=...
+    If `server` already embeds credentials (legacy/raw lines), returns
+    it unchanged — never double-embeds auth (that breaks every probe).
+    """
+    from urllib.parse import quote
+
+    server = (proxy.get("server") or "").strip()
+    if not server:
+        return ""
+    if "://" not in server:
+        server = f"http://{server}"
+    prefix, rest = server.split("://", 1)
+    if "@" in rest:
+        return server
+    user = proxy.get("username") or ""
+    pwd = proxy.get("password") or ""
+    if user:
+        return f"{prefix}://{quote(str(user), safe='')}:{quote(str(pwd), safe='')}@{rest}"
+    return server
+
+
 def _build_state_targeted_proxy(
     base: Dict[str, Any],
     state_code: str,
@@ -3683,12 +3708,15 @@ def _build_state_targeted_proxy(
     if not port_part and host:
         port_part = f"{host}:80"
 
-    new_server = (
+    # Keep server host:port ONLY (same as _parse_proxy_line). Credentials
+    # live in username/password — embedding them in server breaks
+    # _probe_proxy_geo which re-composes the URL and double-embeds auth.
+    new_server = f"{scheme}://{port_part}"
+    raw_line = (
         f"{scheme}://{targeted_user}:{password}@{port_part}"
         if targeted_user
-        else server
+        else new_server
     )
-    raw_line = new_server
 
     out = dict(base)
     out["server"] = new_server
@@ -3755,10 +3783,9 @@ async def _probe_proxy_geo(
         "timezone": "America/New_York", "accept_language": "en-US,en;q=0.9",
         "locale": "en-US", "is_vpn": False, "ok": False,
     }
-    server = proxy["server"]
-    if proxy.get("username"):
-        prefix, rest = server.split("://", 1)
-        server = f"{prefix}://{proxy['username']}:{proxy.get('password','')}@{rest}"
+    server = _proxy_url_for_http(proxy)
+    if not server:
+        return result
 
     _probe_host = _host_from_proxy_server(server).lower()
     _is_decodo = "decodo.com" in _probe_host or "smartproxy.com" in _probe_host
@@ -3860,38 +3887,51 @@ async def _probe_proxy_geo(
         ok = False
         if _TLS_AD_OK and _tls_ad is not None:
             try:
-                # Attempt 1: HTTPS ipwho.is via TLS-spoofed session
-                data_iw = await _tls_ad.get_json(
-                    "https://ipwho.is/",
-                    proxy=proxy, ua=ua, timeout=30.0,
-                )
-                if data_iw and data_iw.get("success") is True:
-                    result["exit_ip"] = data_iw.get("ip")
-                    result["country_name"] = data_iw.get("country") or result["country_name"]
-                    result["country"] = data_iw.get("country_code") or result["country"]
-                    result["region_name"] = data_iw.get("region") or result["region_name"]
-                    result["region"] = data_iw.get("region_code") or result["region"]
-                    result["city"] = data_iw.get("city") or result["city"]
-                    try:
-                        result["lat"] = float(data_iw.get("latitude") or result["lat"])
-                        result["lon"] = float(data_iw.get("longitude") or result["lon"])
-                    except (TypeError, ValueError):
-                        pass
-                    tz = data_iw.get("timezone") or {}
-                    if isinstance(tz, dict):
-                        result["timezone"] = tz.get("id") or result["timezone"]
-                    elif isinstance(tz, str):
-                        result["timezone"] = tz or result["timezone"]
-                    conn = data_iw.get("connection") or {}
-                    # 2026-07 fix E: capture ISP for datacenter check
-                    result["isp"] = data_iw.get("isp") or conn.get("isp") or ""
-                    result["org"] = conn.get("org") or data_iw.get("org") or ""
-                    result["as_name"] = conn.get("asn") or ""
-                    result["is_vpn"] = bool(
-                        conn.get("type") in ("hosting", "datacenter")
-                        or (str(conn.get("org") or "").lower().find("hosting") >= 0)
+                if _is_decodo:
+                    data_dc = await _tls_ad.get_json(
+                        "https://ip.decodo.com/json",
+                        proxy=proxy, ua=ua, timeout=30.0,
                     )
-                    ok = True
+                    if data_dc and (data_dc.get("ip") or data_dc.get("query")):
+                        result["exit_ip"] = data_dc.get("ip") or data_dc.get("query")
+                        result["country"] = data_dc.get("country_code") or data_dc.get("countryCode") or result["country"]
+                        result["region_name"] = data_dc.get("region") or data_dc.get("regionName") or result["region_name"]
+                        result["region"] = data_dc.get("region_code") or data_dc.get("region") or result["region"]
+                        result["city"] = data_dc.get("city") or result["city"]
+                        ok = True
+                # Attempt 1: HTTPS ipwho.is via TLS-spoofed session
+                if not ok:
+                    data_iw = await _tls_ad.get_json(
+                        "https://ipwho.is/",
+                        proxy=proxy, ua=ua, timeout=30.0,
+                    )
+                    if data_iw and data_iw.get("success") is True:
+                        result["exit_ip"] = data_iw.get("ip")
+                        result["country_name"] = data_iw.get("country") or result["country_name"]
+                        result["country"] = data_iw.get("country_code") or result["country"]
+                        result["region_name"] = data_iw.get("region") or result["region_name"]
+                        result["region"] = data_iw.get("region_code") or result["region"]
+                        result["city"] = data_iw.get("city") or result["city"]
+                        try:
+                            result["lat"] = float(data_iw.get("latitude") or result["lat"])
+                            result["lon"] = float(data_iw.get("longitude") or result["lon"])
+                        except (TypeError, ValueError):
+                            pass
+                        tz = data_iw.get("timezone") or {}
+                        if isinstance(tz, dict):
+                            result["timezone"] = tz.get("id") or result["timezone"]
+                        elif isinstance(tz, str):
+                            result["timezone"] = tz or result["timezone"]
+                        conn = data_iw.get("connection") or {}
+                        # 2026-07 fix E: capture ISP for datacenter check
+                        result["isp"] = data_iw.get("isp") or conn.get("isp") or ""
+                        result["org"] = conn.get("org") or data_iw.get("org") or ""
+                        result["as_name"] = conn.get("asn") or ""
+                        result["is_vpn"] = bool(
+                            conn.get("type") in ("hosting", "datacenter")
+                            or (str(conn.get("org") or "").lower().find("hosting") >= 0)
+                        )
+                        ok = True
                 if not ok:
                     # Attempt 2: ip-api.com via TLS-spoofed session
                     data_ia = await _tls_ad.get_json(
