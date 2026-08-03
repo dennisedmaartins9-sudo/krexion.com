@@ -232,11 +232,9 @@ jobs:
 
   build-frontend:
     name: Build React frontend
-    # 2026-01-09 — switched from `ubuntu-latest` (GitHub-hosted, paid
-    # Linux minutes) to the krexion-vps self-hosted runner. Free
-    # forever; queues briefly behind deploy.yml when both fire on
-    # the same push (typical wait: 30-60s).
-    runs-on: [self-hosted, linux, krexion-vps]
+    # v2.6.56 — GitHub-hosted Linux so frontend builds IN PARALLEL with
+    # VPS deploy on krexion-vps (one self-hosted runner = one job at a time).
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

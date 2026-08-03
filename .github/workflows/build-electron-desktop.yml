@@ -39,11 +39,11 @@ concurrency:
 jobs:
   build:
     name: Build Electron installer (Windows x64)
-    # 2026-01-09 — switched from `windows-latest` (paid GH minutes) to
-    # the customer's self-hosted Windows runner. See
-    # deployment/windows-runner/WINDOWS-RUNNER-GUIDE.md for setup +
-    # recovery. Job queues if runner offline (no fallback to hosted).
-    runs-on: [self-hosted, windows, krexion-windows]
+    # v2.6.56 — GitHub-hosted Windows so Electron runs IN PARALLEL with
+    # the native Inno installer on krexion-windows. One self-hosted PC
+    # can only run one Windows job at a time; queuing Electron behind
+    # a 2h native build wasted ~45 min every release.
+    runs-on: windows-latest
     timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
