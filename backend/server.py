@@ -16145,20 +16145,27 @@ async def import_clicks(request: Request, user: dict = Depends(get_current_user_
 @api_router.post("/clicks/bulk-delete")
 async def bulk_delete_clicks(click_ids: List[str], user: dict = Depends(get_current_user_with_fresh_data)):
     check_user_feature(user, "clicks")
-    user_links = await db.links.find({"user_id": user["id"]}, {"_id": 0, "id": 1}).to_list(100000)
+    user_db = get_db_for_user(user)
+    link_query = {"user_id": user["id"]}
+    if user.get("is_sub_user"):
+        link_query["created_by"] = user.get("sub_user_id")
+    user_links = await db.links.find(link_query, {"_id": 0, "id": 1}).to_list(100000)
     link_ids = [link["id"] for link in user_links]
     
     if not link_ids:
         return {"message": "No clicks found", "deleted_count": 0}
     
-    result = await db.clicks.delete_many({
+    query = {
         "id": {"$in": click_ids},
         "link_id": {"$in": link_ids}
-    })
+    }
+    result_user = await user_db.clicks.delete_many(query)
+    result_main = await db.clicks.delete_many(query)
+    total_deleted = result_user.deleted_count + result_main.deleted_count
     
     return {
-        "message": f"Deleted {result.deleted_count} clicks",
-        "deleted_count": result.deleted_count
+        "message": f"Deleted {total_deleted} clicks",
+        "deleted_count": total_deleted
     }
 
 # ==================== VPN CHECK ENDPOINT ====================
@@ -16221,34 +16228,60 @@ async def bulk_check_vpn(data: dict, user: dict = Depends(get_current_user_with_
     }
 
 @api_router.delete("/clicks/delete-by-date")
-async def delete_clicks_by_date(start_date: str, end_date: str, user: dict = Depends(get_current_user_with_fresh_data)):
+async def delete_clicks_by_date(
+    start_date: str = None,
+    end_date: str = None,
+    all_time: bool = False,
+    user: dict = Depends(get_current_user_with_fresh_data),
+):
     check_user_feature(user, "clicks")
+    user_db = get_db_for_user(user)
+    link_query = {"user_id": user["id"]}
+    if user.get("is_sub_user"):
+        link_query["created_by"] = user.get("sub_user_id")
+    user_links = await db.links.find(link_query, {"_id": 0, "id": 1}).to_list(100000)
+    link_ids = [link["id"] for link in user_links]
+
+    if not link_ids:
+        return {"message": "No links found", "deleted_count": 0}
+
     try:
+        if all_time:
+            query = {"link_id": {"$in": link_ids}}
+            result_user = await user_db.clicks.delete_many(query)
+            result_main = await db.clicks.delete_many(query)
+            total_deleted = result_user.deleted_count + result_main.deleted_count
+            return {
+                "message": f"Deleted {total_deleted} clicks (all time)",
+                "deleted_count": total_deleted,
+            }
+
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="start_date and end_date required")
+
         start_datetime = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
         end_datetime = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-        
         end_datetime = end_datetime.replace(hour=23, minute=59, second=59)
-        
-        user_links = await db.links.find({"user_id": user["id"]}, {"_id": 0, "id": 1}).to_list(100000)
-        link_ids = [link["id"] for link in user_links]
-        
-        if not link_ids:
-            return {"message": "No links found", "deleted_count": 0}
-        
-        result = await db.clicks.delete_many({
+
+        query = {
             "link_id": {"$in": link_ids},
             "created_at": {
                 "$gte": start_datetime.isoformat(),
-                "$lte": end_datetime.isoformat()
-            }
-        })
-        
-        return {
-            "message": f"Deleted {result.deleted_count} clicks from {start_date} to {end_date}",
-            "deleted_count": result.deleted_count,
-            "start_date": start_date,
-            "end_date": end_date
+                "$lte": end_datetime.isoformat(),
+            },
         }
+        result_user = await user_db.clicks.delete_many(query)
+        result_main = await db.clicks.delete_many(query)
+        total_deleted = result_user.deleted_count + result_main.deleted_count
+
+        return {
+            "message": f"Deleted {total_deleted} clicks from {start_date} to {end_date}",
+            "deleted_count": total_deleted,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid date format or error: {str(e)}")
 

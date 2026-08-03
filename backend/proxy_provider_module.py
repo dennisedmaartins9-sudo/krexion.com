@@ -175,6 +175,67 @@ def _make_session_id() -> str:
     return str(random.randint(10**7, 10**9 - 1))
 
 
+def _strip_provider_session(username: str) -> str:
+    """Remove embedded session tokens so ROW-FIRST can inject a fresh one."""
+    if not username:
+        return username
+    out = username.replace("{sid}", "")
+    if _SESSION_TOKEN_RE.search(out):
+        out = _SESSION_TOKEN_RE.sub("", out, count=1)
+    # Collapse duplicate delimiters left after stripping (e.g. "--" → "-").
+    out = re.sub(r"-{2,}", "-", out).strip("-")
+    return out
+
+
+def _strip_provider_geo_params(username: str, profile: Optional[Dict[str, Any]]) -> str:
+    """Strip country/state/city/zip/asn tokens from a gateway username."""
+    if not username or not profile:
+        return username
+    out = username
+    prefix = profile.get("prefix") or ""
+    delim = profile.get("delim") or "-"
+    kv = profile.get("kv") or "-"
+    for key in ("country", "state", "city", "zip", "asn"):
+        pk = (profile.get("keys") or {}).get(key)
+        if not pk:
+            continue
+        # Provider DSL token, e.g. -state-us_california or __st.ca (DataImpulse)
+        pat = (
+            rf"(?:{re.escape(prefix)}|{re.escape(delim)})"
+            rf"{re.escape(pk)}{re.escape(kv)}[A-Za-z0-9_]+"
+        )
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    for key in ("country", "state", "city", "zip", "asn"):
+        out = re.sub(rf"[;,\-_]?\{{{key}\}}", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"-{2,}", "-", out).strip("-")
+    return out
+
+
+def _ensure_provider_user_prefix(username: str, profile: Optional[Dict[str, Any]]) -> str:
+    """Decodo/Smartproxy require usernames to start with user-."""
+    if not username or not profile:
+        return username
+    if profile.get("name") != "Smartproxy / Decodo":
+        return username
+    low = username.lower()
+    if low.startswith("user-"):
+        return username
+    return f"user-{username}"
+
+
+def _gateway_base_username(
+    username: str,
+    gateway_host: str,
+    provider_name: str = "",
+) -> str:
+    """Return a clean gateway username (no geo/session) for ROW-FIRST rebuilds."""
+    profile = _detect_profile(gateway_host or "", provider_name)
+    out = _strip_provider_session(username)
+    out = _strip_provider_geo_params(out, profile)
+    out = _ensure_provider_user_prefix(out, profile)
+    return out
+
+
 def _rotate_session_in_username(username: str) -> str:
     """Return `username` with any embedded session token replaced by a
     fresh random id. If no known token is present:
@@ -484,8 +545,16 @@ def _apply_targeting_to_username(
     if not targeting:
         return username_tpl
 
-    out = username_tpl
     profile = _detect_profile(gateway_host or "", provider_name)
+    force_replace = bool(targeting.get("force_replace"))
+
+    out = username_tpl
+    if force_replace and profile:
+        out = _strip_provider_geo_params(out, profile)
+        out = _strip_provider_session(out)
+        out = _ensure_provider_user_prefix(out, profile)
+    elif force_replace:
+        out = _strip_provider_session(out)
 
     # 1. Placeholder substitution — universal, provider-agnostic.
     for key in ("country", "state", "city", "zip", "asn"):
@@ -518,8 +587,12 @@ def _apply_targeting_to_username(
             if not provider_key:
                 continue
             # If the template already contains this provider key, skip
-            # (customer already configured it manually).
-            if re.search(rf"(^|[{re.escape(profile['delim'])}{re.escape(profile['prefix'])}]){re.escape(provider_key)}{re.escape(profile['kv'])}", out):
+            # (customer already configured it manually) — unless force_replace
+            # cleared stale geo tokens above (ROW-FIRST state match).
+            if not force_replace and re.search(
+                rf"(^|[{re.escape(profile['delim'])}{re.escape(profile['prefix'])}]){re.escape(provider_key)}{re.escape(profile['kv'])}",
+                out,
+            ):
                 continue
             nv = _norm_target_val(profile, key, val)
             if nv:

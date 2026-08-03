@@ -3555,7 +3555,7 @@ _ROTATING_GATEWAY_HOSTS = (
     "brightdata.com", "superproxy.io", "brd.superproxy.io", "lum-superproxy.io",
     "iproyal.com",
     "soax.com",
-    "smartproxy.com", "smartproxy.net",
+    "smartproxy.com", "smartproxy.net", "decodo.com",
     "webshare.io",
     "packetstream.io",
     "geosurf.io",
@@ -3638,6 +3638,7 @@ def _build_state_targeted_proxy(
     try:
         from proxy_provider_module import (  # noqa: WPS433
             _apply_targeting_to_username,
+            _gateway_base_username,
             _rotate_session_in_username,
         )
     except Exception:
@@ -3662,10 +3663,19 @@ def _build_state_targeted_proxy(
                 username, _, password = auth.partition(":")
 
     host = _host_from_proxy_server(server)
+    # Strip stale geo/session from bulk-generated lines before injecting
+    # the lead row's state — otherwise Decodo rejects bad usernames and
+    # every probe fails with "exit-IP probe failed".
+    username = _gateway_base_username(username, host)
     targeted_user = _apply_targeting_to_username(
         username,
         host,
-        {"country": country or "US", "state": state_code, "_want_sid": True},
+        {
+            "country": country or "US",
+            "state": state_code,
+            "_want_sid": True,
+            "force_replace": True,
+        },
     )
     targeted_user = _rotate_session_in_username(targeted_user)
 
@@ -3750,11 +3760,33 @@ async def _probe_proxy_geo(
         prefix, rest = server.split("://", 1)
         server = f"{prefix}://{proxy['username']}:{proxy.get('password','')}@{rest}"
 
+    _probe_host = _host_from_proxy_server(server).lower()
+    _is_decodo = "decodo.com" in _probe_host or "smartproxy.com" in _probe_host
+
     # Some commercial residential proxies (proxy-jet, brightdata, etc.) ONLY accept
     # HTTPS CONNECT tunnels and reject plain `GET http://…` forward-proxy requests,
     # so we try an HTTPS geolocation endpoint first. If that fails we fall back to
     # the original HTTP ip-api.com endpoint (which works on proxies that do allow
     # plain HTTP forwarding).
+    async def _try_decodo_ip(cli: httpx.AsyncClient) -> bool:
+        """Decodo/Smartproxy official IP check endpoint."""
+        try:
+            r = await cli.get("https://ip.decodo.com/json")
+            if r.status_code == 200:
+                data = r.json()
+                ip = data.get("ip") or data.get("query")
+                if ip:
+                    result["exit_ip"] = ip
+                    result["country_name"] = data.get("country") or result["country_name"]
+                    result["country"] = data.get("country_code") or data.get("countryCode") or result["country"]
+                    result["region_name"] = data.get("region") or data.get("regionName") or result["region_name"]
+                    result["region"] = data.get("region_code") or data.get("region") or result["region"]
+                    result["city"] = data.get("city") or result["city"]
+                    return True
+        except Exception as e:
+            logger.debug(f"ip.decodo.com probe failed: {e}")
+        return False
+
     async def _try_https_ipwhois(cli: httpx.AsyncClient) -> bool:
         try:
             r = await cli.get("https://ipwho.is/")
@@ -3900,7 +3932,11 @@ async def _probe_proxy_geo(
             for attempt in range(3):
                 try:
                     async with httpx.AsyncClient(proxy=server, timeout=timeout_cfg, headers={"User-Agent": ua}, verify=False, http2=False) as cli:
-                        ok = await _try_https_ipwhois(cli)
+                        ok = False
+                        if _is_decodo:
+                            ok = await _try_decodo_ip(cli)
+                        if not ok:
+                            ok = await _try_https_ipwhois(cli)
                         if not ok:
                             ok = await _try_http_ipapi(cli)
                     if ok:

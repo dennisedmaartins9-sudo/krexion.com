@@ -53,3 +53,29 @@ def test_unknown_provider_defaults_slug():
 def test_all_profiles_have_state_fmt():
     for p in _PROVIDER_PROFILES:
         assert p.get("state_fmt"), f"missing state_fmt on {p['name']}"
+
+
+def test_force_replace_strips_stale_state_and_reapplies():
+    """ROW-FIRST must replace wrong embedded state, not skip append."""
+    stale = "user-sp123-country-us-state-us_texas-session-999888777"
+    user = _apply_targeting_to_username(
+        stale,
+        "gate.decodo.com",
+        {"country": "US", "state": "CA", "_want_sid": True, "force_replace": True},
+        "Smartproxy",
+    )
+    low = user.lower()
+    assert "us_california" in low
+    assert "us_texas" not in low
+    assert low.startswith("user-")
+
+
+def test_gateway_base_username_strips_geo_and_session():
+    from proxy_provider_module import _gateway_base_username
+
+    base = _gateway_base_username(
+        "sp123-country-us-state-us_nebraska-session-111",
+        "gate.decodo.com",
+    )
+    assert base.lower() == "user-sp123"
+

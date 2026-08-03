@@ -43,6 +43,15 @@ class TestBuildStateTargetedProxy:
         )
         assert "us_california" in user.lower()
 
+    def test_force_replace_overwrites_bulk_line_state(self):
+        base = _parse_proxy_line(
+            "http://user-sp123-country-us-state-us_nebraska-session-111:pass@gate.decodo.com:7000"
+        )
+        out = _build_state_targeted_proxy(base, "CA", "US")
+        un = out["username"].lower()
+        assert "us_california" in un
+        assert "nebraska" not in un
+
     def test_session_rotates_between_calls(self):
         base = _parse_proxy_line("http://user-session-abc:pass@gate.smartproxy.com:7000")
         a = _build_state_targeted_proxy(base, "CA", "US")

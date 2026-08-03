@@ -298,7 +298,13 @@ export default function ClicksPage() {
     
     setDeleting(true);
     try {
-      if (dateRange) {
+      if (dateFilter === "all") {
+        const response = await axios.delete(`${API}/clicks/delete-by-date`, {
+          params: { all_time: true },
+          headers: { Authorization: `Bearer ${getToken()}` },
+        });
+        toast.success(response.data.message || "All clicks deleted");
+      } else if (dateRange) {
         const response = await axios.delete(`${API}/clicks/delete-by-date`, {
           params: { 
             start_date: format(dateRange.start, "yyyy-MM-dd"), 
@@ -307,16 +313,6 @@ export default function ClicksPage() {
           headers: { Authorization: `Bearer ${getToken()}` },
         });
         toast.success(response.data.message || "Clicks deleted");
-      } else {
-        // Delete all - use a very wide date range
-        const response = await axios.delete(`${API}/clicks/delete-by-date`, {
-          params: { 
-            start_date: "2000-01-01", 
-            end_date: "2100-12-31" 
-          },
-          headers: { Authorization: `Bearer ${getToken()}` },
-        });
-        toast.success(response.data.message || "All clicks deleted");
       }
       fetchClicks();
     } catch (error) {
