@@ -3781,10 +3781,11 @@ async def _probe_proxy_geo(
         "city": "New York", "region": "NY", "region_name": "New York",
         "lat": 40.7128, "lon": -74.0060,
         "timezone": "America/New_York", "accept_language": "en-US,en;q=0.9",
-        "locale": "en-US", "is_vpn": False, "ok": False,
+        "locale": "en-US", "is_vpn": False, "ok": False, "probe_error": "",
     }
     server = _proxy_url_for_http(proxy)
     if not server:
+        result["probe_error"] = "empty proxy URL"
         return result
 
     _probe_host = _host_from_proxy_server(server).lower()
@@ -3968,6 +3969,7 @@ async def _probe_proxy_geo(
         # nodes; retrying the same proxy usually succeeds with a different
         # exit IP on the next attempt.
         timeout_cfg = httpx.Timeout(30.0, connect=20.0)
+        _last_probe_err = ""
         if not ok:
             for attempt in range(3):
                 try:
@@ -3981,11 +3983,15 @@ async def _probe_proxy_geo(
                             ok = await _try_http_ipapi(cli)
                     if ok:
                         break
+                    _last_probe_err = "geo endpoints returned no IP"
                 except Exception as e:
+                    _last_probe_err = f"{type(e).__name__}: {e}"
                     logger.debug(f"Proxy probe attempt {attempt+1} failed: {e}")
                 # Brief backoff before next attempt
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
+        if not ok and _last_probe_err:
+            result["probe_error"] = _last_probe_err
         if ok:
             cc = (result["country"] or "").lower()
             lang_map = {
@@ -4134,6 +4140,7 @@ async def _probe_proxy_geo(
                     logger.debug(f"VPN cross-check failed (non-blocking): {_xc_e}")
     except Exception as e:
         logger.debug(f"Proxy geo probe failed: {e}")
+        result["probe_error"] = f"{type(e).__name__}: {e}"
 
     # ── 2026-07 CUSTOMER-REQUEST FIX E (v2.6.9) ────────────────────────
     # ISP-name datacenter guard.
@@ -4270,13 +4277,9 @@ async def _probe_proxy_target_reachable(
     404, etc.) mean the proxy DID reach the target — the offer's own
     rules will then handle access; that's the existing engine's job.
     """
-    server = proxy.get("server", "")
-    if proxy.get("username"):
-        try:
-            prefix, rest = server.split("://", 1)
-            server = f"{prefix}://{proxy['username']}:{proxy.get('password','')}@{rest}"
-        except ValueError:
-            return False, "Malformed proxy server string"
+    server = _proxy_url_for_http(proxy)
+    if not server:
+        return False, "Malformed proxy server string"
 
     headers = {
         "User-Agent": ua or _realistic_fallback_ua(),
@@ -6427,13 +6430,9 @@ async def _probe_offer_duplicate_via_proxy(
     to the normal browser path; the existing reachability probe is
     responsible for catching dead proxies separately.
     """
-    server = proxy.get("server", "")
-    if proxy.get("username"):
-        try:
-            prefix, rest = server.split("://", 1)
-            server = f"{prefix}://{proxy['username']}:{proxy.get('password','')}@{rest}"
-        except ValueError:
-            return False, "", ""
+    server = _proxy_url_for_http(proxy)
+    if not server:
+        return False, "", ""
 
     headers = {
         "User-Agent": ua or _realistic_fallback_ua(),
@@ -6827,24 +6826,9 @@ async def _get_exit_ip_via_proxy(
     page-based detection can't run because the browser failed to
     reach the target. Returns None on any failure (caller must
     treat that as 'bypass not possible'). Never raises."""
-    server = (proxy.get("server") or "").strip()
-    username = (proxy.get("username") or "").strip()
-    password = (proxy.get("password") or "").strip()
-    if not server:
+    proxy_url = _proxy_url_for_http(proxy)
+    if not proxy_url:
         return None
-    # Build proxy URL for httpx
-    if "://" in server:
-        proto, hostport = server.split("://", 1)
-    else:
-        proto, hostport = "http", server
-    if username:
-        from urllib.parse import quote
-        proxy_url = (
-            f"{proto}://{quote(username, safe='')}:"
-            f"{quote(password, safe='')}@{hostport}"
-        )
-    else:
-        proxy_url = f"{proto}://{hostport}"
     # Try a couple of neutral IP-echo endpoints. These are known to
     # work through proxy-jet & most residential providers because
     # they are NOT on any tracker blocklist.
@@ -8858,9 +8842,14 @@ async def run_real_user_traffic_job(
                 state["ua_idx"] = max(0, state["ua_idx"] - 1)
                 _geo = await _probe_proxy_geo(parsed, _probe_ua, user_id=engine_user_id)
                 if not _geo["ok"] or not _geo.get("exit_ip"):
-                    last_reason = "exit-IP probe failed"
-                    push_live_step(job_id, i + 1, "proxy", "failed",
-                                   f"Attempt {attempt}/{cap}: probe failed, retrying")
+                    last_reason = (_geo.get("probe_error") or "exit-IP probe failed")[:120]
+                    if attempt == 1 or attempt % 5 == 0:
+                        _gw_user = (parsed.get("username") or "")[:72]
+                        push_live_step(
+                            job_id, i + 1, "proxy", "failed",
+                            f"Attempt {attempt}/{cap}: probe failed — {last_reason}"
+                            + (f" · user={_gw_user}" if _gw_user else ""),
+                        )
                     continue
                 # Gateway ROW-FIRST: confirm exit-IP state matches the lead.
                 if _row_first_state_match and row_state_code:

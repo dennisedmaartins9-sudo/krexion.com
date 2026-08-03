@@ -336,7 +336,7 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
     },
     {
         "name": "Smartproxy / Decodo",
-        "hosts": ["smartproxy.com", "decodo.com", "smart-proxy.com"],
+        "hosts": ["smartproxy.com", "smartproxy.net", "decodo.com", "smart-proxy.com"],
         "prefix": "-",
         "delim": "-",
         "kv": "-",
