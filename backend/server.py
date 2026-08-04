@@ -22945,6 +22945,7 @@ async def vr_dropdown_bind(session_id: str, req: VRDropdownBindReq, user: dict =
 class VRSheetPickBindReq(BaseModel):
     header_name: str
     clicked_text: Optional[str] = None
+    button_labels: List[str] = []
 
 
 class VRGenderPickBindReq(BaseModel):
@@ -22966,6 +22967,7 @@ async def vr_sheet_pick_bind(session_id: str, req: VRSheetPickBindReq, user: dic
         sess,
         header_name=req.header_name,
         clicked_text=req.clicked_text,
+        button_labels=req.button_labels or [],
     )
 
 

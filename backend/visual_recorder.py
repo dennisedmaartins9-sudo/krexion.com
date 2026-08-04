@@ -775,6 +775,7 @@ def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None)
         "var x=((e.innerText||e.textContent||e.value||'')+'').replace(/\\s+/g,' ').trim().toLowerCase();"
         "if(!x)return false;"
         "if(x===t)return true;"
+        "if(t.length>=4&&x.indexOf(t)===0)return true;"
         "if(t.length>=12&&x.indexOf(t)!==-1)return true;"
         "if(t.length>=12&&x.length>=8&&t.indexOf(x)!==-1)return true;"
         "return false;};"
@@ -833,11 +834,95 @@ def _locator_candidates_from_info(info: Dict[str, Any]) -> List[str]:
     return cands
 
 
+_ROBUST_CLICK_AT_POINT_JS = """([x, y]) => {
+  function krxClick(el) {
+    if (!el) return false;
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    el.scrollIntoView({ block: 'center' });
+    try { if (el.disabled) el.disabled = false; } catch (e) {}
+    try {
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
+        el.setAttribute('aria-disabled', 'false');
+      }
+    } catch (e) {}
+    var pe = '';
+    try { pe = el.style.pointerEvents || ''; el.style.pointerEvents = 'auto'; } catch (e) {}
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2;
+    var cy = r.top + r.height / 2;
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
+        }));
+      } catch (e) {}
+    });
+    if (el.tagName === 'A' && el.href && !el.target) {
+      window.location.assign(el.href);
+      return true;
+    }
+    if (el.tagName === 'LABEL' && el.htmlFor) {
+      var ctl = document.getElementById(el.htmlFor);
+      if (ctl) { ctl.click(); return true; }
+    }
+    var inner = el.querySelector && el.querySelector('a[href]');
+    if (inner && inner.href && !inner.target) {
+      window.location.assign(inner.href);
+      return true;
+    }
+    try { el.click(); } catch (e) {}
+    var isSubmit = (el.tagName === 'INPUT' || el.tagName === 'BUTTON') &&
+      (el.type === 'submit' || (el.getAttribute && el.getAttribute('type') === 'submit'));
+    if (isSubmit) {
+      var f = el.form || (el.closest && el.closest('form'));
+      if (f) {
+        setTimeout(function () {
+          try { if (!f._krx_submitted) { f._krx_submitted = true; f.submit(); } } catch (e) {}
+        }, 150);
+      }
+    }
+    try { if (pe) el.style.pointerEvents = pe; } catch (e) {}
+    return true;
+  }
+  var stack = [];
+  if (document.elementsFromPoint) {
+    try { stack = document.elementsFromPoint(x, y) || []; } catch (e) { stack = []; }
+  }
+  if (!stack.length) {
+    var one = document.elementFromPoint(x, y);
+    if (one) stack = [one];
+  }
+  for (var i = 0; i < stack.length; i++) {
+    var el = stack[i];
+    if (!el || el.nodeType !== 1) continue;
+    var tag = el.tagName;
+    if (/^(SCRIPT|STYLE|SVG|PATH)$/i.test(tag)) continue;
+    var role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+    var txt = ((el.innerText || el.textContent || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    var isBtn = /^(A|BUTTON|INPUT|LABEL)$/i.test(tag) ||
+      role === 'button' || role === 'link' || role === 'submit';
+    if (!isBtn && txt.indexOf('continue') !== -1 && tag !== 'BODY' && tag !== 'HTML') isBtn = true;
+    if (isBtn && krxClick(el)) return true;
+    var up = el;
+    for (var d = 0; d < 4 && up; d++) {
+      if (/^(A|BUTTON|INPUT)$/i.test(up.tagName) ||
+          ((up.getAttribute && up.getAttribute('role')) || '').toLowerCase() === 'button') {
+        if (krxClick(up)) return true;
+        break;
+      }
+      up = up.parentElement;
+    }
+  }
+  return false;
+}"""
+
+
 async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
     """Perform a live click using captured element metadata (modal/iframe aware).
 
-    Tries, in order: frame_locator chain + CSS locators, top-level locators,
-    the same selector-priority JS as replay (_build_text_click_evaluate), then
+    Tries, in order: coordinate robust JS click, frame_locator chain + CSS
+    locators, top-level locators, selector-priority JS as replay, then
     coordinate mouse.click as last resort.
     """
     if not info or not isinstance(info, dict):
@@ -848,6 +933,18 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
     if not isinstance(iframe_path, list):
         iframe_path = []
     locators = _locator_candidates_from_info(info)
+
+    # 0. Coordinate robust click first — best for React Continue CTAs that
+    # look enabled but ignore plain Playwright .click().
+    try:
+        x = float(info.get("x", 0))
+        y = float(info.get("y", 0))
+        if x > 0 and y > 0:
+            clicked = await page.evaluate(_ROBUST_CLICK_AT_POINT_JS, [x, y])
+            if clicked:
+                return True
+    except Exception:
+        pass
 
     async def _try_locator_clicks(root: Any, *, force: bool = False) -> bool:
         for sel in locators:
@@ -1050,6 +1147,7 @@ def _build_sheet_pick_evaluate(header_name: str) -> Dict[str, Any]:
         "var x=((e.innerText||e.textContent||e.value||'')+'').replace(/\\s+/g,' ').trim().toLowerCase();"
         "if(!x)return false;"
         "if(x===t)return true;"
+        "if(t.length>=4&&x.indexOf(t)===0)return true;"
         "if(t.length>=12&&x.indexOf(t)!==-1)return true;"
         "if(t.length>=12&&x.length>=8&&t.indexOf(x)!==-1)return true;"
         "if(t==='male'&&(x==='m'||x.indexOf('male')===0))return true;"
@@ -1076,6 +1174,70 @@ def _build_sheet_pick_evaluate(header_name: str) -> Dict[str, Any]:
         "script": script,
         "origin": "sheet_pick",
         "header_name": hn,
+    }
+
+
+def _build_option_pick_evaluate(header_name: str, option_labels: List[str]) -> Dict[str, Any]:
+    """Sheet-driven multi-option button click (Male/Female, Yes/No, etc.)."""
+    hn = (header_name or "").strip()
+    if not hn:
+        raise ValueError("header_name required for option_pick")
+    labels = [(lb or "").strip() for lb in (option_labels or []) if (lb or "").strip()]
+    if len(labels) < 2:
+        raise ValueError("option_pick requires at least 2 button labels")
+    safe_tpl = ("{{" + hn + "}}").replace("\\", "\\\\").replace("'", "\\'")
+    labels_js = _js_str_list(labels)
+    script = (
+        "(function(){"
+        "var raw='" + safe_tpl + "'.replace(/\\s+/g,' ').trim().toLowerCase();"
+        "var optionLabels=" + labels_js + ";"
+        "var norm=function(s){return String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();};"
+        "var aliases=[raw];"
+        "if(raw==='m'||raw==='male'||raw==='man')aliases=['male','m','man'];"
+        "else if(raw==='f'||raw==='female'||raw==='woman')aliases=['female','f','woman'];"
+        "var pick='';"
+        "for(var i=0;i<optionLabels.length;i++){"
+        "var lbl=norm(optionLabels[i]);if(!lbl)continue;"
+        "for(var j=0;j<aliases.length;j++){"
+        "var a=aliases[j];if(!a)continue;"
+        "if(lbl===a||lbl.indexOf(a)!==-1||a.indexOf(lbl)!==-1){pick=lbl;break;}"
+        "if(a==='male'&&(lbl==='m'||lbl.indexOf('male')===0)){pick=lbl;break;}"
+        "if(a==='female'&&(lbl==='f'||lbl.indexOf('female')===0)){pick=lbl;break;}"
+        "}"
+        "if(pick)break;"
+        "}"
+        "if(!pick&&optionLabels.length)pick=norm(optionLabels[0]);"
+        "var t=pick||raw;"
+        "var match=function(e){var s=window.getComputedStyle(e);"
+        "if(s.display==='none'||s.visibility==='hidden')return false;"
+        "var x=norm((e.innerText||e.textContent||e.value||''));"
+        "if(!x)return false;"
+        "if(x===t)return true;"
+        "if(t.length>=2&&x.indexOf(t)!==-1)return true;"
+        "if(t.length>=2&&x.length>=2&&t.indexOf(x)!==-1)return true;"
+        "return false;};"
+        "var anchors=Array.from(document.querySelectorAll('a')).filter(match);"
+        "if(anchors.length){var a=anchors[0];a.scrollIntoView({block:'center'});"
+        "if(a.href&&!a.target){window.location.assign(a.href);}else{a.click();}return;}"
+        "var els=Array.from(document.querySelectorAll('button,div,span,label,input,[role=button],[role=radio]')).filter(match);"
+        "if(els.length){var el=els[0];el.scrollIntoView({block:'center'});"
+        "if(el.tagName==='LABEL'&&el.htmlFor){var ctl=document.getElementById(el.htmlFor);if(ctl){ctl.scrollIntoView({block:'center'});ctl.click();return;}}"
+        "var inner=el.querySelector&&el.querySelector('a[href]');"
+        "if(inner&&inner.href&&!inner.target){window.location.assign(inner.href);return;}"
+        "var box=el.querySelector&&el.querySelector('input[type=checkbox],input[type=radio]');"
+        "if(box&&!box.checked){box.click();return;}"
+        "el.click();"
+        "var isSubmit=(el.tagName==='INPUT'||el.tagName==='BUTTON')&&(el.type==='submit'||el.getAttribute&&el.getAttribute('type')==='submit');"
+        "if(isSubmit){var f=el.form||(el.closest&&el.closest('form'));"
+        "if(f){setTimeout(function(){try{if(!f._krx_submitted){f._krx_submitted=true;f.submit();}}catch(e){}},150);}}"
+        "}})();"
+    )
+    return {
+        "action": "evaluate",
+        "script": script,
+        "origin": "option_pick",
+        "header_name": hn,
+        "option_labels": labels,
     }
 
 
@@ -2733,8 +2895,9 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
     appends a step. Modes:
       - default:    normal text-based click
       - form_fill:  click + remember field for next /type call (Excel header binding)
-      - sheet_pick: click a button (Male/Female etc.) + bind to Excel column via
-                    /sheet-pick-bind (text match at replay — no fixed Male selector)
+      - sheet_pick: (legacy alias) same as option_pick
+      - option_pick: click 2+ buttons (Male/Female etc.) + bind Excel column
+      - gender_pick: shortcut for gender option pools (same bind path)
       - random:     add this element to a "random pick" group (group_id required)
       - dropdown:   click a <select> element, return its <option> list so the
                     caller can bind an option (literal value/label) OR an
@@ -2743,6 +2906,7 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
       - final:      mark current page as conversion target
     """
     sess.touch()
+    live_click_warning: Optional[str] = None
     async with sess.lock:
         # 2026-05 — Use the shared `_RICH_ELEMENT_CAPTURE_JS` so click,
         # form_fill, dropdown and check all get the same xpath_stable /
@@ -2771,11 +2935,19 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         # JS below (label→checkbox walk) so the live page reflects the
         # actual toggled state — a blind mouse.click() at coords could
         # land on a hidden input and do nothing.
-        if mode not in ("random", "random_click", "check", "gender_pick"):
+        if mode not in ("random", "random_click", "check", "gender_pick", "sheet_pick", "option_pick"):
+            live_click_ok = False
             try:
-                await _live_click_captured(sess.page, info)
-            except Exception:
-                pass
+                live_click_ok = await _live_click_captured(sess.page, info)
+            except Exception as live_err:
+                live_click_warning = (
+                    f"Live click failed ({type(live_err).__name__}) — step recorded anyway."
+                )
+            if mode == "default" and not live_click_ok and not live_click_warning:
+                live_click_warning = (
+                    "Click recorded in JSON but live page did not respond — "
+                    "form validation ya disabled button ho sakta hai. Dobara try karein."
+                )
 
         # For dropdown mode we also need to pull the option list out of
         # the element (or its nearest <select> ancestor) BEFORE leaving
@@ -2954,6 +3126,8 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
     # Build & append step (outside lock to keep it short)
     step: Optional[Dict[str, Any]] = None
     extra: Dict[str, Any] = {"element": info}
+    if live_click_warning:
+        extra["live_click_warning"] = live_click_warning
 
     text = info.get("text") or ""
     if mode == "default":
@@ -3105,12 +3279,10 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
                 )
         else:
             step = {"action": "wait_for_selector", "selector": sel, "timeout": 8000, "optional": True}
-    elif mode == "sheet_pick":
-        # Two-step flow (like dropdown): click captures the element, bind
-        # records the per-row text-click evaluate step.
+    elif mode in ("sheet_pick", "option_pick"):
+        # Collect 2+ button labels — bind via /sheet-pick-bind (Option Pick).
         step = None
-        extra["pending_sheet_pick"] = True
-        extra["clicked_text"] = text
+        extra["option_pick_text"] = text
         tag_u = (info.get("tag") or "").upper()
         if tag_u in ("INPUT", "TEXTAREA", "SELECT"):
             extra["warning"] = (
@@ -3119,7 +3291,7 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
             )
         elif not text:
             extra["warning"] = (
-                "No visible text on this element — Sheet Pick works best on "
+                "No visible text on this element — Option Pick works on "
                 "labelled buttons (Male / Female / Yes / No)."
             )
     elif mode == "gender_pick":
@@ -3964,26 +4136,66 @@ async def bind_sheet_pick(
     sess: RecorderSession,
     header_name: str,
     clicked_text: Optional[str] = None,
+    button_labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Finalise a sheet-pick binding started by a ``mode='sheet_pick'`` click."""
+    """Finalise an Option Pick binding (legacy name: sheet_pick)."""
     sess.touch()
     hn = (header_name or "").strip()
     if not hn:
         return {"recorded": False, "error": "header_name required"}
-    try:
-        step = _build_sheet_pick_evaluate(hn)
-    except ValueError as e:
-        return {"recorded": False, "error": str(e)}
+
+    labels = [(lb or "").strip() for lb in (button_labels or []) if (lb or "").strip()]
+    step: Optional[Dict[str, Any]] = None
+    extra: Dict[str, Any] = {}
+    male_labels: List[str] = []
+    female_labels: List[str] = []
+    is_gender_bind = _is_gender_header(hn)
+
+    if len(labels) >= 2:
+        male_labels, female_labels = _split_gender_button_labels(labels)
+        is_gender_bind = is_gender_bind or bool(male_labels and female_labels)
+        try:
+            if is_gender_bind and male_labels and female_labels:
+                step = _build_gender_pick_evaluate(hn, male_labels, female_labels)
+                step["origin"] = "option_pick"
+                extra["male_labels"] = male_labels
+                extra["female_labels"] = female_labels
+            else:
+                step = _build_option_pick_evaluate(hn, labels)
+                extra["option_labels"] = labels
+        except ValueError as e:
+            return {"recorded": False, "error": str(e)}
+    elif clicked_text:
+        try:
+            step = _build_sheet_pick_evaluate(hn)
+        except ValueError as e:
+            return {"recorded": False, "error": str(e)}
+    else:
+        return {
+            "recorded": False,
+            "error": "Add at least 2 buttons (Male + Female) before binding a column",
+        }
+
     sess.append_step(step)
 
-    extra: Dict[str, Any] = {}
     live_val = _resolve_live_value(sess, hn)
     if live_val:
-        click_label = (
-            _normalize_gender_click_label(live_val)
-            if _is_gender_header(hn)
-            else str(live_val).strip()
-        )
+        click_label = str(live_val).strip()
+        if is_gender_bind:
+            side = _classify_gender_side(click_label) or _classify_gender_side(
+                _normalize_gender_click_label(click_label)
+            )
+            if male_labels and female_labels:
+                pick_pool = male_labels if side == "male" else female_labels if side == "female" else []
+                click_label = pick_pool[0] if pick_pool else _normalize_gender_click_label(str(live_val))
+            else:
+                click_label = _normalize_gender_click_label(str(live_val))
+        elif len(labels) >= 2:
+            raw = str(live_val).strip().lower()
+            for lb in labels:
+                if lb.strip().lower() == raw or raw in lb.strip().lower() or lb.strip().lower() in raw:
+                    click_label = lb.strip()
+                    break
         clicked_norm = (clicked_text or "").strip().lower()
         target_norm = click_label.strip().lower()
         if not clicked_norm or clicked_norm != target_norm:

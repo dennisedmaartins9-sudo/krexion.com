@@ -137,8 +137,11 @@ function getStepDisplayName(s) {
         const fl = s.gender_labels?.female?.join("/") || "Female";
         return `Gender → {{${s.header_name}}} (${ml} | ${fl})`;
       }
-      if (s.origin === "sheet_pick" && s.header_name) {
-        return `Sheet Pick → {{${s.header_name}}}`;
+      if ((s.origin === "option_pick" || s.origin === "sheet_pick") && s.header_name) {
+        const opts = s.option_labels?.join(" · ") || s.gender_labels?.male?.join("/") || "";
+        return opts
+          ? `Option Pick → {{${s.header_name}}} (${opts})`
+          : `Option Pick → {{${s.header_name}}}`;
       }
       return s.script ? `Run JS: ${_val(s.script, 30)}` : "Run JS";
     case "dismiss_popups":
@@ -189,8 +192,8 @@ function getStepDisplayName(s) {
 const TOOLS = [
   { id: "default",   icon: Hand,        label: "Click",       key: "1", help: "Normal click — captures button/link text" },
   { id: "form_fill", icon: Type,        label: "Form Fill",   key: "2", help: "Click an input, then bind to Excel column" },
-  { id: "sheet_pick", icon: Columns,   label: "Sheet Pick",  key: "c", help: "Click a button (Male/Female, Yes/No), then bind to Excel column — replays per-row text match" },
-  { id: "gender_pick", icon: Users,    label: "Gender",      key: "g", help: "Click Male + Female buttons, bind {{gender}} column — auto-detects M/F/male/female from sheet" },
+  { id: "option_pick", icon: Columns,   label: "Option Pick", key: "c", help: "Click 2+ buttons (Male/Female, Yes/No), bind Excel column — replays per-row value" },
+  { id: "gender_pick", icon: Users,    label: "Gender",      key: "g", help: "Shortcut for Option Pick — Male + Female pool, bind {{gender}} column (M/F auto)" },
   { id: "dropdown",  icon: ChevronDown, label: "Dropdown",    key: "3", help: "Click a <select> dropdown to bind option / Excel column" },
   { id: "check",     icon: CheckSquare, label: "Check Box",   key: "4", help: "Click a checkbox (consent / agree / opt-in) — works on hidden CSS-styled boxes too" },
   { id: "random",    icon: Shuffle,     label: "Random Pick", key: "5", help: "Auto-detect form-selection buttons (Yes/No/radio/checkbox groups) on page → tick the ones to randomise each run" },
@@ -386,8 +389,7 @@ export default function VisualRecorderPage() {
   const [pageMeta, setPageMeta] = useState({ url: "", title: "" });
   const [tool, setTool] = useState("default");
   const [pendingFormFill, setPendingFormFill] = useState(null); // {selector, header_name?}
-  const [pendingSheetPick, setPendingSheetPick] = useState(null); // {clicked_text?, element?}
-  const [pendingGenderButtons, setPendingGenderButtons] = useState([]); // string labels (Male, Female, …)
+  const [pendingOptionButtons, setPendingOptionButtons] = useState([]); // Option Pick pool
   const [pendingDropdownQueue, setPendingDropdownQueue] = useState([]); // queued dropdown binds
   const pendingDropdown = pendingDropdownQueue[0] || null;
   // 2026-06: If / Else branch editor modal. When non-null an overlay
@@ -1466,8 +1468,7 @@ export default function VisualRecorderPage() {
       // Esc — cancel pending bindings
       if (e.key === "Escape") {
         if (pendingFormFill) { setPendingFormFill(null); e.preventDefault(); return; }
-        if (pendingSheetPick) { setPendingSheetPick(null); e.preventDefault(); return; }
-        if (pendingGenderButtons.length) { setPendingGenderButtons([]); e.preventDefault(); return; }
+        if (pendingOptionButtons.length) { setPendingOptionButtons([]); e.preventDefault(); return; }
         if (pendingDropdown) { setPendingDropdownQueue([]); e.preventDefault(); return; }
         if (pendingRandom.length) { setPendingRandom([]); e.preventDefault(); return; }
         if (["wait_for_text_pick", "wait_for_selector_pick", "wait_for_xpath_pick", "extract_pick"].includes(tool)) {
@@ -1526,24 +1527,24 @@ export default function VisualRecorderPage() {
         setPopupItemActions(new Map());
         e.preventDefault();
       } else if (!editable && !ctrl && (e.key === "c" || e.key === "C")) {
-        setTool("sheet_pick");
+        setTool("option_pick");
         setPendingRandom([]);
         setDetectedClickables([]);
         setSelectedRandomKeys(new Set());
         setDetectedPopupItems([]);
         setSelectedPopupKeys(new Set());
         setPopupItemActions(new Map());
-        setPendingGenderButtons([]);
+        setPendingOptionButtons([]);
         e.preventDefault();
       } else if (!editable && !ctrl && (e.key === "g" || e.key === "G")) {
-        setTool("gender_pick");
+        setTool("option_pick");
         setPendingRandom([]);
         setDetectedClickables([]);
         setSelectedRandomKeys(new Set());
         setDetectedPopupItems([]);
         setSelectedPopupKeys(new Set());
         setPopupItemActions(new Map());
-        setPendingGenderButtons([]);
+        setPendingOptionButtons([]);
         e.preventDefault();
       } else if (!editable && !ctrl && (e.key === "w" || e.key === "W")) {
         // 2026-07 v2.5.4 — "w" → Wait for Button tool
@@ -1569,7 +1570,7 @@ export default function VisualRecorderPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setupStage, steps.length, busy, pendingFormFill, pendingSheetPick, pendingGenderButtons, pendingDropdown, pendingRandom]);
+  }, [setupStage, steps.length, busy, pendingFormFill, pendingOptionButtons, pendingDropdown, pendingRandom]);
 
   // Format the live recording timer as mm:ss
   const fmtTimer = (sec) => {
@@ -1890,26 +1891,20 @@ export default function VisualRecorderPage() {
 
       if (tool === "form_fill" && d.element) {
         setPendingFormFill({ selector: d.selector || "input", element: d.element });
-      } else if (tool === "sheet_pick" && d.element) {
+      } else if ((tool === "option_pick" || tool === "sheet_pick" || tool === "gender_pick") && d.element) {
         if (d.warning) toast.warning(d.warning, { duration: 5000 });
-        setPendingSheetPick({
-          clicked_text: (d.clicked_text || d.element?.text || "").trim(),
-          element: d.element,
-        });
-      } else if (tool === "gender_pick" && d.element) {
-        if (d.warning) toast.warning(d.warning, { duration: 5000 });
-        const txt = (d.gender_pick_text || d.element?.text || "").trim();
+        const txt = (d.option_pick_text || d.gender_pick_text || d.element?.text || "").trim();
         if (!txt) {
-          toast.error("No button text — click Male or Female label");
+          toast.error("No button text — click Male, Female, ya koi option label");
         } else {
-          setPendingGenderButtons((prev) => {
+          setPendingOptionButtons((prev) => {
             if (prev.some((b) => b.toLowerCase() === txt.toLowerCase())) {
               toast.info(`"${txt}" pehle se pool mein hai`);
               return prev;
             }
             const next = [...prev, txt];
             toast.success(
-              `Gender pool (${next.length}): ${next.join(" · ")} — dono add karein phir bind`,
+              `Option pool (${next.length}): ${next.join(" · ")} — 2+ add karein phir column bind`,
             );
             return next;
           });
@@ -1959,6 +1954,9 @@ export default function VisualRecorderPage() {
         }
       } else if (tool === "default") {
         const txt = (d.element?.text || "").slice(0, 30);
+        if (d.live_click_warning) {
+          toast.warning(d.live_click_warning, { duration: 7000 });
+        }
         if (d.cross_origin_iframe || d.warning) {
           toast.warning(d.warning || "Cross-origin iframe — use ⋯ More → iframe click for reliable RUT replay.", { duration: 6000 });
         }
@@ -2066,41 +2064,9 @@ export default function VisualRecorderPage() {
     }
   };
 
-  // ── Gender Pick: bind Male+Female pool to Excel gender column ─────
-  const submitGenderPick = async (headerName) => {
-    if (!sessionId || !headerName || pendingGenderButtons.length < 2) return;
-    setBusy(true);
-    try {
-      const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/gender-pick-bind`, {
-        method: "POST",
-        headers: authH(),
-        body: JSON.stringify({
-          header_name: headerName,
-          button_labels: pendingGenderButtons,
-        }),
-      });
-      const d = await r.json();
-      if (!r.ok || !d.recorded) throw new Error(d.error || d.detail || `HTTP ${r.status}`);
-      const sample = d.clicked_sample;
-      toast.success(
-        `Gender bound to {{${headerName}}}${sample ? ` · live click "${sample}"` : ""}`,
-      );
-      if (d.sample_hint) toast(d.sample_hint, { icon: "ℹ️" });
-      if (d.click_warning) toast.warning(d.click_warning);
-      setPendingGenderButtons([]);
-      setTool("default");
-      refreshState();
-      refreshScreenshot();
-    } catch (err) {
-      toast.error(err.message || String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // ── Sheet Pick: bind button click to Excel column ────────────────
-  const submitSheetPick = async (headerName) => {
-    if (!pendingSheetPick || !sessionId || !headerName) return;
+  // ── Option Pick: bind 2+ buttons to Excel column ─────────────────
+  const submitOptionPick = async (headerName) => {
+    if (!sessionId || !headerName || pendingOptionButtons.length < 2) return;
     setBusy(true);
     try {
       const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/sheet-pick-bind`, {
@@ -2108,18 +2074,19 @@ export default function VisualRecorderPage() {
         headers: authH(),
         body: JSON.stringify({
           header_name: headerName,
-          clicked_text: pendingSheetPick.clicked_text || null,
+          button_labels: pendingOptionButtons,
         }),
       });
       const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || d.error || `HTTP ${r.status}`);
+      if (!r.ok || !d.recorded) throw new Error(d.error || d.detail || `HTTP ${r.status}`);
       const sample = d.clicked_sample;
       toast.success(
-        `Sheet Pick bound to {{${headerName}}}${sample ? ` · live page clicked "${sample}"` : ""}`,
+        `Option Pick bound to {{${headerName}}}${sample ? ` · live click "${sample}"` : ""}`,
       );
       if (d.sample_hint) toast(d.sample_hint, { icon: "ℹ️" });
       if (d.click_warning) toast.warning(d.click_warning);
-      setPendingSheetPick(null);
+      setPendingOptionButtons([]);
+      setTool("default");
       refreshState();
       refreshScreenshot();
     } catch (err) {
@@ -5441,39 +5408,40 @@ export default function VisualRecorderPage() {
               )}
 
 
-              {tool === "gender_pick" && (
+              {(tool === "option_pick" || tool === "sheet_pick" || tool === "gender_pick") && (
                 <div
-                  className="mt-3 p-3 rounded-lg bg-pink-950/40 border border-pink-700/40"
-                  data-testid="vr-gender-pick-hint-panel"
+                  className="mt-3 p-3 rounded-lg bg-violet-950/40 border border-violet-700/40"
+                  data-testid="vr-option-pick-hint-panel"
                 >
-                  <div className="text-xs text-pink-200 leading-snug">
-                    <b>Gender active.</b> Pehle <b>Male</b> button par click karein, phir <b>Female</b> —
-                    dono pool mein add hon ge. Phir neeche <code className="text-zinc-300">{`{{gender}}`}</code> column bind karein.
+                  <div className="text-xs text-violet-200 leading-snug">
+                    <b>Option Pick active.</b> Pehle <b>Male</b> par click karein, phir <b>Female</b> —
+                    ya koi bhi 2+ buttons pool mein add karein. Phir neeche Excel column bind karein
+                    (e.g. <code className="text-zinc-300">{`{{gender}}`}</code>).
                     Sheet mein <b>M / F / male / female</b> sab auto-detect hoga.
                   </div>
                 </div>
               )}
 
-              {(tool === "gender_pick" || pendingGenderButtons.length > 0) && pendingGenderButtons.length > 0 && (
+              {pendingOptionButtons.length > 0 && (
                 <div
-                  className="mt-3 p-3 rounded-lg bg-pink-950/50 border border-pink-600/40"
-                  data-testid="vr-gender-pick-bind-panel"
+                  className="mt-3 p-3 rounded-lg bg-violet-950/50 border border-violet-600/40"
+                  data-testid="vr-option-pick-bind-panel"
                 >
-                  <div className="text-xs text-pink-200 mb-2 font-medium">
-                    Gender pool ({pendingGenderButtons.length}/2+):
+                  <div className="text-xs text-violet-200 mb-2 font-medium">
+                    Option pool ({pendingOptionButtons.length}/2+):
                     {" "}
-                    {pendingGenderButtons.map((t) => (
+                    {pendingOptionButtons.map((t) => (
                       <code key={t} className="text-zinc-200 mx-0.5">{t}</code>
                     ))}
                   </div>
-                  {pendingGenderButtons.length < 2 ? (
-                    <div className="text-[11px] text-pink-200/80 mb-2">
-                      Abhi {2 - pendingGenderButtons.length} aur button add karein (Male + Female).
+                  {pendingOptionButtons.length < 2 ? (
+                    <div className="text-[11px] text-violet-200/80 mb-2">
+                      Abhi {2 - pendingOptionButtons.length} aur button add karein.
                     </div>
                   ) : (
                     <>
                       <div className="text-[11px] text-zinc-400 mb-2">
-                        Excel column bind karein — replay har row ke gender ke mutabiq button click karega:
+                        Excel column bind karein — replay har row ki value se sahi button click karega:
                       </div>
                       <div className="flex flex-wrap gap-1.5 mb-2">
                         {headers.length === 0 && (
@@ -5485,15 +5453,15 @@ export default function VisualRecorderPage() {
                           .filter((h, i, arr) => arr.indexOf(h) === i)
                           .map((h) => (
                             <button
-                              key={`gp-${h}`}
-                              onClick={() => submitGenderPick(h)}
-                              disabled={pendingGenderButtons.length < 2 || busy}
+                              key={`op-${h}`}
+                              onClick={() => submitOptionPick(h)}
+                              disabled={pendingOptionButtons.length < 2 || busy}
                               className={`px-2 py-1 rounded text-xs border ${
                                 /gender|sex/i.test(h)
-                                  ? "bg-pink-600/50 hover:bg-pink-600 border-pink-400/50 text-pink-50"
-                                  : "bg-pink-900/30 hover:bg-pink-800/50 border-pink-700/40 text-pink-100"
+                                  ? "bg-violet-600/50 hover:bg-violet-600 border-violet-400/50 text-violet-50"
+                                  : "bg-violet-900/30 hover:bg-violet-800/50 border-violet-700/40 text-violet-100"
                               }`}
-                              data-testid={`vr-gender-pick-bind-${h}`}
+                              data-testid={`vr-option-pick-bind-${h}`}
                             >
                               {`{{${h}}}`}
                             </button>
@@ -5503,24 +5471,11 @@ export default function VisualRecorderPage() {
                   )}
                   <div className="flex justify-end gap-2">
                     <button
-                      onClick={() => setPendingGenderButtons([])}
+                      onClick={() => setPendingOptionButtons([])}
                       className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs"
                     >
                       Clear pool
                     </button>
-                  </div>
-                </div>
-              )}
-
-              {tool === "sheet_pick" && (
-                <div
-                  className="mt-3 p-3 rounded-lg bg-violet-950/40 border border-violet-700/40"
-                  data-testid="vr-sheet-pick-hint-panel"
-                >
-                  <div className="text-xs text-violet-200 leading-snug">
-                    <b>Sheet Pick active.</b> Male/Female (ya koi button group) par click karein —
-                    phir Excel column bind karein (e.g. <code className="text-zinc-300">{`{{gender}}`}</code>).
-                    Replay har row ke liye us column ki value se button dhundhega.
                   </div>
                 </div>
               )}
@@ -5537,45 +5492,6 @@ export default function VisualRecorderPage() {
                   </div>
                 </div>
               )}
-
-              {pendingSheetPick && (
-                <div
-                  className="mt-3 p-3 rounded-lg bg-violet-950/40 border border-violet-700/40"
-                  data-testid="vr-sheet-pick-bind-panel"
-                >
-                  <div className="text-xs text-violet-200 mb-2 font-medium">
-                    Sheet Pick — bind button
-                    {pendingSheetPick.clicked_text ? (
-                      <> <code className="text-zinc-300">"{pendingSheetPick.clicked_text.slice(0, 40)}"</code></>
-                    ) : null}
-                    {" "}to Excel column:
-                  </div>
-                  <div className="flex flex-wrap gap-1.5 mb-2">
-                    {headers.length === 0 && (
-                      <span className="text-xs text-zinc-500">Upload Excel first — headers appear here</span>
-                    )}
-                    {headers.map((h) => (
-                      <button
-                        key={`sp-${h}`}
-                        onClick={() => submitSheetPick(h)}
-                        className="px-2 py-1 rounded bg-violet-600/40 hover:bg-violet-600 border border-violet-500/40 text-violet-100 text-xs"
-                        data-testid={`vr-sheet-pick-bind-${h}`}
-                      >
-                        {`{{${h}}}`}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex justify-end">
-                    <button
-                      onClick={() => setPendingSheetPick(null)}
-                      className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-xs"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
-
               {pendingFormFill && (
                 <div className="mt-3 p-3 rounded-lg bg-blue-950/40 border border-blue-700/40">
                   <div className="text-xs text-blue-300 mb-2 font-medium">

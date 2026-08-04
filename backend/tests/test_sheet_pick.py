@@ -11,6 +11,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from visual_recorder import (  # noqa: E402
     _build_sheet_pick_evaluate,
+    _build_option_pick_evaluate,
     _is_gender_header,
     _normalize_gender_click_label,
 )
@@ -48,8 +49,18 @@ def test_normalize_gender_click_label():
     assert _normalize_gender_click_label("Continue") == "Continue"
 
 
-def test_substituted_sheet_pick_expands_template():
-    step = _build_sheet_pick_evaluate("gender")
-    js = step["script"].replace("{{gender}}", "Female")
-    assert "Female" in js
-    assert "{{gender}}" not in js
+def test_build_option_pick_requires_two_labels():
+    import pytest
+    with pytest.raises(ValueError):
+        _build_option_pick_evaluate("choice", ["Yes"])
+
+
+def test_build_option_pick_uses_template_and_labels():
+    step = _build_option_pick_evaluate("gender", ["Male", "Female"])
+    assert step["action"] == "evaluate"
+    assert step["origin"] == "option_pick"
+    assert step["header_name"] == "gender"
+    assert step["option_labels"] == ["Male", "Female"]
+    assert "var raw='{{gender}}'" in step["script"]
+    assert "'Male'" in step["script"]
+    assert "'Female'" in step["script"]

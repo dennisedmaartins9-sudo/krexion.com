@@ -607,16 +607,81 @@ def url_deals_from_href(url: str) -> int:
     )
 
 
+_DEAL_HOST_FRAGMENTS = (
+    "displayoptoffers",
+    "uplevelrewards",
+    "levelrewards",
+    "rewardsgiant",
+    "eward4spot",
+    "reward4spot",
+)
+
+
+def _on_deal_host(url: str) -> bool:
+    u = (url or "").lower()
+    return any(h in u for h in _DEAL_HOST_FRAGMENTS)
+
+
+def _body_has_active_survey_question(body: str) -> bool:
+    """True when a live survey question is visible — not deal-wall footer links."""
+    s = (body or "").lower()
+    if any(
+        k in s
+        for k in (
+            "level 1 deals",
+            "level 2 deals",
+            "level 3 deals",
+            "best match for you",
+            "your cost:",
+            "start deal",
+            "next step: complete",
+            "do you already have",
+            "how to complete",
+        )
+    ):
+        return False
+    return any(
+        k in s
+        for k in (
+            "finish your survey",
+            "are you a homeowner",
+            "how often do you",
+            "credit/debit card",
+            "online purchase",
+            "generation do you",
+            "which generation do you",
+            "games do you like",
+            "survey to proceed",
+            "when did you last",
+            "question 1",
+            "question 2",
+            "do you shop at target",
+        )
+    )
+
+
 def _effective_url_deals(
     deals: int,
     body: str,
     url: str = "",
     *,
     survey_active: bool = False,
+    min_deals: int = 0,
 ) -> int:
     """Ignore early URL deal markers while still on retail/survey/form screens."""
     body_l = (body or "").lower()
     url_l = (url or "").lower()
+    min_d = max(1, int(min_deals or 0))
+    if _body_has_deal_wall(body_l, url_l):
+        return deals
+    if min_deals and _on_deal_host(url_l) and deals >= min_d:
+        if _body_is_retail_questions(body_l) or _body_on_form(body_l, url_l):
+            return 0
+        if any(k in body_l for k in ("confirm your email", "your reward is waiting", "sign up or resume")):
+            return 0
+        if survey_active or _body_has_active_survey_question(body_l):
+            return 0
+        return deals
     if survey_active or _body_on_survey(body_l):
         return 0
     if _body_is_retail_questions(body_l):
@@ -625,13 +690,29 @@ def _effective_url_deals(
         return 0
     if any(k in body_l for k in ("confirm your email", "your reward is waiting", "sign up or resume")):
         return 0
-    if _body_has_deal_wall(body_l, url_l):
-        return deals
     if "retailproductsusa" in url_l and not _body_has_deal_wall(body_l, url_l):
         return 0
     if "displayoptoffers" in url_l and _body_on_survey(body_l):
         return 0
     return deals
+
+
+def _survey_blocks_conversion(
+    body: str,
+    url: str,
+    *,
+    url_deals: int,
+    min_deals: int,
+    deal_wall_seen: bool,
+    survey_active: bool = False,
+) -> bool:
+    """Return True when survey state should block declaring conversion."""
+    if deal_wall_seen or _body_has_deal_wall(body, url):
+        return False
+    min_d = max(1, int(min_deals or 2))
+    if url_deals >= min_d and _on_deal_host(url) and not _body_has_active_survey_question(body):
+        return False
+    return bool(survey_active or _body_on_survey(body))
 
 
 def conversion_verified(metrics: Dict[str, Any], min_deals: int, wait_until_conversion: bool) -> bool:
@@ -881,10 +962,18 @@ def _conversion_ready(
         return True
     if not conversion_verified(metrics, cfg.min_deals, cfg.wait_until_conversion):
         return False
-    if survey_active or _body_on_survey(body):
+    url = str(metrics.get("url") or "")
+    url_deals = url_deals_from_href(url)
+    if _survey_blocks_conversion(
+        body,
+        url,
+        url_deals=url_deals,
+        min_deals=cfg.min_deals,
+        deal_wall_seen=deal_wall_seen,
+        survey_active=survey_active,
+    ):
         return False
-    url = str(metrics.get("url") or "").lower()
-    if "finish your survey" in (body or "").lower():
+    if "finish your survey" in (body or "").lower() and _body_has_active_survey_question(body):
         return False
     if cfg.require_deal_wall_seen:
         if not deal_wall_seen and not _body_has_deal_wall(body, url):
@@ -6926,15 +7015,28 @@ async def _final_conversion_gate(page, cfg: SmartFunnelConfig, deal_wall_seen: b
     if getattr(page.context, "_krx_l3_complete", False):
         return True
     body_l = await _retail_body_text(page)
-    if await _survey_active_on_page(page) or _body_on_survey(body_l):
-        return False
-    if "finish your survey" in body_l:
-        return False
     try:
-        url = (page.url or "").lower()
+        url = page.url or ""
     except Exception:
         url = ""
     metrics = await _metrics_from_page(page)
+    url_deals = int(metrics.get("url_deals") or url_deals_from_href(url))
+    survey_active = await _survey_active_on_page(page)
+    if _survey_blocks_conversion(
+        body_l,
+        url,
+        url_deals=url_deals,
+        min_deals=cfg.min_deals,
+        deal_wall_seen=deal_wall_seen,
+        survey_active=survey_active,
+    ):
+        return False
+    if "finish your survey" in body_l and _body_has_active_survey_question(body_l):
+        return False
+    try:
+        url = (url or "").lower()
+    except Exception:
+        url = ""
     if _cfg_stop_at_deal_wall(cfg):
         return await _deal_wall_on_page(page) or _body_has_deal_wall(body_l, url)
     if not conversion_verified(metrics, cfg.min_deals, cfg.wait_until_conversion):
@@ -7090,7 +7192,14 @@ async def execute_smart_funnel(
         url_early = str(metrics.get("url") or "").lower()
         survey_active = await _survey_active_on_page(page)
         on_deal_wall_early = _body_has_deal_wall(body_l, url_early) or await _deal_wall_on_page(page)
-        deals = _effective_url_deals(raw_deals, body_l, url_early, survey_active=survey_active)
+        deals = _effective_url_deals(
+            raw_deals, body_l, url_early, survey_active=survey_active, min_deals=min_d
+        )
+        if raw_deals >= min_d and _on_deal_host(url_early) and not _body_has_active_survey_question(body_l):
+            try:
+                page.context._krx_l3_complete = True
+            except Exception:
+                pass
         on_offers_info = _body_on_offers_info(body_l)
         on_retail_q = _body_is_retail_questions(body_l) or await _page_has_text(
             page,
@@ -7141,7 +7250,7 @@ async def execute_smart_funnel(
                         and not on_offers_info
                     )
                     deals = _effective_url_deals(
-                        raw_deals, body_l, url_early, survey_active=survey_active
+                        raw_deals, body_l, url_early, survey_active=survey_active, min_deals=min_d
                     )
             except Exception as e:
                 logger.debug("smart_funnel reactive burst: %s", e)
@@ -7349,10 +7458,19 @@ async def execute_smart_funnel(
         survey_active = await _survey_active_on_page(page)
         url_post = str(metrics.get("url") or "").lower()
         raw_deals = int(metrics.get("url_deals") or 0)
-        deals = _effective_url_deals(raw_deals, body_l, url_post, survey_active=survey_active)
-        if survey_active or _body_on_survey(body_l):
+        deals = _effective_url_deals(
+            raw_deals, body_l, url_post, survey_active=survey_active, min_deals=min_d
+        )
+        if raw_deals >= min_d and _on_deal_host(url_post) and not _body_has_active_survey_question(body_l):
+            try:
+                page.context._krx_l3_complete = True
+            except Exception:
+                pass
+        if (survey_active or _body_on_survey(body_l)) and _body_has_active_survey_question(body_l):
             deal_wall_seen = False
         elif await _deal_wall_on_page(page) or _body_has_deal_wall(body_l, str(metrics.get("url") or "")):
+            deal_wall_seen = True
+        elif raw_deals >= min_d and _on_deal_host(url_post) and not _body_has_active_survey_question(body_l):
             deal_wall_seen = True
 
         if (
@@ -7459,6 +7577,11 @@ async def execute_smart_funnel(
             or await _deal_wall_on_page(page)
             or (
                 on_deal_host
+                and raw_deals >= min_d
+                and not _body_has_active_survey_question(body_l)
+            )
+            or (
+                on_deal_host
                 and any(
                     k in body_l
                     for k in (
@@ -7479,7 +7602,7 @@ async def execute_smart_funnel(
         elif any(k in body_l for k in ("emailed to you", "explore offers from our sponsors", "status emailed")):
             phase = "email"
         if await _survey_active_on_page(page) or _body_on_survey(body_l):
-            if not has_deal_wall:
+            if not has_deal_wall and _body_has_active_survey_question(body_l):
                 phase = "survey"
         on_form_raw = _body_on_form(body_l, url_l) or await _form_active_on_page(page)
         survey_now = (

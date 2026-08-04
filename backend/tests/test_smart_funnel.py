@@ -186,6 +186,39 @@ def test_effective_url_deals_ignores_early_markers_during_survey():
     assert _effective_url_deals(3, deal_body, url) == 3
 
 
+def test_effective_url_deals_trusts_url_markers_on_deal_host_after_survey():
+    from smart_funnel import _effective_url_deals
+
+    url = "https://displayoptoffers.com/?BVA=True&BVB=True&BVC=True"
+    # Deal host with URL markers but only footer survey link — not an active question
+    body = "get my reward skip the survey program requirements"
+    assert _effective_url_deals(3, body, url, survey_active=False, min_deals=3) == 3
+
+
+def test_survey_blocks_conversion_allows_completed_url_deals_on_deal_host():
+    from smart_funnel import _survey_blocks_conversion
+
+    url = "https://displayoptoffers.com/?BVA=True&BVB=True&BVC=True"
+    body = "get my reward skip the survey"
+    assert not _survey_blocks_conversion(
+        body,
+        url,
+        url_deals=3,
+        min_deals=3,
+        deal_wall_seen=False,
+        survey_active=False,
+    )
+    survey_body = "finish your survey are you a homeowner yes no"
+    assert _survey_blocks_conversion(
+        survey_body,
+        url,
+        url_deals=3,
+        min_deals=3,
+        deal_wall_seen=False,
+        survey_active=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # v2.6.49 regression tests for reward-pattern bug fixes
 # ---------------------------------------------------------------------------
