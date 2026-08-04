@@ -3658,8 +3658,15 @@ def _build_state_targeted_proxy(
 ) -> Dict[str, Any]:
     """Return a rotating-gateway proxy with state/country targeting and a
     fresh session id in the username (Smartproxy, Bright Data, etc.)."""
-    if not base or not state_code:
-        return dict(base) if base else {}
+    if not base:
+        return {}
+    _country = (country or "US").strip().upper()
+    _state = (state_code or "").strip().upper()
+    # Static proxies — no gateway DSL to rewrite.
+    if not base.get("is_rotating_gateway"):
+        return dict(base)
+    if not _state and not _country:
+        return dict(base)
     try:
         from proxy_provider_module import (  # noqa: WPS433
             _apply_targeting_to_username,
@@ -3692,15 +3699,17 @@ def _build_state_targeted_proxy(
     # the lead row's state — otherwise Decodo rejects bad usernames and
     # every probe fails with "exit-IP probe failed".
     username = _gateway_base_username(username, host)
+    _targeting: Dict[str, Any] = {
+        "country": _country or "US",
+        "_want_sid": True,
+        "force_replace": True,
+    }
+    if _state:
+        _targeting["state"] = _state
     targeted_user = _apply_targeting_to_username(
         username,
         host,
-        {
-            "country": country or "US",
-            "state": state_code,
-            "_want_sid": True,
-            "force_replace": True,
-        },
+        _targeting,
     )
     targeted_user = _rotate_session_in_username(targeted_user)
 
@@ -3725,6 +3734,20 @@ def _build_state_targeted_proxy(
     out["raw"] = raw_line
     out["is_rotating_gateway"] = True
     return out
+
+
+def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
+    """ISO country code from a geo probe result."""
+    return (geo.get("country") or "").strip().upper()
+
+
+def _geo_matches_target_country(geo: Dict[str, Any], target_country: str) -> bool:
+    """True when geo exit country matches target ISO code (e.g. US), or target unset."""
+    tc = (target_country or "").strip().upper()
+    if not tc or tc == "ANY":
+        return True
+    exit_cc = _geo_exit_country_code(geo)
+    return bool(exit_cc and exit_cc == tc)
 
 
 _DATACENTER_ISP_KEYWORDS: Tuple[str, ...] = (
@@ -8865,6 +8888,16 @@ async def run_real_user_traffic_job(
                                 f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying",
                             )
                         continue
+                # Country gate — honour proxyjet_country / per-visit MIX pick.
+                if not _geo_matches_target_country(_geo, _visit_pj_country):
+                    _exit_cc = _geo_exit_country_code(_geo)
+                    last_reason = f"exit country {_exit_cc} != target {_visit_pj_country}"
+                    if attempt % 5 == 0 or attempt == 1:
+                        push_live_step(
+                            job_id, i + 1, "proxy", "info",
+                            f"Attempt {attempt}/{cap}: wrong country {_exit_cc}, retrying",
+                        )
+                    continue
                 exit_ip = _geo["exit_ip"]
                 if skip_duplicate_ip and duplicate_ip_set and exit_ip in duplicate_ip_set:
                     last_reason = f"duplicate IP {exit_ip}"
@@ -8937,6 +8970,13 @@ async def run_real_user_traffic_job(
             proxy = on_demand_proxy
         else:
             proxy = pick_next_proxy()
+            # Rotating gateway: inject job country/state into username
+            # (Smartproxy country-us, etc.) — bulk lines may lack geo DSL.
+            if proxy and _has_rotating_gateway:
+                _inj_st = (proxyjet_default_state or "").strip().upper()
+                _inj_cc = (proxyjet_country or "US").strip().upper()
+                if _inj_cc and _inj_cc != "ANY":
+                    proxy = _build_state_targeted_proxy(proxy, _inj_st, _inj_cc)
         if not proxy:
             entry["status"] = "failed"
             entry["error"] = "No more proxies available (no_repeated_proxy = on)"
@@ -9032,12 +9072,28 @@ async def run_real_user_traffic_job(
             )
             return await _record(job_id, entry, report, report_lock, db)
 
-        # Pre-filter: country
+        # Pre-filter: country (allowed_countries list + proxyjet_country target)
         if allowed_countries_lc and geo["country_name"].lower() not in allowed_countries_lc:
             entry["status"] = "skipped_country"
             entry["error"] = f"{geo['country_name']} not in allowed list"
             push_live_step(job_id, i + 1, "filter", "skipped", f"Country not allowed: {geo['country_name']}")
             return await _record(job_id, entry, report, report_lock, db)
+
+        # Enforce job geo hint (Country dropdown) — independent of allowed_countries.
+        # ROW-FIRST loop already validated country before accepting the IP.
+        if not (_use_row_first and on_demand_geo is not None):
+            if not _geo_matches_target_country(geo, proxyjet_country):
+                entry["status"] = "skipped_country"
+                entry["error"] = (
+                    f"Exit country {_geo_exit_country_code(geo)} != "
+                    f"configured target {(proxyjet_country or '').upper()}"
+                )
+                push_live_step(
+                    job_id, i + 1, "filter", "skipped",
+                    f"Wrong exit country: {_geo_exit_country_code(geo)} "
+                    f"(wanted {(proxyjet_country or 'US').upper()})",
+                )
+                return await _record(job_id, entry, report, report_lock, db)
 
         # Pre-filter: VPN / low IP quality
         if skip_vpn and geo["is_vpn"]:
@@ -9317,12 +9373,19 @@ async def run_real_user_traffic_job(
                         _next_px = pick_next_proxy()
                         if not _next_px:
                             break
+                        if _has_rotating_gateway:
+                            _inj_st = (proxyjet_default_state or "").strip().upper()
+                            _inj_cc = (proxyjet_country or "US").strip().upper()
+                            if _inj_cc and _inj_cc != "ANY":
+                                _next_px = _build_state_targeted_proxy(_next_px, _inj_st, _inj_cc)
                         proxy = _next_px
                         entry["proxy"] = proxy.get("server", "")
                         _sm_geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
                         if not _sm_geo.get("ok") or not (_sm_geo.get("exit_ip") or "").strip():
                             continue
                         if allowed_countries_lc and _sm_geo["country_name"].lower() not in allowed_countries_lc:
+                            continue
+                        if not _geo_matches_target_country(_sm_geo, proxyjet_country):
                             continue
                         if skip_vpn and _sm_geo.get("is_vpn"):
                             continue
@@ -13670,6 +13733,15 @@ def _substitute(template: str, row: Dict[str, Any]) -> str:
             return ""
 
         resolved = _resolve(key)
+        # Month columns: text fill fields expect English names (April), not "4".
+        if resolved and not pipeline:
+            try:
+                from value_normalizer import is_month_header, month_name_for_form
+                norm_key = key.strip().lower().replace("-", "_").replace(" ", "_")
+                if is_month_header(norm_key):
+                    resolved = month_name_for_form(resolved)
+            except Exception:
+                pass
         # Apply formatter pipeline if present (e.g. `|upper|first:5`)
         if pipeline and _EXT_LOADED:
             try:
@@ -14570,23 +14642,88 @@ def _frame_locator_for_step(page: Page, step: Any):
 
 
 async def _robust_click_scoped(page: Page, step: Any, selector: str, timeout: int = 25000) -> None:
-    """Click via frame_locator when step carries iframe_path, else top-level _robust_click."""
+    """Click with CSS + xpath fallback chain from the recorded step."""
+    chain = _selector_chain_for_step(step, selector)
+    last_err: Optional[Exception] = None
     fl = _frame_locator_for_step(page, step)
-    if fl is not None and selector:
-        loc = fl.locator(selector).first
+    per_sel = max(2000, int(timeout / max(1, len(chain))))
+    for sel in chain:
         try:
-            await loc.click(timeout=timeout)
+            if fl is not None and sel:
+                loc = fl.locator(sel).first
+                try:
+                    await loc.click(timeout=per_sel)
+                    return
+                except Exception:
+                    await loc.click(force=True, timeout=max(1500, int(per_sel * 0.5)))
+                    return
+            await _robust_click(page, sel, timeout=per_sel)
             return
-        except Exception:
-            await loc.click(force=True, timeout=max(2000, int(timeout * 0.35)))
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"_robust_click_scoped: all strategies failed for {selector!r}")
+
+
+def _selector_chain_for_step(step: Any, primary: str) -> List[str]:
+    """Build ordered selector list: primary CSS, then xpath + attribute fallbacks."""
+    out: List[str] = []
+    seen: set = set()
+
+    def _add(s: Any) -> None:
+        t = (s or "").strip()
+        if not t or t in seen:
             return
-    await _robust_click(page, selector, timeout=timeout)
+        seen.add(t)
+        out.append(t)
+
+    _add(primary)
+    if isinstance(step, dict):
+        step_sel = step.get("selector")
+        if step_sel and step_sel != primary:
+            _add(step_sel)
+        for alt in _smart_priority_fallbacks(step) + _step_fallbacks(step):
+            _add(alt)
+    return out or [(primary or "").strip()]
 
 
 async def _fill_scoped(page: Page, step: Any, selector: str, value: str, timeout: int,
                        humanize: bool = True) -> None:
     """Fill via frame_locator when iframe_path present."""
     fl = _frame_locator_for_step(page, step)
+    # <select> elements need select_option variants, not .fill()
+    try:
+        if fl is not None and selector:
+            loc = fl.locator(selector).first
+            tag = await loc.evaluate("el => el ? el.tagName : ''")
+        else:
+            tag = await page.evaluate(
+                "(s) => { var e = document.querySelector(s); return e ? e.tagName : ''; }",
+                selector,
+            )
+        if tag == "SELECT":
+            if fl is not None:
+                from value_normalizer import expand_value_variants
+                loc = fl.locator(selector).first
+                for cand in expand_value_variants(value):
+                    try:
+                        await loc.select_option(label=str(cand), timeout=timeout)
+                        return
+                    except Exception:
+                        try:
+                            await loc.select_option(value=str(cand), timeout=timeout)
+                            return
+                        except Exception:
+                            continue
+            else:
+                await _smart_select_with_fallback(
+                    page, selector, value, match_by="label", timeout=timeout,
+                )
+            return
+    except Exception:
+        pass
     if fl is not None and selector:
         await fl.locator(selector).first.fill(str(value), timeout=timeout)
         return
@@ -14609,6 +14746,81 @@ async def _fill_scoped(page: Page, step: Any, selector: str, value: str, timeout
 
 
 # Returns silently on success; raises last exception on total failure.
+_ROBUST_CLICK_SELECTOR_JS = """(sel) => {
+  function krxClick(el) {
+    if (!el) return false;
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    el.scrollIntoView({ block: 'center' });
+    try { if (el.disabled) el.disabled = false; } catch (e) {}
+    try {
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
+        el.setAttribute('aria-disabled', 'false');
+      }
+    } catch (e) {}
+    var pe = '';
+    try { pe = el.style.pointerEvents || ''; el.style.pointerEvents = 'auto'; } catch (e) {}
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
+        }));
+      } catch (e) {}
+    });
+    if (el.tagName === 'A' && el.href && !el.target) {
+      window.location.assign(el.href);
+      return true;
+    }
+    try { el.click(); } catch (e) {}
+    var isSubmit = (el.tagName === 'INPUT' || el.tagName === 'BUTTON') &&
+      (el.type === 'submit' || (el.getAttribute && el.getAttribute('type') === 'submit'));
+    if (isSubmit) {
+      var f = el.form || (el.closest && el.closest('form'));
+      if (f) {
+        setTimeout(function () {
+          try { if (!f._krx_submitted) { f._krx_submitted = true; f.submit(); } } catch (e) {}
+        }, 150);
+      }
+    }
+    try { if (pe) el.style.pointerEvents = pe; } catch (e) {}
+    return true;
+  }
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  if (krxClick(el)) return true;
+  var inner = el.querySelector && el.querySelector('button,[role=button],a[href]');
+  if (inner) return krxClick(inner);
+  return false;
+}"""
+
+
+_ROBUST_CLICK_XPATH_JS = """(xp) => {
+  function krxClick(el) {
+    if (!el) return false;
+    el.scrollIntoView({ block: 'center' });
+    try { if (el.disabled) el.disabled = false; } catch (e) {}
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
+        }));
+      } catch (e) {}
+    });
+    try { el.click(); } catch (e) {}
+    return true;
+  }
+  try {
+    var r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    if (r && r.singleNodeValue && krxClick(r.singleNodeValue)) return true;
+  } catch (e) {}
+  return false;
+}"""
+
+
 async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
     """Click that survives "intercepted by another element" and "not in
     view" failures the user has been reporting with the Visual-Recorder
@@ -14640,11 +14852,30 @@ async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
 
     Raises the most recent exception if every strategy fails.
     """
+    sel = (selector or "").strip()
     last_err: Optional[Exception] = None
+
+    # XPath-first when the chain entry is xpath (CSS would mis-parse //...)
+    if sel.startswith("xpath=") or sel.startswith("//") or sel.startswith("/html"):
+        xp = sel[6:] if sel.startswith("xpath=") else sel
+        s0_to = max(2000, int(timeout * 0.35))
+        try:
+            loc = page.locator(sel if sel.startswith("xpath=") else f"xpath={sel}")
+            await loc.first.click(timeout=s0_to)
+            return
+        except Exception as e:
+            last_err = e
+        try:
+            clicked = await page.evaluate(_ROBUST_CLICK_XPATH_JS, xp)
+            if clicked:
+                return
+        except Exception as e:
+            last_err = e
+
     # Strategy 1: locator click (auto-waits + scroll-into-view)
     s1_to = max(3000, int(timeout * 0.45))
     try:
-        loc = page.locator(selector).first
+        loc = page.locator(sel).first
         await loc.click(timeout=s1_to)
         return
     except Exception as e:
@@ -14653,7 +14884,7 @@ async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
     # pages where locator API is too strict)
     s2_to = max(2000, int(timeout * 0.25))
     try:
-        await page.click(selector, timeout=s2_to)
+        await page.click(sel, timeout=s2_to)
         return
     except Exception as e:
         last_err = e
@@ -14662,7 +14893,7 @@ async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
     # par work ni krta" on real lead-gen pages)
     s3_to = max(2000, int(timeout * 0.20))
     try:
-        loc = page.locator(selector).first
+        loc = page.locator(sel).first
         await loc.scroll_into_view_if_needed(timeout=s3_to)
         await loc.click(force=True, timeout=s3_to)
         return
@@ -14674,15 +14905,24 @@ async def _robust_click(page, selector: str, timeout: int = 25000) -> None:
     # ignore the click — that's why this is last.
     s4_to = max(1000, int(timeout * 0.10))
     try:
-        el = await page.wait_for_selector(selector, timeout=s4_to, state="attached")
+        el = await page.wait_for_selector(sel, timeout=s4_to, state="attached")
         if el is not None:
             await el.dispatch_event("click")
             return
     except Exception as e:
         last_err = e
+    # Strategy 5: full pointer-event click via JS (disabled/grey React buttons)
+    s5_to = max(1000, int(timeout * 0.10))
+    try:
+        if not (sel.startswith("xpath=") or sel.startswith("//") or sel.startswith("/html")):
+            clicked = await page.evaluate(_ROBUST_CLICK_SELECTOR_JS, sel)
+            if clicked:
+                return
+    except Exception as e:
+        last_err = e
     if last_err is not None:
         raise last_err
-    raise RuntimeError(f"_robust_click: all strategies failed for selector {selector!r}")
+    raise RuntimeError(f"_robust_click: all strategies failed for selector {sel!r}")
 
 
 async def _smart_check_with_fallback(page, selector: str, want_checked: bool = True,
@@ -15472,6 +15712,20 @@ async def _execute_automation_steps(
                     _native_handled = False
                     _native_picked: Optional[str] = None
                     try:
+                        _step_sel = (step.get("selector") or "").strip()
+                        if _step_sel and not _native_handled:
+                            try:
+                                await _robust_click_scoped(
+                                    page, step, _step_sel,
+                                    timeout=min(10000, timeout),
+                                )
+                                _native_handled = True
+                                _step_note = f"selector_click '{_step_sel[:80]}'"
+                            except Exception as _sel_e:
+                                logger.warning(
+                                    f"[evaluate→selector_click] '{_step_sel}' failed: "
+                                    f"{str(_sel_e)[:100]} — falling back to JS"
+                                )
                         _rp_labels = _extract_random_pick_labels(js)
                         if _rp_labels:
                             # 2026-06 — Customer ask: random_pick should

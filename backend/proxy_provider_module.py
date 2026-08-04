@@ -1255,6 +1255,7 @@ async def get_proxy_lines_from_provider(
     unique_ip_seen: Optional[set] = None,
     strict_unique_ip: Optional[bool] = None,
     skip_datacenter_ip: Optional[bool] = None,
+    targeting: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Fetch `count` proxy lines from a single provider. Rotating-gateway
@@ -1357,13 +1358,34 @@ async def get_proxy_lines_from_provider(
         port = str(cfg.get("gateway_port") or "").strip()
         if not host or not port:
             return {"lines": [], "error": "gateway_host/port missing", **ret_common}
+        username_tpl = str(cfg.get("username") or "").strip()
+        # RUT Auto Mode passes job geo hints (proxyjet_country/state) here
+        # so Smartproxy / Decodo / Bright Data lines honour the operator's
+        # Country dropdown — previously only session ids rotated.
+        _tgt = targeting or {}
+        if _tgt and username_tpl:
+            _apply_tgt = {
+                k: _tgt[k]
+                for k in ("country", "state", "city", "zip", "asn", "sticky_minutes")
+                if _tgt.get(k)
+            }
+            if _apply_tgt:
+                _apply_tgt["_want_sid"] = True
+                _apply_tgt["force_replace"] = True
+                username_tpl = _apply_targeting_to_username(
+                    username_tpl,
+                    host,
+                    _apply_tgt,
+                    str(provider.get("name") or ""),
+                )
         lines: List[str] = []
         MAX_RETRIES_PER_SLOT = 5
         exhaustion_streak = 0     # consecutive slots that gave up
+        _gw_cfg = {**cfg, "username": username_tpl}
         for _ in range(count):
             ln = None
             for _try in range(MAX_RETRIES_PER_SLOT):
-                candidate = _format_gateway_line(cfg, proxy_type, rotate_session=True)
+                candidate = _format_gateway_line(_gw_cfg, proxy_type, rotate_session=True)
                 if not candidate:
                     break
                 ok, exit_ip, reason = await _line_passes(candidate)

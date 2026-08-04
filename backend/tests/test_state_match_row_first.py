@@ -78,6 +78,14 @@ class TestBuildStateTargetedProxy:
         out = _build_state_targeted_proxy(base, "", "US")
         assert out.get("server") == base.get("server")
 
+    def test_country_only_on_rotating_gateway(self):
+        base = _parse_proxy_line("http://user-sp123:secret@gate.smartproxy.com:7000")
+        out = _build_state_targeted_proxy(base, "", "US")
+        un = (out.get("username") or "").lower()
+        assert "country" in un or "area" in un or "_area-us" in un
+        assert out["server"].startswith("http://")
+        assert "@" not in out["server"]
+
 
 class TestRotatingGatewayDetection:
     def test_smartproxy_net(self):

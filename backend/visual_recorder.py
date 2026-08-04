@@ -623,6 +623,23 @@ def _attach_selector_and_xpath(step: Dict[str, Any], info: Optional[Dict[str, An
             step["selector"] = best
 
 
+def _promote_step_locators(step: Dict[str, Any]) -> None:
+    """Copy fallbacks → top-level selector + xpath so replay + UI always have both."""
+    if not isinstance(step, dict):
+        return
+    fb = step.get("fallbacks")
+    if not isinstance(fb, dict) or not fb:
+        return
+    attrs = fb.get("attrs") if isinstance(fb.get("attrs"), dict) else {}
+    info: Dict[str, Any] = {
+        "xpath_stable": (fb.get("xpath") or "").strip(),
+        "xpath_abs": (fb.get("xpath_abs") or "").strip(),
+        "attrs": attrs,
+        "tag": (fb.get("tag") or "").strip(),
+        "id": (attrs.get("id") or "").strip() if isinstance(attrs, dict) else "",
+    }
+    _attach_selector_and_xpath(step, info)
+
 
 def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """JS that finds an element by visible text and clicks it.
@@ -731,21 +748,23 @@ def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None)
             "var s=window.getComputedStyle(el);"
             "if(s.display==='none'||s.visibility==='hidden')return false;"
             "el.scrollIntoView({block:'center'});"
-            # Anchor → location.assign for deterministic nav
+            "try{if(el.disabled)el.disabled=false;}catch(e){}"
+            "try{if(el.getAttribute&&el.getAttribute('aria-disabled')==='true')el.setAttribute('aria-disabled','false');}catch(e){}"
+            "var pe='';try{pe=el.style.pointerEvents||'';el.style.pointerEvents='auto';}catch(e){}"
+            "var r=el.getBoundingClientRect();var cx=r.left+r.width/2,cy=r.top+r.height/2;"
+            "['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(type){"
+            "try{el.dispatchEvent(new MouseEvent(type,{bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy}));}catch(e){}});"
             "if(el.tagName==='A'&&el.href&&!el.target){window.location.assign(el.href);return true;}"
-            # LABEL[for] → click the real control
             "if(el.tagName==='LABEL'&&el.htmlFor){var ctl=document.getElementById(el.htmlFor);if(ctl){ctl.scrollIntoView({block:'center'});ctl.click();return true;}}"
-            # Inner anchor (CTA-card pattern)
             "var inner=el.querySelector&&el.querySelector('a[href]');"
             "if(inner&&inner.href&&!inner.target){window.location.assign(inner.href);return true;}"
-            # Inner checkbox/radio
             "var box=el.querySelector&&el.querySelector('input[type=checkbox],input[type=radio]');"
             "if(box&&!box.checked){box.click();return true;}"
-            # Plain click
-            "el.click();"
+            "try{el.click();}catch(e){}"
             "var isSubmit=(el.tagName==='INPUT'||el.tagName==='BUTTON')&&(el.type==='submit'||el.getAttribute&&el.getAttribute('type')==='submit');"
             "if(isSubmit){var f=el.form||(el.closest&&el.closest('form'));"
             "if(f){setTimeout(function(){try{if(!f._krx_submitted){f._krx_submitted=true;f.submit();}}catch(e){}},150);}}"
+            "try{if(pe)el.style.pointerEvents=pe;}catch(e){}"
             "return true;};"
             # 1. CSS selectors
             "var _css=" + css_arr_js + ";"
@@ -1510,7 +1529,20 @@ def _format_sample_cell_value(header_name: str, raw: Any) -> str:
     if isinstance(raw, float) and raw == int(raw):
         return str(int(raw))
     if isinstance(raw, int) and not isinstance(raw, bool):
-        return str(raw)
+        raw_str = str(raw)
+        try:
+            from value_normalizer import is_month_header, month_name_for_form
+            if is_month_header(key):
+                return month_name_for_form(raw)
+        except Exception:
+            pass
+        return raw_str
+    try:
+        from value_normalizer import is_month_header, month_name_for_form
+        if is_month_header(key):
+            return month_name_for_form(raw)
+    except Exception:
+        pass
     return str(raw).strip()
 
 
@@ -1983,6 +2015,10 @@ class RecorderSession:
         """Append a recorded step and optionally auto-insert settle waits."""
         if not step:
             return
+        try:
+            _promote_step_locators(step)
+        except Exception:
+            pass
         self.steps.append(step)
         if not allow_auto_waits or not self.auto_insert_waits:
             return
@@ -4636,6 +4672,59 @@ async def navigate_only_click(sess: RecorderSession, x: int, y: int) -> Dict[str
     return {"clicked": True, "recorded": False}
 
 
+_ROBUST_CLICK_SELECTOR_JS = """(sel) => {
+  function krxClick(el) {
+    if (!el) return false;
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    el.scrollIntoView({ block: 'center' });
+    try { if (el.disabled) el.disabled = false; } catch (e) {}
+    try {
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
+        el.setAttribute('aria-disabled', 'false');
+      }
+    } catch (e) {}
+    var pe = '';
+    try { pe = el.style.pointerEvents || ''; el.style.pointerEvents = 'auto'; } catch (e) {}
+    var r = el.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
+      try {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
+        }));
+      } catch (e) {}
+    });
+    if (el.tagName === 'A' && el.href && !el.target) {
+      window.location.assign(el.href);
+      return true;
+    }
+    try { el.click(); } catch (e) {}
+    var isSubmit = (el.tagName === 'INPUT' || el.tagName === 'BUTTON') &&
+      (el.type === 'submit' || (el.getAttribute && el.getAttribute('type') === 'submit'));
+    if (isSubmit) {
+      var f = el.form || (el.closest && el.closest('form'));
+      if (f) {
+        setTimeout(function () {
+          try { if (!f._krx_submitted) { f._krx_submitted = true; f.submit(); } } catch (e) {}
+        }, 150);
+      }
+    }
+    try { if (pe) el.style.pointerEvents = pe; } catch (e) {}
+    return true;
+  }
+  var el = document.querySelector(sel);
+  if (!el) return false;
+  if (krxClick(el)) return true;
+  var role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+  if (role !== 'button') {
+    var inner = el.querySelector && el.querySelector('button,[role=button],a[href]');
+    if (inner) return krxClick(inner);
+  }
+  return false;
+}"""
+
+
 async def _fill_live_input(page: Any, selector: str, live_val: str) -> Tuple[bool, Dict[str, Any]]:
     """Fill a live input during recording (no step appended).
 
@@ -4647,6 +4736,20 @@ async def _fill_live_input(page: Any, selector: str, live_val: str) -> Tuple[boo
     fill_err: Optional[str] = None
     if not live_val:
         return False, extra
+    # Month/select dropdowns: page.fill() on <select> silently fails.
+    try:
+        is_select = await page.evaluate(
+            "(s) => { var e = document.querySelector(s); return !!(e && e.tagName === 'SELECT'); }",
+            selector,
+        )
+        if is_select:
+            ok, used = await _smart_select_option(page, selector, live_val, "label")
+            if ok:
+                extra["filled_sample"] = (used or live_val)[:30]
+                extra["fill_strategy"] = "select"
+                return True, extra
+    except Exception:
+        pass
     try:
         await page.fill(selector, live_val, timeout=6000)
         _got = await page.evaluate(

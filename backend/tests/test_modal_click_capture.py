@@ -154,8 +154,28 @@ def test_live_click_captured_force_fallback_after_normal_fails():
     assert loc.force is True
 
 
+def test_live_click_captured_prefers_coordinate_robust_click():
+    """Grey React CTAs: coordinate pointer-click runs before id locator."""
+    page = _StubPage()
+    info = {
+        "id": "cpa_linkout_btn",
+        "tag": "BUTTON",
+        "text": "START DEAL",
+        "x": 200,
+        "y": 400,
+        "attrs": {"id": "cpa_linkout_btn"},
+    }
+    ok = asyncio.run(_live_click_captured(page, info))
+    assert ok is True
+    page.evaluate.assert_called_once()
+    loc = page.locator("#cpa_linkout_btn")
+    assert loc.clicked is False
+    page.mouse.click.assert_not_called()
+
+
 def test_live_click_captured_uses_id_locator():
     page = _StubPage()
+    page.evaluate = AsyncMock(return_value=False)
     info = {
         "id": "cpa_linkout_btn",
         "tag": "BUTTON",

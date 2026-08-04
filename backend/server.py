@@ -9206,6 +9206,13 @@ async def rut_create_job(
                 # IPs BEFORE the visits start. This closes the gap where
                 # the offer's tracker recorded duplicate blocked IPs.
                 _pp_unique_ip_seen: set = set()
+                _pp_targeting: Dict[str, Any] = {}
+                _pp_cc = (proxyjet_country or "").strip().upper()
+                if _pp_cc and _pp_cc != "ANY":
+                    _pp_targeting["country"] = _pp_cc
+                _pp_st = (proxyjet_state or "").strip().upper()
+                if _pp_st:
+                    _pp_targeting["state"] = _pp_st
                 _pp_res = await _pp_bulk(
                     user["id"], proxy_provider_id, int(total_clicks) or 1,
                     unique_ip_seen=_pp_unique_ip_seen,
@@ -9215,6 +9222,7 @@ async def rut_create_job(
                     # the provider config — no admin-flippable footgun.
                     strict_unique_ip=True,
                     skip_datacenter_ip=True,
+                    targeting=_pp_targeting or None,
                 )
                 if _pp_res.get("use_proxyjet"):
                     use_proxyjet_auto = True

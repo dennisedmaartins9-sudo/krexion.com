@@ -82,6 +82,49 @@ for _i, _m in enumerate(_MONTHS_FULL, start=1):
     _MONTH_LOOKUP[_m.lower()] = _i
     _MONTH_LOOKUP[_m.lower()[:3]] = _i
 
+_MONTH_HEADER_KEYS = frozenset({
+    "month", "birth_month", "birthmonth", "dob_month", "dmonth", "bmonth", "birth_m",
+})
+
+
+def is_month_header(name: str) -> bool:
+    """True when an Excel/header name refers to a birth-month field."""
+    k = (name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if k in _MONTH_HEADER_KEYS:
+        return True
+    return "month" in k and "amount" not in k and "monthly" not in k
+
+
+def month_name_for_form(value, *, abbrev: bool = False) -> str:
+    """Convert 1-12 (or 01 / 4.0 / Jun) to an English month label for text fill.
+
+    Used by Visual Recorder live fill and RUT ``fill`` steps where dropdown
+    variant expansion does not run. ``abbrev=True`` returns ``Jan``..``Dec``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float) and value == int(value):
+        raw = str(int(value))
+    elif isinstance(value, int) and not isinstance(value, bool):
+        raw = str(value)
+    else:
+        raw = str(value).strip()
+    if not raw:
+        return ""
+    if raw.lstrip("-").replace(".", "", 1).isdigit():
+        try:
+            n = int(float(raw))
+            if 1 <= n <= 12:
+                full = _MONTHS_FULL[n - 1]
+                return full[:3] if abbrev else full
+        except (ValueError, OverflowError):
+            pass
+    lower = raw.lower()
+    if lower in _MONTH_LOOKUP:
+        full = _MONTHS_FULL[_MONTH_LOOKUP[lower] - 1]
+        return full[:3] if abbrev else full
+    return raw
+
 # ── Boolean-ish ──────────────────────────────────────────────────────────
 _TRUE_TOKENS = {"y", "yes", "true", "1", "on", "checked"}
 _FALSE_TOKENS = {"n", "no", "false", "0", "off", "unchecked"}
@@ -360,6 +403,8 @@ def expand_value_variants(value) -> List[str]:
 __all__ = [
     "expand_value_variants",
     "is_date_like",
+    "is_month_header",
+    "month_name_for_form",
     "US_STATES",
     "CA_PROVINCES",
 ]

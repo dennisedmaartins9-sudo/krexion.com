@@ -60,6 +60,18 @@ def test_month_name_to_number():
     _contains(v, "June", "6", "06", "Jun")
 
 
+def test_month_name_for_form_numeric():
+    from value_normalizer import month_name_for_form, is_month_header
+    assert month_name_for_form(1) == "January"
+    assert month_name_for_form("4") == "April"
+    assert month_name_for_form(4.0) == "April"
+    assert month_name_for_form("11") == "November"
+    assert month_name_for_form("Jun") == "June"
+    assert is_month_header("month")
+    assert is_month_header("birth_month")
+    assert not is_month_header("amount")
+
+
 def test_month_zero_padded():
     v = expand_value_variants("06")
     _contains(v, "06", "6", "June", "Jun")
