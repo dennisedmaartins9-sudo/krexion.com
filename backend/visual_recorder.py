@@ -641,6 +641,39 @@ def _promote_step_locators(step: Dict[str, Any]) -> None:
     _attach_selector_and_xpath(step, info)
 
 
+def _rebuild_evaluate_click_from_step(step: Dict[str, Any]) -> None:
+    """Rebuild embedded click JS after Edit Step changes selector/xpath."""
+    if (step.get("action") or "").lower() != "evaluate":
+        return
+    fb = step.get("fallbacks") if isinstance(step.get("fallbacks"), dict) else {}
+    text = (fb.get("text") or step.get("hint_text") or "").strip()
+    if not text and isinstance(step.get("script"), str):
+        for pat in (r"var\s+t\s*=\s*'((?:[^'\\]|\\.)*)'", r"text\s*===\s*'((?:[^'\\]|\\.)*)'"):
+            m = re.search(pat, step["script"])
+            if m:
+                text = m.group(1).replace("\\'", "'").replace("\\\\", "\\").strip()
+                break
+    attrs = fb.get("attrs") if isinstance(fb.get("attrs"), dict) else {}
+    sel = (step.get("selector") or "").strip()
+    xp = (step.get("xpath") or fb.get("xpath") or "").strip()
+    xpa = (step.get("xpath_abs") or fb.get("xpath_abs") or "").strip()
+    el_id = (attrs.get("id") or "").strip()
+    if sel.startswith("#") and len(sel) > 1 and not el_id:
+        el_id = sel[1:]
+    if not text and not sel and not xp:
+        return
+    info: Dict[str, Any] = {
+        "id": el_id,
+        "tag": (fb.get("tag") or "").strip(),
+        "attrs": attrs,
+        "xpath_stable": xp,
+        "xpath_abs": xpa,
+        "text": text,
+    }
+    rebuilt = _build_text_click_evaluate(text or " ", info)
+    step["script"] = rebuilt["script"]
+
+
 def _build_text_click_evaluate(text: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """JS that finds an element by visible text and clicks it.
 
@@ -872,9 +905,10 @@ _ROBUST_CLICK_AT_POINT_JS = """([x, y]) => {
     var cy = r.top + r.height / 2;
     ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
       try {
-        el.dispatchEvent(new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
-        }));
+        var ev = (type.indexOf('pointer') === 0)
+          ? new PointerEvent(type, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+          : new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 });
+        el.dispatchEvent(ev);
       } catch (e) {}
     });
     if (el.tagName === 'A' && el.href && !el.target) {
@@ -940,9 +974,10 @@ _ROBUST_CLICK_AT_POINT_JS = """([x, y]) => {
 async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
     """Perform a live click using captured element metadata (modal/iframe aware).
 
-    Tries, in order: coordinate robust JS click, frame_locator chain + CSS
-    locators, top-level locators, selector-priority JS as replay, then
-    coordinate mouse.click as last resort.
+    Tries, in order: trusted Playwright mouse click at coords (same as Move
+    tool — works on modal YES/NO / START DEAL), coordinate robust JS,
+    frame_locator chain + CSS locators, top-level locators, selector-priority
+    JS as replay, then mouse.click again as last resort.
     """
     if not info or not isinstance(info, dict):
         return False
@@ -953,13 +988,29 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
         iframe_path = []
     locators = _locator_candidates_from_info(info)
 
-    # 0. Coordinate robust click first — best for React Continue CTAs that
-    # look enabled but ignore plain Playwright .click().
+    click_x = float(info.get("x", 0))
+    click_y = float(info.get("y", 0))
+
+    async def _trusted_mouse_click() -> bool:
+        """Playwright trusted pointer events — matches navigate_only_click (Move)."""
+        if click_x <= 0 or click_y <= 0:
+            return False
+        try:
+            await page.mouse.move(click_x, click_y)
+            await page.mouse.click(click_x, click_y)
+            return True
+        except Exception:
+            return False
+
+    # 0. Trusted mouse click FIRST — modal popup buttons (YES/NO/START DEAL)
+    # respond to this but often ignore synthetic JS dispatchEvent clicks.
+    if await _trusted_mouse_click():
+        return True
+
+    # 1. Coordinate robust JS (pointer events + elementsFromPoint stack)
     try:
-        x = float(info.get("x", 0))
-        y = float(info.get("y", 0))
-        if x > 0 and y > 0:
-            clicked = await page.evaluate(_ROBUST_CLICK_AT_POINT_JS, [x, y])
+        if click_x > 0 and click_y > 0:
+            clicked = await page.evaluate(_ROBUST_CLICK_AT_POINT_JS, [click_x, click_y])
             if clicked:
                 return True
     except Exception:
@@ -1018,15 +1069,9 @@ async def _live_click_captured(page: Any, info: Dict[str, Any]) -> bool:
         except Exception:
             pass
 
-    # 4. Coordinate fallback
-    try:
-        x = float(info.get("x", 0))
-        y = float(info.get("y", 0))
-        if x > 0 and y > 0:
-            await page.mouse.click(x, y)
-            return True
-    except Exception:
-        pass
+    # 5. Last resort — trusted mouse again (in case locators moved the overlay)
+    if await _trusted_mouse_click():
+        return True
 
     return False
 
@@ -3243,6 +3288,9 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
                 _xp = (info.get("xpath_stable") or info.get("xpath_abs") or "").strip() if isinstance(info, dict) else ""
                 if _xp and not step.get("xpath"):
                     step["xpath"] = _xp
+                _xpa = (info.get("xpath_abs") or "").strip() if isinstance(info, dict) else ""
+                if _xpa and _xpa != _xp and not step.get("xpath_abs"):
+                    step["xpath_abs"] = _xpa
             except Exception:
                 # Never let a cosmetic-only enhancement break recording.
                 pass
@@ -4666,7 +4714,9 @@ async def navigate_only_click(sess: RecorderSession, x: int, y: int) -> Dict[str
     sess.touch()
     async with sess.lock:
         try:
-            await sess.page.mouse.click(int(x), int(y))
+            ix, iy = int(x), int(y)
+            await sess.page.mouse.move(ix, iy)
+            await sess.page.mouse.click(ix, iy)
         except Exception as e:  # noqa: BLE001
             return {"clicked": False, "error": f"{type(e).__name__}: {e}"}
     return {"clicked": True, "recorded": False}
@@ -4690,9 +4740,10 @@ _ROBUST_CLICK_SELECTOR_JS = """(sel) => {
     var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
     ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (type) {
       try {
-        el.dispatchEvent(new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy
-        }));
+        var ev = (type.indexOf('pointer') === 0)
+          ? new PointerEvent(type, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+          : new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 });
+        el.dispatchEvent(ev);
       } catch (e) {}
     });
     if (el.tagName === 'A' && el.href && !el.target) {
@@ -5076,7 +5127,7 @@ _EDITABLE_STEP_FIELDS = {
     # `step["xpath"]` set inside click_at). Replay engine reads this
     # via `_step_fallbacks` so the value participates in the rescue
     # chain even though the primary mechanism remains the embedded JS.
-    "xpath",
+    "xpath", "xpath_abs",
     # 2026-05 — random-pick advanced editor. Lets the operator edit
     # an existing evaluate step to add per-option selector/xpath
     # fallbacks. See _build_random_pick_advanced.
@@ -5123,11 +5174,22 @@ def update_step(sess: RecorderSession, index: int, patch: Dict[str, Any]) -> Dic
             v_clean = v.strip()
             if k in ("value", "name", "match_by", "state"):
                 step[k] = v_clean or None
-            elif k in ("selector", "key"):
-                # Selector / key are required-ish — keep as empty string
-                # if user explicitly cleared (caller's responsibility to
-                # validate before saving in the UI).
+            elif k in ("selector", "key", "xpath", "xpath_abs"):
                 step[k] = v_clean
+                if k == "xpath" and v_clean:
+                    fb_sync = dict(step["fallbacks"]) if isinstance(step.get("fallbacks"), dict) else {}
+                    fb_sync["xpath"] = v_clean
+                    step["fallbacks"] = fb_sync
+                elif k == "xpath_abs" and v_clean:
+                    fb_sync = dict(step["fallbacks"]) if isinstance(step.get("fallbacks"), dict) else {}
+                    fb_sync["xpath_abs"] = v_clean
+                    step["fallbacks"] = fb_sync
+                elif k == "selector" and v_clean.startswith("#"):
+                    fb_sync = dict(step["fallbacks"]) if isinstance(step.get("fallbacks"), dict) else {}
+                    attrs = dict(fb_sync.get("attrs") or {}) if isinstance(fb_sync.get("attrs"), dict) else {}
+                    attrs["id"] = v_clean[1:]
+                    fb_sync["attrs"] = attrs
+                    step["fallbacks"] = fb_sync
             else:
                 step[k] = v_clean
             applied[k] = step[k]
@@ -5210,6 +5272,13 @@ def update_step(sess: RecorderSession, index: int, patch: Dict[str, Any]) -> Dic
         else:
             step[k] = v
             applied[k] = v
+    if (step.get("action") or "").lower() == "evaluate":
+        if any(k in applied for k in ("selector", "xpath", "xpath_abs", "fallbacks")):
+            try:
+                _rebuild_evaluate_click_from_step(step)
+                applied["script"] = "rebuilt"
+            except Exception:
+                pass
     return {"updated": True, "applied": applied, "step": step, "_old_selector": old_selector}
 
 

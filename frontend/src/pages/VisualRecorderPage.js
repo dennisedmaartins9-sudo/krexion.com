@@ -3120,6 +3120,8 @@ export default function VisualRecorderPage() {
       draft: {
         action: s.action || "",       // read-only display
         selector: s.selector || "",
+        xpath: s.xpath || fb.xpath || "",
+        xpath_abs: s.xpath_abs || fb.xpath_abs || "",
         value: s.value != null ? String(s.value) : "",
         timeout: s.timeout != null ? String(s.timeout) : "",
         key: s.key || "",
@@ -3482,6 +3484,8 @@ export default function VisualRecorderPage() {
     const patch = {};
     const action = (draft.action || "").toLowerCase();
     if (draft.selector !== undefined) patch.selector = draft.selector;
+    if (draft.xpath !== undefined) patch.xpath = draft.xpath;
+    if (draft.xpath_abs !== undefined) patch.xpath_abs = draft.xpath_abs;
     if (draft.name !== undefined) patch.name = draft.name;
     if (action === "fill" || action === "type" || action === "select") {
       patch.value = draft.value;
@@ -6213,6 +6217,7 @@ export default function VisualRecorderPage() {
                       />
                       <div className="text-zinc-500 truncate">
                         {s.selector && <span>sel: <code className="text-zinc-400">{s.selector.slice(0, 28)}</code></span>}
+                        {s.xpath && <span className="ml-1">xp: <code className="text-sky-400/80">{s.xpath.slice(0, 24)}</code></span>}
                         {s.value && <span> → {String(s.value).slice(0, 30)}</span>}
                         {s.ms && <span>{s.ms}ms</span>}
                         {s.timeout && !s.ms && <span>tout: {s.timeout}</span>}
@@ -7884,6 +7889,28 @@ export default function VisualRecorderPage() {
                     className="w-full px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-700 focus:border-amber-500 text-zinc-200 text-xs font-mono outline-none"
                     data-testid="vr-edit-selector"
                   />
+                  {/* XPath — dedicated field (CSS selector ke neeche) */}
+                  <div className="mt-2">
+                    <label className="block text-[11px] text-zinc-400 mb-1">
+                      XPath{" "}
+                      <span className="text-zinc-600">
+                        (stable path — e.g. <code>{`//button[@id="cpa_linkout_btn"]`}</code>)
+                      </span>
+                    </label>
+                    <input
+                      type="text"
+                      value={editingStep.draft.xpath || ""}
+                      onChange={(e) =>
+                        setEditingStep({
+                          ...editingStep,
+                          draft: { ...editingStep.draft, xpath: e.target.value },
+                        })
+                      }
+                      placeholder='//button[@id="cpa_linkout_btn"]'
+                      className="w-full px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-700 focus:border-sky-500 text-zinc-200 text-xs font-mono outline-none"
+                      data-testid="vr-edit-xpath"
+                    />
+                  </div>
                   {/* Suggestions panel */}
                   {selectorSuggest.items !== null && (
                     <div className="mt-2 rounded border border-emerald-700/30 bg-emerald-950/20 p-2">

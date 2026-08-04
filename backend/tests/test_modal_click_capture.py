@@ -108,6 +108,7 @@ class _StubPage:
         self._locator_map: Dict[str, _StubLocator] = {}
         self.evaluate = AsyncMock(return_value=True)
         self.mouse = MagicMock()
+        self.mouse.move = AsyncMock(return_value=True)
         self.mouse.click = AsyncMock(return_value=True)
 
     def frame_locator(self, sel: str):
@@ -137,6 +138,8 @@ def test_rich_capture_prefers_interactive_in_modal():
 
 def test_live_click_captured_force_fallback_after_normal_fails():
     page = _StubPage()
+    page.mouse.move = AsyncMock(side_effect=RuntimeError("blocked"))
+    page.mouse.click = AsyncMock(side_effect=RuntimeError("blocked"))
     info = {
         "id": "cpa_linkout_btn",
         "tag": "BUTTON",
@@ -154,8 +157,8 @@ def test_live_click_captured_force_fallback_after_normal_fails():
     assert loc.force is True
 
 
-def test_live_click_captured_prefers_coordinate_robust_click():
-    """Grey React CTAs: coordinate pointer-click runs before id locator."""
+def test_live_click_captured_uses_trusted_mouse_first():
+    """Modal buttons: Playwright mouse.click first (same as Move tool)."""
     page = _StubPage()
     info = {
         "id": "cpa_linkout_btn",
@@ -167,14 +170,32 @@ def test_live_click_captured_prefers_coordinate_robust_click():
     }
     ok = asyncio.run(_live_click_captured(page, info))
     assert ok is True
-    page.evaluate.assert_called_once()
-    loc = page.locator("#cpa_linkout_btn")
-    assert loc.clicked is False
-    page.mouse.click.assert_not_called()
+    page.mouse.move.assert_called_once()
+    page.mouse.click.assert_called_once_with(200, 400)
+
+
+def test_live_click_captured_prefers_coordinate_robust_click():
+    """When mouse click fails, fall back to coordinate robust JS."""
+    page = _StubPage()
+    page.mouse.move = AsyncMock(side_effect=RuntimeError("blocked"))
+    page.mouse.click = AsyncMock(side_effect=RuntimeError("blocked"))
+    info = {
+        "id": "cpa_linkout_btn",
+        "tag": "BUTTON",
+        "text": "START DEAL",
+        "x": 200,
+        "y": 400,
+        "attrs": {"id": "cpa_linkout_btn"},
+    }
+    ok = asyncio.run(_live_click_captured(page, info))
+    assert ok is True
+    page.evaluate.assert_called()
 
 
 def test_live_click_captured_uses_id_locator():
     page = _StubPage()
+    page.mouse.move = AsyncMock(side_effect=RuntimeError("blocked"))
+    page.mouse.click = AsyncMock(side_effect=RuntimeError("blocked"))
     page.evaluate = AsyncMock(return_value=False)
     info = {
         "id": "cpa_linkout_btn",
