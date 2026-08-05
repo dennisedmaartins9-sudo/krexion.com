@@ -12481,6 +12481,9 @@ async def run_real_user_traffic_job(
                 await asyncio.sleep(min(0.5, target_t - time.time()))
         if cancel_event.is_set() or target_drain_event.is_set():
             return
+        # v2.6.64 — yield so Local PC Dashboard /api/desktop/* can run
+        # between paced visits (prevents false "Backend offline" during RUT).
+        await asyncio.sleep(0)
         async with semaphore:
             # Skip both on hard-cancel AND on target-drain. We haven't
             # picked any proxy / UA / lead row yet (those happen at the
@@ -12489,6 +12492,7 @@ async def run_real_user_traffic_job(
             # run to completion regardless of target_drain_event.
             if cancel_event.is_set() or target_drain_event.is_set():
                 return
+            await asyncio.sleep(0)
             # 2026-02 v2.6.13 — CONCURRENCY OBSERVABILITY
             # Log the moment this visit's process_one loop starts, so a
             # `grep RUT-PARALLEL` shows N visits entering process_one at

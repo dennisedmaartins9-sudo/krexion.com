@@ -25,7 +25,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -46,11 +46,164 @@ desktop_router = APIRouter(prefix="/api/desktop", tags=["desktop"])
 _db: Any = None
 _get_bridge_stats: Any = None
 
+# ── v2.6.64 — Non-blocking keepalive during RUT / Live Test ──────────
+# Problem: single uvicorn worker + Playwright RUT can starve the
+# asyncio event loop so /api/desktop/stats times out → dashboard shows
+# "Backend offline" even though KrexionBackend is RUNNING.
+# Fix: (1) cache last-good stats (2) thread sidecar on :8002 that always
+# answers (3) heavy-job busy counter so UI says "busy" not "crashed".
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_STATS_CACHE: dict[str, Any] = {}
+_STATS_CACHE_TS: float = 0.0
+_STATS_CACHE_LOCK = threading.Lock()
+_STATS_CACHE_TTL_S = 2.5
+
+_HEAVY_BUSY = 0
+_HEAVY_BUSY_LOCK = threading.Lock()
+_HEAVY_LABEL = ""
+
+_SIDECAR_SERVER: Any = None
+_SIDECAR_THREAD: Any = None
+_SIDECAR_PORT = int(os.environ.get("KREXION_DESKTOP_HEARTBEAT_PORT", "8002") or "8002")
+_PROCESS_STARTED_AT = time.time()
+
 
 def _bind(*, main_db, get_bridge_stats=None) -> None:
     global _db, _get_bridge_stats
     _db = main_db
     _get_bridge_stats = get_bridge_stats
+    if _is_local_mode():
+        try:
+            start_desktop_heartbeat_sidecar()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Desktop heartbeat sidecar failed to start: {exc}")
+
+
+def mark_heavy_job_busy(label: str = "heavy job") -> None:
+    """Call when RUT / Live Test / Form Filler starts on this PC."""
+    global _HEAVY_BUSY, _HEAVY_LABEL
+    with _HEAVY_BUSY_LOCK:
+        _HEAVY_BUSY += 1
+        _HEAVY_LABEL = (label or "heavy job")[:80]
+
+
+def mark_heavy_job_idle(label: str = "") -> None:
+    """Call when a heavy job finishes (success or fail)."""
+    global _HEAVY_BUSY, _HEAVY_LABEL
+    with _HEAVY_BUSY_LOCK:
+        _HEAVY_BUSY = max(0, _HEAVY_BUSY - 1)
+        if _HEAVY_BUSY == 0:
+            _HEAVY_LABEL = ""
+        elif label:
+            _HEAVY_LABEL = (label or _HEAVY_LABEL)[:80]
+
+
+def heavy_job_status() -> dict:
+    with _HEAVY_BUSY_LOCK:
+        n = int(_HEAVY_BUSY)
+        label = _HEAVY_LABEL
+    return {"busy": n > 0, "active_count": n, "label": label}
+
+
+def _cache_stats_payload(payload: dict) -> None:
+    global _STATS_CACHE, _STATS_CACHE_TS
+    with _STATS_CACHE_LOCK:
+        _STATS_CACHE = dict(payload)
+        _STATS_CACHE_TS = time.time()
+
+
+def _cached_stats_payload(*, max_age_s: float = 30.0) -> Optional[dict]:
+    with _STATS_CACHE_LOCK:
+        if not _STATS_CACHE:
+            return None
+        age = time.time() - _STATS_CACHE_TS
+        if age > max_age_s:
+            return None
+        out = dict(_STATS_CACHE)
+        out["_cache_age_s"] = round(age, 2)
+        out["_from_cache"] = True
+        return out
+
+
+def _heartbeat_snapshot() -> dict:
+    """Tiny payload the sidecar always returns — never touches Mongo/Playwright."""
+    busy = heavy_job_status()
+    cached = _cached_stats_payload(max_age_s=120.0) or {}
+    return {
+        "ok": True,
+        "alive": True,
+        "mode": (os.environ.get("KREXION_MODE") or "local").lower(),
+        "backend_version": _read_version(),
+        "uptime_s": int(time.time() - _PROCESS_STARTED_AT),
+        "heavy": busy,
+        "sidecar": True,
+        "sidecar_port": _SIDECAR_PORT,
+        "main_port": 8001,
+        "cached_stats": bool(cached),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class _HeartbeatHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        return  # silence access log spam
+
+    def _send_json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = (self.path or "/").split("?", 1)[0]
+        if path in ("/ping", "/api/desktop/ping", "/"):
+            self._send_json(200, _heartbeat_snapshot())
+            return
+        if path in ("/stats", "/api/desktop/stats"):
+            cached = _cached_stats_payload(max_age_s=120.0)
+            if cached is not None:
+                cached = dict(cached)
+                cached["heavy"] = heavy_job_status()
+                cached["sidecar"] = True
+                self._send_json(200, cached)
+                return
+            self._send_json(200, _heartbeat_snapshot())
+            return
+        self._send_json(404, {"ok": False, "error": "not found"})
+
+
+def start_desktop_heartbeat_sidecar(port: Optional[int] = None) -> dict:
+    """Start (or no-op) the threaded keepalive HTTP server on 127.0.0.1."""
+    global _SIDECAR_SERVER, _SIDECAR_THREAD, _SIDECAR_PORT
+    if not _is_local_mode():
+        return {"started": False, "reason": "cloud mode"}
+    if _SIDECAR_SERVER is not None:
+        return {"started": True, "already": True, "port": _SIDECAR_PORT}
+    p = int(port or _SIDECAR_PORT or 8002)
+    _SIDECAR_PORT = p
+
+    def _run() -> None:
+        global _SIDECAR_SERVER
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", p), _HeartbeatHandler)
+            srv.daemon_threads = True
+            _SIDECAR_SERVER = srv
+            logger.info(f"Desktop heartbeat sidecar listening on 127.0.0.1:{p}")
+            srv.serve_forever(poll_interval=0.5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Desktop heartbeat sidecar stopped: {exc}")
+            _SIDECAR_SERVER = None
+
+    t = threading.Thread(target=_run, name="krexion-desktop-heartbeat", daemon=True)
+    _SIDECAR_THREAD = t
+    t.start()
+    return {"started": True, "port": p}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -521,18 +674,32 @@ async def _dependency_health() -> dict:
 
 # ── Routes ──────────────────────────────────────────────────────────
 
+@desktop_router.get("/ping")
+async def desktop_ping():
+    """Ultra-light liveness for the Local PC Dashboard. Never hits Mongo
+    or Playwright — safe to call every 2s even during RUT."""
+    return _heartbeat_snapshot()
+
+
 @desktop_router.get("/stats")
 async def desktop_stats():
     """One-shot snapshot the PyWebView dashboard polls every 2s. We
     keep it heterogeneous (system + license + jobs + cloud-link +
     dependency-health) so the dashboard makes ONE request, not five.
+
+    v2.6.64 — Prefer a fresh cache (<=2.5s) so concurrent RUT workers
+    don't pile Mongo/psutil work onto the event loop. Sync get_specs()
+    runs in a thread pool. Soft timeouts on DB sections.
     """
-    # Lazy import — keeps the cloud edge clean (system_info is shipped
-    # with the desktop bundle, not necessarily present in production
-    # Docker containers).
+    # Serve very-fresh cache immediately (RUT-friendly).
+    cached = _cached_stats_payload(max_age_s=_STATS_CACHE_TTL_S)
+    if cached is not None:
+        cached["heavy"] = heavy_job_status()
+        return cached
+
+    loop = asyncio.get_running_loop()
     try:
-        from desktop.system_info import get_specs  # type: ignore
-        system = get_specs()
+        system = await loop.run_in_executor(None, _safe_get_specs)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"system_info unavailable on this host: {exc}")
         system = {
@@ -541,32 +708,70 @@ async def desktop_stats():
             "detected_by": "fallback",
         }
 
-    db_health = await _db_health()
-    cloud_link = await _cloud_link_status()
-    jobs = await _active_and_recent_jobs() if _is_local_mode() else {
-        "active": [], "recent": [],
-        "throughput": {"jobs_per_hour": 0, "success_rate_pct": 0},
-    }
-    # v2.1.59 — dependency health so dashboard can show which features
-    # are usable right now vs still installing.
     try:
-        deps = await _dependency_health() if _is_local_mode() else {}
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"dependency health check failed: {exc}")
+        db_health = await asyncio.wait_for(_db_health(), timeout=2.5)
+    except Exception:  # noqa: BLE001
+        db_health = {"connected": False, "collections": 0, "last_error": "timeout"}
+
+    try:
+        cloud_link = await asyncio.wait_for(_cloud_link_status(), timeout=1.5)
+    except Exception:  # noqa: BLE001
+        cloud_link = {"connected": False, "last_sync_age": None}
+
+    if _is_local_mode():
+        try:
+            jobs = await asyncio.wait_for(_active_and_recent_jobs(), timeout=2.5)
+        except Exception:  # noqa: BLE001
+            jobs = {
+                "active": [], "recent": [],
+                "throughput": {"jobs_per_hour": 0, "success_rate_pct": 0},
+            }
+        try:
+            deps = await asyncio.wait_for(_dependency_health(), timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"dependency health check failed: {exc}")
+            deps = {}
+    else:
+        jobs = {
+            "active": [], "recent": [],
+            "throughput": {"jobs_per_hour": 0, "success_rate_pct": 0},
+        }
         deps = {}
 
-    return {
+    try:
+        license_info = await loop.run_in_executor(None, _read_license_summary)
+    except Exception:  # noqa: BLE001
+        license_info = {"active": False, "email": None, "expires_at": None, "key_tail": None}
+
+    payload = {
         "ok": True,
         "mode": (os.environ.get("KREXION_MODE") or "local").lower(),
         "backend_version": _read_version(),
         "system": system,
         "database": db_health,
         "cloud": cloud_link,
-        "license": _read_license_summary(),
+        "license": license_info,
         "jobs": jobs,
         "dependencies": deps,
+        "heavy": heavy_job_status(),
+        "heartbeat_port": _SIDECAR_PORT if _is_local_mode() else None,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    _cache_stats_payload(payload)
+    return payload
+
+
+def _safe_get_specs() -> dict:
+    try:
+        from desktop.system_info import get_specs  # type: ignore
+        return get_specs()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"system_info unavailable: {exc}")
+        return {
+            "ram_gb": 0, "cpu_cores": 0, "ram_used_gb": 0, "ram_used_pct": 0,
+            "cpu_pct": 0, "tier": "unknown", "max_concurrent_heavy_jobs": 2,
+            "detected_by": "fallback",
+        }
 
 
 @desktop_router.post("/run-update")

@@ -7878,6 +7878,25 @@ async def _rut_prepare_and_run(
     # visits have started yet (Live Activity dialog uses idx as cursor).
     _prep_step_counter = {"n": 0}
 
+    # v2.6.64 — keep Local PC Dashboard responsive during RUT
+    _kx_busy_cleared = {"v": False}
+
+    def _kx_clear_busy() -> None:
+        if _kx_busy_cleared["v"]:
+            return
+        _kx_busy_cleared["v"] = True
+        try:
+            from desktop_module import mark_heavy_job_idle as _kx_idle
+            _kx_idle()
+        except Exception:
+            pass
+
+    try:
+        from desktop_module import mark_heavy_job_busy as _kx_busy
+        _kx_busy(f"RUT {job_id[:8]}")
+    except Exception:
+        pass
+
     async def _set_step(step_label: str) -> None:
         """Update the job's `prep_step` field so the UI can show what
         prep phase is currently running. Also ensures status is flipped
@@ -7938,6 +7957,7 @@ async def _rut_prepare_and_run(
             pass
 
     async def _mark_failed(reason: str) -> None:
+        _kx_clear_busy()
         try:
             await db.real_user_traffic_jobs.update_one(
                 {"job_id": job_id},
@@ -8744,6 +8764,8 @@ async def _rut_prepare_and_run(
     except Exception as e:  # noqa: BLE001
         logger.exception(f"_rut_prepare_and_run crashed for job {job_id}: {e}")
         await _mark_failed(f"Prep/run crashed: {e}")
+    finally:
+        _kx_clear_busy()
 
 
 # ── Data-file preview (auto-detect states, columns, quality) ─────────
@@ -23028,15 +23050,29 @@ async def vr_live_test(session_id: str, req: _VRLiveTestReq, user: dict = Depend
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
     _vr_require_ready(sess)
-    return await vr.live_test(
-        sess,
-        sample_row=req.sample_row,
-        fresh_page=req.fresh_page,
-        start_index=max(0, int(req.start_index or 0)),
-        rut_parity=bool(req.rut_parity),
-        self_heal=req.self_heal,
-        skip_captcha=req.skip_captcha,
-    )
+    _kx_idle = None
+    try:
+        from desktop_module import mark_heavy_job_busy, mark_heavy_job_idle
+        mark_heavy_job_busy("Visual Recorder Live Test")
+        _kx_idle = mark_heavy_job_idle
+    except Exception:
+        pass
+    try:
+        return await vr.live_test(
+            sess,
+            sample_row=req.sample_row,
+            fresh_page=req.fresh_page,
+            start_index=max(0, int(req.start_index or 0)),
+            rut_parity=bool(req.rut_parity),
+            self_heal=req.self_heal,
+            skip_captcha=req.skip_captcha,
+        )
+    finally:
+        try:
+            if _kx_idle:
+                _kx_idle()
+        except Exception:
+            pass
 
 
 @api_router.get("/visual-recorder/{session_id}/diagnostics")

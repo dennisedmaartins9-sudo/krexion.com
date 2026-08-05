@@ -10,6 +10,7 @@
  */
 
 const LOCAL = "http://127.0.0.1:8001";
+const LOCAL_HEARTBEAT = "http://127.0.0.1:8002";
 const CLOUD = "https://krexion.com";
 
 const POLL_LOCAL_MS = 2000;
@@ -80,22 +81,62 @@ function setPill(id, label, variant) {
 }
 
 /* ── Poll local backend ─────────────────────────────────────────── */
+async function fetchWithTimeout(url, ms) {
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { cache: "no-store", signal: ac.signal });
+  } finally {
+    clearTimeout(to);
+  }
+}
+
 async function pollLocal() {
   try {
     // Explicit 4 s per-poll timeout using AbortController so we can
     // distinguish "connection refused" (backend service dead) from
     // "backend hung on this request" — both show up in _diag.lastError
     // instead of the browser's opaque generic TypeError.
-    const ac = new AbortController();
-    const to = setTimeout(() => ac.abort(), 4000);
+    //
+    // v2.6.64 — During RUT the main :8001 loop can be busy. Fall back
+    // to the threaded heartbeat sidecar on :8002 so we never false-
+    // alarm "Backend offline" while visits are still running.
     let r;
+    let fromSidecar = false;
     try {
-      r = await fetch(`${LOCAL}/api/desktop/stats`, { cache: "no-store", signal: ac.signal });
-    } finally {
-      clearTimeout(to);
+      r = await fetchWithTimeout(`${LOCAL}/api/desktop/stats`, 4000);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } catch (mainErr) {
+      try {
+        r = await fetchWithTimeout(`${LOCAL_HEARTBEAT}/stats`, 2000);
+        if (!r.ok) {
+          r = await fetchWithTimeout(`${LOCAL_HEARTBEAT}/ping`, 1500);
+        }
+        if (!r.ok) throw mainErr;
+        fromSidecar = true;
+      } catch (_) {
+        throw mainErr;
+      }
     }
-    if (!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
+
+    // Sidecar-only ping (no full stats) — backend is ALIVE / BUSY, not crashed.
+    if (fromSidecar && (d.sidecar || d.alive) && !d.system) {
+      _diag.everSucceeded = true;
+      _diag.lastSuccessAt = Date.now();
+      _diag.consecutiveFailures = 0;
+      _diag.firstFailAt = 0;
+      hideDiagnosePanel();
+      const busy = !!(d.heavy && d.heavy.busy);
+      setPill("connection-pill", busy ? "Backend busy (RUT)" : "Backend alive", busy ? "warn" : "");
+      setDot("backend-dot", busy ? "warn" : "ok");
+      setText("backend-detail",
+        busy
+          ? `heavy job running${d.heavy && d.heavy.label ? " · " + d.heavy.label : ""} — visits continue normally`
+          : "main API briefly busy — heartbeat OK");
+      setText("version-pill", "v" + (d.backend_version || "—"));
+      return;
+    }
 
     // v2.1.79 — reset diagnostic state on ANY success; dismiss panel.
     _diag.firstFailAt = 0;
@@ -108,11 +149,17 @@ async function pollLocal() {
     _diag.autoRepairResult = null;
     hideDiagnosePanel();
 
-    setPill("connection-pill", "Backend Online", "ok");
+    const heavyBusy = !!(d.heavy && d.heavy.busy);
+    setPill("connection-pill",
+      heavyBusy ? "Backend busy (job running)" : "Backend Online",
+      heavyBusy ? "warn" : "ok");
 
     // ── Services ─────────────────────────
-    setDot("backend-dot", "ok");
-    setText("backend-detail", d.backend_version ? `running · ${d.backend_version}` : "running");
+    setDot("backend-dot", heavyBusy ? "warn" : "ok");
+    setText("backend-detail",
+      heavyBusy
+        ? `job running${d.heavy.label ? " · " + d.heavy.label : ""} · v${d.backend_version || "—"}`
+        : (d.backend_version ? `running · ${d.backend_version}` : "running"));
     setDot("db-dot", d.database?.connected ? "ok" : "danger");
     setText("db-detail", d.database?.connected
       ? `connected · ${d.database.collections || 0} collections`
