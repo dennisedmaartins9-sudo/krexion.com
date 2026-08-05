@@ -101,19 +101,39 @@ def find_full_chromium_executable() -> Optional[str]:
 
 def find_headless_shell_executable() -> Optional[str]:
     """The lightweight chromium-headless-shell that ships with
-    Playwright. Returns None if the user hasn't run `playwright install`
-    yet (rare — `real_user_traffic._ensure_chromium_ready()` keeps it
-    installed)."""
+    Playwright. Searches PLAYWRIGHT_BROWSERS_PATH + native Krexion
+    browser-engine roots (Windows installer path included)."""
     try:
-        browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
-        # Playwright uses BOTH layouts depending on rev:
-        #   chromium-headless-shell-<rev>/chrome-linux/headless_shell  (newer)
-        #   chromium_headless_shell-<rev>/chrome-linux/headless_shell  (older)
-        for glob in ("chromium-headless-shell-*", "chromium_headless_shell-*"):
-            for p in Path(browsers_root).glob(glob):
-                for cand in p.rglob("headless_shell*"):
-                    if cand.is_file() and os.access(str(cand), os.X_OK):
-                        return str(cand)
+        roots: List[str] = []
+        env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_root:
+            roots.append(env_root)
+        roots.append("/pw-browsers")
+        # Native Windows installer default
+        roots.append(r"C:\Program Files\Krexion\browser-engine")
+        try:
+            from real_user_traffic import _browsers_search_roots  # type: ignore
+            for r in _browsers_search_roots():
+                roots.append(str(r))
+        except Exception:
+            pass
+        seen = set()
+        for browsers_root in roots:
+            if not browsers_root or browsers_root in seen:
+                continue
+            seen.add(browsers_root)
+            root = Path(browsers_root)
+            if not root.is_dir():
+                continue
+            # Playwright uses BOTH layouts depending on rev:
+            #   chromium-headless-shell-<rev>/.../headless_shell
+            #   chromium_headless_shell-<rev>/.../headless_shell(.exe)
+            for glob in ("chromium-headless-shell-*", "chromium_headless_shell-*"):
+                for p in root.glob(glob):
+                    for cand in p.rglob("headless_shell*"):
+                        name = cand.name.lower()
+                        if name in ("headless_shell", "headless_shell.exe") and cand.is_file():
+                            return str(cand)
         return None
     except Exception:
         return None

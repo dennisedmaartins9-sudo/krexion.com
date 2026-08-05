@@ -631,8 +631,10 @@ export default function RealUserTrafficPage() {
   const [proxyChainEnabled, setProxyChainEnabled] = useState(false);
   const [proxyChainUseTor, setProxyChainUseTor] = useState(true);
   const [proxyChainExtraHops, setProxyChainExtraHops] = useState("");
-  const [browserVariant, setBrowserVariant] = useState("auto");
+  const [browserVariant, setBrowserVariant] = useState("chromium"); // Full Chromium ON by default (strict offers)
   const [adCapabilities, setAdCapabilities] = useState(null);
+  const fullChromiumOn = browserVariant !== "headless-shell";
+  const setFullChromiumOn = (on) => setBrowserVariant(on ? "chromium" : "headless-shell");
 
   // ── 2026-02 v2.1.31 — Step 4: Phase-4 Anti-Detect ──
   const [behavioralBioEnabled, setBehavioralBioEnabled] = useState(true);
@@ -937,7 +939,7 @@ export default function RealUserTrafficPage() {
         }
       })
       .catch(() => { /* silent — UI keeps its hard-coded fallback */ });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Smart Funnel pattern list (Reward, Auto, etc.) from backend
@@ -3547,8 +3549,52 @@ export default function RealUserTrafficPage() {
                 className="mt-1 bg-zinc-800 border-zinc-700 text-zinc-100"
               />
               <p className="text-xs text-gray-500 mt-1">
-                Recommended: 20-30 (safe) | 40-50 (ultra speed)
+                Jo number likho utni parallel visits. 8 GB PC pe 1–3 usually smooth; zyada RAM pe higher OK. Customer decide karta hai.
               </p>
+            </div>
+            <div className="sm:col-span-2">
+              <div className="mt-1 p-3 rounded-lg border border-sky-500/30 bg-sky-950/15">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <Label className="text-sky-200 text-sm font-semibold">High Strict Offer</Label>
+                    <p className="text-xs text-zinc-400 mt-0.5">
+                      ON = Full Chromium (strict / IPQS). OFF = Headless-shell (soft offer, lighter PC).
+                    </p>
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer select-none shrink-0">
+                    <button
+                      type="button"
+                      data-testid="rut-full-chromium-toggle"
+                      role="switch"
+                      aria-checked={fullChromiumOn}
+                      aria-label="High Strict Offer"
+                      onClick={() => setFullChromiumOn(!fullChromiumOn)}
+                      className={`relative w-12 h-6 rounded-full transition-colors ${
+                        fullChromiumOn ? "bg-sky-500" : "bg-zinc-600"
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${
+                          fullChromiumOn ? "translate-x-6" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                    <span
+                      className={`text-sm font-semibold min-w-[2.5rem] ${
+                        fullChromiumOn ? "text-sky-300" : "text-zinc-500"
+                      }`}
+                      data-testid="rut-high-strict-offer-state"
+                    >
+                      {fullChromiumOn ? "ON" : "OFF"}
+                    </span>
+                  </label>
+                </div>
+                <p className="text-[11px] text-zinc-500 mt-2" data-testid="rut-browser-engine-hint">
+                  {fullChromiumOn
+                    ? "ON — Full Chromium (--headless=new). Best for high-strict / IPQS offers. Uses more RAM."
+                    : "OFF — Headless-shell (light Chrome). Fine for low-strict offers; easier on 8 GB PCs."}
+                </p>
+              </div>
             </div>
             <div>
               <Label className="text-zinc-300 text-sm">Stuck-Page Watchdog (sec) ⏱️</Label>
@@ -3595,15 +3641,16 @@ export default function RealUserTrafficPage() {
                       setTlsPrewarm(true);
                       setBehavioralBioEnabled(true);
                       setIpWarmupEnabled(true);
-                      setBrowserVariant("rotate");
+                      // Keep Browser Engine toggle (Full Chromium / Light)
+                      // — do not force "rotate" over the user's choice.
                       // Multi-hop proxy chain stays opt-in (heavy resource
                       // — Tor adds ~3-5s per visit). Auto-enable only when
                       // proxies list exists and customer wants paranoia.
                     } else {
                       // Reset heavy opt-ins only — production anti-detect
                       // baselines (TLS prewarm, IP warm-up, behavioral bio)
-                      // stay ON per v2.6.35 defaults.
-                      setBrowserVariant("auto");
+                      // stay ON per v2.6.35 defaults. Browser Engine toggle
+                      // stays as the operator left it.
                       setProxyChainEnabled(false);
                     }
                   }}
@@ -4777,22 +4824,18 @@ export default function RealUserTrafficPage() {
                 </p>
               </div>
               <div>
-                <Label className="text-zinc-300 text-sm">Browser Binary</Label>
+                <Label className="text-zinc-300 text-sm">Browser Binary (advanced)</Label>
                 <select
                   data-testid="rut-browser-variant"
                   value={browserVariant}
                   onChange={(e) => setBrowserVariant(e.target.value)}
                   className="mt-1 w-full bg-zinc-800 border border-zinc-700 text-zinc-100 rounded-md px-2 py-1.5 text-sm"
                 >
-                  <option value="auto">Auto (default — full chromium when available)</option>
-                  {adCapabilities?.browser_variants?.includes("chromium") && (
-                    <option value="chromium">Full Chromium (--headless=new)</option>
-                  )}
+                  <option value="chromium">Full Chromium (--headless=new) — strict offers</option>
+                  <option value="headless-shell">Headless-shell — light / soft offers</option>
+                  <option value="auto">Auto (prefer full chromium when installed)</option>
                   {adCapabilities?.browser_variants?.includes("brave") && (
                     <option value="brave">Brave Browser</option>
-                  )}
-                  {adCapabilities?.browser_variants?.includes("headless-shell") && (
-                    <option value="headless-shell">Chromium Headless-Shell (lightweight)</option>
                   )}
                   <option value="rotate">Rotate (random per job from installed binaries)</option>
                 </select>
@@ -4807,7 +4850,7 @@ export default function RealUserTrafficPage() {
                   </div>
                 )}
                 <p className="text-xs text-gray-500 mt-1">
-                  Defeats "100% Chromium" cohort tell. Brave path: set <code>KREXION_BRAVE_PATH</code> env or install at standard paths. Variants not present here will fall back to auto.
+                  Same as High Strict Offer toggle above (ON=Full Chromium, OFF=Headless-shell). Use this only for Brave / Rotate.
                 </p>
               </div>
             </div>

@@ -676,12 +676,15 @@ def _full_chromium_binary_path() -> Optional[Path]:
     return best[1] if best else None
 
 
+def lightweight_reporting_enabled() -> bool:
+    from hardware_tune import lightweight_reporting_enabled as _fn
+    return _fn()
+
+
 def _use_full_chromium() -> bool:
-    """Should we launch the full chromium (with --headless=new) instead of
-    the lightweight chromium-headless-shell? Yes when the binary is
-    installed AND the env override `KREXION_FORCE_HEADLESS_SHELL=1` is NOT
-    set (operators can flip this to revert if a new bug appears)."""
-    if os.environ.get("KREXION_FORCE_HEADLESS_SHELL", "").strip() in ("1", "true", "yes"):
+    """Prefer full chromium for stealth unless operator forced light shell."""
+    from hardware_tune import want_headless_shell
+    if want_headless_shell():
         return False
     return _full_chromium_binary_path() is not None
 
@@ -807,8 +810,19 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
                     "RUT browser variant: %s — exe=%s", engine, exe,
                 )
                 try:
+                    v_low = (variant or "").lower()
+                    # headless_shell binary is not a full Chrome — classic
+                    # headless=True. Full chromium/Brave use --headless=new
+                    # with headless=False so Playwright does not add legacy
+                    # --headless on top.
+                    use_classic_headless = (
+                        v_low == "headless-shell"
+                        or "headless_shell" in str(exe).lower()
+                        or "headless-shell" in str(exe).lower()
+                        or (engine or "").lower() == "headless-shell"
+                    )
                     return await pw.chromium.launch(
-                        headless=False,  # Brave/Chromium with --headless=new mode
+                        headless=use_classic_headless,
                         executable_path=exe,
                         args=[*args_extra, *_BROWSER_LAUNCH_ARGS_BASE],
                     )
@@ -821,8 +835,8 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
         except Exception as _v_err:  # noqa: BLE001
             logger.debug(f"browser_variants import/use failed: {_v_err}")
 
-    fc_exe = _full_chromium_binary_path()
-    if fc_exe is not None and not os.environ.get("KREXION_FORCE_HEADLESS_SHELL", "").strip() in ("1", "true", "yes"):
+    fc_exe = _full_chromium_binary_path() if _use_full_chromium() else None
+    if fc_exe is not None:
         # Prefer the pinned full-chromium binary path over Playwright's
         # channel lookup — guarantees we launch the exact revision that
         # matches our installed build (stronger anti-detect than shell).
@@ -1022,6 +1036,69 @@ def get_stream_mode(job_id: str, visit_idx: int) -> str:
     return _STREAM_MODE.get(_live_key(job_id, visit_idx), "off")
 
 
+def _downscale_live_jpeg(
+    jpeg_bytes: bytes,
+    *,
+    max_width: int = 800,
+    quality: int = 45,
+) -> bytes:
+    from hardware_tune import downscale_live_jpeg
+    return downscale_live_jpeg(jpeg_bytes, max_width=max_width, quality=quality)
+
+
+async def _capture_live_step_jpeg(
+    page: Any,
+    *,
+    job_id: Optional[str] = None,
+    visit_idx: Optional[int] = None,
+    force: bool = False,  # kept for call-site compat; always captures
+) -> str:
+    """Best-effort data-URL JPEG for live tiles / step progress.
+
+    Always captures (same as pre-v2.6.65 gate). Full page + downscale so
+    the preview stays light while the whole page remains visible.
+    Automation path is untouched.
+    """
+    mode = "off"
+    if job_id is not None and visit_idx is not None:
+        mode = get_stream_mode(job_id, visit_idx)
+    # Preview widths — readable on tiles, far fewer pixels than raw 1280+.
+    if mode == "expanded":
+        max_w, quality, capture_q = 960, 48, 55
+    elif mode == "grid":
+        max_w, quality, capture_q = 720, 42, 50
+    else:
+        max_w, quality, capture_q = 800, 42, 50
+    try:
+        import base64 as _b64
+        _shot = await page.screenshot(
+            type="jpeg",
+            quality=capture_q,
+            full_page=True,
+            timeout=4000,
+        )
+        if len(_shot) > 1_200_000:
+            _shot = await page.screenshot(
+                type="jpeg", quality=capture_q, full_page=False, timeout=2500,
+            )
+        _shot = await asyncio.to_thread(
+            _downscale_live_jpeg, _shot, max_width=max_w, quality=quality,
+        )
+        return "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
+    except Exception:
+        try:
+            import base64 as _b64
+            _shot = await page.screenshot(
+                type="jpeg", quality=50, full_page=False, timeout=2000,
+            )
+            _shot = await asyncio.to_thread(
+                _downscale_live_jpeg, _shot, max_width=max_w, quality=quality,
+            )
+            return "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
+        except Exception:
+            return ""
+
+
 async def set_stream_mode(job_id: str, visit_idx: int, mode: str) -> None:
     """Set stream mode + spin up/down the per-visit screenshot daemon."""
     mode = (mode or "off").lower().strip()
@@ -1064,14 +1141,14 @@ async def _live_streamer(job_id: str, visit_idx: int, page: Any) -> None:
             mode = _STREAM_MODE.get(key, "off")
             if mode == "off":
                 return
-            # Cadence by mode
+            # Cadence by mode — full-page capture + downscale so tiles show
+            # the whole page without high-res cost. Automation untouched.
             if mode == "expanded":
                 interval = 0.15  # ~6-7 fps
-                quality = 60
+                max_w, quality, capture_q = 960, 48, 55
             else:
-                interval = 0.70  # ~1.4 fps — fills the gaps between
-                                 # script-emitted screenshots
-                quality = 55
+                interval = 0.70  # ~1.4 fps
+                max_w, quality, capture_q = 720, 42, 50
             now = time.time()
             wait = max(0.0, interval - (now - last_capture))
             if wait > 0:
@@ -1081,8 +1158,16 @@ async def _live_streamer(job_id: str, visit_idx: int, page: Any) -> None:
                 if getattr(page, "is_closed", lambda: False)():
                     return
                 buf = await page.screenshot(
-                    type="jpeg", quality=quality, full_page=False,
-                    timeout=2500
+                    type="jpeg", quality=capture_q, full_page=True,
+                    timeout=3500,
+                )
+                if len(buf) > 1_200_000:
+                    buf = await page.screenshot(
+                        type="jpeg", quality=capture_q, full_page=False,
+                        timeout=2500,
+                    )
+                buf = await asyncio.to_thread(
+                    _downscale_live_jpeg, buf, max_width=max_w, quality=quality,
                 )
                 fail_streak = 0
                 import base64 as _b64
@@ -10895,30 +10980,51 @@ async def run_real_user_traffic_job(
                     # Each step is best-effort with its own timeout —
                     # transient SPAs that never reach networkidle still
                     # produce a useful screenshot via the fallback paths.
+                    #
+                    # ── 2026-08 light-weight (LOW/MICRO RAM) ──
+                    # Skip networkidle + use jpeg so 8 GB PCs don't burn
+                    # ~16s CPU/RAM per visit just for a Live Activity thumb.
+                    # Automation clicks/fills are unchanged.
                     try:
+                        _light_rep = lightweight_reporting_enabled()
                         try:
-                            await page.wait_for_load_state("load", timeout=8000)
+                            await page.wait_for_load_state(
+                                "load", timeout=4000 if _light_rep else 8000,
+                            )
                         except Exception:
                             pass
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=8000)
-                        except Exception:
-                            pass
+                        if not _light_rep:
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=8000)
+                            except Exception:
+                                pass
                         # Ensure something has actually painted — wait until
                         # body has non-zero height (covers SPAs that finish
                         # network early but still render JS shortly after).
                         try:
                             await page.wait_for_function(
                                 "() => document.body && document.body.scrollHeight > 100 && (document.body.innerText||'').trim().length > 0",
-                                timeout=4000,
+                                timeout=2000 if _light_rep else 4000,
                             )
                         except Exception:
                             pass
                         # Final paint settle so first-contentful-paint frame
                         # isn't captured mid-animation.
-                        await asyncio.sleep(0.25)
-                        landing_shot = shots_dir / f"visit_{i+1:05d}_landing.png"
-                        await page.screenshot(path=str(landing_shot), full_page=False, timeout=10000)
+                        await asyncio.sleep(0.1 if _light_rep else 0.25)
+                        if _light_rep:
+                            landing_shot = shots_dir / f"visit_{i+1:05d}_landing.jpg"
+                            await page.screenshot(
+                                path=str(landing_shot),
+                                type="jpeg",
+                                quality=50,
+                                full_page=False,
+                                timeout=5000,
+                            )
+                        else:
+                            landing_shot = shots_dir / f"visit_{i+1:05d}_landing.png"
+                            await page.screenshot(
+                                path=str(landing_shot), full_page=False, timeout=10000,
+                            )
                         push_live_step(job_id, i + 1, "landing", "ok",
                                        f"📷 1/4 URL fully loaded (HTTP {entry['http_status'] or '?'})",
                                        screenshot=landing_shot.name)
@@ -12018,10 +12124,27 @@ async def run_real_user_traffic_job(
                 # bad jo page ay os k ss ay". File lands in the results ZIP
                 # and is also pushed into the Live Activity panel so the
                 # user can click to enlarge.
+                #
+                # Light-weight (LOW/MICRO): viewport jpeg instead of
+                # full_page PNG — full-page scrapes multi-MB DOM on survey
+                # funnels and spikes RAM on 8 GB PCs.
                 try:
-                    post_shot_name = f"visit_{i+1:05d}_post_submit.png"
+                    _light_rep = lightweight_reporting_enabled()
+                    post_shot_name = (
+                        f"visit_{i+1:05d}_post_submit.jpg"
+                        if _light_rep else f"visit_{i+1:05d}_post_submit.png"
+                    )
                     post_shot_path = shots_dir / post_shot_name
-                    await page.screenshot(path=str(post_shot_path), full_page=True)
+                    if _light_rep:
+                        await page.screenshot(
+                            path=str(post_shot_path),
+                            type="jpeg",
+                            quality=55,
+                            full_page=False,
+                            timeout=8000,
+                        )
+                    else:
+                        await page.screenshot(path=str(post_shot_path), full_page=True)
                     entry["post_submit_screenshot"] = post_shot_name
                     push_live_step(
                         job_id, i + 1, "post_submit", "info",
@@ -12230,8 +12353,13 @@ async def run_real_user_traffic_job(
                                 pass
                             await asyncio.sleep(0.5)
                         # Reduced settle time from 1.2s to 0.3s for speed
-                        await asyncio.sleep(0.3)
-                        await page.screenshot(path=str(shot_path), full_page=True)
+                        await asyncio.sleep(0.15 if lightweight_reporting_enabled() else 0.3)
+                        # Light-weight: viewport only (full-page spikes RAM on surveys)
+                        await page.screenshot(
+                            path=str(shot_path),
+                            full_page=not lightweight_reporting_enabled(),
+                            timeout=8000,
+                        )
                         entry["screenshot"] = shot_path.name
                         # Push its own live-activity step with the explicit
                         # 4/4 label so users see all 4 checkpoints clearly
@@ -12312,8 +12440,12 @@ async def run_real_user_traffic_job(
                     try:
                         fail_shot = shots_dir / f"visit_{i+1:05d}_final.png"
                         # short settle so animations / errors render
-                        await asyncio.sleep(0.5)
-                        await page.screenshot(path=str(fail_shot), full_page=True, timeout=6000)
+                        await asyncio.sleep(0.25 if lightweight_reporting_enabled() else 0.5)
+                        await page.screenshot(
+                            path=str(fail_shot),
+                            full_page=not lightweight_reporting_enabled(),
+                            timeout=6000,
+                        )
                         entry["final_screenshot"] = fail_shot.name
                         # If no other screenshot field is set, use this for
                         # the visit row preview so the user always sees
@@ -12424,17 +12556,21 @@ async def run_real_user_traffic_job(
 
         await _record(job_id, entry, report, report_lock, db)
 
-    # Launch with concurrency + optional pacing
-    # Extreme speed mode: Max 50 concurrent workers for ultra-fast processing
-    # Can handle 100 conversions in 15-20 minutes with proper resources
-    # — but on low-RAM boxes (8 GB laptops) the operator can hard-cap the
-    # ceiling via RUT_MAX_CONCURRENCY env var so a careless slider value
-    # of 10 doesn't OOM the host. Defaults to 50 (the old hard ceiling).
-    _rut_hard_cap = max(1, int(os.environ.get("RUT_MAX_CONCURRENCY", "50")))
+    # Launch with concurrency + optional pacing.
+    # Customer chooses concurrency (UI 1–50). Optional env
+    # RUT_MAX_CONCURRENCY is a soft installer ceiling only (default 50) —
+    # no automatic RAM-based clamp (operator decides).
+    try:
+        _rut_hard_cap = max(1, int(os.environ.get("RUT_MAX_CONCURRENCY", "50") or "50"))
+    except (TypeError, ValueError):
+        _rut_hard_cap = 50
     semaphore = asyncio.Semaphore(max(1, min(int(concurrency or 1), _rut_hard_cap)))
     conc = max(1, min(int(concurrency or 1), _rut_hard_cap))
 
-    logger.info(f"RUT Speed Mode: {conc} concurrent workers enabled (env cap={_rut_hard_cap})")
+    logger.info(
+        f"RUT Speed Mode: {conc} concurrent workers enabled "
+        f"(env_cap={_rut_hard_cap}, lightweight_reporting={lightweight_reporting_enabled()})"
+    )
 
     async def worker(i: int, shared_browser: Browser):
         # Per-visit pacing: target time for this visit = i * delay_between
@@ -16916,44 +17052,12 @@ async def _execute_automation_steps(
                             await _hb_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                    # Capture a small JPEG of the current viewport so
-                    # the frontend Live Activity panel can show a real
-                    # "what is the page doing right now" image. Best-
-                    # effort — failures don't break the automation.
-                    # 2026-05 — switched to full_page=True so the
-                    # operator can see the WHOLE offer page (scroll
-                    # below the fold inside the expanded tile).
-                    # Quality dropped to 35 because full-page JPEGs
-                    # can be 5-10× bigger than viewport — at 35
-                    # quality a typical 3000px-tall offer page is
-                    # ~80-150KB which is fine for 800ms polling.
-                    _live_b64 = ""
-                    try:
-                        import base64 as _b64
-                        _shot = await page.screenshot(
-                            type="jpeg", quality=35, full_page=True, timeout=4000,
-                        )
-                        # Hard cap on b64 payload size — if a page is
-                        # unusually tall (50k px lazy-load mega-pages),
-                        # fall back to viewport-only so the tile still
-                        # updates instead of the polling endpoint
-                        # choking on a 5 MB JSON blob.
-                        if len(_shot) > 800_000:
-                            _shot = await page.screenshot(
-                                type="jpeg", quality=45, full_page=False, timeout=2500,
-                            )
-                        _live_b64 = "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
-                    except Exception:
-                        # Retry once with viewport-only — for cases
-                        # where full_page fails (e.g. page mid-nav).
-                        try:
-                            import base64 as _b64
-                            _shot = await page.screenshot(
-                                type="jpeg", quality=50, full_page=False, timeout=2000,
-                            )
-                            _live_b64 = "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
-                        except Exception:
-                            pass
+                    # Capture a live JPEG only when Visual Grid streaming is
+                    # on (or RUT_LIVE_FRAMES=1). Always-on full-page shots
+                    # were a top RAM killer on 8 GB PCs with grid closed.
+                    _live_b64 = await _capture_live_step_jpeg(
+                        page, job_id=job_id, visit_idx=visit_idx,
+                    )
 
                     # ── 2026-05: Step-marker bounding box capture ──
                     # User ask: "Show Step Markers — har step ki target
@@ -16966,9 +17070,10 @@ async def _execute_automation_steps(
                     # scale the dots to the rendered image dimensions.
                     # Best-effort — failure leaves the keys absent so
                     # the marker for this step just isn't drawn.
+                    # Skip box work when no live frame (nothing to overlay).
                     _target_box = None
                     _doc_size = None
-                    if selector and action in (
+                    if _live_b64 and selector and action in (
                         "click", "fill", "type", "select", "check",
                         "uncheck", "hover", "press",
                     ):
@@ -17208,30 +17313,11 @@ async def _execute_automation_steps(
                     _err_msg = f"{_err_msg} | Hint: {_hint}"
                 # 2026-01: emit "failed" progress event + final screenshot
                 if on_step_progress is not None:
-                    _live_b64 = ""
-                    try:
-                        import base64 as _b64
-                        # 2026-05 — full_page=True so operator can see
-                        # the WHOLE page state at moment of failure
-                        # (often the failed selector IS below the fold,
-                        # which the old viewport-only capture missed).
-                        _shot = await page.screenshot(
-                            type="jpeg", quality=35, full_page=True, timeout=4000,
-                        )
-                        if len(_shot) > 800_000:
-                            _shot = await page.screenshot(
-                                type="jpeg", quality=45, full_page=False, timeout=2500,
-                            )
-                        _live_b64 = "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
-                    except Exception:
-                        try:
-                            import base64 as _b64
-                            _shot = await page.screenshot(
-                                type="jpeg", quality=50, full_page=False, timeout=2000,
-                            )
-                            _live_b64 = "data:image/jpeg;base64," + _b64.b64encode(_shot).decode("ascii")
-                        except Exception:
-                            pass
+                    # Always try one failure frame (viewport if grid off) so
+                    # Live Activity shows why a required step aborted.
+                    _live_b64 = await _capture_live_step_jpeg(
+                        page, job_id=job_id, visit_idx=visit_idx, force=True,
+                    )
                     try:
                         await on_step_progress({
                             "idx": idx,
