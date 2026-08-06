@@ -6867,7 +6867,10 @@ export default function RealUserTrafficPage() {
                         const _elap_suffix = (typeof _elap === 'number' && _elap >= 6)
                           ? ` (${_elap}s)`
                           : '';
-                        const descr = ev.action
+                        const _stepLabel = ev.name || ev.label || ev.detail || '';
+                        const descr = _stepLabel
+                          ? `step #${(ev.idx ?? 0) + 1} · ${_stepLabel.slice(0, 48)}${_elap_suffix}`
+                          : ev.action
                           ? `step #${(ev.idx ?? 0) + 1} · ${ev.action}${ev.selector ? ' ' + ev.selector.slice(0, 30) : ''}${_elap_suffix}`
                           : ev.stage
                           ? `${ev.stage} · ${(ev.detail || '').slice(0, 50)}`

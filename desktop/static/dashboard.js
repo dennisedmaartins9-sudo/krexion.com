@@ -14,7 +14,9 @@ const LOCAL_HEARTBEAT = "http://127.0.0.1:8002";
 const CLOUD = "https://krexion.com";
 
 const POLL_LOCAL_MS = 2000;
-const POLL_CLOUD_MS = 15 * 60 * 1000;
+// Check cloud for new Setup.exe more often so customers see the blink
+// soon after a release (was 15 min — easy to miss all day).
+const POLL_CLOUD_MS = 5 * 60 * 1000;
 
 // v2.1.79 — Diagnostic thresholds when the local backend never
 // answers. Prevents the dashboard from silently sitting on
@@ -47,6 +49,16 @@ const _diag = {
   lastSuccessAt: 0,        // unix ms of most recent success (for uptime label)
   autoRepairAttempted: false,  // v2.1.81 — one silent restart per session
   autoRepairResult: null,      // last restart_services() payload
+};
+
+// Local installed version (from /api/desktop/stats) — used so update
+// checks compare against THIS PC, not the cloud VERSION file.
+let _localVersion = "";
+const _updateUi = {
+  available: false,
+  latestVersion: "",
+  title: "",
+  notes: "",
 };
 
 // v2.1.81 — Access the PyWebView JS bridge safely. Returns null when
@@ -135,6 +147,9 @@ async function pollLocal() {
           ? `heavy job running${d.heavy && d.heavy.label ? " · " + d.heavy.label : ""} — visits continue normally`
           : "main API briefly busy — heartbeat OK");
       setText("version-pill", "v" + (d.backend_version || "—"));
+      if (d.backend_version) {
+        _localVersion = String(d.backend_version).replace(/^v/i, "");
+      }
       return;
     }
 
@@ -204,6 +219,9 @@ async function pollLocal() {
     renderDeps(d.dependencies || {});
 
     setText("version-pill", "v" + (d.backend_version || "—"));
+    if (d.backend_version) {
+      _localVersion = String(d.backend_version).replace(/^v/i, "");
+    }
   } catch (e) {
     // v2.1.79 — Track failure duration + surface diagnostic UI.
     const now = Date.now();
@@ -546,34 +564,90 @@ async function openLogsFolder() {
   try { await api.open_logs_folder(); } catch (_) {}
 }
 
-/* ── Auto-update banner ─────────────────────────────────────────── */
+/* ── Auto-update banner + blink notify icon ─────────────────────── */
+function _parseSemver(v) {
+  const m = String(v || "").trim().replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return [0, 0, 0];
+  return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+function _isNewer(remote, local) {
+  const a = _parseSemver(remote);
+  const b = _parseSemver(local);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] > b[i]) return true;
+    if (a[i] < b[i]) return false;
+  }
+  return false;
+}
+
+function _showUpdateBanner() {
+  const banner = $("update-banner");
+  if (!banner || !_updateUi.available) return;
+  banner.classList.remove("hidden");
+  const v = _updateUi.latestVersion || "newer";
+  const you = _localVersion || "—";
+  setText("update-version", `Krexion ${v} is available  (you have ${you})`);
+  setText(
+    "update-notes",
+    _updateUi.title
+      || "Click Update Now — downloads & installs here. No website visit needed. Krexion restarts automatically."
+  );
+  banner.dataset.targetVersion = v;
+}
+
+function _renderUpdateNotify() {
+  const btn = $("update-notify-btn");
+  if (!btn) return;
+  if (_updateUi.available) {
+    btn.classList.remove("hidden");
+    btn.title = `Krexion ${_updateUi.latestVersion} available — click to update`;
+    const dismissed = sessionStorage.getItem("krexion_update_dismissed_" + _updateUi.latestVersion) === "1";
+    if (!dismissed) _showUpdateBanner();
+    else $("update-banner")?.classList.add("hidden");
+  } else {
+    btn.classList.add("hidden");
+    $("update-banner")?.classList.add("hidden");
+  }
+}
+
 async function pollUpdate() {
   try {
-    const r = await fetch(`${CLOUD}/api/system/public-latest`, { cache: "no-store" });
+    // Wait until we know our installed version so cloud can compare correctly.
+    const current = (_localVersion || "").replace(/^v/i, "");
+    const qs = current ? `?current=${encodeURIComponent(current)}` : "";
+    const r = await fetch(`${CLOUD}/api/system/public-latest${qs}`, { cache: "no-store" });
     if (!r.ok) return;
     const d = await r.json();
-    if (d.update_available && d.latest) {
-      const v = d.latest.version || "newer";
-      const dismissed = sessionStorage.getItem("krexion_update_dismissed_" + v) === "1";
-      if (dismissed) return;
-      $("update-banner").classList.remove("hidden");
-      setText("update-version", `Krexion ${v} is available  (you have ${d.current || "—"})`);
-      setText("update-notes", d.latest.title || "Click Update to install — Krexion will restart automatically.");
-      $("update-banner").dataset.targetVersion = v;
-    } else {
-      $("update-banner").classList.add("hidden");
+    const latestVer = (d.latest && d.latest.version) ? String(d.latest.version).replace(/^v/i, "") : "";
+    // Prefer server flag when we sent current=; also compare client-side
+    // so older cloud builds (without the ?current= fix) still work.
+    let available = !!(d.update_available && latestVer);
+    if (latestVer && current && _isNewer(latestVer, current)) {
+      available = true;
     }
+    if (available && latestVer) {
+      _updateUi.available = true;
+      _updateUi.latestVersion = latestVer;
+      _updateUi.title = (d.latest && d.latest.title) || "";
+      _updateUi.notes = (d.latest && d.latest.notes) || "";
+    } else {
+      _updateUi.available = false;
+      _updateUi.latestVersion = "";
+    }
+    _renderUpdateNotify();
   } catch (e) {
-    // silent — banner just stays hidden if cloud is unreachable
+    // silent — notify stays hidden if cloud is unreachable
   }
 }
 
 async function applyUpdate() {
   const btn = $("update-now-btn");
   const banner = $("update-banner");
-  const target = banner?.dataset?.targetVersion || "";
-  btn.disabled = true;
-  btn.textContent = "Downloading…";
+  const target = banner?.dataset?.targetVersion || _updateUi.latestVersion || "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Downloading…";
+  }
   try {
     const r = await fetch(`${LOCAL}/api/desktop/run-update`, {
       method: "POST",
@@ -582,17 +656,26 @@ async function applyUpdate() {
     });
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = "Installing — Krexion will restart…";
-      // Banner will disappear once the new version reports back
+      if (btn) btn.textContent = "Installing — Krexion will restart…";
+      const notify = $("update-notify-btn");
+      if (notify) {
+        notify.classList.remove("hidden");
+        const label = notify.querySelector(".update-notify-label");
+        if (label) label.textContent = "Installing…";
+      }
     } else {
-      btn.disabled = false;
-      btn.textContent = "Update Now";
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Update Now";
+      }
       alert("Update failed: " + (d.message || "unknown error"));
     }
   } catch (e) {
-    btn.disabled = false;
-    btn.textContent = "Update Now";
-    alert("Could not reach the local Krexion service.");
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Update Now";
+    }
+    alert("Could not reach the local Krexion service. Make sure Backend Online is green, then try again.");
   }
 }
 
@@ -608,10 +691,19 @@ function init() {
   });
   $("update-now-btn").addEventListener("click", applyUpdate);
   $("update-dismiss-btn").addEventListener("click", () => {
-    const v = $("update-banner")?.dataset?.targetVersion;
+    const v = $("update-banner")?.dataset?.targetVersion || _updateUi.latestVersion;
     if (v) sessionStorage.setItem("krexion_update_dismissed_" + v, "1");
     $("update-banner").classList.add("hidden");
+    // Keep the blinking Update pill so they can still open it later.
   });
+  const notifyBtn = $("update-notify-btn");
+  if (notifyBtn) {
+    notifyBtn.addEventListener("click", () => {
+      const v = _updateUi.latestVersion;
+      if (v) sessionStorage.removeItem("krexion_update_dismissed_" + v);
+      _showUpdateBanner();
+    });
+  }
 
   // v2.1.79 — Diagnose panel wiring (retry + copy-logs-path helpers).
   const retryBtn = $("diag-retry-btn");
@@ -637,9 +729,10 @@ function init() {
   if (showLogBtn) showLogBtn.addEventListener("click", showBackendLogTail);
 
   pollLocal();
-  pollUpdate();
-  setInterval(pollLocal, POLL_LOCAL_MS);
+  // First update check after local version is known (~3s), then every 5 min.
+  setTimeout(pollUpdate, 3000);
   setInterval(pollUpdate, POLL_CLOUD_MS);
+  setInterval(pollLocal, POLL_LOCAL_MS);
 }
 
 document.addEventListener("DOMContentLoaded", init);

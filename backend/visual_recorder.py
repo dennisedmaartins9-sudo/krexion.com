@@ -2052,6 +2052,12 @@ class RecorderSession:
     fix_history: List[Dict[str, Any]] = field(default_factory=list)
     # When True, append short settle waits after each recorded action step.
     auto_insert_waits: bool = False
+    # ── 2026-08: Stage markers (optional path groups) ──
+    # When True, New Stage markers gate whole blocks (e.g. skip Form fill
+    # in one shot if the big form never opens). When False, stage steps
+    # are ignored at replay → classic linear behavior.
+    stage_markers_enabled: bool = False
+    current_stage: str = ""
 
     def touch(self):
         self.last_activity = time.time()
@@ -2064,6 +2070,29 @@ class RecorderSession:
             _promote_step_locators(step)
         except Exception:
             pass
+        # Auto human label so VR list + RUT live feed stay readable
+        # (Click: No thanks, Fill: email, …) without manual rename.
+        try:
+            if not (step.get("name") or "").strip():
+                from step_labels import friendly_step_label
+                step["name"] = friendly_step_label(step)
+        except Exception:
+            pass
+        # Stamp active stage name onto recorded steps (display + grouping).
+        try:
+            if (
+                getattr(self, "stage_markers_enabled", False)
+                and getattr(self, "current_stage", "")
+                and (step.get("action") or "").strip().lower() not in ("stage", "stage_markers")
+            ):
+                step.setdefault("stage", self.current_stage)
+        except Exception:
+            pass
+        if (step.get("action") or "").strip().lower() == "stage":
+            try:
+                self.current_stage = (step.get("name") or step.get("stage") or "").strip()
+            except Exception:
+                pass
         self.steps.append(step)
         if not allow_auto_waits or not self.auto_insert_waits:
             return
@@ -2073,6 +2102,13 @@ class RecorderSession:
             auto = dict(wait_step)
             auto["source"] = "auto_wait"
             auto.setdefault("optional", True)
+            try:
+                from step_labels import friendly_step_label
+                auto.setdefault("name", friendly_step_label(auto))
+            except Exception:
+                pass
+            if getattr(self, "stage_markers_enabled", False) and getattr(self, "current_stage", ""):
+                auto.setdefault("stage", self.current_stage)
             self.steps.append(auto)
 
 
@@ -3479,6 +3515,13 @@ async def click_at(sess: RecorderSession, x: int, y: int, mode: str = "default",
         step = _build_text_click_evaluate(text) if text else None
 
     if step is not None:
+        # Persist visible CTA / field text so auto labels read
+        # "Click: No thanks" instead of bare "evaluate"/"click".
+        try:
+            if text and not (step.get("text") or "").strip():
+                step["text"] = str(text).strip()[:120]
+        except Exception:
+            pass
         # 2026-06 — Ensure every recorded step has BOTH selector + xpath
         # at the TOP LEVEL (so RUT replay always has a backup selector
         # path, and the operator can SEE both in the Edit Step UI).
@@ -5135,6 +5178,8 @@ _EDITABLE_STEP_FIELDS = {
     # 2026-02 — branch step (conditional if/else-if/else). Nested step
     # arrays are passed through verbatim by the dict-validator below.
     "branches", "default_steps", "timeout_ms",
+    # 2026-08 — stage markers
+    "open_when", "skip_if_not_open", "stage", "enabled",
 }
 
 
@@ -5327,6 +5372,8 @@ _MANUAL_STEP_ACTIONS = {
     # `close_tab` is the safe-close counterpart so a recipe can clean
     # up the per-deal popup before moving on.
     "switch_tab", "close_tab",
+    # 2026-08 — stage markers (path groups + open_when gate)
+    "stage", "stage_markers",
 }
 
 
@@ -5397,6 +5444,27 @@ def add_manual_step(sess: RecorderSession, step: Dict[str, Any], position: Optio
                 clean["timeout_ms"] = max(0, int(step["timeout_ms"]))
             except (TypeError, ValueError):
                 pass
+    # 2026-08 — stage marker: open_when detect + skip whole following block
+    if action == "stage":
+        if isinstance(step.get("open_when"), dict):
+            clean["open_when"] = step["open_when"]
+        clean["skip_if_not_open"] = bool(step.get("skip_if_not_open", True))
+        if step.get("stage"):
+            clean["stage"] = str(step.get("stage")).strip()
+        # Keep name as stage label
+        if not clean.get("name") and clean.get("stage"):
+            clean["name"] = clean["stage"]
+        try:
+            sess.current_stage = (clean.get("name") or clean.get("stage") or "").strip()
+            sess.stage_markers_enabled = True
+        except Exception:
+            pass
+    if action == "stage_markers":
+        clean["enabled"] = bool(step.get("enabled", True))
+        try:
+            sess.stage_markers_enabled = bool(clean["enabled"])
+        except Exception:
+            pass
     # Tag this step so the UI can show a small "manual" badge — purely
     # cosmetic, doesn't affect replay.
     clean["source"] = "manual"
@@ -6712,12 +6780,21 @@ def set_session_settings(
     sess: RecorderSession,
     *,
     auto_insert_waits: Optional[bool] = None,
+    stage_markers_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Update live recorder preferences (e.g. auto wait insertion)."""
     sess.touch()
     if auto_insert_waits is not None:
         sess.auto_insert_waits = bool(auto_insert_waits)
-    return {"auto_insert_waits": sess.auto_insert_waits}
+    if stage_markers_enabled is not None:
+        sess.stage_markers_enabled = bool(stage_markers_enabled)
+        if not sess.stage_markers_enabled:
+            sess.current_stage = ""
+    return {
+        "auto_insert_waits": sess.auto_insert_waits,
+        "stage_markers_enabled": bool(getattr(sess, "stage_markers_enabled", False)),
+        "current_stage": getattr(sess, "current_stage", "") or "",
+    }
 
 
 async def finalize(sess: RecorderSession) -> Dict[str, Any]:
@@ -6738,7 +6815,25 @@ async def finalize(sess: RecorderSession) -> Dict[str, Any]:
         "final_text_snippet": sess.final_text_snippet,
         "step_count": len(sess.steps),
         "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
+        "stage_markers_enabled": bool(getattr(sess, "stage_markers_enabled", False)),
+        "current_stage": getattr(sess, "current_stage", "") or "",
     }
+    # Ensure a leading stage_markers control step matches the session toggle
+    # so RUT / Live Test honor ON vs OFF without a separate job flag.
+    try:
+        steps = out["automation_json"]
+        if isinstance(steps, list) and any(
+            isinstance(s, dict) and (s.get("action") or "").strip().lower() == "stage"
+            for s in steps
+        ):
+            enabled = bool(getattr(sess, "stage_markers_enabled", False))
+            control = {"action": "stage_markers", "enabled": enabled, "source": "system"}
+            if steps and isinstance(steps[0], dict) and (steps[0].get("action") or "").strip().lower() == "stage_markers":
+                steps[0]["enabled"] = enabled
+            else:
+                steps.insert(0, control)
+    except Exception:
+        pass
     # Persist to disk before stopping
     try:
         folder = SESSIONS_ROOT / sess.session_id

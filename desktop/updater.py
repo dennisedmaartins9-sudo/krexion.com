@@ -3,23 +3,21 @@ Krexion Desktop Updater — handles self-update flow
 ====================================================
 Triggered from the dashboard's "Update Now" banner click. Steps:
 
-  1. Hit /api/system/latest-version (auth) to get installer URL + size
-  2. Download Krexion-Setup-vX.Y.Z.exe to %TEMP%
-  3. Verify download (size match — sha256 optional, server hasn't shipped
-     hashes yet so we keep this best-effort)
-  4. Launch installer with /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  1. Download Krexion-Setup.exe to %TEMP% (license redirect → GitHub,
+     or direct CDN fallback for native Setup-latest.exe)
+  2. Launch installer with /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
      /CLOSEAPPLICATIONS — Inno Setup will:
         * Stop the running Krexion services
         * Overwrite the program files
         * Restart the services
      User data (%PROGRAMDATA%\\Krexion + license) is preserved by virtue
      of being in a separate path the installer never touches.
-  5. Exit current dashboard process (the fresh installer's [Run] section
+  3. Exit current dashboard process (the fresh installer's [Run] section
      will spawn a new instance once install finishes).
 
 This module is called BY the dashboard JS via a tiny endpoint
-``/api/desktop/run-update`` exposed in server.py — keeps all subprocess
-logic out of the browser sandbox.
+``/api/desktop/run-update`` exposed in desktop_module.py — keeps all
+subprocess logic out of the browser sandbox.
 """
 from __future__ import annotations
 
@@ -36,6 +34,11 @@ logger = logging.getLogger("krexion.updater")
 
 CLOUD = os.environ.get("KREXION_CLOUD_URL", "https://krexion.com").rstrip("/")
 LICENSE_FILE = Path(os.environ.get("LICENSE_KEY_FILE", "C:/ProgramData/Krexion/license-key.txt"))
+# Stable native CDN path written by build-windows-release.yml
+NATIVE_CDN_URL = os.environ.get(
+    "KREXION_NATIVE_INSTALLER_URL",
+    f"{CLOUD}/downloads/windows/Krexion-Setup-latest.exe",
+)
 
 
 def _read_license_key() -> str:
@@ -45,35 +48,55 @@ def _read_license_key() -> str:
         return ""
 
 
-def download_installer(target_version: str | None = None) -> Path | None:
-    """Download the latest installer .exe to %TEMP%. Returns the file
-    path on success, None on any failure (logged)."""
-    key = _read_license_key()
-    if not key:
-        logger.error("No license key file — cannot download installer.")
-        return None
-
-    download_url = f"{CLOUD}/api/license/download-installer/{key}"
+def _stream_download(url: str, dest: Path, *, headers: dict | None = None) -> bool:
+    """Stream a URL to dest. Returns True on HTTP 200 + non-empty file."""
     try:
-        # We follow redirects (the endpoint 302s to the actual GitHub
-        # release asset) and stream so a 400 MB .exe doesn't blow up RAM.
-        with requests.get(download_url, stream=True, timeout=60, allow_redirects=True) as r:
+        with requests.get(url, stream=True, timeout=120, allow_redirects=True, headers=headers or {}) as r:
             if r.status_code != 200:
-                logger.error(f"Installer download HTTP {r.status_code}: {r.text[:200]}")
-                return None
-            # Use the version in the filename so multiple updates in a
-            # row don't clobber each other.
-            suffix = f"-{target_version}" if target_version else ""
-            dest = Path(tempfile.gettempdir()) / f"Krexion-Setup{suffix}.exe"
+                logger.error(f"Installer download HTTP {r.status_code} from {url}: {r.text[:200]}")
+                return False
             with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         f.write(chunk)
-            logger.info(f"Installer downloaded to {dest} ({dest.stat().st_size} bytes)")
-            return dest
+            size = dest.stat().st_size if dest.exists() else 0
+            if size < 1_000_000:
+                # Real Setup.exe is hundreds of MB — tiny body is an error HTML page
+                logger.error(f"Installer download too small ({size} bytes) from {url}")
+                try:
+                    dest.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+            logger.info(f"Installer downloaded to {dest} ({size} bytes) from {url}")
+            return True
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"Installer download failed: {exc}")
-        return None
+        logger.error(f"Installer download failed from {url}: {exc}")
+        return False
+
+
+def download_installer(target_version: str | None = None) -> Path | None:
+    """Download the latest native installer .exe to %TEMP%.
+
+    Order:
+      1. License-gated redirect (admin-published GitHub asset)
+      2. Public CDN Krexion-Setup-latest.exe (always mirrors latest native build)
+    """
+    suffix = f"-{target_version}" if target_version else ""
+    dest = Path(tempfile.gettempdir()) / f"Krexion-Setup{suffix}.exe"
+
+    key = _read_license_key()
+    if key:
+        license_url = f"{CLOUD}/api/license/download-installer/{key}"
+        if _stream_download(license_url, dest):
+            return dest
+        logger.warning("License installer download failed — trying public CDN.")
+    else:
+        logger.warning("No license key file — trying public CDN for installer.")
+
+    if _stream_download(NATIVE_CDN_URL, dest):
+        return dest
+    return None
 
 
 def run_installer(installer_path: Path) -> bool:
@@ -112,10 +135,18 @@ def apply_update(target_version: str | None = None) -> dict:
     """High-level orchestrator the dashboard endpoint calls."""
     installer = download_installer(target_version)
     if installer is None:
-        return {"ok": False, "stage": "download", "message": "Installer download failed. Check internet + license key."}
+        return {
+            "ok": False,
+            "stage": "download",
+            "message": "Installer download failed. Check internet connection and try again.",
+        }
     ok = run_installer(installer)
     if not ok:
-        return {"ok": False, "stage": "launch", "message": "Could not launch installer. Antivirus may be blocking — please run as admin."}
+        return {
+            "ok": False,
+            "stage": "launch",
+            "message": "Could not launch installer. Antivirus may be blocking — please run as admin.",
+        }
     return {
         "ok": True,
         "stage": "running",

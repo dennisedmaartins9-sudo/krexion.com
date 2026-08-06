@@ -21840,7 +21840,8 @@ class VRStartReq(BaseModel):
 
 
 class VRSettingsReq(BaseModel):
-    auto_insert_waits: bool
+    auto_insert_waits: Optional[bool] = None
+    stage_markers_enabled: Optional[bool] = None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -22685,6 +22686,8 @@ async def vr_state(session_id: str, user: dict = Depends(get_current_user)):
         "step_count": len(sess.steps),
         "headers": sess.headers,
         "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
+        "stage_markers_enabled": bool(getattr(sess, "stage_markers_enabled", False)),
+        "current_stage": getattr(sess, "current_stage", "") or "",
         "target_screenshot_set": bool(sess.target_screenshot_path),
         "final_url": sess.final_url,
         "idle_seconds": int(time.time() - sess.last_activity),
@@ -22699,7 +22702,11 @@ async def vr_settings(session_id: str, req: VRSettingsReq, user: dict = Depends(
         sess = vr.get_session(session_id, user["id"])
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
-    return vr.set_session_settings(sess, auto_insert_waits=req.auto_insert_waits)
+    return vr.set_session_settings(
+        sess,
+        auto_insert_waits=req.auto_insert_waits,
+        stage_markers_enabled=req.stage_markers_enabled,
+    )
 
 
 class VRClickReq(BaseModel):

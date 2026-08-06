@@ -171,6 +171,14 @@ function getStepDisplayName(s) {
       const i = typeof s.index === "number" ? `#${s.index}` : "(current)";
       return `✕ Close tab ${i}`;
     }
+    case "stage": {
+      const nm = _val(s.name || s.stage, 28) || "Stage";
+      const ow = s.open_when;
+      const hasDetect = ow && (ow.selector || ow.text || ow.value || ow.type);
+      return hasDetect ? `📦 Stage: ${nm} (detect)` : `📦 Stage: ${nm}`;
+    }
+    case "stage_markers":
+      return s.enabled === false ? "Stage markers OFF" : "Stage markers ON";
     case "accept_dialog": {
       // v2.1.74 — JS dialog accept (alert/confirm/prompt)
       const t = s.dialog_type || "dialog";
@@ -432,6 +440,8 @@ export default function VisualRecorderPage() {
       return false;
     }
   });
+  const [stageMarkersOn, setStageMarkersOn] = useState(false);
+  const [currentStageName, setCurrentStageName] = useState("");
   const [waitAutoDetect, setWaitAutoDetect] = useState(() => {
     try {
       const v = localStorage.getItem(LS_VR_WAIT_AUTO_DETECT);
@@ -1215,6 +1225,12 @@ export default function VisualRecorderPage() {
           localStorage.setItem(LS_VR_AUTO_WAITS, d.auto_insert_waits ? "1" : "0");
         } catch { /* quota / private mode */ }
       }
+      if (typeof d.stage_markers_enabled === "boolean") {
+        setStageMarkersOn(d.stage_markers_enabled);
+      }
+      if (typeof d.current_stage === "string") {
+        setCurrentStageName(d.current_stage || "");
+      }
     } catch {}
   }, [sessionId]);
 
@@ -1231,6 +1247,88 @@ export default function VisualRecorderPage() {
         body: JSON.stringify({ auto_insert_waits: !!enabled }),
       });
     } catch { /* best effort */ }
+  };
+
+  const setStageMarkersPref = async (enabled) => {
+    setStageMarkersOn(enabled);
+    if (!enabled) setCurrentStageName("");
+    if (!sessionId) return;
+    try {
+      await fetch(`${API_URL}/api/visual-recorder/${sessionId}/settings`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({ stage_markers_enabled: !!enabled }),
+      });
+    } catch { /* best effort */ }
+  };
+
+  const addNewStageMarker = async () => {
+    if (!sessionId) {
+      toast.error("Start a recording session first");
+      return;
+    }
+    if (!stageMarkersOn) {
+      await setStageMarkersPref(true);
+    }
+    const name = (await vrPrompt(
+      "Stage name (e.g. Questions, Email, Form fill, Survey, Deals):",
+      currentStageName || "Form fill"
+    ) || "").trim();
+    if (!name) return;
+    const detectKind = (await vrPrompt(
+      "Open-when detect? none / selector / text / url\n(none = always run this stage; selector/text/url = skip whole stage if not found)",
+      name.toLowerCase().includes("form") ? "selector" : "none"
+    ) || "none").trim().toLowerCase();
+    let open_when = null;
+    if (detectKind === "selector" || detectKind === "css") {
+      const sel = (await vrPrompt(
+        "CSS/XPath that ONLY appears when this stage is open (e.g. input[name=first_name]):",
+        "input[name=first_name]"
+      ) || "").trim();
+      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
+      if (sel) open_when = { type: "selector_visible", selector: sel, timeout_ms: tmo };
+    } else if (detectKind === "text") {
+      const txt = (await vrPrompt("Text that ONLY appears when this stage is open:", "First Name") || "").trim();
+      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
+      if (txt) open_when = { type: "text_visible", text: txt, timeout_ms: tmo };
+    } else if (detectKind === "url") {
+      const part = (await vrPrompt("URL must contain:", "/form") || "").trim();
+      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
+      if (part) open_when = { type: "url_contains", value: part, timeout_ms: tmo };
+    }
+    const step = {
+      action: "stage",
+      name,
+      stage: name,
+      skip_if_not_open: true,
+      source: "manual",
+    };
+    if (open_when) step.open_when = open_when;
+    setBusy(true);
+    try {
+      await setStageMarkersPref(true);
+      const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/manual-step`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({ step }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.added === false) {
+        toast.error(d.detail || d.reason || "Could not add stage");
+        return;
+      }
+      setCurrentStageName(name);
+      await refreshState();
+      toast.success(
+        open_when
+          ? `Stage "${name}" added — will SKIP whole block if detect fails`
+          : `Stage "${name}" added — always runs (no detect)`
+      );
+    } catch (e) {
+      toast.error(e.message || "Add stage failed");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const setWaitAutoDetectPref = (enabled) => {
@@ -2953,7 +3051,7 @@ export default function VisualRecorderPage() {
   const insertStepAt = async (position) => {
     if (!sessionId) return;
     const action = await vrPrompt(
-      "Step action to insert? Options: click, fill, type, select, check, uncheck, wait, wait_for_selector, wait_for_text, wait_for_url, press, scroll, screenshot, hover, dismiss_popups, extract, branch",
+      "Step action to insert? Options: click, fill, type, select, check, uncheck, wait, wait_for_selector, wait_for_text, wait_for_url, press, scroll, screenshot, hover, dismiss_popups, extract, branch, stage",
       "wait"
     );
     if (!action || !action.trim()) return;
@@ -3017,6 +3115,28 @@ export default function VisualRecorderPage() {
         ],
         default_steps: [],
       };
+    } else if (cleanAction === "stage") {
+      const label = (await vrPrompt("Stage name:", "Form fill") || "Form fill").trim();
+      const detectKind = (await vrPrompt("Detect: none / selector / text / url", "selector") || "none").trim().toLowerCase();
+      stepDraft = {
+        action: "stage",
+        name: label,
+        stage: label,
+        skip_if_not_open: true,
+      };
+      if (detectKind === "selector" || detectKind === "css") {
+        const sel = (await vrPrompt("Selector when stage is open:", "") || "").trim();
+        const tmo = Math.max(1000, Number(await vrPrompt("Timeout ms:", "5000")) || 5000);
+        if (sel) stepDraft.open_when = { type: "selector_visible", selector: sel, timeout_ms: tmo };
+      } else if (detectKind === "text") {
+        const txt = (await vrPrompt("Text when stage is open:", "") || "").trim();
+        const tmo = Math.max(1000, Number(await vrPrompt("Timeout ms:", "5000")) || 5000);
+        if (txt) stepDraft.open_when = { type: "text_visible", text: txt, timeout_ms: tmo };
+      } else if (detectKind === "url") {
+        const part = (await vrPrompt("URL contains:", "") || "").trim();
+        const tmo = Math.max(1000, Number(await vrPrompt("Timeout ms:", "5000")) || 5000);
+        if (part) stepDraft.open_when = { type: "url_contains", value: part, timeout_ms: tmo };
+      }
     } else if (["click", "fill", "type", "select", "check", "uncheck", "hover", "wait_for_selector"].includes(cleanAction)) {
       const sel = await vrPrompt("CSS selector (or XPath e.g. //input[@name='x']):", "");
       if (!sel || !sel.trim()) return;
@@ -5647,9 +5767,51 @@ export default function VisualRecorderPage() {
                   />
                   Auto waits after steps
                 </label>
+                <label
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border text-xs cursor-pointer select-none ${
+                    stageMarkersOn
+                      ? "bg-sky-950/40 border-sky-500/40 text-sky-200"
+                      : "bg-zinc-900 border-zinc-800 text-zinc-300"
+                  }`}
+                  title="ON = stage groups with open-when detect (skip whole Form fill block if form never opens). OFF = classic linear steps."
+                  data-testid="vr-stage-markers-toggle-label"
+                >
+                  <input
+                    type="checkbox"
+                    checked={stageMarkersOn}
+                    onChange={(e) => setStageMarkersPref(e.target.checked)}
+                    data-testid="vr-stage-markers-toggle"
+                  />
+                  Stage markers
+                </label>
+                {stageMarkersOn && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={addNewStageMarker}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-sky-700/80 hover:bg-sky-600 text-white text-xs font-medium"
+                      data-testid="vr-new-stage-btn"
+                      title="Start a named stage group (Questions / Email / Form fill / Survey / Deals)"
+                    >
+                      + New Stage
+                    </button>
+                    {currentStageName ? (
+                      <span className="text-[10px] text-sky-300/90 px-2 py-1 rounded bg-sky-950/30 border border-sky-800/40" data-testid="vr-current-stage">
+                        Current: {currentStageName}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-zinc-500">Add a stage, then record steps inside it</span>
+                    )}
+                  </>
+                )}
                 <p className="w-full text-[10px] text-amber-600/90 -mt-1">
                   Optional auto-waits can mask missing selectors — prefer explicit wait_for_selector when debugging failures.
                 </p>
+                {stageMarkersOn && (
+                  <p className="w-full text-[10px] text-sky-500/90 -mt-1">
+                    Stage markers: Form fill pe open-when set karo — form na khule to poori stage ek shot mein skip (har step timeout nahi).
+                  </p>
+                )}
                 <label
                   className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs cursor-pointer select-none"
                   title="When ON, Wait for text/selector/xpath buttons let you click the page to auto-fill — no manual scan/copy."
@@ -6116,14 +6278,32 @@ export default function VisualRecorderPage() {
                     auto_continue: { icon: "🔄", color: "text-violet-400", bg: "bg-violet-700/30 border-violet-500/30" },
                     auto_continue_survey: { icon: "🔄", color: "text-violet-400", bg: "bg-violet-700/30 border-violet-500/30" },
                     branch: { icon: "🔀", color: "text-fuchsia-400", bg: "bg-fuchsia-700/30 border-fuchsia-500/30" },
+                    stage: { icon: "📦", color: "text-sky-300", bg: "bg-sky-800/40 border-sky-500/40" },
+                    stage_markers: { icon: "🏷", color: "text-sky-400", bg: "bg-sky-900/40 border-sky-600/30" },
                     switch_tab: { icon: "↔", color: "text-blue-400", bg: "bg-blue-700/30 border-blue-500/30" },
                     close_tab: { icon: "✕", color: "text-rose-400", bg: "bg-rose-700/30 border-rose-500/30" },
                   };
                   const sm = stepIconMap[s.action] || { icon: "•", color: "text-zinc-400", bg: "bg-zinc-700/30 border-zinc-500/30" };
                   const isDragSrc = dragSrc === i;
                   const isDragOver = dragOver === i;
+                  const isStageHeader = (s.action || "").toLowerCase() === "stage";
                   return (
                   <React.Fragment key={i}>
+                    {isStageHeader && (
+                      <div
+                        className="mt-2 mb-0.5 px-2 py-1 rounded-md bg-sky-950/50 border border-sky-600/40 text-[11px] text-sky-200 font-semibold tracking-wide"
+                        data-testid={`vr-stage-header-${i}`}
+                      >
+                        ── {s.name || s.stage || "Stage"} ──
+                        {s.open_when?.selector || s.open_when?.text || s.open_when?.value ? (
+                          <span className="ml-2 font-normal text-sky-400/80 text-[10px]">
+                            open when: {s.open_when.selector || s.open_when.text || s.open_when.value}
+                          </span>
+                        ) : (
+                          <span className="ml-2 font-normal text-zinc-500 text-[10px]">always run</span>
+                        )}
+                      </div>
+                    )}
                     {/* 2026-06 — Insert-between-steps button now
                         ALWAYS visible (was opacity-0 until hover, so
                         most operators never discovered it). Customer
@@ -6492,8 +6672,10 @@ export default function VisualRecorderPage() {
                             <span className="flex-shrink-0 w-3">{icon}</span>
                             <span className="flex-shrink-0 text-zinc-500">[{time}]</span>
                             <span className="flex-shrink-0">#{stepNum}</span>
-                            <span className="flex-shrink-0 text-zinc-300">{ev.action}</span>
-                            {ev.selector && (
+                            <span className="flex-shrink-0 text-zinc-200 font-medium truncate max-w-[220px]" title={ev.name || ev.label || ev.detail || ev.action}>
+                              {ev.name || ev.label || ev.detail || ev.action}
+                            </span>
+                            {!(ev.name || ev.label) && ev.selector && (
                               <span className="flex-shrink-0 text-zinc-500 truncate max-w-[140px]" title={ev.selector}>
                                 {ev.selector.slice(0, 24)}{ev.selector.length > 24 ? '…' : ''}
                               </span>

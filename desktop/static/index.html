@@ -18,6 +18,12 @@
     </div>
     <div class="topbar-right">
       <span id="connection-pill" class="pill pill-warn" data-testid="connection-pill">connecting…</span>
+      <!-- Blinks when a newer Krexion-Setup is available; click opens Update banner -->
+      <button id="update-notify-btn" class="update-notify hidden" type="button"
+              title="Update available" data-testid="update-notify-btn" aria-label="Update available">
+        <span class="update-notify-dot" aria-hidden="true"></span>
+        <span class="update-notify-label">Update</span>
+      </button>
       <span id="version-pill" class="pill" data-testid="version-pill">v—</span>
       <button id="open-cloud-btn" class="btn-ghost" data-testid="open-cloud-btn">Open krexion.com →</button>
     </div>
@@ -29,7 +35,7 @@
       <div class="update-banner-icon">⬆</div>
       <div class="update-banner-text">
         <strong id="update-version">A new Krexion version is available</strong>
-        <span id="update-notes">Click Update to install — Krexion will restart automatically.</span>
+        <span id="update-notes">Click Update to download &amp; install here — no website visit needed. Krexion will restart automatically.</span>
       </div>
       <div class="update-banner-actions">
         <button id="update-now-btn" class="btn-primary" data-testid="update-now-btn">Update Now</button>

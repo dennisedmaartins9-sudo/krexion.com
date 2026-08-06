@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 
 logger = logging.getLogger(__name__)
 releases_router = APIRouter(tags=["releases"])
@@ -126,7 +126,8 @@ async def _displayed_current_version() -> str:
 
 
 def _parse(v: str) -> tuple:
-    m = SEMVER_RE.match((v or "").strip())
+    s = (v or "").strip().lstrip("vV")
+    m = SEMVER_RE.match(s)
     if not m:
         return (0, 0, 0)
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -564,38 +565,90 @@ def _build_customer_endpoints(get_user_dep):
     }
 
     @router.get("/api/system/latest-version")
-    async def latest_version(x_krexion_license: Optional[str] = Header(None)):
+    async def latest_version(
+        x_krexion_license: Optional[str] = Header(None),
+        current: Optional[str] = Query(None),
+    ):
         """License-authenticated - returns the latest published release plus
-        whether the caller is behind."""
+        whether the caller is behind.
+
+        Pass ``?current=X.Y.Z`` for the installer's local version so
+        update_available is correct even when cloud VERSION already
+        matches the published release.
+        """
         await _validate_license(x_krexion_license)
-        local = await _displayed_current_version()
+        file_ver = current_version()
+        client_ver = (current or "").strip().lstrip("vV") or None
+        baseline = client_ver or file_ver
         rel = await _db.app_releases.find_one(
             _REAL_RELEASE_FILTER, sort=[("created_at", -1)], projection={"_id": 0}
         )
         if not rel:
-            return {"current": local, "latest": None, "update_available": False}
+            # Fall back to cloud file VERSION as "latest" signal
+            if client_ver and is_newer(file_ver, client_ver):
+                return {
+                    "current": baseline,
+                    "latest": {"version": file_ver, "title": f"Krexion {file_ver}"},
+                    "update_available": True,
+                }
+            return {"current": baseline, "latest": None, "update_available": False}
         return {
-            "current": local,
+            "current": baseline,
             "latest": rel,
-            "update_available": is_newer(rel["version"], local),
+            "update_available": is_newer(rel["version"], baseline),
         }
 
     @router.get("/api/system/public-latest")
-    async def public_latest():
-        """No-auth lite endpoint for the local dashboard banner so it can
-        decide whether to nag the user - does not expose download URL."""
+    async def public_latest(current: Optional[str] = Query(None)):
+        """No-auth lite endpoint for the Local PC Dashboard banner.
+
+        Pass ``?current=X.Y.Z`` = the customer's *installed* version so
+        ``update_available`` compares against their PC — not the cloud
+        VERSION file. After a release is published, cloud VERSION ==
+        latest, so comparing against cloud alone always hid updates
+        from every customer still on an older Setup.exe.
+
+        Does not expose the download URL (installer goes through
+        license download / CDN).
+        """
         rel = await _db.app_releases.find_one(
             _REAL_RELEASE_FILTER,
             sort=[("created_at", -1)],
             projection={"_id": 0, "version": 1, "title": 1, "severity": 1, "created_at": 1, "notes": 1},
         )
-        local = await _displayed_current_version()
-        if not rel:
-            return {"current": local, "latest": None, "update_available": False}
+        # Cloud file VERSION (what just shipped to VPS) — useful when
+        # admin hasn't Quick-Published a DB row yet but CDN already
+        # has Krexion-Setup-latest.exe matching this build.
+        file_ver = current_version()
+        client_ver = (current or "").strip().lstrip("vV") or None
+
+        # Prefer a real published release; fall back to cloud file ver.
+        latest_ver = None
+        latest_payload = None
+        if rel and rel.get("version"):
+            latest_ver = str(rel["version"]).strip().lstrip("vV")
+            latest_payload = rel
+        elif file_ver and file_ver != "0.0.0":
+            latest_ver = file_ver.lstrip("vV")
+            latest_payload = {
+                "version": latest_ver,
+                "title": f"Krexion {latest_ver}",
+                "severity": "normal",
+                "notes": "Latest build on krexion.com",
+            }
+
+        # Baseline for "are YOU behind?": client's installed version
+        # when provided; otherwise cloud file (legacy callers).
+        # Never use _displayed_current_version() here — that returns
+        # the published release itself and makes update_available
+        # permanently false after every successful publish.
+        baseline = client_ver or file_ver
+        available = bool(latest_ver) and is_newer(latest_ver, baseline)
         return {
-            "current": local,
-            "latest": rel,
-            "update_available": is_newer(rel["version"], local),
+            "current": baseline,
+            "cloud": file_ver,
+            "latest": latest_payload,
+            "update_available": available,
         }
 
     @router.get("/api/system/installer-info")

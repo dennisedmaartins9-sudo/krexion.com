@@ -84,6 +84,40 @@ html, body {
 .pill-warn  { background: rgba(247, 185, 85, 0.08); color: var(--warn); border-color: rgba(247, 185, 85, 0.25); }
 .pill-danger{ background: rgba(239, 77, 94, 0.08); color: var(--danger); border-color: rgba(239, 77, 94, 0.25); }
 
+/* ── Update notification (blinks next to Backend Online) ───────── */
+.update-notify {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: #1a1f2e;
+  background: linear-gradient(135deg, #f7b955, #f59e0b);
+  border: 1px solid rgba(247, 185, 85, 0.55);
+  box-shadow: 0 0 0 0 rgba(247, 185, 85, 0.55);
+  animation: update-notify-pulse 1.6s ease-in-out infinite;
+}
+.update-notify.hidden { display: none; }
+.update-notify:hover { filter: brightness(1.06); }
+.update-notify-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #1a1f2e;
+  animation: update-notify-dot 1s ease-in-out infinite;
+}
+.update-notify-label { letter-spacing: 0.02em; }
+@keyframes update-notify-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(247, 185, 85, 0.55); }
+  50% { box-shadow: 0 0 0 8px rgba(247, 185, 85, 0); }
+}
+@keyframes update-notify-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
 .btn-ghost {
   background: transparent;
   color: var(--text-1);

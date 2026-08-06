@@ -703,15 +703,19 @@ async def download_installer_with_key(license_key: str, request: Request):
     except Exception:
         latest_rel = None
 
-    # 2026-02 — Self-hosted Electron Desktop fallback. If the admin
-    # hasn't manually published a release row yet, we still serve the
-    # canonical Electron Desktop installer from the VPS-mirrored CDN
-    # (https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe).
-    # Env var KREXION_DESKTOP_INSTALLER_URL lets the operator override
-    # this default without touching the DB.
+    # Fallback when no admin-published release row exists yet: serve
+    # the native Windows installer from the VPS CDN (written by the
+    # build-windows-release workflow). Prefer native Setup.exe over
+    # Electron — Local PC Dashboard silent updates must install the
+    # same product customers already have (Inno / Krexion-Setup).
+    # Override with KREXION_NATIVE_INSTALLER_URL or legacy
+    # KREXION_DESKTOP_INSTALLER_URL.
     if not latest_rel or not latest_rel.get("download_url"):
-        fallback_url = os.environ.get("KREXION_DESKTOP_INSTALLER_URL") or \
-            "https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe"
+        fallback_url = (
+            os.environ.get("KREXION_NATIVE_INSTALLER_URL")
+            or os.environ.get("KREXION_DESKTOP_INSTALLER_URL")
+            or "https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"
+        )
         # Read current VERSION file for analytics tagging
         try:
             from pathlib import Path as _P

@@ -15174,6 +15174,57 @@ def _is_step_miss_error(err: Any) -> bool:
     )
 
 
+async def _page_condition_met(
+    page: Page,
+    cond: Dict[str, Any],
+    *,
+    default_timeout_ms: int = 5000,
+    alias_alts_fn: Optional[Callable[[str], List[str]]] = None,
+) -> bool:
+    """Shared condition check for stage open_when / branch (selector/text/url)."""
+    if not isinstance(cond, dict):
+        return False
+    ct = (cond.get("type") or "").strip().lower()
+    tmo_ms = int(cond.get("timeout_ms") or cond.get("timeout") or default_timeout_ms)
+    tmo_ms = max(500, min(tmo_ms, 60000))
+    try:
+        if ct in ("selector_visible", "selector", "wait_for_selector"):
+            sel = (cond.get("selector") or "").strip()
+            if not sel:
+                return False
+            extra = alias_alts_fn(sel) if alias_alts_fn else []
+            resolved = await _smart_wait_for_selector(
+                page, sel, state="visible", timeout=tmo_ms, extra_alts=extra or [],
+            )
+            return bool(resolved)
+        if ct in ("text_visible", "text", "wait_for_text"):
+            txt = (cond.get("text") or "").strip()
+            if not txt:
+                return False
+            try:
+                await page.locator(f"text={txt}").first.wait_for(state="visible", timeout=tmo_ms)
+                return True
+            except Exception:
+                return False
+        if ct in ("url_contains", "url"):
+            needle = (cond.get("value") or cond.get("url") or "").strip().lower()
+            if not needle:
+                return False
+            import time as _t
+            deadline = _t.perf_counter() + (tmo_ms / 1000.0)
+            while _t.perf_counter() < deadline:
+                try:
+                    if needle in (page.url or "").lower():
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+            return False
+    except Exception:
+        return False
+    return False
+
+
 async def _execute_automation_steps(
     page: Page,
     row: Dict[str, Any],
@@ -15349,8 +15400,50 @@ async def _execute_automation_steps(
 
     try:
         _conditional_skip_remaining = 0
+        # 2026-08 — Stage markers: skip whole blocks when open_when fails
+        # (e.g. Form fill never opened → skip all form steps instantly).
+        _stage_gate_on = True
+        _stage_skip_active = False
         for idx, step in enumerate(steps or []):
             if not isinstance(step, dict):
+                continue
+            action_peek = (step.get("action") or "").strip().lower()
+            if action_peek == "stage_markers":
+                _stage_gate_on = bool(step.get("enabled", True))
+                _stage_skip_active = False
+                executed += 1
+                if collect_timings:
+                    step_results.append({
+                        "idx": idx, "action": "stage_markers", "selector": "",
+                        "ok": True, "error": None, "ms": 0,
+                        "note": f"stage_markers enabled={_stage_gate_on}",
+                        "optional": True,
+                    })
+                continue
+            if _stage_gate_on and _stage_skip_active and action_peek not in ("stage", "stage_markers"):
+                # Instant skip — no per-step timeout (the whole pain point).
+                executed += 1
+                if collect_timings:
+                    step_results.append({
+                        "idx": idx,
+                        "action": action_peek or "skip",
+                        "selector": (step.get("selector") or "")[:200],
+                        "ok": True,
+                        "error": "(skipped — stage not open)",
+                        "ms": 0,
+                        "optional": True,
+                        "stage_skipped": True,
+                    })
+                if on_step_progress is not None:
+                    try:
+                        await on_step_progress({
+                            "idx": idx,
+                            "action": action_peek or "skip",
+                            "status": "skipped",
+                            "detail": "Skipped — stage not open",
+                        })
+                    except Exception:
+                        pass
                 continue
             if _conditional_skip_remaining > 0:
                 _conditional_skip_remaining -= 1
@@ -15481,13 +15574,21 @@ async def _execute_automation_steps(
             # informational; never blocks the automation.
             if on_step_progress is not None:
                 try:
+                    try:
+                        from step_labels import friendly_step_label as _fsl
+                        _label = (step.get("name") or "").strip() or _fsl(step)
+                    except Exception:
+                        _label = (step.get("name") or action or "step")
                     await on_step_progress({
                         "idx": idx,
                         "action": action,
+                        "name": _label,
+                        "label": _label,
                         "selector": (selector or "")[:200],
                         "value_preview": (str(value) if value else "")[:80],
                         "total_steps": len(steps or []),
                         "status": "running",
+                        "detail": f"#{idx + 1} {_label}",
                         "timestamp_ms": int(_time_mod.time() * 1000),
                     })
                 except Exception:
@@ -16645,6 +16746,58 @@ async def _execute_automation_steps(
                         f"[otp_wait] step #{idx+1} skipped — OTP polling not automated in headless RUT"
                     )
                     _step_note = "OTP wait not automated (skipped)"
+                elif action == "stage":
+                    # 2026-08 — Stage marker gate.
+                    # open_when fail + skip_if_not_open → skip all following
+                    # steps until the next stage (instant, no per-step timeouts).
+                    _stage_name = (step.get("name") or step.get("stage") or "stage").strip()
+                    if not _stage_gate_on:
+                        _stage_skip_active = False
+                        _step_note = f"stage '{_stage_name}' ignored (stage_markers OFF)"
+                    else:
+                        open_when = step.get("open_when") or {}
+                        skip_if = bool(step.get("skip_if_not_open", True))
+                        # No open_when → always run this stage (e.g. Questions)
+                        if not isinstance(open_when, dict) or not (
+                            (open_when.get("type") or "").strip()
+                            or (open_when.get("selector") or "").strip()
+                            or (open_when.get("text") or "").strip()
+                            or (open_when.get("value") or "").strip()
+                        ):
+                            _stage_skip_active = False
+                            _step_note = f"stage '{_stage_name}' open (no detect) — running"
+                        else:
+                            # Normalize shorthand fields into condition dict
+                            cond = dict(open_when)
+                            if not (cond.get("type") or "").strip():
+                                if (cond.get("selector") or "").strip():
+                                    cond["type"] = "selector_visible"
+                                elif (cond.get("text") or "").strip():
+                                    cond["type"] = "text_visible"
+                                elif (cond.get("value") or cond.get("url") or "").strip():
+                                    cond["type"] = "url_contains"
+                            opened = await _page_condition_met(
+                                page, cond,
+                                default_timeout_ms=int(
+                                    cond.get("timeout_ms") or step.get("timeout") or 5000
+                                ),
+                                alias_alts_fn=_alias_alts_for,
+                            )
+                            if opened:
+                                _stage_skip_active = False
+                                _step_note = f"stage '{_stage_name}' OPEN — running steps"
+                            elif skip_if:
+                                _stage_skip_active = True
+                                _step_note = (
+                                    f"stage '{_stage_name}' NOT open — "
+                                    f"skipping whole stage block"
+                                )
+                            else:
+                                _stage_skip_active = False
+                                _step_note = (
+                                    f"stage '{_stage_name}' not open but "
+                                    f"skip_if_not_open=false — continuing"
+                                )
                 elif action == "conditional_skip":
                     _if_type = (step.get("if_type") or "visible").strip().lower()
                     _matched = False
@@ -17127,12 +17280,20 @@ async def _execute_automation_steps(
                             pass
 
                     try:
+                        try:
+                            from step_labels import friendly_step_label as _fsl
+                            _label = (step.get("name") or "").strip() or _fsl(step)
+                        except Exception:
+                            _label = (step.get("name") or action or "step")
                         await on_step_progress({
                             "idx": idx,
                             "action": action,
+                            "name": _label,
+                            "label": _label,
                             "selector": (selector or "")[:200],
                             "total_steps": len(steps or []),
                             "status": "ok",
+                            "detail": f"#{idx + 1} {_label}",
                             "ms": int((_time_mod.perf_counter() - _t_step_start) * 1000),
                             "timestamp_ms": int(_time_mod.time() * 1000),
                             "screenshot_b64": _live_b64,

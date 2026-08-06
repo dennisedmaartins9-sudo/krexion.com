@@ -196,6 +196,7 @@ def _build_tray():
         pystray.MenuItem("Show Dashboard", _on_show_dashboard, default=True),
         pystray.MenuItem("Hide Dashboard", _on_hide_dashboard),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Check for Updates…", _on_check_updates_now),
         pystray.MenuItem("Open krexion.com", _on_open_krexion),
         pystray.MenuItem("View Logs", _on_open_logs),
         pystray.MenuItem("View System Specs", _on_open_specs),
@@ -646,86 +647,148 @@ def _user_session_browser_launcher_loop() -> None:
         logger.warning(f"[user-session-launcher] thread crashed: {exc}", exc_info=True)
 
 
-def _check_for_updates() -> None:
-    """Hit GitHub Releases API, compare latest tag to bundled VERSION.
-    If newer, show a Win32 MessageBoxW with "Download v1.0.X" so the
-    customer can one-click open the installer download. Runs in a
-    daemon thread; failures are logged and silently ignored — the app
-    keeps working regardless."""
-    # 5 s delay so the dashboard window finishes opening first
-    import time as _t
-    _t.sleep(5)
+def _read_bundled_version() -> str | None:
+    """Return installed VERSION (no leading v), or None."""
+    version_paths = [
+        HERE / "VERSION",
+        HERE.parent / "VERSION",
+        HERE.parent.parent / "backend" / "VERSION",
+        HERE.parent.parent.parent / "backend" / "VERSION",
+        HERE.parent.parent.parent.parent / "backend" / "VERSION",
+    ]
+    for p in version_paths:
+        try:
+            if p.exists():
+                return p.read_text(encoding="utf-8").strip().lstrip("vV")
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _parse_semver_tuple(v: str) -> tuple:
+    parts = []
+    for chunk in (v or "").split("."):
+        num = ""
+        for c in chunk:
+            if c.isdigit():
+                num += c
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _on_check_updates_now(icon=None, _item=None) -> None:
+    """Tray menu: re-run update check immediately (non-blocking)."""
+    threading.Thread(
+        target=_check_for_updates,
+        kwargs={"prompt_always": True, "delay_s": 0},
+        daemon=True,
+        name="krexion-update-check-now",
+    ).start()
+
+
+def _run_silent_update(target_version: str | None = None) -> None:
+    """Download + silent-install latest Setup.exe (same path as dashboard)."""
     try:
-        # Find bundled VERSION file. Same lookup as installer/PS1.
-        version_paths = [
-            HERE / "VERSION",
-            HERE.parent / "VERSION",
-            HERE.parent.parent / "backend" / "VERSION",
-            HERE.parent.parent.parent / "backend" / "VERSION",
-            HERE.parent.parent.parent.parent / "backend" / "VERSION",
-        ]
-        current = None
-        for p in version_paths:
+        from desktop.updater import apply_update  # type: ignore
+        result = apply_update(target_version)
+        logger.info(f"[update] apply_update result: {result}")
+        if not result.get("ok"):
             try:
-                if p.exists():
-                    current = p.read_text(encoding="utf-8").strip()
-                    break
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    f"Update failed:\n\n{result.get('message') or 'unknown error'}",
+                    "Krexion Update",
+                    0x00000010,  # MB_ICONERROR
+                )
             except Exception:  # noqa: BLE001
-                continue
-        if not current:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[update] silent update failed: {exc}")
+
+
+def _check_for_updates(prompt_always: bool = False, delay_s: float = 5.0) -> None:
+    """Compare installed VERSION to krexion.com public-latest.
+
+    If newer, show MessageBox: OK = download & silent-install here
+    (no website visit). Dashboard blink icon is the primary UX; this
+    is a launch-time / tray backup for customers who never open the
+    window. Failures are logged and ignored.
+    """
+    import time as _t
+    if delay_s:
+        _t.sleep(delay_s)
+    try:
+        current_norm = _read_bundled_version()
+        if not current_norm:
             logger.info("[update] no VERSION file found; skipping update check")
             return
-        # Normalise (drop leading "v")
-        current_norm = current.lstrip("vV")
         logger.info(f"[update] current version: {current_norm}")
 
-        import urllib.request, json as _json
+        import urllib.request
+        import json as _json
+        url = f"{KREXION_CLOUD}/api/system/public-latest?current={current_norm}"
         req = urllib.request.Request(
-            "https://api.github.com/repos/dennisedmaartins9-sudo/krexion.com/releases/latest",
+            url,
             headers={"User-Agent": f"Krexion-Desktop/{current_norm}"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
-        latest_tag = (data.get("tag_name") or "").strip()
-        latest_norm = latest_tag.lstrip("vV")
+        latest = data.get("latest") or {}
+        latest_norm = str(latest.get("version") or "").strip().lstrip("vV")
         if not latest_norm:
-            logger.info("[update] no latest tag; skipping")
+            logger.info("[update] no latest version from cloud; skipping")
             return
-        logger.info(f"[update] latest GitHub release: {latest_norm}")
+        logger.info(f"[update] latest cloud release: {latest_norm}")
 
-        # Compare as tuple-of-ints
-        def _parse(v: str):
-            parts = []
-            for chunk in v.split("."):
-                num = ""
-                for c in chunk:
-                    if c.isdigit():
-                        num += c
-                    else:
-                        break
-                parts.append(int(num) if num else 0)
-            return tuple(parts)
-
-        if _parse(latest_norm) <= _parse(current_norm):
+        available = bool(data.get("update_available")) or (
+            _parse_semver_tuple(latest_norm) > _parse_semver_tuple(current_norm)
+        )
+        if not available:
             logger.info("[update] already up to date")
+            if prompt_always:
+                try:
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(
+                        None,
+                        f"Krexion is up to date.\n\nYou have v{current_norm}.",
+                        "Krexion Update",
+                        0x00000040,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             return
 
         logger.info(f"[update] NEW version available: {latest_norm} (currently {current_norm})")
-        # Show MessageBoxW prompt — minimal modal, non-blocking-ish.
         try:
+            # Notify tray if available
+            if _tray is not None:
+                try:
+                    _tray.notify(
+                        f"Krexion {latest_norm} is ready — open Dashboard or click OK to install.",
+                        "Update available",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             import ctypes
-            MB_FLAGS = 0x00000001 | 0x00000040  # OK|CANCEL | INFO icon
+            MB_FLAGS = 0x00000001 | 0x00000040  # OK|CANCEL | INFO
             title = "Krexion - Update Available"
             body = (
                 f"A new version of Krexion is available!\n\n"
                 f"  Current : v{current_norm}\n"
                 f"  Latest  : v{latest_norm}\n\n"
-                f"Press OK to open the download page in your browser, or\n"
-                f"Cancel to skip (you can update later from krexion.com)."
+                f"Press OK to download & install here automatically\n"
+                f"(no website visit needed).\n\n"
+                f"Cancel to skip — the blinking Update button stays\n"
+                f"on the Local PC Dashboard."
             )
             rv = ctypes.windll.user32.MessageBoxW(None, body, title, MB_FLAGS)
             if rv == 1:
-                webbrowser.open(f"{KREXION_CLOUD}/download")
+                _run_silent_update(latest_norm)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[update] could not show MessageBox: {exc}")
     except Exception as exc:  # noqa: BLE001
