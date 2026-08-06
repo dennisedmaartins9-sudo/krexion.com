@@ -729,8 +729,10 @@ function init() {
   if (showLogBtn) showLogBtn.addEventListener("click", showBackendLogTail);
 
   pollLocal();
-  // First update check after local version is known (~3s), then every 5 min.
-  setTimeout(pollUpdate, 3000);
+  // First update check after local version is known (~2s), again at 15s
+  // (VERSION may arrive slightly later), then every 5 min.
+  setTimeout(pollUpdate, 2000);
+  setTimeout(pollUpdate, 15000);
   setInterval(pollUpdate, POLL_CLOUD_MS);
   setInterval(pollLocal, POLL_LOCAL_MS);
 }

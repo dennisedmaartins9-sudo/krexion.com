@@ -11363,6 +11363,19 @@ async def run_real_user_traffic_job(
                          + (f" (retry {retry_attempt}/{MAX_INVALID_RETRIES})" if retry_attempt else ""))
                         if row else "Filling form",
                     )
+                    # Early lead delete (form submit / next page) — shared by
+                    # Smart Funnel + custom JSON. Conversion wait NOT required.
+                    async def _on_lead_submitted_early(reason: str):
+                        if row_index is None:
+                            return
+                        async with report_lock:
+                            consumed_row_indices.add(row_index)
+                        push_live_step(
+                            job_id, i + 1, "submit", "ok",
+                            f"Lead row #{row_index + 1} used ({reason}) — removed from Uploaded Things",
+                        )
+                        _spawn_live(_live_remove_data_row(row_index))
+
                     # Native Smart Funnel → custom JSON → legacy heuristic.
                     if smart_funnel_enabled:
                         from smart_funnel import SmartFunnelConfig, execute_smart_funnel, rut_config_for_pattern
@@ -11440,6 +11453,7 @@ async def run_real_user_traffic_job(
                                 on_step_progress=_sf_progress_cb,
                                 job_id=job_id,
                                 visit_idx=i + 1,
+                                on_lead_submitted=_on_lead_submitted_early,
                             )
                         )
 
@@ -11604,6 +11618,14 @@ async def run_real_user_traffic_job(
                         # cancels the steps task so the job moves on
                         # to the next visit instead of wasting the full
                         # automation budget on a dead page.
+                        # Start a watchdog task that records a "stuck"
+                        # event if the page URL hasn't changed for >25s
+                        # while the automation script is running. The
+                        # watchdog also captures a screenshot + body
+                        # text snapshot for offline debugging, then
+                        # cancels the steps task so the job moves on
+                        # to the next visit instead of wasting the full
+                        # automation budget on a dead page.
                         _steps_task = asyncio.create_task(
                             _execute_automation_steps(
                                 page, row or {}, automation_steps, skip_captcha=skip_captcha,
@@ -11615,6 +11637,7 @@ async def run_real_user_traffic_job(
                                 visit_idx=i + 1,         # 2026-06: manual takeover pause hook
                                 step_timeout_multiplier=step_timeout_multiplier,  # 2026-06: user-configurable slow-step wait
                                 skip_missing_steps=True,
+                                on_lead_submitted=_on_lead_submitted_early,
                             )
                         )
 
@@ -12057,7 +12080,8 @@ async def run_real_user_traffic_job(
 
                 # Mark the FINAL lead row as CONSUMED if submit succeeded — it
                 # will be excluded from the pending_leads.xlsx so the user
-                # never reuses it.
+                # never reuses it. Backup for paths that never fired the
+                # mid-automation early delete (form submit → next page).
                 if entry["status"] == "ok" and row_index is not None:
                     async with report_lock:
                         consumed_row_indices.add(row_index)
@@ -13589,11 +13613,101 @@ def _extract_random_pick_labels(script: Any) -> Optional[List[str]]:
 def _normalize_gender_click_label(label: str) -> str:
     """Map M/F shorthands to button-visible labels for native text-click."""
     g = (label or "").strip().lower()
-    if g in ("m", "male", "man"):
+    if g in ("m", "male", "man", "1"):
         return "Male"
-    if g in ("f", "female", "woman"):
+    if g in ("f", "female", "woman", "2", "0"):
         return "Female"
     return (label or "").strip()
+
+
+def _resolve_sheet_option_pick_label(
+    step: Dict[str, Any],
+    row: Dict[str, Any],
+) -> Optional[str]:
+    """Resolve Option Pick / Gender Pick sheet value → visible button text.
+
+    Visual Recorder flow:
+      1. Option Pick / Gender Pick captures Male + Female (or other) labels
+      2. Operator binds Excel header (e.g. gender)
+      3. Job row has M / F / Male / Female → click matching recorded button
+
+    Returns the visible label to click (e.g. ``Male``), or None if this
+    step is not a sheet-bound option/gender pick.
+    """
+    if not isinstance(step, dict):
+        return None
+    origin = (step.get("origin") or "").strip().lower()
+    header = (step.get("header_name") or "").strip()
+    gl = step.get("gender_labels") if isinstance(step.get("gender_labels"), dict) else None
+    ol = step.get("option_labels") if isinstance(step.get("option_labels"), list) else None
+    is_pick = origin in ("gender_pick", "option_pick", "sheet_pick") or bool(gl) or bool(ol)
+    if not is_pick:
+        return None
+    if not header:
+        # Common default for gender_pick recordings
+        if gl or origin == "gender_pick":
+            header = "gender"
+        else:
+            return None
+
+    raw = (_substitute("{{" + header + "}}", row) or "").strip()
+    if not raw:
+        for syn in ("gender", "sex", "Gender", "SEX"):
+            if syn.lower() == header.lower():
+                continue
+            raw = (_substitute("{{" + syn + "}}", row) or "").strip()
+            if raw:
+                break
+    if not raw:
+        return None
+
+    raw_l = raw.lower().strip()
+    want_male = raw_l in ("m", "male", "man", "1")
+    want_female = raw_l in ("f", "female", "woman", "2", "0")
+
+    def _prefer_full(labels: List[Any], side: str) -> str:
+        cleaned = [(str(x) or "").strip() for x in (labels or []) if (str(x) or "").strip()]
+        if not cleaned:
+            return "Male" if side == "male" else "Female"
+        # Prefer exact "Male"/"Female" over M/F for native click
+        for cand in cleaned:
+            if cand.lower() == side:
+                return cand
+        for cand in cleaned:
+            if cand.lower().startswith(side):
+                return cand
+        return cleaned[0]
+
+    if gl or origin == "gender_pick" or header.lower() in ("gender", "sex"):
+        male_labels = list((gl or {}).get("male") or ["Male", "M", "male", "m"])
+        female_labels = list((gl or {}).get("female") or ["Female", "F", "female", "f"])
+        if want_male:
+            return _prefer_full(male_labels, "male")
+        if want_female:
+            return _prefer_full(female_labels, "female")
+        # Raw already looks like a button label
+        return _normalize_gender_click_label(raw) or raw
+
+    if ol:
+        labels = [(str(x) or "").strip() for x in ol if (str(x) or "").strip()]
+        aliases = [raw_l]
+        if want_male:
+            aliases = ["male", "m", "man"]
+        elif want_female:
+            aliases = ["female", "f", "woman"]
+        for lbl in labels:
+            nl = lbl.lower()
+            for a in aliases:
+                if not a:
+                    continue
+                if nl == a or nl.startswith(a) or (len(a) >= 2 and a.startswith(nl)):
+                    return lbl
+        # Fall back: map gender shorthand onto first Male/Female-ish label
+        if want_male or want_female:
+            return _normalize_gender_click_label(raw)
+        return labels[0] if labels else raw
+
+    return _normalize_gender_click_label(raw) or raw
 
 
 def _extract_text_click_label(script: Any) -> Optional[str]:
@@ -13732,6 +13846,11 @@ async def _native_click_by_text(page: Any, text: str, timeout_ms: int = 8000) ->
     (button / link → most reliable on SPA pages) then falls back
     to plain `get_by_text`.
 
+    IMPORTANT: for short labels like ``Male`` / ``Female``, we MUST use
+    exact matching. ``get_by_text('Male', exact=False)`` can match
+    ``Female`` because ``male`` is a substring of ``female`` — that was
+    the root cause of gender Option Pick never selecting correctly.
+
     Returns:
         (clicked: bool, frame_url: str, error: str)
     """
@@ -13740,6 +13859,14 @@ async def _native_click_by_text(page: Any, text: str, timeout_ms: int = 8000) ->
     text = text.strip()
     if not text:
         return False, "", "empty text"
+
+    # Short / gender labels → exact only (avoid Male matching Female)
+    _exact_preferred = (
+        len(text) <= 12
+        or text.lower() in ("male", "female", "m", "f", "yes", "no")
+        or text.lower().startswith("male")
+        or text.lower().startswith("female")
+    )
 
     last_err = ""
     try:
@@ -13752,44 +13879,100 @@ async def _native_click_by_text(page: Any, text: str, timeout_ms: int = 8000) ->
         except Exception:
             frames = []
 
+    async def _try_click(loc, how: str) -> Tuple[bool, str]:
+        nonlocal last_err
+        try:
+            if await loc.count() <= 0:
+                return False, ""
+            try:
+                await loc.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                await loc.click(timeout=timeout_ms)
+                return True, ""
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{how}: {type(e).__name__}: {str(e)[:90]}"
+                # Force-click for stubborn custom tiles
+                try:
+                    await loc.click(timeout=timeout_ms, force=True)
+                    return True, ""
+                except Exception as e2:  # noqa: BLE001
+                    last_err = f"{how}/force: {type(e2).__name__}: {str(e2)[:90]}"
+                    return False, ""
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{how}: {type(e).__name__}: {str(e)[:90]}"
+            return False, ""
+
     for frame in frames:
         try:
             frame_url = getattr(frame, "url", "") or ""
         except Exception:
             frame_url = ""
 
-        # Strategy 1: role-based (button / link) — most reliable on SPA
-        for role in ("button", "link"):
+        # Strategy 1: role-based (button / link / radio)
+        for role in ("button", "link", "radio"):
             try:
-                loc = frame.get_by_role(role, name=text).first
-                if await loc.count() > 0:
-                    try:
-                        await loc.scroll_into_view_if_needed(timeout=2000)
-                    except Exception:
-                        pass
-                    try:
-                        await loc.click(timeout=timeout_ms)
-                        return True, frame_url, ""
-                    except Exception as e:  # noqa: BLE001
-                        last_err = f"role={role}: {type(e).__name__}: {str(e)[:90]}"
+                loc = frame.get_by_role(role, name=text, exact=True).first
+                ok, _ = await _try_click(loc, f"role={role}/exact")
+                if ok:
+                    return True, frame_url, ""
             except Exception as e:  # noqa: BLE001
                 last_err = f"role={role}: {type(e).__name__}: {str(e)[:90]}"
-
-        # Strategy 2: plain text locator (fuzzy)
-        try:
-            loc = frame.get_by_text(text, exact=False).first
-            if await loc.count() > 0:
+            if not _exact_preferred:
                 try:
-                    await loc.scroll_into_view_if_needed(timeout=2000)
-                except Exception:
-                    pass
-                try:
-                    await loc.click(timeout=timeout_ms)
-                    return True, frame_url, ""
+                    loc = frame.get_by_role(role, name=text).first
+                    ok, _ = await _try_click(loc, f"role={role}")
+                    if ok:
+                        return True, frame_url, ""
                 except Exception as e:  # noqa: BLE001
-                    last_err = f"text: {type(e).__name__}: {str(e)[:90]}"
+                    last_err = f"role={role}: {type(e).__name__}: {str(e)[:90]}"
+
+        # Strategy 2: exact text (critical for Male vs Female)
+        try:
+            loc = frame.get_by_text(text, exact=True).first
+            ok, _ = await _try_click(loc, "text/exact")
+            if ok:
+                return True, frame_url, ""
         except Exception as e:  # noqa: BLE001
-            last_err = f"text: {type(e).__name__}: {str(e)[:90]}"
+            last_err = f"text/exact: {type(e).__name__}: {str(e)[:90]}"
+
+        # Strategy 3: fuzzy text ONLY when safe (not Male/Female short labels)
+        if not _exact_preferred:
+            try:
+                loc = frame.get_by_text(text, exact=False).first
+                ok, _ = await _try_click(loc, "text")
+                if ok:
+                    return True, frame_url, ""
+            except Exception as e:  # noqa: BLE001
+                last_err = f"text: {type(e).__name__}: {str(e)[:90]}"
+
+        # Strategy 4: CSS :has-text with exact filter (custom Male/Female tiles)
+        try:
+            loc = frame.locator(
+                "button, a, div, span, label, [role=button], [role=radio]"
+            ).filter(has_text=text).first
+            # Prefer leaf with exact trimmed text via evaluate-free click
+            # Playwright filter has_text is substring — verify exact via all()
+            cands = frame.locator(
+                "button, a, div, span, label, [role=button], [role=radio]"
+            ).filter(has_text=text)
+            n = await cands.count()
+            for i in range(min(n, 12)):
+                el = cands.nth(i)
+                try:
+                    t = ((await el.inner_text()) or "").replace("\n", " ").strip()
+                except Exception:
+                    continue
+                if t.lower() != text.lower():
+                    # Allow exact single-word match only
+                    if t.lower() not in (text.lower(),):
+                        continue
+                ok, _ = await _try_click(el, f"filter[{i}]")
+                if ok:
+                    return True, frame_url, ""
+        except Exception as e:  # noqa: BLE001
+            last_err = f"filter: {type(e).__name__}: {str(e)[:90]}"
 
     return False, "", last_err or "no match in any frame"
 
@@ -15239,6 +15422,7 @@ async def _execute_automation_steps(
     visit_idx: Optional[int] = None,
     step_timeout_multiplier: float = 1.0,  # 2026-06 — stretch per-step ceilings
     skip_missing_steps: bool = True,  # 2026-07 — skip absent steps, try next
+    on_lead_submitted: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Dict[str, Any]:
     """Execute a user-provided automation script step-by-step. Returns
     {status, error?, executed_steps, step_results?}.  Each step format:
@@ -15265,6 +15449,12 @@ async def _execute_automation_steps(
     step is slow/failing BEFORE committing the automation to a RUT job.
     Production RUT visits leave this OFF (default) so there's zero
     overhead in the hot loop.
+
+    2026-08 — ``on_lead_submitted(reason)`` fires once when lead PII has
+    been submitted and the flow moved past the form (e.g. survey stage
+    opens, explicit ``consume_lead`` step, or post-submit page). Caller
+    deletes the Uploaded Things row immediately — does NOT wait for
+    conversion / visit complete.
     """
     import time as _time_mod
     executed = 0
@@ -15272,6 +15462,39 @@ async def _execute_automation_steps(
     MAX_HEAL = 3  # total AI recovery attempts per row
     step_results: List[Dict[str, Any]] = []
     _t_total_start = _time_mod.perf_counter() if collect_timings else 0.0
+    # Early lead-consume tracking (form submit → delete, not conversion)
+    _lead_submitted_fired = False
+    _lead_pii_filled = False
+    _LEAD_PII_TOKENS = (
+        "email", "first", "last", "address", "city", "state",
+        "zip", "zip_code", "cellphone", "phone", "mobile", "gender",
+    )
+    _POST_FORM_STAGE_HINTS = (
+        "survey", "post-form", "post_form", "postform", "thank",
+        "deal", "conversion", "offers", "cidmain",
+    )
+
+    def _raw_value_is_pii_bind(raw_val: Any) -> bool:
+        s = str(raw_val or "").lower()
+        if "{{" in s:
+            return any(tok in s for tok in _LEAD_PII_TOKENS)
+        return False
+
+    def _stage_implies_post_form(stage_name: str) -> bool:
+        n = (stage_name or "").strip().lower()
+        return any(h in n for h in _POST_FORM_STAGE_HINTS)
+
+    async def _fire_lead_submitted(reason: str) -> None:
+        nonlocal _lead_submitted_fired
+        if _lead_submitted_fired or on_lead_submitted is None:
+            return
+        _lead_submitted_fired = True
+        try:
+            await on_lead_submitted(str(reason or "form_submit")[:120])
+            logger.info(f"[lead-consume] early delete fired: {reason}")
+        except Exception as _lc_err:  # noqa: BLE001
+            _lead_submitted_fired = False
+            logger.debug(f"[lead-consume] callback failed: {_lc_err}")
 
     # ── 2026-01: Selector Aliases (self-healing replay) ──────────────
     # If user_id is provided, pre-load all alias mappings for the
@@ -15511,7 +15734,8 @@ async def _execute_automation_steps(
             # step_results.append below.
             _step_note: str = ""
             selector = step.get("selector") or ""
-            value = _substitute(step.get("value", ""), row)
+            _raw_value_template = step.get("value", "")
+            value = _substitute(_raw_value_template, row)
             # ── 2026-05: longer default per-step timeout ──
             # Bumped from 10s → 25s. Visual Recorder doesn't emit a
             # per-step `timeout` so the default IS what every fill /
@@ -15732,6 +15956,8 @@ async def _execute_automation_steps(
                         page, step, selector, str(value), timeout,
                         humanize=step.get("humanize") is not False,
                     )
+                    if _raw_value_is_pii_bind(_raw_value_template) or _raw_value_is_pii_bind(selector):
+                        _lead_pii_filled = True
                 elif action == "type":
                     # Slower per-char typing (more human) — now with
                     # variable delay + thinking pauses via the helper.
@@ -15752,6 +15978,8 @@ async def _execute_automation_steps(
                                 await page.type(selector, str(value), delay=int(step.get("delay") or 50), timeout=timeout)
                         except Exception:
                             await page.type(selector, str(value), delay=int(step.get("delay") or 50), timeout=timeout)
+                    if _raw_value_is_pii_bind(_raw_value_template) or _raw_value_is_pii_bind(selector):
+                        _lead_pii_filled = True
                 elif action == "select":
                     _fl_sel = _frame_locator_for_step(page, step)
                     if _fl_sel is not None and selector:
@@ -15967,8 +16195,88 @@ async def _execute_automation_steps(
                                     f"[evaluate→selector_click] '{_step_sel}' failed: "
                                     f"{str(_sel_e)[:100]} — falling back to JS"
                                 )
+                        # ── Option Pick / Gender Pick (sheet-bound) ──
+                        # VR: capture Male+Female → bind {{gender}} →
+                        # row M/F/Male/Female → native click exact label.
+                        # Must run BEFORE random-pick / fuzzy text-click
+                        # (fuzzy 'Male' can match 'Female').
+                        if not _native_handled:
+                            _sheet_label = _resolve_sheet_option_pick_label(step, row)
+                            if _sheet_label:
+                                _native_picked = _sheet_label
+                                logger.info(
+                                    f"[option-pick] sheet→button '{_native_picked}' "
+                                    f"(header={step.get('header_name') or '?'}, "
+                                    f"origin={step.get('origin') or '?'})"
+                                )
+                                _ok_n, _frame_url_n, _err_n = await _native_click_by_text(
+                                    page, _native_picked, timeout_ms=8000
+                                )
+                                if not _ok_n:
+                                    # Coordinate fallback: exact-text leaf → mouse.click center
+                                    # (custom Male/Female tiles often ignore locator clicks)
+                                    try:
+                                        _box = await page.evaluate(
+                                            """(label) => {
+                                              const want = String(label||'').trim().toLowerCase();
+                                              const vis = (e) => {
+                                                if (!e) return null;
+                                                const s = getComputedStyle(e);
+                                                if (s.display==='none'||s.visibility==='hidden') return null;
+                                                const r = e.getBoundingClientRect();
+                                                if (r.width<20||r.height<10) return null;
+                                                return r;
+                                              };
+                                              const txt = (e) => ((e.innerText||e.textContent||'')+'').replace(/\\s+/g,' ').trim();
+                                              const nodes = Array.from(document.querySelectorAll(
+                                                'button,a,div,span,label,[role=button],[role=radio]'
+                                              ));
+                                              let best = null, bestArea = 1e15;
+                                              for (const el of nodes) {
+                                                const t = txt(el);
+                                                if (t.toLowerCase() !== want) continue;
+                                                const r = vis(el);
+                                                if (!r) continue;
+                                                const area = r.width * r.height;
+                                                if (area < bestArea) { bestArea = area; best = r; }
+                                              }
+                                              if (!best) return null;
+                                              return {x: best.left + best.width/2, y: best.top + best.height/2};
+                                            }""",
+                                            _native_picked,
+                                        )
+                                        if isinstance(_box, dict) and _box.get("x") is not None:
+                                            await page.mouse.click(float(_box["x"]), float(_box["y"]))
+                                            _ok_n = True
+                                            _err_n = ""
+                                            _frame_url_n = ""
+                                            logger.info(
+                                                f"[option-pick] mouse.click at "
+                                                f"({_box['x']:.0f},{_box['y']:.0f}) for '{_native_picked}'"
+                                            )
+                                    except Exception as _mouse_e:  # noqa: BLE001
+                                        logger.warning(f"[option-pick] mouse fallback failed: {_mouse_e}")
+                                if _ok_n:
+                                    logger.info(
+                                        f"[evaluate→native_click] option-pick='{_native_picked}' "
+                                        f"frame='{(_frame_url_n or '')[:60]}'"
+                                    )
+                                    _native_handled = True
+                                    _step_note = (
+                                        f"option-pick='{_native_picked}'"
+                                        + (f" frame='{(_frame_url_n or '')[:80]}'" if _frame_url_n else "")
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[evaluate→native_click] option-pick='{_native_picked}' "
+                                        f"failed: {_err_n[:100]} — falling back to JS"
+                                    )
+                                    _step_note = (
+                                        f"native_click option-pick failed ({_err_n[:60]}), "
+                                        f"fell back to JS"
+                                    )
                         _rp_labels = _extract_random_pick_labels(js)
-                        if _rp_labels:
+                        if _rp_labels and not _native_handled:
                             # 2026-06 — Customer ask: random_pick should
                             # be TRULY different per visit ("har bar
                             # random mix"). The previous code used
@@ -16012,7 +16320,7 @@ async def _execute_automation_steps(
                                     f"failed: {_err_n[:100]} — falling back to JS"
                                 )
                                 _step_note = f"native_click random-pick failed ({_err_n[:60]}), fell back to JS"
-                        else:
+                        elif not _native_handled:
                             _tc_label = _extract_text_click_label(js)
                             if _tc_label:
                                 _native_picked = _normalize_gender_click_label(_tc_label)
@@ -16746,11 +17054,20 @@ async def _execute_automation_steps(
                         f"[otp_wait] step #{idx+1} skipped — OTP polling not automated in headless RUT"
                     )
                     _step_note = "OTP wait not automated (skipped)"
+                elif action in ("consume_lead", "mark_lead_used", "lead_used"):
+                    # Explicit JSON hook: delete Uploaded Things row now
+                    # (form already submitted / email landed).
+                    await _fire_lead_submitted(
+                        (step.get("name") or step.get("reason") or action).strip()
+                        or "consume_lead"
+                    )
+                    _step_note = "lead marked used (Uploaded Things delete)"
                 elif action == "stage":
                     # 2026-08 — Stage marker gate.
                     # open_when fail + skip_if_not_open → skip all following
                     # steps until the next stage (instant, no per-step timeouts).
                     _stage_name = (step.get("name") or step.get("stage") or "stage").strip()
+                    _stage_opened_now = False
                     if not _stage_gate_on:
                         _stage_skip_active = False
                         _step_note = f"stage '{_stage_name}' ignored (stage_markers OFF)"
@@ -16765,6 +17082,7 @@ async def _execute_automation_steps(
                             or (open_when.get("value") or "").strip()
                         ):
                             _stage_skip_active = False
+                            _stage_opened_now = True
                             _step_note = f"stage '{_stage_name}' open (no detect) — running"
                         else:
                             # Normalize shorthand fields into condition dict
@@ -16785,6 +17103,7 @@ async def _execute_automation_steps(
                             )
                             if opened:
                                 _stage_skip_active = False
+                                _stage_opened_now = True
                                 _step_note = f"stage '{_stage_name}' OPEN — running steps"
                             elif skip_if:
                                 _stage_skip_active = True
@@ -16798,6 +17117,13 @@ async def _execute_automation_steps(
                                     f"stage '{_stage_name}' not open but "
                                     f"skip_if_not_open=false — continuing"
                                 )
+                    # Form submit → next page (survey/deals/…) = lead used.
+                    # Do NOT wait for conversion / visit complete.
+                    if _stage_opened_now and (
+                        bool(step.get("consume_lead"))
+                        or _stage_implies_post_form(_stage_name)
+                    ):
+                        await _fire_lead_submitted(f"stage:{_stage_name}")
                 elif action == "conditional_skip":
                     _if_type = (step.get("if_type") or "visible").strip().lower()
                     _matched = False
@@ -17182,6 +17508,34 @@ async def _execute_automation_steps(
                     except Exception as _nt_e:
                         logger.debug(f"new-tab detection skipped: {_nt_e}")
                 executed += 1
+                # Early lead consume: PII was filled, then a click/submit/
+                # evaluate moved us off the big form (email/#fn gone).
+                if (
+                    not _lead_submitted_fired
+                    and _lead_pii_filled
+                    and on_lead_submitted is not None
+                    and action in ("click", "evaluate", "press", "submit")
+                ):
+                    try:
+                        _form_still = await page.evaluate(
+                            """() => {
+                              const q = (s) => { try { return document.querySelector(s); } catch(_) { return null; } };
+                              const vis = (el) => {
+                                if (!el) return false;
+                                const s = window.getComputedStyle(el);
+                                if (!s || s.display==='none' || s.visibility==='hidden') return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 2 && r.height > 2;
+                              };
+                              if (vis(q('#fn')) || vis(q('#email')) || vis(q('input[name=email]'))
+                                  || vis(q('input[type=email]'))) return true;
+                              return false;
+                            }"""
+                        )
+                        if _form_still is False:
+                            await _fire_lead_submitted(f"post_submit:{action}")
+                    except Exception:
+                        pass
                 if collect_timings:
                     _ok_entry: Dict[str, Any] = {
                         "idx": idx, "action": action,
@@ -17339,6 +17693,7 @@ async def _execute_automation_steps(
                                 self_heal=False,
                                 user_id=alias_user_id,
                                 skip_missing_steps=skip_missing_steps,
+                                on_lead_submitted=on_lead_submitted,
                             )
                             if _sub.get("status") == "ok":
                                 _retry_recovered = True

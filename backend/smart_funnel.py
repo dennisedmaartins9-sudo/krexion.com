@@ -7076,6 +7076,7 @@ async def execute_smart_funnel(
     on_step_progress: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     job_id: Optional[str] = None,
     visit_idx: Optional[int] = None,
+    on_lead_submitted: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> Dict[str, Any]:
     """
     Run the adaptive smart funnel until conversion or safety cap.
@@ -7083,6 +7084,19 @@ async def execute_smart_funnel(
     Returns same shape as _execute_automation_steps for drop-in use.
     """
     cfg = config or SmartFunnelConfig()
+    _lead_submitted_fired = False
+    _saw_form_phase = False
+
+    async def _fire_lead_submitted(reason: str) -> None:
+        nonlocal _lead_submitted_fired
+        if _lead_submitted_fired or on_lead_submitted is None:
+            return
+        _lead_submitted_fired = True
+        try:
+            await on_lead_submitted(str(reason or "smart_funnel_form")[:120])
+        except Exception:
+            _lead_submitted_fired = False
+
     try:
         _seed_visit_context(page, row or {}, job_id, visit_idx)
         page.context._krx_fast_survey = bool(cfg.fast_survey)
@@ -7630,6 +7644,7 @@ async def execute_smart_funnel(
         except Exception:
             pass
         if on_form:
+            _saw_form_phase = True
             try:
                 await _native_form_step(page, row or {})
             except Exception:
@@ -7650,6 +7665,9 @@ async def execute_smart_funnel(
                     await _native_email_step(page, row or {})
             except Exception:
                 pass
+        # Form filled + moved to survey/deals/email = lead used (not conversion wait)
+        if _saw_form_phase and not on_form and phase in ("survey", "email", "deals", "offers"):
+            await _fire_lead_submitted(f"smart_funnel:{phase}")
         if on_survey:
             cur_sfp = await _survey_fingerprint(page)
             new_q = cur_sfp != getattr(page.context, "_krx_last_survey_loop_fp", "")

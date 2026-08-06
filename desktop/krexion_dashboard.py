@@ -103,6 +103,12 @@ KREXION_CLOUD = os.environ.get("KREXION_CLOUD_URL", "https://krexion.com").rstri
 
 _window = None
 _tray = None
+_pending_update_version: str | None = None
+_UPDATE_ICON_BASE = None  # PIL image cached
+_UPDATE_ICON_BADGE = None
+_UPDATE_LAST_TOAST_AT = 0.0
+_UPDATE_TOAST_EVERY_S = 6 * 3600  # re-toast at most every 6h
+_UPDATE_POLL_EVERY_S = 15 * 60  # background poll while tray is alive
 
 
 def _open_in_explorer(path: Path) -> None:
@@ -167,6 +173,7 @@ def _load_tray_icon():
     tray icon still appears, even without the .ico file). Previously
     we returned a 1x1 fully-transparent pixel which Windows refused
     to render at all → tray icon invisible bug."""
+    global _UPDATE_ICON_BASE
     from PIL import Image  # type: ignore
     candidates = [
         HERE / "icons" / "krexion.ico",
@@ -178,15 +185,100 @@ def _load_tray_icon():
     for p in candidates:
         try:
             if p.exists():
-                img = Image.open(str(p))
+                img = Image.open(str(p)).convert("RGBA")
                 logger.info(f"Tray icon loaded from {p}")
+                _UPDATE_ICON_BASE = img
                 return img
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Tray icon at {p} failed to load: {exc}")
             continue
     # Visible fallback — solid teal square so the icon is at least clickable
     logger.warning("No .ico found, using solid-colour fallback (16x16 teal).")
-    return Image.new("RGBA", (16, 16), (45, 212, 191, 255))
+    img = Image.new("RGBA", (16, 16), (45, 212, 191, 255))
+    _UPDATE_ICON_BASE = img
+    return img
+
+
+def _tray_icon_with_update_badge():
+    """Orange corner dot on tray icon so customer sees update without
+    opening the dashboard window."""
+    global _UPDATE_ICON_BADGE
+    if _UPDATE_ICON_BADGE is not None:
+        return _UPDATE_ICON_BADGE
+    from PIL import Image, ImageDraw  # type: ignore
+    base = _UPDATE_ICON_BASE or _load_tray_icon()
+    try:
+        img = base.copy().convert("RGBA")
+        # Normalize to ~32px for badge placement
+        if max(img.size) < 24:
+            resample = getattr(getattr(Image, "Resampling", Image), "NEAREST", Image.NEAREST)
+            img = img.resize((32, 32), resample)
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        r = max(4, w // 5)
+        # Amber badge bottom-right
+        draw.ellipse(
+            (w - r - 1, h - r - 1, w - 1, h - 1),
+            fill=(245, 158, 11, 255),
+            outline=(26, 31, 46, 255),
+        )
+        _UPDATE_ICON_BADGE = img
+        return img
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Update badge icon failed: {exc}")
+        return base
+
+
+def _on_install_pending_update(icon=None, _item=None) -> None:
+    """Tray menu: install the pending update silently (no website)."""
+    ver = _pending_update_version
+    threading.Thread(
+        target=_run_silent_update,
+        args=(ver,),
+        daemon=True,
+        name="krexion-tray-install-update",
+    ).start()
+
+
+def _refresh_tray_for_update(latest_norm: str | None) -> None:
+    """Swap tray icon + tooltip when an update is (or isn't) available."""
+    global _pending_update_version
+    if _tray is None:
+        return
+    try:
+        if latest_norm:
+            _pending_update_version = latest_norm
+            _tray.icon = _tray_icon_with_update_badge()
+            _tray.title = f"Krexion — UPDATE v{latest_norm} available"
+            # Rebuild menu so Install Update is visible at the top
+            import pystray  # type: ignore
+            _tray.menu = pystray.Menu(
+                pystray.MenuItem(
+                    f"⬆ Install Update v{latest_norm}",
+                    _on_install_pending_update,
+                    default=True,
+                ),
+                pystray.MenuItem("Show Dashboard", _on_show_dashboard),
+                pystray.MenuItem("Hide Dashboard", _on_hide_dashboard),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Check for Updates…", _on_check_updates_now),
+                pystray.MenuItem("Open krexion.com", _on_open_krexion),
+                pystray.MenuItem("View Logs", _on_open_logs),
+                pystray.MenuItem("View System Specs", _on_open_specs),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit Krexion Dashboard", _on_quit),
+            )
+            try:
+                _tray.update_menu()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _pending_update_version = None
+            base = _UPDATE_ICON_BASE or _load_tray_icon()
+            _tray.icon = base
+            _tray.title = "Krexion — running"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"tray update refresh failed: {exc}")
 
 
 def _build_tray():
@@ -511,6 +603,9 @@ def main() -> int:
 
     # v1.0.21: auto-update check (non-blocking daemon).
     threading.Thread(target=_check_for_updates, daemon=True, name="krexion-update-check").start()
+    # Keep polling so customers who leave Krexion running for days still
+    # get tray badge + notify when a new Setup ships.
+    threading.Thread(target=_update_poll_loop, daemon=True, name="krexion-update-poll").start()
 
     # 2026-06-28 — user-session browser-profile launcher (Session-0 fix).
     # The NSSM-installed backend service runs in Session 0 and can't
@@ -711,15 +806,39 @@ def _run_silent_update(target_version: str | None = None) -> None:
         logger.warning(f"[update] silent update failed: {exc}")
 
 
+def _prompted_update_path(version: str) -> Path:
+    return PROGRAM_DATA / f"update-prompted-{version}.flag"
+
+
+def _already_prompted_version(version: str) -> bool:
+    try:
+        return _prompted_update_path(version).exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _mark_prompted_version(version: str) -> None:
+    try:
+        PROGRAM_DATA.mkdir(parents=True, exist_ok=True)
+        _prompted_update_path(version).write_text("1", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _check_for_updates(prompt_always: bool = False, delay_s: float = 5.0) -> None:
     """Compare installed VERSION to krexion.com public-latest.
 
-    If newer, show MessageBox: OK = download & silent-install here
-    (no website visit). Dashboard blink icon is the primary UX; this
-    is a launch-time / tray backup for customers who never open the
-    window. Failures are logged and ignored.
+    Primary UX for customers who leave the dashboard closed:
+      * Tray icon gets an amber badge + tooltip "UPDATE vX available"
+      * Tray menu top item becomes "Install Update vX"
+      * Windows tray balloon notify
+      * MessageBox once per version (OK = silent install here)
+
+    Dashboard blink "Update" pill is a second surface when the window
+    is open. Failures are logged and ignored.
     """
     import time as _t
+    global _UPDATE_LAST_TOAST_AT
     if delay_s:
         _t.sleep(delay_s)
     try:
@@ -750,6 +869,7 @@ def _check_for_updates(prompt_always: bool = False, delay_s: float = 5.0) -> Non
         )
         if not available:
             logger.info("[update] already up to date")
+            _refresh_tray_for_update(None)
             if prompt_always:
                 try:
                     import ctypes
@@ -764,16 +884,27 @@ def _check_for_updates(prompt_always: bool = False, delay_s: float = 5.0) -> Non
             return
 
         logger.info(f"[update] NEW version available: {latest_norm} (currently {current_norm})")
+        _refresh_tray_for_update(latest_norm)
+
+        # Tray balloon — always useful; throttle repeats
+        now = _t.time()
+        should_toast = (now - _UPDATE_LAST_TOAST_AT) >= _UPDATE_TOAST_EVERY_S
+        if should_toast and _tray is not None:
+            try:
+                _tray.notify(
+                    f"Krexion {latest_norm} ready — click tray icon → Install Update "
+                    f"(or open Local PC Dashboard blink Update).",
+                    "Krexion Update Available",
+                )
+                _UPDATE_LAST_TOAST_AT = now
+            except Exception:  # noqa: BLE001
+                pass
+
+        # MessageBox once per version (or always on manual Check)
+        show_box = prompt_always or not _already_prompted_version(latest_norm)
+        if not show_box:
+            return
         try:
-            # Notify tray if available
-            if _tray is not None:
-                try:
-                    _tray.notify(
-                        f"Krexion {latest_norm} is ready — open Dashboard or click OK to install.",
-                        "Update available",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
             import ctypes
             MB_FLAGS = 0x00000001 | 0x00000040  # OK|CANCEL | INFO
             title = "Krexion - Update Available"
@@ -783,16 +914,32 @@ def _check_for_updates(prompt_always: bool = False, delay_s: float = 5.0) -> Non
                 f"  Latest  : v{latest_norm}\n\n"
                 f"Press OK to download & install here automatically\n"
                 f"(no website visit needed).\n\n"
-                f"Cancel to skip — the blinking Update button stays\n"
-                f"on the Local PC Dashboard."
+                f"Cancel to skip — tray icon stays marked Update\n"
+                f"and Local PC Dashboard shows a blinking Update button."
             )
             rv = ctypes.windll.user32.MessageBoxW(None, body, title, MB_FLAGS)
+            _mark_prompted_version(latest_norm)
             if rv == 1:
                 _run_silent_update(latest_norm)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[update] could not show MessageBox: {exc}")
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[update] check failed (will retry next launch): {exc}")
+        logger.warning(f"[update] check failed (will retry): {exc}")
+
+
+def _update_poll_loop() -> None:
+    """Keep checking while tray lives — customers leave Krexion running
+    for days; a single launch-time check is not enough."""
+    import time as _t
+    # First check is started separately with a short delay; this loop
+    # covers subsequent polls.
+    _t.sleep(_UPDATE_POLL_EVERY_S)
+    while True:
+        try:
+            _check_for_updates(prompt_always=False, delay_s=0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[update] poll loop error: {exc}")
+        _t.sleep(_UPDATE_POLL_EVERY_S)
 
 
 if __name__ == "__main__":

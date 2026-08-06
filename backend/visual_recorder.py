@@ -5179,7 +5179,7 @@ _EDITABLE_STEP_FIELDS = {
     # arrays are passed through verbatim by the dict-validator below.
     "branches", "default_steps", "timeout_ms",
     # 2026-08 — stage markers
-    "open_when", "skip_if_not_open", "stage", "enabled",
+    "open_when", "skip_if_not_open", "stage", "enabled", "consume_lead",
 }
 
 
@@ -5374,6 +5374,8 @@ _MANUAL_STEP_ACTIONS = {
     "switch_tab", "close_tab",
     # 2026-08 — stage markers (path groups + open_when gate)
     "stage", "stage_markers",
+    # 2026-08 — early Uploaded Things row delete after form submit
+    "consume_lead", "mark_lead_used", "lead_used",
 }
 
 
@@ -5449,6 +5451,8 @@ def add_manual_step(sess: RecorderSession, step: Dict[str, Any], position: Optio
         if isinstance(step.get("open_when"), dict):
             clean["open_when"] = step["open_when"]
         clean["skip_if_not_open"] = bool(step.get("skip_if_not_open", True))
+        if step.get("consume_lead") is not None:
+            clean["consume_lead"] = bool(step.get("consume_lead"))
         if step.get("stage"):
             clean["stage"] = str(step.get("stage")).strip()
         # Keep name as stage label
@@ -5459,6 +5463,12 @@ def add_manual_step(sess: RecorderSession, step: Dict[str, Any], position: Optio
             sess.stage_markers_enabled = True
         except Exception:
             pass
+    if action in ("consume_lead", "mark_lead_used", "lead_used"):
+        clean["action"] = "consume_lead"
+        if step.get("name"):
+            clean["name"] = str(step.get("name")).strip()
+        if step.get("reason"):
+            clean["reason"] = str(step.get("reason")).strip()[:120]
     if action == "stage_markers":
         clean["enabled"] = bool(step.get("enabled", True))
         try:
