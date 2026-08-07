@@ -7,6 +7,10 @@ none may reuse an exit IP another VPS-ON teammate already used.
 
 DB VPS OFF → user keeps only their own IP history (no peer merge),
 even if they sit in an isolation group.
+
+``vps_ip_claims`` — atomic same-second IP reservation (unique on
+ledger_key+ip) so two teammates cannot both pass the tracker before
+either finishes the slow geo/VPN path and writes a full click row.
 """
 from __future__ import annotations
 
@@ -16,6 +20,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 COLLECTION = "cross_user_ip_groups"
+CLAIMS_COLLECTION = "vps_ip_claims"
+
+_PLACEHOLDER_IPS = frozenset(
+    {"", "unknown", "Unknown", "no-ipv4-detected", "no-ip-detected"}
+)
 
 _GROUP_CACHE: Dict[str, Any] = {"at": 0.0, "user_to_peers": {}}
 _GROUP_CACHE_TTL = 60.0
@@ -112,6 +121,130 @@ async def get_vps_ledger_member_ids(db, user_id: str) -> List[str]:
         return [uid]
     peers = await get_vps_ledger_peer_user_ids(db, uid)
     return sorted(set([uid] + peers))
+
+
+def _clean_claim_ips(ips: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in ips or []:
+        if not isinstance(raw, str):
+            continue
+        ip = raw.strip()
+        if not ip or ip in _PLACEHOLDER_IPS or ip in seen:
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
+
+
+async def ledger_key_for_user(db, user_id: str) -> str:
+    """Stable key for the shared IP claim namespace (self or VPS-ON team)."""
+    members = await get_vps_ledger_member_ids(db, user_id)
+    if not members:
+        uid = (user_id or "").strip()
+        return uid
+    return "|".join(members)
+
+
+async def ensure_vps_ip_claim_indexes(db) -> None:
+    """Unique (ledger_key, ip) — first open wins the same-second race."""
+    await db[CLAIMS_COLLECTION].create_index(
+        [("ledger_key", 1), ("ip", 1)],
+        unique=True,
+        name="uniq_ledger_ip",
+    )
+    await db[CLAIMS_COLLECTION].create_index(
+        [("ip", 1), ("claimed_at", -1)],
+        name="ip_claimed_at",
+    )
+
+
+async def find_vps_ip_claim(db, user_id: str, ips: List[str]) -> Optional[str]:
+    """Return a claimed IP if any candidate is already reserved on this ledger."""
+    clean = _clean_claim_ips(ips)
+    if not clean or not (user_id or "").strip():
+        return None
+    key = await ledger_key_for_user(db, user_id)
+    if not key:
+        return None
+    doc = await db[CLAIMS_COLLECTION].find_one(
+        {"ledger_key": key, "ip": {"$in": clean}},
+        {"ip": 1, "_id": 0},
+    )
+    if doc and doc.get("ip"):
+        return str(doc["ip"])
+    return None
+
+
+async def claim_vps_ips(
+    db,
+    user_id: str,
+    ips: List[str],
+    *,
+    link_id: str = "",
+    short_code: str = "",
+) -> Optional[str]:
+    """Atomically reserve IPs for this user's ledger.
+
+    Returns the conflicting IP when another request already claimed it
+    (lost the race); returns None when all inserts succeeded.
+    """
+    uid = (user_id or "").strip()
+    clean = _clean_claim_ips(ips)
+    if not uid or not clean:
+        return None
+    key = await ledger_key_for_user(db, uid)
+    if not key:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        from pymongo.errors import DuplicateKeyError as _DupKey
+    except Exception:  # noqa: BLE001
+        _DupKey = Exception  # type: ignore[misc, assignment]
+
+    for ip in clean:
+        try:
+            await db[CLAIMS_COLLECTION].insert_one(
+                {
+                    "id": str(uuid.uuid4()),
+                    "ledger_key": key,
+                    "ip": ip,
+                    "user_id": uid,
+                    "link_id": (link_id or "").strip() or None,
+                    "short_code": (short_code or "").strip() or None,
+                    "claimed_at": now,
+                }
+            )
+        except _DupKey:
+            return ip
+        except Exception:
+            # Index missing / race without unique — fall back to find
+            existing = await db[CLAIMS_COLLECTION].find_one(
+                {"ledger_key": key, "ip": ip},
+                {"ip": 1, "user_id": 1, "_id": 0},
+            )
+            if existing and str(existing.get("user_id") or "") != uid:
+                return ip
+            if existing:
+                return ip
+            raise
+    return None
+
+
+async def list_claimed_ips_for_user(db, user_id: str) -> Set[str]:
+    """All IPs already claimed on this user's ledger (for RUT dup sets)."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return set()
+    key = await ledger_key_for_user(db, uid)
+    if not key:
+        return set()
+    out: Set[str] = set()
+    async for doc in db[CLAIMS_COLLECTION].find({"ledger_key": key}, {"ip": 1, "_id": 0}):
+        ip = doc.get("ip")
+        if isinstance(ip, str) and ip.strip() and ip.strip() not in _PLACEHOLDER_IPS:
+            out.add(ip.strip())
+    return out
 
 
 async def list_groups(db) -> List[Dict[str, Any]]:

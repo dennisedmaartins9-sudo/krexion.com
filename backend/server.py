@@ -482,6 +482,15 @@ async def get_all_click_ips_from_entire_database(
                 )
         except Exception as _iso_err:
             logger.warning(f"VPS IP ledger peer load failed: {_iso_err}")
+
+        # Same-second claims (tracker reserves IP before full click write)
+        try:
+            from cross_user_ip_isolation import list_claimed_ips_for_user as _list_claims
+            _claimed = await _list_claims(db, user_id)
+            if _claimed:
+                all_click_ips.update(_claimed)
+        except Exception as _claim_load_err:
+            logger.warning(f"VPS IP claims load failed: {_claim_load_err}")
     else:
         # ── Legacy "all users" path (kept for debug + global refresh) ──
         try:
@@ -18541,19 +18550,13 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     proxy_ips = client_ips.get("proxy_ips", [])
 
     # ──────────────────────────────────────────────────────────────────
-    # 2026-01 BUGFIX — Strict-duplicate detection failed when the same
-    # visitor's IP rotated between visits (mobile network, VPN, NAT).
-    # We now layer THREE independent duplicate signals so any one of
-    # them triggers a block:
-    #   1. IP address  (existing logic)
-    #   2. Browser fingerprint (UA + Accept-Language + Accept-Encoding
-    #      + Sec-CH-UA hash) — survives IP rotation on the same device
-    #   3. Signed cookie set on the FIRST visit's redirect — survives
-    #      both IP rotation AND minor UA changes (private mode breaks
-    #      this one, but the other two still catch it)
-    # All three signals are recorded in the click document so future
-    # visits can match against ANY of them. The detection cost is one
-    # extra hashing + one extra cookie read per visit (microseconds).
+    # Duplicate signals (2026-08 customer fix):
+    #   ONLY the visitor's CURRENT primary IP (client_ip / ipv4 / ipv6)
+    #   may block. Secondary header hops (extra all_ips / proxy_ips),
+    #   browser fingerprint, and visit cookies must NOT reject a FRESH
+    #   exit IP — otherwise residential proxies show
+    #   "This IP <old> … Your current IP: <new>" and block good traffic.
+    # Fingerprint / cookie are still STORED on the click for analytics.
     # ──────────────────────────────────────────────────────────────────
     import hashlib as _hashlib_dup
     import hmac as _hmac_dup
@@ -18614,7 +18617,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     except Exception:
         pass
 
-    # Check for duplicate clicks - IPv4 ONLY
+    # Check for duplicate clicks — CURRENT primary IP only
     ip_conditions = []
 
     # 2026-05 BUGFIX — placeholder values like "unknown" / "Unknown" /
@@ -18649,48 +18652,23 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         """Either IPv4 or IPv6 is a valid duplicate-check signal."""
         return _is_valid_dup_ipv4(_ip) or _is_valid_dup_ipv6(_ip)
 
-    # Check primary IP (IPv4 or IPv6 — 2026-07)
-    if _is_valid_dup_ip(client_ip):
-        ip_conditions.append({"ip_address": client_ip})
-        ip_conditions.append({"ipv4": client_ip})
-        ip_conditions.append({"ipv6": client_ip})
-        ip_conditions.append({"detected_ip": client_ip})
-        ip_conditions.append({"all_ips": client_ip})
-        ip_conditions.append({"proxy_ips": client_ip})
+    # Primary current IPs only — do NOT scan secondary header hops.
+    # Extra all_ips / proxy_ips used to match a STALE hop in DB while
+    # the real exit (client_ip) was fresh → false Duplicate IP page.
+    _dup_check_ips: list = []
+    for _dip in (client_ip, ipv4, ipv6):
+        if _is_valid_dup_ip(_dip) and _dip not in _dup_check_ips:
+            _dup_check_ips.append(_dip)
 
-    # Check IPv4 specifically
-    if _is_valid_dup_ipv4(ipv4) and ipv4 != client_ip:
-        ip_conditions.append({"ip_address": ipv4})
-        ip_conditions.append({"ipv4": ipv4})
-        ip_conditions.append({"detected_ip": ipv4})
-        ip_conditions.append({"all_ips": ipv4})
-        ip_conditions.append({"proxy_ips": ipv4})
-
-    # 2026-07: Check IPv6 specifically — legacy code SKIPPED IPv6 which
-    # meant IPv6-only visitors could click the same link infinite times
-    # without triggering duplicate detection. Now equal-weight with v4.
-    if _is_valid_dup_ipv6(ipv6) and ipv6 != client_ip:
-        ip_conditions.append({"ip_address": ipv6})
-        ip_conditions.append({"ipv6": ipv6})
-        ip_conditions.append({"detected_ip": ipv6})
-        ip_conditions.append({"all_ips": ipv6})
-        ip_conditions.append({"proxy_ips": ipv6})
-
-    # Check all proxy IPs from headers (IPv4 or IPv6)
-    for pip in proxy_ips:
-        if _is_valid_dup_ip(pip) and pip not in [client_ip, ipv4, ipv6]:
-            ip_conditions.append({"ip_address": pip})
-            ip_conditions.append({"ipv4": pip})
-            ip_conditions.append({"ipv6": pip})
-            ip_conditions.append({"detected_ip": pip})
-            ip_conditions.append({"all_ips": pip})
-            ip_conditions.append({"proxy_ips": pip})
-
-    # Check all_ips array (IPv4 or IPv6)
-    for ip in all_ips:
-        if _is_valid_dup_ip(ip) and ip not in [client_ip, ipv4, ipv6]:
-            ip_conditions.append({"ip_address": ip})
-            ip_conditions.append({"all_ips": ip})
+    for _dip in _dup_check_ips:
+        ip_conditions.append({"ip_address": _dip})
+        ip_conditions.append({"ipv4": _dip})
+        ip_conditions.append({"ipv6": _dip})
+        ip_conditions.append({"detected_ip": _dip})
+        # Still search historical all_ips/proxy_ips ARRAYS on stored
+        # rows — but only for THIS current IP value, never for other hops.
+        ip_conditions.append({"all_ips": _dip})
+        ip_conditions.append({"proxy_ips": _dip})
 
     # 2026-05 BUGFIX — earlier the fallback added a sentinel
     # `{"ip_address": "no-ipv4-detected"}` here, which matched any old
@@ -18712,47 +18690,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     # device to be allowed to click multiple times.
     if not link.get("strict_duplicate_check", True):
         existing_click = None
-    elif cookie_already_seen:
-        # ─── 2026-01: Signed cookie already present on this browser ───
-        # The visitor previously clicked this exact short_code (cookie
-        # was set on the first visit's redirect response). This catches
-        # the "same browser, rotated IP" case our IP-only check missed.
-        # 2026-07 — accept IPv4 OR IPv6 as the reported blocked-IP so
-        # IPv6-only visitors no longer see "IP: unknown" on the block
-        # page.
-        _cookie_ip = None
-        for _cand in [client_ip, ipv4, ipv6] + list(all_ips or []) + list(proxy_ips or []):
-            if _is_valid_dup_ip(_cand):
-                _cookie_ip = _cand
-                break
-        existing_click = {
-            "ip_address": _cookie_ip or client_ip or ipv4 or ipv6 or "unknown",
-            "link_id": link.get("id"),
-            "matched_via": "cookie",
-        }
-        try:
-            logger.info(f"[dup-block] code={short_code} matched via SIGNED COOKIE")
-        except Exception:
-            pass
-    elif not ip_conditions and not browser_fp:
-        # 2026-05 BUGFIX — no real IPv4 was detected for this visitor
-        # AND no browser fingerprint either (e.g. visitor came in over
-        # IPv6-only with bare headers). With nothing concrete to match
-        # against, running the duplicate check would either error
-        # (`{"$or": []}` is invalid) or — worse, the legacy behaviour —
-        # match a placeholder like "unknown" and falsely block. Safest
-        # behaviour: skip the duplicate check and let the click pass.
+    elif not ip_conditions:
+        # No real current IP → cannot run IP duplicate check.
         existing_click = None
     else:
-        # ─── 2026-01: Layer the browser fingerprint into ip_conditions ──
-        # so a returning visitor whose IP has rotated (mobile, VPN, NAT)
-        # but whose browser headers are identical STILL gets blocked.
-        # We don't *require* fingerprint to match — it's another OR
-        # branch. Real IP matches still work as before.
-        if browser_fp:
-            ip_conditions.append({"browser_fingerprint": browser_fp})
-
-        duplicate_query = {"$or": ip_conditions}  # No link_id filter - global check
+        # 2026-08: IP-only duplicate check. Cookie / browser fingerprint
+        # intentionally NOT used for blocking so a fresh proxy exit IP
+        # always opens even on the same browser/device.
+        duplicate_query = {"$or": ip_conditions}
 
         existing_click = None
 
@@ -18841,10 +18786,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                     except Exception:
                         continue
                 if not existing_click:
-                    _cand_ips = []
-                    for _cand in [client_ip, ipv4, ipv6] + list(all_ips or []) + list(proxy_ips or []):
-                        if _is_valid_dup_ip(_cand) and _cand not in _cand_ips:
-                            _cand_ips.append(_cand)
+                    _cand_ips = list(_dup_check_ips)
                     if _cand_ips:
                         _ledger_uids = [main_user_id] + list(_peer_uids)
                         _burnt = await db.rut_burnt_ips.find_one(
@@ -18865,6 +18807,98 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                             )
             except Exception as _vps_dup_err:
                 logger.warning(f"[dup-check] VPS ledger peer scan failed: {_vps_dup_err}")
+
+    # 2026-08 — Same-second atomic IP claim.
+    # Historical click scans alone leave a race: two teammates can both
+    # pass find_one, then both spend 1–3s on geo/VPN before either
+    # insert_one runs. Claim (unique ledger_key+ip) + optional early
+    # stub click closes that window immediately on first open.
+    _early_stub_id = None
+    if (
+        existing_click is None
+        and link.get("strict_duplicate_check", True)
+    ):
+        # Claim CURRENT primary IPs only (same set as dup check).
+        _claim_ips: list = list(_dup_check_ips)
+        if _claim_ips:
+            try:
+                from cross_user_ip_isolation import (
+                    find_vps_ip_claim as _find_claim,
+                    claim_vps_ips as _claim_ips_fn,
+                )
+                _already = await _find_claim(db, main_user_id, _claim_ips)
+                if _already:
+                    existing_click = {
+                        "ip_address": _already,
+                        "matched_via": "vps_ip_claim",
+                    }
+                    logger.info(
+                        f"[dup-block] code={short_code} matched via IP claim {_already}"
+                    )
+                else:
+                    _conflict = await _claim_ips_fn(
+                        db,
+                        main_user_id,
+                        _claim_ips,
+                        link_id=str(link.get("id") or ""),
+                        short_code=str(short_code or ""),
+                    )
+                    if _conflict:
+                        existing_click = {
+                            "ip_address": _conflict,
+                            "matched_via": "vps_ip_claim_race",
+                        }
+                        logger.info(
+                            f"[dup-block] code={short_code} lost same-second IP "
+                            f"claim race on {_conflict}"
+                        )
+                    else:
+                        try:
+                            _invalidate_all_click_ips_cache()
+                        except Exception:
+                            pass
+                        # Early stub in owner clicks DB so peer scans see
+                        # the IP before geo/VPN finishes (non-RUT only).
+                        if not _should_defer_click_log_to_rut(request):
+                            _PLACEHOLDER_STUB = (
+                                "unknown", "Unknown", "no-ipv4-detected",
+                                "no-ip-detected", "",
+                            )
+                            if ipv4 and ipv4 not in _PLACEHOLDER_STUB:
+                                _stub_primary = ipv4
+                            elif ipv6 and ipv6 not in _PLACEHOLDER_STUB:
+                                _stub_primary = ipv6
+                            elif client_ip and client_ip not in _PLACEHOLDER_STUB:
+                                _stub_primary = client_ip
+                            else:
+                                _stub_primary = _claim_ips[0]
+                            _early_stub_id = str(uuid.uuid4())
+                            try:
+                                await user_db.clicks.insert_one(
+                                    {
+                                        "id": _early_stub_id,
+                                        "click_id": _early_stub_id,
+                                        "link_id": link["id"],
+                                        "user_id": main_user_id,
+                                        "created_by": link_created_by,
+                                        "ip_address": _stub_primary,
+                                        "ipv4": ipv4,
+                                        "ipv6": ipv6,
+                                        "detected_ip": client_ip if client_ip not in _PLACEHOLDER_STUB else None,
+                                        "all_ips": list(_dup_check_ips),
+                                        "proxy_ips": [],
+                                        "browser_fingerprint": browser_fp or None,
+                                        "early_ip_stub": True,
+                                        "created_at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                )
+                            except Exception as _stub_err:
+                                logger.warning(
+                                    f"[early-ip-stub] insert failed: {_stub_err}"
+                                )
+                                _early_stub_id = None
+            except Exception as _claim_err:
+                logger.warning(f"[dup-check] same-second IP claim failed: {_claim_err}")
     
     # Get timer settings for display (NOT for checking duplicates)
     timer_enabled = link.get("duplicate_timer_enabled", False)
@@ -18936,6 +18970,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             )
         if not matched_ip:
             matched_ip = "unknown"
+
+        # 2026-08 — Always prefer CURRENT primary IP for the block page
+        # when it is one of the IPs we actually checked. Stops
+        # "This IP <stale> / Your current IP: <fresh>" mismatch after
+        # IP-only duplicate matching.
+        _current_for_display = _first_valid_ip(client_ip, ipv4, ipv6)
+        if _current_for_display:
+            matched_ip = _current_for_display
 
         # 2026-06 — clearer message: surface the matched IP inside the
         # main heading so customers immediately see *which* IP is the
@@ -19530,8 +19572,10 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "ip_address": primary_ip_for_storage,  # Store IPv4 as primary (IPv6 fallback for v6-only visitors)
         "ipv4": ipv4,
         "ipv6": ipv6,  # 2026-07: NEW — store IPv6 so Clicks UI can show real IP for v6-only visitors
-        "all_ips": all_ips,
-        "proxy_ips": proxy_ips,
+        # 2026-08: persist CURRENT primary IPs only — do not store extra
+        # header hops that caused stale-IP false duplicates.
+        "all_ips": list(_dup_check_ips),
+        "proxy_ips": [],
         "country": country,
         "city": city,
         "region": region,
@@ -19573,9 +19617,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "sub1": sub1 or None,
         "sub2": sub2 or None,
         "sub3": sub3 or None,
-        # 2026-01: layered duplicate-detection signals — stored alongside
-        # the IP so a future visit from the same browser (even after IP
-        # rotation) gets blocked by the strict-duplicate check above.
+        # 2026-01: fingerprint / cookie stored for analytics only —
+        # duplicate BLOCKING is IP-only (see dup-check above).
         "browser_fingerprint": browser_fp or None,
         "duplicate_signals": {
             "ip": primary_ip_for_storage,
@@ -19585,9 +19628,20 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
-    # Save click to user's database (skip when RUT engine owns logging)
+    # Save click to user's database (skip when RUT engine owns logging).
+    # If an early IP stub was written at claim-time, upgrade it in place
+    # so the same-second IP is already visible to peer duplicate scans.
     if not _defer_click_to_rut:
-        await user_db.clicks.insert_one(click_doc)
+        if _early_stub_id:
+            click_doc["id"] = _early_stub_id
+            click_doc["click_id"] = _early_stub_id
+            click_doc.pop("early_ip_stub", None)
+            await user_db.clicks.update_one(
+                {"id": _early_stub_id},
+                {"$set": click_doc, "$unset": {"early_ip_stub": ""}},
+            )
+        else:
+            await user_db.clicks.insert_one(click_doc)
         
         # Update link click count in main database (where links are stored)
         # v2.1.83 Feature 10 — Also increment `consecutive_no_conversions`
@@ -25832,6 +25886,13 @@ async def startup_db_indexes():
         await db.clicks.create_index([("click_id", 1)], unique=True)
         # Compound index for fast duplicate checking
         await db.clicks.create_index([("ip_address", 1), ("created_at", -1)])
+
+        # Same-second VPS / self IP claims (tracker race lock)
+        try:
+            from cross_user_ip_isolation import ensure_vps_ip_claim_indexes
+            await ensure_vps_ip_claim_indexes(db)
+        except Exception as _claim_idx_err:
+            logger.warning(f"vps_ip_claims index ensure failed: {_claim_idx_err}")
         
         # Links collection indexes - short_code is critical for redirects
         await db.links.create_index([("user_id", 1)])

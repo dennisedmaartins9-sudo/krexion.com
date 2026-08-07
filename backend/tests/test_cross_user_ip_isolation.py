@@ -42,3 +42,33 @@ def test_tracker_dup_checks_vps_ledger_peers():
     assert "vps_ledger_peer" in text
     assert "vps_ledger_burnt" in text
     assert "get_vps_ledger_peer_user_ids" in text
+
+
+def test_same_second_ip_claim_helpers():
+    text = (ROOT / "backend" / "cross_user_ip_isolation.py").read_text(encoding="utf-8")
+    assert "CLAIMS_COLLECTION" in text
+    assert "claim_vps_ips" in text
+    assert "find_vps_ip_claim" in text
+    assert "list_claimed_ips_for_user" in text
+    assert "ensure_vps_ip_claim_indexes" in text
+
+
+def test_tracker_same_second_ip_claim_wired():
+    text = (ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+    assert "claim_vps_ips" in text
+    assert "find_vps_ip_claim" in text
+    assert "vps_ip_claim" in text
+    assert "early_ip_stub" in text
+    assert "list_claimed_ips_for_user" in text
+    assert "ensure_vps_ip_claim_indexes" in text
+
+
+def test_tracker_dup_is_current_ip_only():
+    """Fresh exit IP must not be blocked by stale hops / fingerprint / cookie."""
+    text = (ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+    assert "_dup_check_ips" in text
+    assert "IP-only duplicate check" in text
+    assert "Primary current IPs only" in text
+    assert 'ip_conditions.append({"browser_fingerprint": browser_fp})' not in text
+    assert 'matched_via": "cookie"' not in text
+    assert "_current_for_display" in text
