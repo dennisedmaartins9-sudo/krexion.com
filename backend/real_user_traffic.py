@@ -6641,7 +6641,7 @@ async def _persist_burnt_ip(
         _user_ids_to_tag: List[str] = []
         if user_id:
             try:
-                from cross_user_ip_isolation import get_isolation_group_member_ids as _iso_members
+                from cross_user_ip_isolation import get_vps_ledger_member_ids as _iso_members
                 _user_ids_to_tag = await _iso_members(db, user_id)
             except Exception:
                 _user_ids_to_tag = [user_id]

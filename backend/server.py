@@ -468,19 +468,20 @@ async def get_all_click_ips_from_entire_database(
         # ── Per-user (CORRECT for any RUT/proxy duplicate check) ──
         all_click_ips.update(await _load_ips_for_user(user_id, offer_url))
 
-        # Cross-user IP isolation — merge admin-selected peers' histories
+        # Cross-user IP isolation — merge VPS-ON teammates only
+        # (Admin › Users › DB VPS + same IP Isolation group).
         try:
-            from cross_user_ip_isolation import get_isolation_peer_user_ids as _iso_peers
+            from cross_user_ip_isolation import get_vps_ledger_peer_user_ids as _iso_peers
             _peer_ids = await _iso_peers(db, user_id)
             for _peer_id in _peer_ids:
                 all_click_ips.update(await _load_ips_for_user(_peer_id, offer_url))
             if _peer_ids:
                 logger.info(
-                    f"Cross-user IP isolation: merged {len(_peer_ids)} peer(s) "
+                    f"VPS IP ledger: merged {len(_peer_ids)} DB-VPS peer(s) "
                     f"for user {user_id[:8]}… → {len(all_click_ips)} total IPs"
                 )
         except Exception as _iso_err:
-            logger.warning(f"Cross-user IP isolation peer load failed: {_iso_err}")
+            logger.warning(f"VPS IP ledger peer load failed: {_iso_err}")
     else:
         # ── Legacy "all users" path (kept for debug + global refresh) ──
         try:
@@ -2231,6 +2232,8 @@ class UserUpdate(BaseModel):
     # (RUT, Form Filler, Visual Recorder, bulk proxy tests) on the VPS
     # even when strict mode is ON for everyone else.
     allow_cloud_heavy: Optional[bool] = None
+    # Admin › Users › DB VPS — shared VPS IP ledger with isolation teammates
+    vps_ip_db_enabled: Optional[bool] = None
 
 class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
@@ -2264,6 +2267,8 @@ class UserResponse(BaseModel):
     created_at: str
     # v2.6.1 — per-customer VPS heavy override (Admin › Users toggle)
     allow_cloud_heavy: bool = False
+    # Admin › Users › DB VPS — join shared VPS IP ledger with isolation teammates
+    vps_ip_db_enabled: bool = False
 
 class SubUserResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -5407,6 +5412,7 @@ async def get_all_users(admin: dict = Depends(get_current_admin)):
                 "created_at": created_at,
                 "sub_user_count": sub_count,
                 "allow_cloud_heavy": bool(user.get("allow_cloud_heavy")),
+                "vps_ip_db_enabled": bool(user.get("vps_ip_db_enabled")),
             }))
         except Exception as e:
             logger.error(f"Failed to serialize user {user.get('email')}: {e}")
@@ -5742,6 +5748,7 @@ async def get_user(user_id: str, admin: dict = Depends(get_current_admin)):
         "status": user.get("status", "pending"),
         "features": user.get("features", DEFAULT_FEATURES),
         "allow_cloud_heavy": bool(user.get("allow_cloud_heavy")),
+        "vps_ip_db_enabled": bool(user.get("vps_ip_db_enabled")),
     })
 
 
@@ -6990,6 +6997,8 @@ async def update_user(user_id: str, update: UserUpdate, admin: dict = Depends(ge
     # v2.6.1 — per-customer VPS heavy override
     if update.allow_cloud_heavy is not None:
         update_data["allow_cloud_heavy"] = bool(update.allow_cloud_heavy)
+    if update.vps_ip_db_enabled is not None:
+        update_data["vps_ip_db_enabled"] = bool(update.vps_ip_db_enabled)
     
     # Admin can update email
     if update.email and update.email != user["email"]:

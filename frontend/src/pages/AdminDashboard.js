@@ -21,7 +21,7 @@ import {
   LogOut, Settings, Trash2, CheckCircle, XCircle, 
   Clock, Search, RefreshCw, Eye, EyeOff, UserPlus,
   Palette, Image, Type, RotateCcw, Save, Server, Key, Plus, TestTube, Globe,
-  Activity, Mail, Send, ExternalLink, AlertCircle, Menu, Cpu, ShieldCheck, Cloud, Lock
+  Activity, Mail, Send, ExternalLink, AlertCircle, Menu, Cpu, ShieldCheck, Cloud, Lock, Database
 } from "lucide-react";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "../components/ui/dropdown-menu";
 
@@ -418,6 +418,32 @@ export default function AdminDashboard() {
         prev.map((u) => (u.id === user.id ? { ...u, allow_cloud_heavy: !nextValue } : u))
       );
       toast.error("Failed to update VPS heavy override");
+    }
+  };
+
+  // Shared VPS IP ledger with IP Isolation teammates (DB VPS).
+  const toggleVpsIpDb = async (user) => {
+    const nextValue = !user.vps_ip_db_enabled;
+    setUsers((prev) =>
+      prev.map((u) => (u.id === user.id ? { ...u, vps_ip_db_enabled: nextValue } : u))
+    );
+    try {
+      await axios.put(
+        `${API}/admin/users/${user.id}`,
+        { vps_ip_db_enabled: nextValue },
+        { headers: { Authorization: `Bearer ${getAdminToken()}` } }
+      );
+      toast.success(
+        nextValue
+          ? `${user.email} — DB VPS ON (team IP ledger / no duplicate with VPS-ON teammates)`
+          : `${user.email} — DB VPS OFF (own IP history only)`
+      );
+      fetchData();
+    } catch (error) {
+      setUsers((prev) =>
+        prev.map((u) => (u.id === user.id ? { ...u, vps_ip_db_enabled: !nextValue } : u))
+      );
+      toast.error("Failed to update DB VPS toggle");
     }
   };
 
@@ -1399,6 +1425,25 @@ export default function AdminDashboard() {
                                 <Cloud size={14} className="mr-1" />
                               )}
                               {user.allow_cloud_heavy ? "VPS Heavy ON" : "VPS Heavy OFF"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant={user.vps_ip_db_enabled ? "default" : "outline"}
+                              className={user.vps_ip_db_enabled
+                                ? "bg-[#22C55E] hover:bg-[#16A34A] text-black border-[#22C55E] font-semibold"
+                                : "border-[var(--brand-border)] text-[#94A3B8] hover:bg-white/5"}
+                              onClick={() => toggleVpsIpDb(user)}
+                              data-testid={`db-vps-user-${user.id}`}
+                              title={user.vps_ip_db_enabled
+                                ? "DB VPS ON — shared IP ledger with IP Isolation teammates who also have DB VPS ON"
+                                : "DB VPS OFF — own IP history only (turn ON + add to IP Isolation team to share)"}
+                            >
+                              {user.vps_ip_db_enabled ? (
+                                <CheckCircle size={14} className="mr-1" />
+                              ) : (
+                                <Database size={14} className="mr-1" />
+                              )}
+                              {user.vps_ip_db_enabled ? "DB VPS ON" : "DB VPS OFF"}
                             </Button>
                             <Button 
                               size="sm" 

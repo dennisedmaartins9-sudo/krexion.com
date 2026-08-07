@@ -1,8 +1,12 @@
 """Admin-configured cross-user IP isolation groups.
 
-When users A, B, C are in the same enabled group, RUT duplicate-IP
-checks merge click + burnt-IP history across all members — none may
-reuse an exit IP another member already used.
+When users A, B, C are in the same enabled group **and** each has
+Admin › Users › **DB VPS** (`vps_ip_db_enabled`) ON, RUT duplicate-IP
+checks merge click + burnt-IP history across those VPS-ON members —
+none may reuse an exit IP another VPS-ON teammate already used.
+
+DB VPS OFF → user keeps only their own IP history (no peer merge),
+even if they sit in an isolation group.
 """
 from __future__ import annotations
 
@@ -43,7 +47,7 @@ async def _load_user_to_peers(db) -> Dict[str, Set[str]]:
 
 
 async def get_isolation_peer_user_ids(db, user_id: str) -> List[str]:
-    """Other main-user IDs in the same enabled isolation group."""
+    """Other main-user IDs in the same enabled isolation group (raw)."""
     uid = (user_id or "").strip()
     if not uid:
         return []
@@ -59,6 +63,54 @@ async def get_isolation_group_member_ids(db, user_id: str) -> List[str]:
     peers = await get_isolation_peer_user_ids(db, uid)
     if not peers:
         return [uid]
+    return sorted(set([uid] + peers))
+
+
+async def _user_vps_ip_db_enabled(db, user_id: str) -> bool:
+    uid = (user_id or "").strip()
+    if not uid:
+        return False
+    doc = await db.users.find_one({"id": uid}, {"vps_ip_db_enabled": 1, "_id": 0})
+    return bool(doc and doc.get("vps_ip_db_enabled"))
+
+
+async def get_vps_ledger_peer_user_ids(db, user_id: str) -> List[str]:
+    """Isolation peers who also have Admin **DB VPS** ON.
+
+    Returns [] when the caller does not have DB VPS enabled — they only
+    use their own IP history.
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    if not await _user_vps_ip_db_enabled(db, uid):
+        return []
+    peers = await get_isolation_peer_user_ids(db, uid)
+    if not peers:
+        return []
+    enabled: Set[str] = set()
+    async for doc in db.users.find(
+        {"id": {"$in": peers}, "vps_ip_db_enabled": True},
+        {"id": 1, "_id": 0},
+    ):
+        pid = doc.get("id")
+        if pid:
+            enabled.add(str(pid))
+    return sorted(enabled)
+
+
+async def get_vps_ledger_member_ids(db, user_id: str) -> List[str]:
+    """Self + VPS-ON isolation peers (for tagging ``rut_burnt_ips``).
+
+    If self has DB VPS OFF, only ``[self]`` is returned so burnt rows
+    stay private to that user.
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    if not await _user_vps_ip_db_enabled(db, uid):
+        return [uid]
+    peers = await get_vps_ledger_peer_user_ids(db, uid)
     return sorted(set([uid] + peers))
 
 

@@ -120,9 +120,11 @@ export default function CrossUserIpIsolationPanel({ users = [], getAdminToken })
               Cross-User IP Isolation
             </CardTitle>
             <CardDescription className="mt-2 max-w-3xl">
-              Admin yahan users ko group mein select kare. Ek group ke andar koi b user doosre user ka
-              exit IP dubara use nahi kar sakta — RUT job chalte waqt duplicate IP skip hogi. Jo users
-              group mein nahi, unka IP pool alag rehta hai.
+              Admin yahan users ko group mein select kare. Shared duplicate-IP block tabhi chalta hai
+              jab group Active ho <strong>aur</strong> har member ke liye User Management pe{" "}
+              <strong>DB VPS ON</strong> ho. Phir VPS pe IP ledger share hoti hai — teammate ka exit IP
+              dubara use nahi hoga. DB VPS OFF wala user sirf apni history use karta hai (group mein
+              hone ke bawajood). Jo users kisi group mein nahi, unka pool alag rehta hai.
             </CardDescription>
           </div>
           <div className="flex gap-2">
