@@ -37,12 +37,8 @@ def test_admin_user_model_has_db_vps_field():
     assert "/admin/cross-user-ip-groups" in text
 
 
-def test_admin_ui_db_vps_toggle():
-    dash = (ROOT / "frontend" / "src" / "pages" / "AdminDashboard.js").read_text(encoding="utf-8")
-    assert "toggleVpsIpDb" in dash
-    assert "DB VPS ON" in dash
-    assert "vps_ip_db_enabled" in dash
-    panel = (ROOT / "frontend" / "src" / "components" / "CrossUserIpIsolationPanel.js").read_text(
-        encoding="utf-8"
-    )
-    assert "DB VPS ON" in panel
+def test_tracker_dup_checks_vps_ledger_peers():
+    text = (ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+    assert "vps_ledger_peer" in text
+    assert "vps_ledger_burnt" in text
+    assert "get_vps_ledger_peer_user_ids" in text

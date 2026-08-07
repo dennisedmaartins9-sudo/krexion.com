@@ -18811,6 +18811,60 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                     existing_click = await db.clicks.find_one(scoped_q, _DUP_PROJECTION)
             except Exception:
                 pass
+
+        # 3. 2026-08 — Admin DB VPS + IP Isolation teammates.
+        # Browser/open-link path previously only scanned THIS owner's
+        # clicks DB. RUT already merged VPS-ON peers, but a manual
+        # open of teammate B's short link with the same exit IP still
+        # passed — customer report: both users DB VPS ON + same team,
+        # same IP opened both links. Fix: also scan each VPS-ON peer's
+        # per-tenant clicks (+ shared burnt ledger).
+        if not existing_click:
+            try:
+                from cross_user_ip_isolation import get_vps_ledger_peer_user_ids as _vps_peers
+                _peer_uids = await _vps_peers(db, main_user_id)
+                for _peer_uid in _peer_uids:
+                    try:
+                        _peer_db = get_user_db(_peer_uid)
+                        existing_click = await _peer_db.clicks.find_one(
+                            duplicate_query, _DUP_PROJECTION
+                        )
+                        if existing_click:
+                            existing_click = dict(existing_click)
+                            existing_click["matched_via"] = "vps_ledger_peer"
+                            existing_click["matched_peer_user_id"] = _peer_uid
+                            logger.info(
+                                f"[dup-block] code={short_code} matched via DB VPS peer "
+                                f"{_peer_uid[:8]}…"
+                            )
+                            break
+                    except Exception:
+                        continue
+                if not existing_click:
+                    _cand_ips = []
+                    for _cand in [client_ip, ipv4, ipv6] + list(all_ips or []) + list(proxy_ips or []):
+                        if _is_valid_dup_ip(_cand) and _cand not in _cand_ips:
+                            _cand_ips.append(_cand)
+                    if _cand_ips:
+                        _ledger_uids = [main_user_id] + list(_peer_uids)
+                        _burnt = await db.rut_burnt_ips.find_one(
+                            {
+                                "ip": {"$in": _cand_ips},
+                                "user_ids": {"$in": _ledger_uids},
+                            },
+                            {"_id": 0, "ip": 1},
+                        )
+                        if _burnt and _burnt.get("ip"):
+                            existing_click = {
+                                "ip_address": _burnt["ip"],
+                                "matched_via": "vps_ledger_burnt",
+                            }
+                            logger.info(
+                                f"[dup-block] code={short_code} matched via DB VPS "
+                                f"burnt IP {_burnt['ip']}"
+                            )
+            except Exception as _vps_dup_err:
+                logger.warning(f"[dup-check] VPS ledger peer scan failed: {_vps_dup_err}")
     
     # Get timer settings for display (NOT for checking duplicates)
     timer_enabled = link.get("duplicate_timer_enabled", False)
