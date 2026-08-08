@@ -254,3 +254,11 @@ def test_current_ip_precedence_and_subuser_scope_contract():
     assert "elif cf_ip:" in source
     assert "forwarded.split(\",\", 1)[0].strip()" in source
     assert 'engine_user_id=user.get("parent_user_id") or user["id"]' in source
+
+
+def test_group_id_index_reuses_existing_production_name():
+    source = (
+        Path(__file__).resolve().parents[1] / "cross_user_ip_isolation.py"
+    ).read_text(encoding="utf-8")
+    assert 'create_index("id", unique=True)' in source
+    assert 'name="uniq_isolation_group_id"' not in source

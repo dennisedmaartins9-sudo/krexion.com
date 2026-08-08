@@ -155,7 +155,11 @@ async def ensure_team_offer_claim_indexes(db) -> None:
     await db[TEAM_OFFER_CLAIMS_COLLECTION].create_index(
         [("visit_token", 1), ("scope_key", 1)], name="visit_scope_lookup"
     )
-    await db[COLLECTION].create_index("id", unique=True, name="uniq_isolation_group_id")
+    # This collection already has the production index named ``id_1`` from
+    # server startup. Let Mongo/PyMongo derive that same name so deployment is
+    # idempotent; requesting a second custom name for the identical key raises
+    # IndexOptionsConflict and prevents the backend from starting.
+    await db[COLLECTION].create_index("id", unique=True)
     await db[COLLECTION].create_index([("enabled", 1), ("user_ids", 1)], name="enabled_group_members")
 
 
