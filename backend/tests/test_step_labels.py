@@ -22,6 +22,9 @@ def test_wait_and_stage():
     assert "Form fill" in friendly_step_label({
         "action": "stage", "name": "Form fill",
     })
+    assert "Stage End" in friendly_step_label({
+        "action": "stage_end", "stage": "Form fill",
+    })
 
 
 def test_existing_name_wins():

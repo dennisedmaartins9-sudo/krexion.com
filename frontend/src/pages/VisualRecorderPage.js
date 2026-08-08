@@ -177,6 +177,10 @@ function getStepDisplayName(s) {
       const hasDetect = ow && (ow.selector || ow.text || ow.value || ow.type);
       return hasDetect ? `📦 Stage: ${nm} (detect)` : `📦 Stage: ${nm}`;
     }
+    case "stage_end": {
+      const nm = _val(s.stage || s.name, 28);
+      return nm ? `🏁 Stage End: ${nm}` : "🏁 Stage End";
+    }
     case "stage_markers":
       return s.enabled === false ? "Stage markers OFF" : "Stage markers ON";
     case "accept_dialog": {
@@ -442,6 +446,7 @@ export default function VisualRecorderPage() {
   });
   const [stageMarkersOn, setStageMarkersOn] = useState(false);
   const [currentStageName, setCurrentStageName] = useState("");
+  const [insertionPosition, setInsertionPosition] = useState(null);
   const [waitAutoDetect, setWaitAutoDetect] = useState(() => {
     try {
       const v = localStorage.getItem(LS_VR_WAIT_AUTO_DETECT);
@@ -1231,6 +1236,9 @@ export default function VisualRecorderPage() {
       if (typeof d.current_stage === "string") {
         setCurrentStageName(d.current_stage || "");
       }
+      setInsertionPosition(
+        Number.isInteger(d.insertion_position) ? d.insertion_position : null
+      );
     } catch {}
   }, [sessionId]);
 
@@ -1275,27 +1283,6 @@ export default function VisualRecorderPage() {
       currentStageName || "Form fill"
     ) || "").trim();
     if (!name) return;
-    const detectKind = (await vrPrompt(
-      "Open-when detect? none / selector / text / url\n(none = always run this stage; selector/text/url = skip whole stage if not found)",
-      name.toLowerCase().includes("form") ? "selector" : "none"
-    ) || "none").trim().toLowerCase();
-    let open_when = null;
-    if (detectKind === "selector" || detectKind === "css") {
-      const sel = (await vrPrompt(
-        "CSS/XPath that ONLY appears when this stage is open (e.g. input[name=first_name]):",
-        "input[name=first_name]"
-      ) || "").trim();
-      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
-      if (sel) open_when = { type: "selector_visible", selector: sel, timeout_ms: tmo };
-    } else if (detectKind === "text") {
-      const txt = (await vrPrompt("Text that ONLY appears when this stage is open:", "First Name") || "").trim();
-      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
-      if (txt) open_when = { type: "text_visible", text: txt, timeout_ms: tmo };
-    } else if (detectKind === "url") {
-      const part = (await vrPrompt("URL must contain:", "/form") || "").trim();
-      const tmo = Math.max(1000, Number(await vrPrompt("Detect timeout ms:", "5000")) || 5000);
-      if (part) open_when = { type: "url_contains", value: part, timeout_ms: tmo };
-    }
     const step = {
       action: "stage",
       name,
@@ -1303,7 +1290,6 @@ export default function VisualRecorderPage() {
       skip_if_not_open: true,
       source: "manual",
     };
-    if (open_when) step.open_when = open_when;
     setBusy(true);
     try {
       await setStageMarkersPref(true);
@@ -1320,12 +1306,36 @@ export default function VisualRecorderPage() {
       setCurrentStageName(name);
       await refreshState();
       toast.success(
-        open_when
-          ? `Stage "${name}" added — will SKIP whole block if detect fails`
-          : `Stage "${name}" added — always runs (no detect)`
+        `Stage "${name}" started`
       );
     } catch (e) {
       toast.error(e.message || "Add stage failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addStageEndMarker = async () => {
+    if (!sessionId) return;
+    setBusy(true);
+    try {
+      const stage = currentStageName || "";
+      const r = await fetch(`${API_URL}/api/visual-recorder/${sessionId}/manual-step`, {
+        method: "POST",
+        headers: authH(),
+        body: JSON.stringify({
+          step: { action: "stage_end", ...(stage ? { stage } : {}) },
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.added === false) {
+        throw new Error(d.detail || d.reason || "Could not end stage");
+      }
+      setCurrentStageName("");
+      await refreshState();
+      toast.success(stage ? `Stage "${stage}" ended` : "Stage end inserted");
+    } catch (e) {
+      toast.error(e.message || "End stage failed");
     } finally {
       setBusy(false);
     }
@@ -3047,9 +3057,34 @@ export default function VisualRecorderPage() {
   const [dragOver, setDragOver] = useState(null);
 
   // 2026-01: Insert a new step at a SPECIFIC index (between two existing steps).
-  // Prompts the user to pick action type, then opens the existing modal.
+  // Selecting a gap now enables live insert mode. Existing recorder tools then
+  // capture from the preview normally; no action/selector prompt is involved.
   const insertStepAt = async (position) => {
     if (!sessionId) return;
+    if (Number.isInteger(position)) {
+      try {
+        const r = await fetch(
+          `${API_URL}/api/visual-recorder/${sessionId}/insertion-position`,
+          {
+            method: "POST",
+            headers: authH(),
+            body: JSON.stringify({ position }),
+          }
+        );
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || "Could not enter insert mode");
+        setInsertionPosition(d.insertion_position);
+        toast.success(`Recording new steps at position ${position + 1}`);
+      } catch (e) {
+        toast.error(e.message || "Insert mode failed");
+      }
+      return;
+    }
+    /*
+     * Legacy prompt-based positional insertion is intentionally disabled.
+     * Insertion zones always pass an integer and enter live insert mode above;
+     * operators then use the normal recorder toolbar and preview interaction.
+     *
     const action = await vrPrompt(
       "Step action to insert? Options: click, fill, type, select, check, uncheck, wait, wait_for_selector, wait_for_text, wait_for_url, press, scroll, screenshot, hover, dismiss_popups, extract, branch, stage",
       "wait"
@@ -3188,6 +3223,29 @@ export default function VisualRecorderPage() {
       refreshState();
     } catch (e) {
       toast.error(e.message || "Insert failed");
+    }
+    */
+  };
+
+  const exitInsertMode = async () => {
+    if (!sessionId) return;
+    try {
+      const r = await fetch(
+        `${API_URL}/api/visual-recorder/${sessionId}/insertion-position`,
+        {
+          method: "POST",
+          headers: authH(),
+          body: JSON.stringify({ position: null }),
+        }
+      );
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.detail || "Could not exit insert mode");
+      }
+      setInsertionPosition(null);
+      toast.success("Insert mode finished");
+    } catch (e) {
+      toast.error(e.message || "Could not exit insert mode");
     }
   };
 
@@ -5142,6 +5200,25 @@ export default function VisualRecorderPage() {
                 )}
               </div>
 
+              {insertionPosition !== null && (
+                <div
+                  className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-emerald-500/60 bg-emerald-950/50 px-3 py-2 text-xs text-emerald-100"
+                  data-testid="vr-insert-mode-banner"
+                >
+                  <span>
+                    Recording new steps at position {insertionPosition + 1}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={exitInsertMode}
+                    className="rounded bg-emerald-600 px-2.5 py-1 font-medium text-white hover:bg-emerald-500"
+                    data-testid="vr-exit-insert-mode"
+                  >
+                    Finish / Exit Insert Mode
+                  </button>
+                </div>
+              )}
+
               {/* Toolbar — 7-col grid with kbd hints */}
               <div className="mt-3 grid grid-cols-4 sm:grid-cols-7 gap-2">
                 {TOOLS.map((t) => {
@@ -5784,16 +5861,25 @@ export default function VisualRecorderPage() {
                   />
                   Stage markers
                 </label>
-                {stageMarkersOn && (
+                {(
                   <>
                     <button
                       type="button"
                       onClick={addNewStageMarker}
                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-sky-700/80 hover:bg-sky-600 text-white text-xs font-medium"
-                      data-testid="vr-new-stage-btn"
+                      data-testid="vr-stage-start-btn"
                       title="Start a named stage group (Questions / Email / Form fill / Survey / Deals)"
                     >
-                      + New Stage
+                      Stage Start
+                    </button>
+                    <button
+                      type="button"
+                      onClick={addStageEndMarker}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-sky-950/70 hover:bg-sky-900 text-sky-200 border border-sky-700/50 text-xs font-medium"
+                      data-testid="vr-stage-end-btn"
+                      title="End the current stage and stop stage gating"
+                    >
+                      Stage End
                     </button>
                     {currentStageName ? (
                       <span className="text-[10px] text-sky-300/90 px-2 py-1 rounded bg-sky-950/30 border border-sky-800/40" data-testid="vr-current-stage">
@@ -6279,6 +6365,7 @@ export default function VisualRecorderPage() {
                     auto_continue_survey: { icon: "🔄", color: "text-violet-400", bg: "bg-violet-700/30 border-violet-500/30" },
                     branch: { icon: "🔀", color: "text-fuchsia-400", bg: "bg-fuchsia-700/30 border-fuchsia-500/30" },
                     stage: { icon: "📦", color: "text-sky-300", bg: "bg-sky-800/40 border-sky-500/40" },
+                    stage_end: { icon: "🏁", color: "text-sky-300", bg: "bg-sky-950/60 border-sky-600/40" },
                     stage_markers: { icon: "🏷", color: "text-sky-400", bg: "bg-sky-900/40 border-sky-600/30" },
                     switch_tab: { icon: "↔", color: "text-blue-400", bg: "bg-blue-700/30 border-blue-500/30" },
                     close_tab: { icon: "✕", color: "text-rose-400", bg: "bg-rose-700/30 border-rose-500/30" },
@@ -6287,6 +6374,7 @@ export default function VisualRecorderPage() {
                   const isDragSrc = dragSrc === i;
                   const isDragOver = dragOver === i;
                   const isStageHeader = (s.action || "").toLowerCase() === "stage";
+                  const isStageEnd = (s.action || "").toLowerCase() === "stage_end";
                   return (
                   <React.Fragment key={i}>
                     {isStageHeader && (
@@ -6311,16 +6399,22 @@ export default function VisualRecorderPage() {
                         option ho". Visible as a thin separator with a
                         centered + icon — solid colour on hover. */}
                     <div
-                      className="relative h-3 group/insert"
+                      className={`relative h-3 group/insert ${
+                        insertionPosition === i ? "bg-emerald-500/20 rounded" : ""
+                      }`}
                       data-testid={`vr-step-insert-zone-${i}`}
                     >
                       <button
                         onClick={() => insertStepAt(i)}
                         title={`Insert a new step BEFORE step #${i + 1}`}
-                        className="absolute left-1/2 -translate-x-1/2 top-0 px-2 py-0.5 rounded-full bg-zinc-800 border border-emerald-700/50 hover:bg-emerald-600 hover:border-emerald-400 text-emerald-400 hover:text-white text-[9px] font-bold transition-colors z-10 leading-none shadow"
+                        className={`absolute left-1/2 -translate-x-1/2 top-0 px-2 py-0.5 rounded-full border text-[9px] font-bold transition-colors z-10 leading-none shadow ${
+                          insertionPosition === i
+                            ? "bg-emerald-600 border-emerald-300 text-white"
+                            : "bg-zinc-800 border-emerald-700/50 hover:bg-emerald-600 hover:border-emerald-400 text-emerald-400 hover:text-white"
+                        }`}
                         data-testid={`vr-step-insert-before-${i}`}
                       >
-                        + insert step here
+                        Insert before #{i + 1}
                       </button>
                     </div>
                   <div
@@ -6422,6 +6516,14 @@ export default function VisualRecorderPage() {
                     {/* Step actions — visible on hover */}
                     <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button
+                        onClick={() => insertStepAt(i + 1)}
+                        title={`Insert after step #${i + 1} using live recorder tools`}
+                        className="px-1 py-0.5 text-[9px] text-emerald-500 hover:text-emerald-300"
+                        data-testid={`vr-step-insert-after-${i}`}
+                      >
+                        Insert after
+                      </button>
+                      <button
                         onClick={() => moveStep(i, "up")}
                         disabled={i === 0}
                         title="Move up"
@@ -6466,19 +6568,33 @@ export default function VisualRecorderPage() {
                       </button>
                     </div>
                   </div>
+                  {isStageEnd && (
+                    <div className="mb-1 text-center text-[10px] text-sky-500/80">
+                      ── end {s.stage || "stage"} ──
+                    </div>
+                  )}
                   </React.Fragment>
                   );
                 })}
                 {/* 2026-06 — Final "insert at end" button (ALWAYS visible — same UX as in-between insert) */}
-                {steps.length > 0 && (
-                  <div className="relative h-4 mt-1 group/insert" data-testid="vr-step-insert-zone-end">
+                {(
+                  <div
+                    className={`relative h-4 mt-1 group/insert ${
+                      insertionPosition === steps.length ? "bg-emerald-500/20 rounded" : ""
+                    }`}
+                    data-testid="vr-step-insert-zone-end"
+                  >
                     <button
                       onClick={() => insertStepAt(steps.length)}
                       title="Insert a new step at the END"
-                      className="absolute left-1/2 -translate-x-1/2 top-0 px-2.5 py-1 rounded-full bg-zinc-800 border border-emerald-700/50 hover:bg-emerald-600 hover:border-emerald-400 text-emerald-400 hover:text-white text-[10px] font-bold transition-colors z-10 leading-none shadow"
+                      className={`absolute left-1/2 -translate-x-1/2 top-0 px-2.5 py-1 rounded-full border text-[10px] font-bold transition-colors z-10 leading-none shadow ${
+                        insertionPosition === steps.length
+                          ? "bg-emerald-600 border-emerald-300 text-white"
+                          : "bg-zinc-800 border-emerald-700/50 hover:bg-emerald-600 hover:border-emerald-400 text-emerald-400 hover:text-white"
+                      }`}
                       data-testid="vr-step-insert-end"
                     >
-                      + insert step at end
+                      Append / insert at end
                     </button>
                   </div>
                 )}

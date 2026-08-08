@@ -70,8 +70,12 @@ const APPS = [
   { key: "tiktok",    label: "TikTok",        icon: Music2,        color: "bg-black border border-pink-500" },
   { key: "youtube",   label: "YouTube",       icon: Youtube,       color: "bg-red-600" },
   { key: "whatsapp",  label: "WhatsApp",      icon: MessageCircle, color: "bg-green-600" },
+  { key: "linkedin",  label: "LinkedIn",      icon: Globe,         color: "bg-blue-700" },
+  { key: "twitter",   label: "Twitter / X",   icon: Globe,         color: "bg-zinc-800" },
+  { key: "reddit",    label: "Reddit",        icon: MessageCircle, color: "bg-orange-600" },
+  { key: "telegram",  label: "Telegram",      icon: MessageCircle, color: "bg-sky-500" },
   { key: "gsearch",   label: "Google Search", icon: Search,        color: "bg-amber-500" },
-  { key: "gchrome",   label: "Google Native", icon: ChromeIcon,    color: "bg-sky-600" },
+  { key: "gchrome",   label: "Google Chrome", icon: ChromeIcon,    color: "bg-sky-600" },
   { key: "pinterest", label: "Pinterest",     icon: ImageIcon,     color: "bg-rose-600" },
   { key: "snapchat",  label: "Snapchat",      icon: Ghost,         color: "bg-yellow-500" },
   { key: "chrome",    label: "Browser",       icon: Globe,         color: "bg-zinc-600" },
@@ -269,7 +273,11 @@ export default function UserAgentGeneratorPage() {
         return;
       }
       const data = await r.json();
-      setResults(data.user_agents || []);
+      setResults(
+        data.profiles ||
+          data.results ||
+          (data.user_agents || []).map((user_agent) => ({ user_agent }))
+      );
       setMixMeta({
         mix_mode: !!data.mix_mode,
         apps_pool: data.apps_pool || [],

@@ -69,9 +69,15 @@ const PACING_PRESETS = [
   { label: "Instant", value: 0 },
 ];
 
+const TERMINAL_JOB_STATUSES = ["completed", "partial", "exhausted", "failed", "stopped"];
+const isSmokePassed = (job) =>
+  !!job && TERMINAL_JOB_STATUSES.includes(job.status) && Number(job.succeeded || 0) >= 1;
+
 function StatusBadge({ status }) {
   const map = {
     completed: "bg-emerald-900/50 text-emerald-200 border-emerald-800",
+    partial: "bg-amber-900/50 text-amber-200 border-amber-800",
+    exhausted: "bg-orange-900/50 text-orange-200 border-orange-800",
     running: "bg-blue-900/50 text-blue-200 border-blue-800",
     queued: "bg-blue-900/50 text-blue-200 border-blue-800",
     preparing: "bg-cyan-900/50 text-cyan-200 border-cyan-800",
@@ -708,7 +714,7 @@ export default function RealUserTrafficPage() {
   const [refererSocialWrapper, setRefererSocialWrapper] = useState(true);
   const [refererInappDeep, setRefererInappDeep] = useState(true);
   const [refererStripSearchPath, setRefererStripSearchPath] = useState(true);
-  const [refererNetworkClickChain, setRefererNetworkClickChain] = useState(false);
+  const [, setRefererNetworkClickChain] = useState(false);
   // v2.6.25 — Paid vs Organic referer split (mirrors LinksPage dropdown).
   // "auto" preserves legacy behaviour so existing saved jobs keep working
   // identically. Operator can force paid / organic / mixed per job.
@@ -826,7 +832,7 @@ export default function RealUserTrafficPage() {
       if (typeof cfg.social_wrapper === "boolean") setRefererSocialWrapper(cfg.social_wrapper);
       if (typeof cfg.inapp_deep === "boolean") setRefererInappDeep(cfg.inapp_deep);
       if (typeof cfg.strip_search_path === "boolean") setRefererStripSearchPath(cfg.strip_search_path);
-      if (typeof cfg.network_click_chain === "boolean") setRefererNetworkClickChain(cfg.network_click_chain);
+      setRefererNetworkClickChain(false);
       // v2.6.25 — restore paid/organic split settings from saved config
       if (typeof cfg.traffic_type === "string") setRefererTrafficType(cfg.traffic_type);
       if (typeof cfg.campaign_type === "string") setRefererCampaignType(cfg.campaign_type);
@@ -861,7 +867,7 @@ export default function RealUserTrafficPage() {
       // v2.6.25 — persist paid/organic split settings in saved config
       traffic_type: refererTrafficType,
       campaign_type: refererCampaignType,
-      network_click_chain: refererNetworkClickChain,
+      network_click_chain: false,
       pass_to_offer: refererPassToOffer,
       match_ua_to_platform: refererMatchUaToPlatform,
       search_engine: refererSearchEngine,
@@ -1034,7 +1040,7 @@ export default function RealUserTrafficPage() {
         facebook: 30, instagram: 15, tiktok: 20,
         google: 20, twitter: 5, email: 10,
       });
-      setRefererNetworkClickChain(true);   // affiliate-chain look
+      setRefererNetworkClickChain(false);
       setRefererSearchEngine("google");
     } else if (trafficSourcePreset === "social_media_ads") {
       setRefererTrafficType("paid");
@@ -1042,7 +1048,7 @@ export default function RealUserTrafficPage() {
       setRefererPlatformWeights({
         facebook: 40, instagram: 30, tiktok: 25, twitter: 5,
       });
-      setRefererNetworkClickChain(true);
+      setRefererNetworkClickChain(false);
       setRefererSearchEngine("google");
     } else if (trafficSourcePreset === "search_engine_ads") {
       setRefererTrafficType("paid");
@@ -1453,7 +1459,9 @@ export default function RealUserTrafficPage() {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
-      const list = (d.user_agents || []).map((x) => x.user_agent).filter(Boolean);
+      const list = (d.user_agents || [])
+        .map((x) => (typeof x === "string" ? x : x?.user_agent))
+        .filter(Boolean);
       if (!list.length) {
         toast.error("Generator returned 0 UAs — try a different app/platform");
         return;
@@ -1514,7 +1522,7 @@ export default function RealUserTrafficPage() {
       if (r.ok) {
         const data = await r.json();
         setActiveJob(data);
-        if (["completed", "failed", "stopped"].includes(data.status) && pollRef.current) {
+        if (TERMINAL_JOB_STATUSES.includes(data.status) && pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
           fetchJobs();
@@ -2271,7 +2279,7 @@ export default function RealUserTrafficPage() {
       // 2026-02 v2.1.31 — Step 4
       fd.append("behavioral_bio_enabled", String(!!behavioralBioEnabled));
       fd.append("ip_warmup_enabled", String(!!ipWarmupEnabled));
-      fd.append("ad_chain_simulation_enabled", "true");
+      fd.append("ad_chain_simulation_enabled", "false");
       fd.append("ip_quality_check_enabled", "true");
 
       // 2026-06 — Referrer Override (off-by-default, customer opt-in)
@@ -2303,7 +2311,7 @@ export default function RealUserTrafficPage() {
       fd.append("referer_search_engine", refererSearchEngine || "google");
       fd.append("referer_search_keywords", refererSearchKeywords || "");
       fd.append("referer_strip_search_path", String(!!refererStripSearchPath));
-      fd.append("referer_network_click_chain", String(!!refererNetworkClickChain));
+      fd.append("referer_network_click_chain", "false");
       // 2026-01 — Pass-Referer-To-Offer (direct offer navigation).
       fd.append("referer_pass_to_offer", String(!!refererPassToOffer));
       // 2026-06-14 — UA ↔ Referer coercion (anti-fraud, default ON).
@@ -3158,6 +3166,14 @@ export default function RealUserTrafficPage() {
                         <option value="tiktok">TikTok</option>
                         <option value="snapchat">Snapchat</option>
                         <option value="pinterest">Pinterest</option>
+                        <option value="youtube">YouTube</option>
+                        <option value="whatsapp">WhatsApp</option>
+                        <option value="linkedin">LinkedIn</option>
+                        <option value="twitter">Twitter / X</option>
+                        <option value="reddit">Reddit</option>
+                        <option value="telegram">Telegram</option>
+                        <option value="gsearch">Google Search</option>
+                        <option value="gchrome">Google Chrome</option>
                       </select>
                     </div>
                     <div>
@@ -3881,14 +3897,14 @@ export default function RealUserTrafficPage() {
                       {trafficSourcePreset === "mixed_realistic" && (
                         <>
                           <li>• <span className="text-emerald-300">Traffic mix:</span> 30% Facebook · 20% TikTok · 20% Google · 15% Instagram · 10% Email · 5% Twitter</li>
-                          <li>• <span className="text-emerald-300">Realism:</span> In-app deep paths + Social link wrappers + Network click chain — all ON</li>
+                          <li>• <span className="text-emerald-300">Realism:</span> In-app deep paths + social link wrappers</li>
                           <li>• <span className="text-emerald-300">Anti-fraud:</span> UA↔Platform matching + Pass-to-Offer — all ON</li>
                         </>
                       )}
                       {trafficSourcePreset === "social_media_ads" && (
                         <>
                           <li>• <span className="text-emerald-300">Traffic mix:</span> 40% Facebook · 30% Instagram · 25% TikTok · 5% Twitter</li>
-                          <li>• <span className="text-emerald-300">Realism:</span> Deep post/reel/video paths + <span className="font-mono text-zinc-200">l.facebook.com</span> / <span className="font-mono text-zinc-200">t.co</span> wrappers + Ad-network click chain</li>
+                          <li>• <span className="text-emerald-300">Realism:</span> Deep post/reel/video paths + <span className="font-mono text-zinc-200">l.facebook.com</span> / <span className="font-mono text-zinc-200">t.co</span> wrappers</li>
                           <li>• <span className="text-emerald-300">Mobile in-app markers:</span> FBAN/FBIOS · musical_ly · Instagram — auto-appended to UA per visit</li>
                         </>
                       )}
@@ -4164,8 +4180,6 @@ export default function RealUserTrafficPage() {
                                   label: "Social link wrappers", hint: "l.facebook.com, t.co, lnkd.in, out.reddit.com" },
                                 { key: "inappDeep", state: refererInappDeep, set: setRefererInappDeep,
                                   label: "In-app deep paths", hint: "TikTok video URLs, IG /p/ post URLs, FB pfbid posts" },
-                                { key: "networkClickChain", state: refererNetworkClickChain, set: setRefererNetworkClickChain,
-                                  label: "Ad-network click chain", hint: "Referer becomes affiliate-network host (sig.click.com, trklink)" },
                                 { key: "passToOffer", state: refererPassToOffer, set: setRefererPassToOffer,
                                   label: "Pass Referer to offer", hint: "Bypass Krexion origin leak — offer sees exact Referer" },
                                 { key: "matchUaToPlatform", state: refererMatchUaToPlatform, set: setRefererMatchUaToPlatform,
@@ -4600,16 +4614,9 @@ export default function RealUserTrafficPage() {
                             <span className="text-zinc-500"> (auto-append FB_IAB / BytedanceWebview / Instagram markers so mobile traffic matches real in-app clicks — kills the #1 fraud signal)</span>
                           </span>
                         </label>
-                        <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
-                          <input
-                            data-testid="rut-pro-network-chain"
-                            type="checkbox"
-                            checked={refererNetworkClickChain}
-                            onChange={(e) => setRefererNetworkClickChain(e.target.checked)}
-                            className="w-4 h-4 rounded accent-fuchsia-500"
-                          />
-                          <span>Network click-redirect chain <span className="text-zinc-500">(one extra 302 hop)</span></span>
-                        </label>
+                        <div className="text-xs text-zinc-500">
+                          Synthetic network redirect chains are disabled; your selected Referer is preserved.
+                        </div>
                         <div className="text-xs text-zinc-400 leading-relaxed">
                           <span className="text-fuchsia-300">Sec-Fetch-*</span> headers + UTM source/medium variation are <span className="text-emerald-300">always ON</span> in Pro Mode (no off-switch needed — they're 100% safe additive signals).
                         </div>
@@ -6025,41 +6032,41 @@ export default function RealUserTrafficPage() {
               <div
                 data-testid="rut-smoke-test-result"
                 className={`mb-4 rounded-lg border px-4 py-3 ${
-                  activeJob.status === "completed"
+                  isSmokePassed(activeJob)
                     ? "border-emerald-900/60 bg-emerald-950/40"
-                    : activeJob.status === "failed" || activeJob.status === "stopped"
+                    : TERMINAL_JOB_STATUSES.includes(activeJob.status)
                     ? "border-rose-900/60 bg-rose-950/40"
                     : "border-amber-900/60 bg-amber-950/30"
                 }`}
               >
                 <div className="flex items-start gap-3">
                   <ClipboardCheck className={`w-5 h-5 mt-0.5 flex-shrink-0 ${
-                    activeJob.status === "completed" ? "text-emerald-300" :
-                    activeJob.status === "failed" || activeJob.status === "stopped" ? "text-rose-300" :
+                    isSmokePassed(activeJob) ? "text-emerald-300" :
+                    TERMINAL_JOB_STATUSES.includes(activeJob.status) ? "text-rose-300" :
                     "text-amber-300"
                   }`} />
                   <div className="flex-1 min-w-0">
                     <div className={`text-sm font-semibold ${
-                      activeJob.status === "completed" ? "text-emerald-100" :
-                      activeJob.status === "failed" || activeJob.status === "stopped" ? "text-rose-100" :
+                      isSmokePassed(activeJob) ? "text-emerald-100" :
+                      TERMINAL_JOB_STATUSES.includes(activeJob.status) ? "text-rose-100" :
                       "text-amber-100"
                     }`}>
-                      {activeJob.status === "completed"
+                      {isSmokePassed(activeJob)
                         ? "Smoke test PASSED — recording, proxies and form-fill all look good."
-                        : activeJob.status === "failed" || activeJob.status === "stopped"
+                        : TERMINAL_JOB_STATUSES.includes(activeJob.status)
                         ? `Smoke test FAILED${activeJob.processed > 0 ? " — visit completed but didn't reach conversion page" : " — visit could not finish"}.`
                         : "Smoke test running — validating 1 visit before full job…"}
                     </div>
                     <div className="text-xs text-zinc-400 mt-1">
-                      {activeJob.status === "completed"
+                      {isSmokePassed(activeJob)
                         ? `Click below to launch your full run with the original settings (${totalClicks} ${formFillEnabled ? "visits" : "clicks"}, concurrency ${concurrency}).`
-                        : activeJob.status === "failed" || activeJob.status === "stopped"
+                        : TERMINAL_JOB_STATUSES.includes(activeJob.status)
                         ? "Fix the failing step (see Live Activity below) BEFORE running the full job — this saves the proxies + leads you would have wasted on 1000 broken visits."
                         : "This validation visit costs only 1 proxy + 1 lead. Full job spawns only on your confirmation."}
                     </div>
-                    {(activeJob.status === "completed" || activeJob.status === "failed" || activeJob.status === "stopped") && (
+                    {TERMINAL_JOB_STATUSES.includes(activeJob.status) && (
                       <div className="mt-3 flex flex-wrap gap-2">
-                        {activeJob.status === "completed" && (
+                        {isSmokePassed(activeJob) && (
                           <Button
                             data-testid="rut-smoke-test-start-full-btn"
                             size="sm"
@@ -6071,7 +6078,7 @@ export default function RealUserTrafficPage() {
                             Start Full Job ({targetMode === "conversions" ? `${targetConversions} conv` : `${totalClicks} clicks`})
                           </Button>
                         )}
-                        {(activeJob.status === "failed" || activeJob.status === "stopped") && (
+                        {!isSmokePassed(activeJob) && (
                           <>
                             <Button
                               data-testid="rut-smoke-test-retry-btn"
@@ -6181,7 +6188,7 @@ export default function RealUserTrafficPage() {
                           toast.success(_doneAlready > 0
                             ? `Resuming from visit #${_doneAlready + 1} (${_doneAlready} already done)`
                             : "Job re-queued — preparing now");
-                          await loadJobs();
+                          await fetchJobs();
                           setActiveJob(null);
                         } catch (e) {
                           toast.error(`Resume failed: ${e.message || e}`);
@@ -6200,8 +6207,10 @@ export default function RealUserTrafficPage() {
                 </div>
               </div>
             )}
-            <div className="grid grid-cols-2 md:grid-cols-8 gap-3 mb-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 xl:grid-cols-10 gap-3 mb-4">
               <Stat label="Total" value={activeJob.total ?? 0} />
+              <Stat label="Started" value={activeJob.attempts_started ?? activeJob.attempts_spawned ?? 0} />
+              <Stat label="In Flight" value={activeJob.in_flight ?? 0} color="fuchsia" />
               <Stat label="Processed" value={activeJob.processed ?? 0} />
               <Stat label="Succeeded" value={activeJob.succeeded ?? 0} color="emerald" />
               <Stat
@@ -6212,13 +6221,13 @@ export default function RealUserTrafficPage() {
               />
               <Stat
                 label="Skipped"
-                value={(activeJob.skipped_captcha ?? 0) + (activeJob.skipped_country ?? 0) + (activeJob.skipped_os ?? 0) + (activeJob.skipped_duplicate_ip ?? 0) + (activeJob.skipped_vpn ?? 0) + (activeJob.skipped_state_mismatch ?? 0)}
+                value={activeJob.skipped ?? ((activeJob.skipped_captcha ?? 0) + (activeJob.skipped_country ?? 0) + (activeJob.skipped_os ?? 0) + (activeJob.skipped_duplicate_ip ?? 0) + (activeJob.skipped_vpn ?? 0) + (activeJob.skipped_state_mismatch ?? 0))}
                 color="amber"
                 data-testid="rut-skipped-total"
               />
               <Stat label="Invalid Data" value={activeJob.invalid_data ?? 0} color="red" data-testid="rut-invalid-stat" />
               <Stat label="Failed" value={activeJob.failed ?? 0} color="red" />
-              <Stat label="Leads Left" value={activeJob.leftover_leads_count ?? "—"} color="emerald" data-testid="rut-leads-left-stat" />
+              <Stat label="Leads Left" value={activeJob.leads_remaining ?? activeJob.leftover_leads_count ?? activeJob.pending_leads_count ?? "—"} color="emerald" data-testid="rut-leads-left-stat" />
             </div>
             <div className="border border-zinc-800 rounded-lg overflow-hidden">
               <div className="bg-zinc-950 text-zinc-400 text-xs font-semibold px-3 py-2 uppercase tracking-wide">
@@ -6293,7 +6302,7 @@ export default function RealUserTrafficPage() {
                   </Button>
                 </>
               )}
-              {(activeJob.status === "completed" || activeJob.status === "stopped") && (
+              {TERMINAL_JOB_STATUSES.includes(activeJob.status) && (
                 <>
                   <Button
                     data-testid="rut-download-active"
@@ -6424,7 +6433,7 @@ export default function RealUserTrafficPage() {
                             <StopCircle size={12} />
                           </Button>
                         )}
-                        {(j.status === "completed" || j.status === "stopped") && (
+                        {TERMINAL_JOB_STATUSES.includes(j.status) && (
                           <>
                             <Button size="sm" onClick={() => onDownload(j.job_id)} className="bg-emerald-600 hover:bg-emerald-700 text-white" title="Download full results ZIP"><Download size={12} /></Button>
                             {j.form_fill_enabled && (

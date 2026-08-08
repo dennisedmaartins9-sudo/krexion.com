@@ -151,8 +151,8 @@ def _preview(api, headers, payload, timeout=30):
 
 class TestNetworkClickReferer:
     """
-    Bug #1 + #5 + #6 — with network_click_chain=True, EVERY sample
-    must contain a non-empty `network_click_referer`, not just social.
+    Retired-chain contract — stale clients may still submit the old flag,
+    but no platform may receive a synthetic network click referer.
     """
 
     def test_google_pool_with_network_click(self, api, user_headers):
@@ -165,13 +165,7 @@ class TestNetworkClickReferer:
         for s in body["samples"]:
             assert "error" not in s, f"resolver error: {s}"
             assert s["platform"] == "google", f"expected google, got {s['platform']}"
-            assert s["network_click_referer"], (
-                f"Bug #1: sample {s['index']} missing network_click_referer "
-                f"even though network_click_chain=True: {s}"
-            )
-            assert s["network_click_referer"].startswith(("http://", "https://")), (
-                f"invalid network_click_referer URL: {s['network_click_referer']}"
-            )
+            assert not s["network_click_referer"], s
 
     def test_email_pool_with_network_click(self, api, user_headers):
         body = _preview(api, user_headers, {
@@ -183,9 +177,7 @@ class TestNetworkClickReferer:
         for s in body["samples"]:
             assert "error" not in s, f"resolver error: {s}"
             assert s["platform"] == "email", f"expected email, got {s['platform']}"
-            assert s["network_click_referer"], (
-                f"Bug #5: sample {s['index']} email pool missing network_click_referer: {s}"
-            )
+            assert not s["network_click_referer"], s
 
     def test_bing_pool_with_network_click(self, api, user_headers):
         body = _preview(api, user_headers, {
@@ -197,9 +189,7 @@ class TestNetworkClickReferer:
         for s in body["samples"]:
             assert "error" not in s
             assert s["platform"] == "bing"
-            assert s["network_click_referer"], (
-                f"Bug #6: sample {s['index']} bing search pool missing network_click_referer"
-            )
+            assert not s["network_click_referer"], s
 
 
 # ─────────────────────────── Bug #2 ─────────────────────────────────────

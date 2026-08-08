@@ -1,19 +1,12 @@
 """
-Regression tests — v2.6.19 UA REBUILD fix for TikTok Android.
+Historical regression coverage updated for the offer-page browser contract.
 
-Real TikTok Android UA:
-    Mozilla/5.0 (Linux; U; Android 14; en_US; SM-S928B;
-                Build/UP1A.231005.007; Cronet/58.0.2991.0)
-                musical_ly_… JsSdk/1.0 …
-
-Our old (broken) output:
+RUT drives Chromium page navigation, so TikTok Android must use:
     Mozilla/5.0 (Linux; Android 15; SM-S931B Build/…; wv)
                 AppleWebKit/537.36 (KHTML, like Gecko)
                 Version/4.0 Chrome/146.0.7432.116 Mobile Safari/537.36
                 musical_ly_…
-
-Advertiser parsers classified the old form as Chrome. v2.6.19 rebuilds
-the base to Cronet form so parsers correctly detect TikTok.
+Standalone Cronet remains valid only as an external native-network identity.
 """
 
 import importlib
@@ -25,6 +18,21 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFERRER_FILE = REPO_ROOT / "referrer_pro.py"
+sys.path.insert(0, str(REPO_ROOT))
+from ua_profile_contract import (  # noqa: E402
+    client_hint_headers_for_ua,
+    validate_header_coherence,
+    validate_user_agent,
+)
+
+
+def _assert_chromium_hints_match(ua: str):
+    hints = client_hint_headers_for_ua(ua)
+    major = next(part.split("/", 1)[1].split(".", 1)[0] for part in ua.split() if part.startswith("Chrome/"))
+    assert f'"Chromium";v="{major}"' in hints["sec-ch-ua"]
+    assert hints["sec-ch-ua-platform"] == '"Android"'
+    assert hints["sec-ch-ua-mobile"] == "?1"
+    assert validate_header_coherence(ua, hints) == []
 
 
 def test_version_bumped_to_2_6_19_or_higher():
@@ -38,9 +46,8 @@ def _get_rp():
     return importlib.import_module("referrer_pro")
 
 
-def test_tiktok_android_ua_uses_cronet_not_chrome():
-    """After coerce, a Chrome-WebView Android UA MUST be rebuilt with
-    Cronet/… and MUST NOT retain Chrome/… or Mobile Safari/… tokens."""
+def test_tiktok_android_ua_uses_page_navigation_webview():
+    """Coercion must preserve a coherent Chromium WebView page identity."""
     rp = _get_rp()
     input_ua = (
         "Mozilla/5.0 (Linux; Android 15; SM-S931B Build/AP3A.240905.015; wv) "
@@ -48,13 +55,16 @@ def test_tiktok_android_ua_uses_cronet_not_chrome():
         "Chrome/146.0.7432.116 Mobile Safari/537.36"
     )
     out = rp.coerce_ua_for_platform(input_ua, "tiktok")
-    assert "Cronet/" in out, f"Cronet token missing: {out}"
-    assert "Chrome/" not in out, f"Chrome/ leaked (breaks TikTok detection): {out}"
-    assert "Mobile Safari/" not in out, f"Mobile Safari/ leaked: {out}"
-    assert "AppleWebKit/" not in out, f"AppleWebKit/ leaked (real TikTok has none): {out}"
+    for token in ("; wv)", "AppleWebKit/537.36", "Version/4.0", "Chrome/", "Mobile Safari/537.36"):
+        assert token in out, f"{token} missing: {out}"
+    assert "Cronet/" not in out
+    assert "TikTok/" in out
     assert "musical_ly_" in out, f"TikTok suffix missing: {out}"
-    # Real TikTok has `Linux; U; Android` (with the U;) — we do too.
-    assert "Linux; U; Android" in out, f"Missing `Linux; U; Android`: {out}"
+    profile = validate_user_agent(out, expected_app="tiktok")
+    assert profile["engine"] == "android_webview"
+    assert profile["runtime_compatible"] is True
+    assert profile["issues"] == []
+    _assert_chromium_hints_match(out)
 
 
 def test_tiktok_android_preserves_device_and_version():
@@ -104,11 +114,14 @@ def test_tiktok_ios_still_uses_webkit_no_safari():
     assert "Safari/604.1" not in out, f"Safari must be stripped on iOS in-app: {out}"
     assert "Version/26.3" not in out, f"Version/xxx must be stripped: {out}"
     assert "musical_ly_" in out
+    profile = validate_user_agent(out, expected_app="tiktok")
+    assert profile["profile_type"] == "ios_wkwebview"
+    assert profile["issues"] == []
 
 
-def test_wechat_ua_gets_cronet_after_scrub_and_tiktok_coerce():
+def test_wechat_ua_gets_webview_after_scrub_and_tiktok_coerce():
     """End-to-end: WeChat mobile UA + tiktok platform → no WeChat marker
-    AND (if Android) Cronet base."""
+    AND a coherent Android WebView base."""
     rp = _get_rp()
     # WeChat Android UA
     input_ua = (
@@ -119,11 +132,10 @@ def test_wechat_ua_gets_cronet_after_scrub_and_tiktok_coerce():
     out = rp.coerce_ua_for_platform(input_ua, "tiktok")
     assert "MicroMessenger" not in out
     assert "musical_ly_" in out
-    # The trailing MicroMessenger bracket is stripped BEFORE coerce
-    # rebuilds — but the base was Android WebView so Cronet rebuild
-    # should have kicked in.
-    assert "Cronet/" in out
-    assert "Chrome/" not in out
+    assert "Cronet/" not in out
+    for token in ("; wv)", "AppleWebKit/537.36", "Version/4.0", "Chrome/", "Mobile Safari/537.36"):
+        assert token in out
+    _assert_chromium_hints_match(out)
 
 
 if __name__ == "__main__":

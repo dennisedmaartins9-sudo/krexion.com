@@ -621,8 +621,8 @@ export default function LinksPage() {
         referrer_pro_social_wrapper: formData.referrer_pro_social_wrapper,
         referrer_pro_inapp_deep_path: formData.referrer_pro_inapp_deep_path,
         referrer_pro_strip_search_path: formData.referrer_pro_strip_search_path,
-        referrer_pro_network_click_chain: formData.referrer_pro_network_click_chain,
-        referrer_pro_network_click_host: formData.referrer_pro_network_click_host,
+        referrer_pro_network_click_chain: false,
+        referrer_pro_network_click_host: "",
         referrer_pro_wrapper_redirect: formData.referrer_pro_wrapper_redirect,
         referrer_pro_traffic_type: formData.referrer_pro_traffic_type || "auto",
         referrer_pro_lang_match: formData.referrer_pro_lang_match,
@@ -749,8 +749,8 @@ export default function LinksPage() {
       referrer_pro_social_wrapper: link.referrer_pro_social_wrapper !== undefined ? link.referrer_pro_social_wrapper : true,
       referrer_pro_inapp_deep_path: link.referrer_pro_inapp_deep_path !== undefined ? link.referrer_pro_inapp_deep_path : true,
       referrer_pro_strip_search_path: link.referrer_pro_strip_search_path !== undefined ? link.referrer_pro_strip_search_path : true,
-      referrer_pro_network_click_chain: link.referrer_pro_network_click_chain || false,
-      referrer_pro_network_click_host: link.referrer_pro_network_click_host || "",
+      referrer_pro_network_click_chain: false,
+      referrer_pro_network_click_host: "",
       referrer_pro_wrapper_redirect: link.referrer_pro_wrapper_redirect || false,
       // v2.1.83 fields
       referrer_pro_lang_match: link.referrer_pro_lang_match !== undefined ? link.referrer_pro_lang_match : true,
@@ -1723,28 +1723,7 @@ export default function LinksPage() {
                             />
                             <span className="text-xs">Strip search-engine paths</span>
                           </label>
-                          <label className="flex items-center gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                            <input
-                              type="checkbox"
-                              checked={formData.referrer_pro_network_click_chain}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_network_click_chain: e.target.checked })}
-                              className="w-4 h-4"
-                            />
-                            <span className="text-xs">Network-click chain</span>
-                          </label>
                         </div>
-
-                        {formData.referrer_pro_network_click_chain && (
-                          <div>
-                            <Label className="text-xs text-[#A1A1AA]">Network Click Host</Label>
-                            <Input
-                              value={formData.referrer_pro_network_click_host}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_network_click_host: e.target.value })}
-                              placeholder="tracker.example.com"
-                              className="mt-1"
-                            />
-                          </div>
-                        )}
 
                         {/* Wrapper redirect — the powerful one */}
                         <label className="flex items-start gap-2 cursor-pointer p-3 rounded border-2 border-[#F59E0B] bg-[#F59E0B08]">

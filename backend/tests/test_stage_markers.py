@@ -14,6 +14,10 @@ def _simulate_stage_skips(steps, *, gate_on=True, open_results=None):
             skip = False
             out.append((i, "control", False))
             continue
+        if action == "stage_end":
+            skip = False
+            out.append((i, "stage_end", False))
+            continue
         if gate_on and skip and action not in ("stage", "stage_markers"):
             out.append((i, "skipped", True))
             continue
@@ -74,3 +78,34 @@ def test_stage_markers_off_ignores_gates():
     ]
     sim = _simulate_stage_skips(steps, open_results={"Form fill": False})
     assert sim[2] == (2, "run", False)
+
+
+def test_stage_end_executes_while_skipping_and_resets_gate():
+    steps = [
+        {"action": "stage", "name": "Optional", "open_when": {"selector": "#missing"}},
+        {"action": "click", "selector": "#inside"},
+        {"action": "stage_end", "stage": "Optional"},
+        {"action": "click", "selector": "#after"},
+    ]
+    sim = _simulate_stage_skips(steps, open_results={"Optional": False})
+    assert sim[1] == (1, "skipped", True)
+    assert sim[2] == (2, "stage_end", False)
+    assert sim[3] == (3, "run", False)
+
+
+def test_replay_loop_handles_stage_end_before_skip_gate():
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "real_user_traffic.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_execute_automation_steps"
+    )
+    source = ast.get_source_segment(source, fn)
+    stage_end = source.index('if action_peek == "stage_end":')
+    skip_gate = source.index("if _stage_gate_on and _stage_skip_active")
+    assert stage_end < skip_gate

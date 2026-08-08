@@ -62,6 +62,11 @@ import resend
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from ua_profile_contract import (
+    APP_VERSION_POOLS,
+    detect_app as detect_profile_app,
+    validate_user_agent,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -389,13 +394,26 @@ async def get_all_click_ips_from_entire_database(
     single_ip_fields = ["ip_address", "ipv4", "detected_ip"]
     array_ip_fields = ["proxy_ips", "all_ips"]
 
-    async def extract_ips_from_db(database, db_name=""):
+    async def extract_ips_from_db(
+        database, db_name="", *, offer_key: str = "", legacy_link_ids: Optional[List[str]] = None
+    ):
         """Extract all IPs from a database's clicks collection"""
         extracted = set()
+        click_filter: Dict[str, Any] = {}
+        if offer_key:
+            click_filter = {
+                "$or": [
+                    {"offer_scope_key": offer_key},
+                    {
+                        "offer_scope_key": {"$exists": False},
+                        "link_id": {"$in": legacy_link_ids or []},
+                    },
+                ]
+            }
         try:
             for field in single_ip_fields:
                 try:
-                    distinct_ips = await database.clicks.distinct(field)
+                    distinct_ips = await database.clicks.distinct(field, click_filter)
                     for ip in distinct_ips:
                         if ip and ip != "unknown" and isinstance(ip, str):
                             extracted.add(ip)
@@ -404,8 +422,11 @@ async def get_all_click_ips_from_entire_database(
 
             for field in array_ip_fields:
                 try:
+                    field_match: Dict[str, Any] = {field: {"$exists": True, "$nin": [None, []]}}
+                    if click_filter:
+                        field_match = {"$and": [click_filter, field_match]}
                     pipeline = [
-                        {"$match": {field: {"$exists": True, "$nin": [None, []]}}},
+                        {"$match": field_match},
                         {"$unwind": f"${field}"},
                         {"$group": {"_id": f"${field}"}}
                     ]
@@ -425,17 +446,43 @@ async def get_all_click_ips_from_entire_database(
         merged: set = set()
         if not uid:
             return merged
+        offer_key = ""
+        same_offer_link_ids: List[str] = []
+        if offer_scope:
+            try:
+                from cross_user_ip_isolation import canonical_offer_identity
+                _, offer_key = canonical_offer_identity(offer_scope)
+                configured_links = await db.links.find(
+                    {"user_id": uid}, {"_id": 0, "id": 1, "offer_url": 1}
+                ).to_list(100000)
+                for configured_link in configured_links:
+                    try:
+                        if canonical_offer_identity(
+                            str(configured_link.get("offer_url") or "")
+                        )[1] == offer_key:
+                            same_offer_link_ids.append(configured_link.get("id"))
+                    except ValueError:
+                        continue
+            except Exception:
+                raise
         try:
             user_db_instance = get_user_db(uid)
-            merged.update(await extract_ips_from_db(user_db_instance, f"krexion_user_{uid}"))
+            merged.update(await extract_ips_from_db(
+                user_db_instance,
+                f"krexion_user_{uid}",
+                offer_key=offer_key,
+                legacy_link_ids=same_offer_link_ids,
+            ))
         except Exception as e:
             logger.error(f"Error fetching IPs from user DB {uid}: {e}")
 
         try:
-            legacy_links = await db.links.find(
-                {"user_id": uid}, {"_id": 0, "id": 1},
-            ).to_list(100000)
-            legacy_link_ids = [l["id"] for l in legacy_links if l.get("id")]
+            legacy_link_ids = same_offer_link_ids
+            if not offer_key:
+                legacy_links = await db.links.find(
+                    {"user_id": uid}, {"_id": 0, "id": 1},
+                ).to_list(100000)
+                legacy_link_ids = [l["id"] for l in legacy_links if l.get("id")]
             if legacy_link_ids:
                 for field in single_ip_fields:
                     try:
@@ -453,10 +500,13 @@ async def get_all_click_ips_from_entire_database(
             logger.warning(f"Legacy main-db scan failed for {uid}: {e}")
 
         try:
-            _burnt_query: Dict[str, Any] = {"user_ids": uid}
-            if offer_scope:
-                _burnt_query["offer_urls"] = offer_scope
-            async for doc in db.rut_burnt_ips.find(_burnt_query, {"ip": 1, "_id": 0}):
+            if offer_key:
+                _burnt_collection = db.rut_burnt_offer_ips
+                _burnt_query = {"user_id": uid, "offer_scope_key": offer_key}
+            else:
+                _burnt_collection = db.rut_burnt_ips
+                _burnt_query = {"user_ids": uid}
+            async for doc in _burnt_collection.find(_burnt_query, {"ip": 1, "_id": 0}):
                 ip = doc.get("ip")
                 if ip and isinstance(ip, str):
                     merged.add(ip.strip())
@@ -485,8 +535,12 @@ async def get_all_click_ips_from_entire_database(
 
         # Same-second claims (tracker reserves IP before full click write)
         try:
-            from cross_user_ip_isolation import list_claimed_ips_for_user as _list_claims
-            _claimed = await _list_claims(db, user_id)
+            if offer_url:
+                from cross_user_ip_isolation import list_team_offer_claimed_ips
+                _claimed = await list_team_offer_claimed_ips(db, user_id, offer_url)
+            else:
+                from cross_user_ip_isolation import list_claimed_ips_for_user as _list_claims
+                _claimed = await _list_claims(db, user_id)
             if _claimed:
                 all_click_ips.update(_claimed)
         except Exception as _claim_load_err:
@@ -540,6 +594,33 @@ app = FastAPI(
     # we never have to manually .isoformat() before returning.
     default_response_class=__import__("fastapi.responses", fromlist=["ORJSONResponse"]).ORJSONResponse,
 )
+
+
+@app.middleware("http")
+async def _release_failed_tracker_team_claim(request: Request, call_next):
+    """Release a tracker pending claim when request construction/persistence fails."""
+    try:
+        response = await call_next(request)
+    except Exception:
+        claim = getattr(request.state, "team_offer_pending_claim", None)
+        if claim:
+            try:
+                from cross_user_ip_isolation import release_team_offer_ip_claim
+                await release_team_offer_ip_claim(db, **claim)
+                request.state.team_offer_pending_claim = None
+            except Exception as release_error:
+                logger.error("Failed to release tracker team claim: %s", release_error)
+        raise
+    if response.status_code >= 500:
+        claim = getattr(request.state, "team_offer_pending_claim", None)
+        if claim:
+            try:
+                from cross_user_ip_isolation import release_team_offer_ip_claim
+                await release_team_offer_ip_claim(db, **claim)
+                request.state.team_offer_pending_claim = None
+            except Exception as release_error:
+                logger.error("Failed to release tracker team claim: %s", release_error)
+    return response
 
 # v1.0.19: clean way to return a body from inside a FastAPI Depends.
 # require_local_mode (used as a Depends) needs to short-circuit the
@@ -2871,31 +2952,40 @@ def get_all_client_ips(request: Request) -> dict:
             if ip not in ips["all"]:
                 ips["all"].append(ip)
 
-    # 1. X-Forwarded-For — first IP is the original client
+    # Select ONE authoritative current-client source. Mixing CF/XFF/X-Real
+    # values made an IPv4 from an older/spoofed header outrank the actual
+    # current IPv6 and caused false/avoidable duplicate decisions.
     forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        for _ip in [x.strip() for x in forwarded.split(",")]:
-            _accept(_ip)
-            # Original client (first token) is enough — later tokens are
-            # proxy hops that we deliberately no longer store.
-            break
-
-    # 2. CF-Connecting-IP (Cloudflare real IP — most reliable, may be IPv6)
     cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip:
-        _accept(cf_ip)
-
-    # 3. X-Real-IP (nginx / other reverse proxies)
     real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        _accept(real_ip)
-
-    # 4. True-Client-IP (Akamai / some CDNs)
     tc_ip = request.headers.get("True-Client-IP")
-    if tc_ip:
-        _accept(tc_ip)
+    _signed_rut = False
+    try:
+        _visit_token = (request.query_params.get("_kx_visit_token") or "").strip()
+        _signed_rut = bool(
+            _visit_token
+            and _kx_rut_defer_verify(
+                _visit_token,
+                request.query_params.get("_kx_rut_defer_sig") or "",
+            )
+        )
+    except Exception:
+        _signed_rut = False
 
-    # 5. Fallback: direct TCP peer
+    # A signed RUT handoff intentionally carries the browser proxy exit IP in
+    # XFF. Normal public traffic uses the CDN's current-client header first.
+    if _signed_rut and forwarded:
+        _accept(forwarded.split(",", 1)[0].strip())
+    elif cf_ip:
+        _accept(cf_ip)
+    elif real_ip:
+        _accept(real_ip)
+    elif tc_ip:
+        _accept(tc_ip)
+    elif forwarded:
+        _accept(forwarded.split(",", 1)[0].strip())
+
+    # Fallback: direct TCP peer
     if not ips["all"] and request.client and request.client.host:
         _accept(request.client.host)
 
@@ -3412,20 +3502,21 @@ def _kx_src_verify(platform: str, sig: str) -> bool:
         return False
 
 
-def _kx_rut_defer_sign() -> str:
-    """HMAC for server-side tracker resolve — RUT owns click logging."""
+def _kx_rut_defer_sign(visit_token: str = "") -> str:
+    """HMAC bound to one RUT visit token; never a reusable global grant."""
     import hmac as _hmac
     import hashlib as _hashlib
     key = SECRET_KEY.encode("utf-8") if isinstance(SECRET_KEY, str) else bytes(SECRET_KEY)
-    return _hmac.new(key, b"rut_defer_click", _hashlib.sha256).hexdigest()[:16]
+    msg = f"rut_defer_click:{(visit_token or '').strip()}".encode("utf-8")
+    return _hmac.new(key, msg, _hashlib.sha256).hexdigest()[:32]
 
 
-def _kx_rut_defer_verify(sig: str) -> bool:
+def _kx_rut_defer_verify(visit_token: str, sig: str) -> bool:
     import hmac as _hmac
     try:
-        if not sig:
+        if not visit_token or not sig:
             return False
-        return _hmac.compare_digest(_kx_rut_defer_sign(), str(sig)[:16])
+        return _hmac.compare_digest(_kx_rut_defer_sign(visit_token), str(sig)[:32])
     except Exception:
         return False
 
@@ -3438,15 +3529,25 @@ def _should_defer_click_log_to_rut(request: Request) -> bool:
         _kx_sig = qp.get("_kx_sig")
         if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
             return True
-        if qp.get("_kx_rut_defer") == "1" and _kx_rut_defer_verify(qp.get("_kx_rut_defer_sig") or ""):
+        if (
+            qp.get("_kx_rut_defer") == "1"
+            and _kx_rut_defer_verify(
+                qp.get("_kx_visit_token") or "", qp.get("_kx_rut_defer_sig") or ""
+            )
+        ):
             return True
     except Exception:
         pass
     return False
 
 
-def build_kx_rut_defer_qs() -> str:
-    return f"_kx_rut_defer=1&_kx_rut_defer_sig={_kx_rut_defer_sign()}"
+def build_kx_rut_defer_qs(visit_token: str = "") -> str:
+    from urllib.parse import quote
+    token = (visit_token or "").strip()
+    return (
+        f"_kx_rut_defer=1&_kx_visit_token={quote(token)}"
+        f"&_kx_rut_defer_sig={_kx_rut_defer_sign(token)}"
+    )
 
 
 def _validate_offer_url(url: str) -> None:
@@ -8026,7 +8127,12 @@ async def _rut_prepare_and_run(
             # 2026-02 v2.6.17: pass offer_url so the burnt-IP scan is
             # scoped to THIS offer only — IPs burnt on other offers no
             # longer pollute this job's blocklist.
-            _dup_offer_url = params.get("target_url") or ""
+            _dup_offer_url = (
+                params.get("offer_url_normalized")
+                or params.get("offer_url")
+                or params.get("target_url")
+                or ""
+            )
             dup_ip_task = asyncio.create_task(
                 _get_dup_ip_set_safe(
                     force_refresh=True,
@@ -8538,7 +8644,12 @@ async def _rut_prepare_and_run(
             try:
                 dup_ip_set = await dup_ip_task if dup_ip_task else await _get_dup_ip_set_safe(
                     user_id=(user.get("parent_user_id") or user["id"]),
-                    offer_url=params.get("target_url") or "",
+                    offer_url=(
+                        params.get("offer_url_normalized")
+                        or params.get("offer_url")
+                        or params.get("target_url")
+                        or ""
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"dup-IP fetch failed (continuing without): {e}")
@@ -8704,7 +8815,9 @@ async def _rut_prepare_and_run(
             link_id=link.get("id") if link else None,
             link_owner_id=(link or {}).get("user_id") or user["id"],
             link_short_code=(link or {}).get("short_code"),
-            engine_user_id=user["id"],
+            # Claims/history must resolve through the account owner so a
+            # sub-user cannot fall into a separate user:<id> isolation scope.
+            engine_user_id=user.get("parent_user_id") or user["id"],
             upload_proxy_id=(upload_proxy_id or None),
             upload_ua_id=(ua_batch_ids[0] if len(ua_batch_ids) == 1 else None),
             upload_ua_ids=(ua_batch_ids if len(ua_batch_ids) > 1 else None),
@@ -8741,7 +8854,7 @@ async def _rut_prepare_and_run(
             # 2026-02 v2.1.31 — Step 4 wiring
             behavioral_bio_enabled=bool(params.get("behavioral_bio_enabled", True)),
             ip_warmup_enabled=bool(params.get("ip_warmup_enabled", True)),
-            ad_chain_simulation_enabled=bool(params.get("ad_chain_simulation_enabled", True)),
+            ad_chain_simulation_enabled=False,
             ip_quality_check_enabled=bool(params.get("ip_quality_check_enabled", True)),
             # 2026-06 — Referrer override wiring
             referer_override_enabled=bool(params.get("referer_override_enabled")),
@@ -8759,7 +8872,7 @@ async def _rut_prepare_and_run(
             referer_search_engine=str(params.get("referer_search_engine") or "google"),
             referer_search_keywords=str(params.get("referer_search_keywords") or ""),
             referer_strip_search_path=bool(params.get("referer_strip_search_path", True)),
-            referer_network_click_chain=bool(params.get("referer_network_click_chain", False)),
+            referer_network_click_chain=False,
             # v2.6.25 — Paid vs Organic split
             referer_traffic_type=str(params.get("referer_traffic_type") or "auto"),
             referer_campaign_type=str(params.get("referer_campaign_type") or "auto"),
@@ -9122,7 +9235,7 @@ async def rut_create_job(
     behavioral_bio_enabled: bool = Form(True),
     ip_warmup_enabled: bool = Form(True),
     # v2.6.35 — Pixel prefire + intermediate redirect hops before offer.
-    ad_chain_simulation_enabled: bool = Form(True),
+    ad_chain_simulation_enabled: bool = Form(False),
     # v2.6.35 — Block datacenter / high fraud-score exit IPs pre-visit.
     ip_quality_check_enabled: bool = Form(True),
     # ── 2026-06: User-configurable Referrer Override ─────────────────
@@ -9497,7 +9610,21 @@ async def rut_create_job(
 
     # Build params dict + resumability flag BEFORE the DB upsert so we
     # can persist them into the job record for auto-resume on restart.
+    from cross_user_ip_isolation import canonical_offer_identity
+    _rut_offer_url = str(link.get("offer_url") or target or "")
+    _rut_offer_url_normalized, _rut_offer_scope_key = canonical_offer_identity(
+        _rut_offer_url
+    )
+    _RUT_JOBS.setdefault(job_id, {}).update({
+        "offer_url": _rut_offer_url,
+        "offer_url_normalized": _rut_offer_url_normalized,
+        "offer_scope_key": _rut_offer_scope_key,
+    })
     params_dict = {
+        "target_url": target,
+        "offer_url": _rut_offer_url,
+        "offer_url_normalized": _rut_offer_url_normalized,
+        "offer_scope_key": _rut_offer_scope_key,
         "proxies": proxies,
         "user_agents": user_agents,
         "use_stored_proxies": use_stored_proxies,
@@ -9592,7 +9719,7 @@ async def rut_create_job(
         # 2026-02 v2.1.31 — Step 4 wiring
         "behavioral_bio_enabled": bool(behavioral_bio_enabled),
         "ip_warmup_enabled": bool(ip_warmup_enabled),
-        "ad_chain_simulation_enabled": bool(ad_chain_simulation_enabled),
+        "ad_chain_simulation_enabled": False,
         "ip_quality_check_enabled": bool(ip_quality_check_enabled),
         # 2026-06 — User-configurable Referrer override
         "referer_override_enabled": bool(referer_override_enabled),
@@ -9609,7 +9736,7 @@ async def rut_create_job(
         "referer_search_engine": (referer_search_engine or "google").strip().lower()[:24],
         "referer_search_keywords": (referer_search_keywords or "")[:8000],
         "referer_strip_search_path": bool(referer_strip_search_path),
-        "referer_network_click_chain": bool(referer_network_click_chain),
+        "referer_network_click_chain": False,
         # v2.6.25 — Paid vs Organic split
         "referer_traffic_type": (referer_traffic_type or "auto").strip().lower()[:16],
         "referer_campaign_type": (referer_campaign_type or "auto").strip().lower()[:24],
@@ -9660,10 +9787,19 @@ async def rut_create_job(
             "job_id": job_id,
             "user_id": user["id"],
             "target_url": target,
+            "offer_url": _rut_offer_url,
+            "offer_url_normalized": _rut_offer_url_normalized,
+            "offer_scope_key": _rut_offer_scope_key,
             "total": total_clicks,
             "form_fill_enabled": form_fill_enabled,
             "status": "queued",
             "preparing": True,
+            "attempts_started": 0,
+            "in_flight": 0,
+            "processed": 0,
+            "skipped": 0,
+            "cancelled": 0,
+            "leads_remaining": 0,
             "created_at": queued_at,
             "queued_at": queued_at,
             "concurrency": concurrency,
@@ -9740,7 +9876,7 @@ async def rut_create_job(
             # 2026-02 v2.1.31 — Step 4 wiring (persisted)
             "behavioral_bio_enabled": bool(behavioral_bio_enabled),
             "ip_warmup_enabled": bool(ip_warmup_enabled),
-            "ad_chain_simulation_enabled": bool(ad_chain_simulation_enabled),
+            "ad_chain_simulation_enabled": False,
         "ip_quality_check_enabled": bool(ip_quality_check_enabled),
             # 2026-06 — Referrer override (persisted so Past-Jobs + retry
             # see the exact settings used for the run)
@@ -9758,7 +9894,7 @@ async def rut_create_job(
             "referer_search_engine": (referer_search_engine or "google").strip().lower()[:24],
             "referer_search_keywords": (referer_search_keywords or "")[:8000],
             "referer_strip_search_path": bool(referer_strip_search_path),
-            "referer_network_click_chain": bool(referer_network_click_chain),
+            "referer_network_click_chain": False,
             # v2.6.25 — Paid vs Organic split (persisted so operator's
             # saved job resumes with the same realism mode next time).
             "referer_traffic_type": (referer_traffic_type or "auto").strip().lower()[:16],
@@ -10003,7 +10139,7 @@ async def rut_pending_candidates_v2(user: dict = Depends(get_current_user)):
     cursor = db.real_user_traffic_jobs.find(
         {
             "user_id": user["id"],
-            "status": {"$in": ["completed", "stopped"]},
+            "status": {"$in": ["completed", "partial", "exhausted", "stopped"]},
             "pending_leads_count": {"$gt": 0},
         },
         {
@@ -10755,7 +10891,7 @@ async def rut_stop_job(
     if j:
         if j.get("user_id") != user["id"]:
             raise HTTPException(status_code=404, detail="Job not found")
-        if j.get("status") in ("completed", "failed", "stopped"):
+        if j.get("status") in ("completed", "partial", "exhausted", "failed", "stopped"):
             return {"stopped": False, "message": "Job already finished", "status": j.get("status")}
         ok = request_job_cancel(job_id)
         return {
@@ -10765,7 +10901,7 @@ async def rut_stop_job(
         }
 
     # Case 2: Only DB knows about the job (worker reloaded / task died).
-    if j_db.get("status") in ("completed", "failed", "stopped"):
+    if j_db.get("status") in ("completed", "partial", "exhausted", "failed", "stopped"):
         return {"stopped": False, "message": "Job already finished", "status": j_db.get("status")}
 
     # Try to package whatever partial output exists on disk.
@@ -13197,11 +13333,8 @@ _ANDROID_DEVICES = [
     {"brand":"Vivo","model":"V2312A","vendor":"vivo","chipset":"mt6896","soc":"pyrite","res":"1260x2800","dpi":"453dpi","and_ver":"14","sdk":"34","build":"UP1A.231005.007"},
 ]
 
-# Realistic iOS device pool — all modern iPhones on current iOS builds
-# (June 2026). Every device runs iOS 26.x (current series after Apple's
-# WWDC-2025 year-based renaming; iOS 26.5 shipped June 1 2026 per
-# support.apple.com/en-us/123075) so every generated UA matches what a
-# real user's device sends right now.
+# Curated iOS device/OS compatibility snapshot.  Values are candidates,
+# not a claim that every device is currently running the newest release.
 _IOS_DEVICES = [
     {"brand":"iPhone","model":"iPhone12,1","name":"iPhone 11","ios":"26_1","res":"828x1792","scale":"2.00"},
     {"brand":"iPhone","model":"iPhone12,3","name":"iPhone 11 Pro","ios":"26_2","res":"1125x2436","scale":"3.00"},
@@ -13234,23 +13367,9 @@ _IOS_DEVICES = [
 # Backwards-compat alias — some older code paths reference this name.
 _IOS_DEVICES_MODERN = [d for d in _IOS_DEVICES if d["brand"] == "iPhone"]
 
-_APP_VERSIONS = {
-    # ─────────────────────────────────────────────────────────────────
-    # Keep only the latest ~7 versions of each app.
-    # These lists are auto-refreshed on startup (and every 24h) from the
-    # iTunes Lookup API — see `_auto_refresh_ua_versions_task()` below.
-    # Admin can also force a refresh via POST /api/admin/ua-versions/refresh
-    # ─────────────────────────────────────────────────────────────────
-    "instagram": ["425.0.0", "422.0.0", "420.0.0.35.87", "418.0.0", "415.0.0.36.111", "412.0.0.35.87", "410.0.0.36.111"],
-    "facebook":  ["557.0", "555.0", "553.0", "551.0", "550.0.0.45.102", "549.0", "547.0"],
-    "tiktok":    ["44.7.0", "44.3.0", "43.9.0", "43.5.0", "43.1.0", "42.7.0", "42.3.0"],
-    "pinterest": ["14.14", "14.10", "14.5", "14.1", "13.8", "13.5", "13.2"],
-    "snapchat":  ["13.88.0.56", "13.85.0.51", "13.80.0.48", "13.75.0.45", "13.70.0.41", "13.65.0.38", "13.60.0.35"],
-    "youtube":   ["20.15.3", "20.14.2", "20.13.0", "20.12.3", "20.11.4", "20.10.2", "20.09.3"],
-    "whatsapp":  ["25.4.82", "25.4.78", "25.3.75", "25.3.70", "25.2.73", "25.2.68", "25.1.72"],
-    "gsearch":   ["332.0.755318947", "331.0.754842390", "330.0.752551382", "329.0.750019021", "328.0.747855320", "327.0.745210445", "326.0.742180108"],
-    "gchrome":   ["147.0.7727.102", "146.0.7680.177", "145.0.7600.130", "144.0.7559.63", "143.0.7637.60", "142.0.7835.13", "141.0.7390.72"],
-}
+# Mutable runtime copy of the shared cold-start pools.  Refresh tasks update
+# this copy only; the shared contract remains deterministic for validation.
+_APP_VERSIONS = {key: list(values) for key, values in APP_VERSION_POOLS.items()}
 
 # iTunes app-store IDs for pulling the *current* live version of each app.
 # iTunes Lookup API is free, unauthenticated, and extremely stable.
@@ -13365,11 +13484,9 @@ _MOBILE_RESOLUTIONS = [
     "1440x3088", "1440x3120", "1440x3200",
 ]
 
-# Supported OS versions the user can pin. Kept to the latest 7 — older
-# values are auto-dropped as newer ones are released and pulled in by
-# `_auto_refresh_ua_versions_task()` below. Defaults reflect June 2026
-# (iOS 26 series after Apple's WWDC-2025 year-based renaming + Android 16)
-# and are overridden live on startup by ipsw.me / Chrome version API.
+# Supported OS-version snapshot for user selection. Runtime refreshes record
+# their source in `_UA_VERSIONS_META`; cold-start values do not claim to be
+# live/latest.
 #
 # WHY iOS 26 IS CORRECT IN 2026:
 #   At WWDC 2025 Apple announced year-aligned OS versioning — the version
@@ -13746,11 +13863,8 @@ async def _auto_refresh_ua_versions_task():
 # the iPhone subset of the main iOS pool (which is fully modernised).
 # (See `_IOS_DEVICES` above — every entry runs iOS 18.x in 2026 anyway.)
 
-# Chrome version pool — 4-week-cadence majors, June 2026 stable is
-# Chrome 149 (released June 2, 2026 per chromereleases.googleblog.com).
-# `_auto_refresh_ua_versions_task()` keeps this fresh from the official
-# Chrome Version History API at runtime; the hardcoded list below is
-# only the cold-start default.
+# Browser-version cold-start snapshots. Runtime refreshes can replace these
+# from the recorded upstream source; hardcoded values are not labelled live.
 _CHROME_VERSIONS = ["149.0.7827.114", "149.0.7827.104", "148.0.7752.93", "148.0.7752.80", "147.0.7727.102", "146.0.7680.177", "145.0.7600.130"]
 # Firefox — June 2026 stable around 140-141, ESR 128.x for slow tail.
 _FIREFOX_VERSIONS = ["141.0.2", "141.0", "140.0.4", "140.0.1", "139.0.4", "139.0", "128.12.0esr"]
@@ -13767,6 +13881,25 @@ _DESKTOP_DEVICES = [
 
 def _rand_build_id() -> int:
     return random.randint(100_000_000, 999_999_999)
+
+
+def _ua_android_webview(d: dict, chrome_ver: str, app_marker: str) -> str:
+    """Build an offer-page Android WebView UA with an app identity marker."""
+    return (
+        f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+        f"Chrome/{chrome_ver} Mobile Safari/537.36 {app_marker}"
+    )
+
+
+def _ua_ios_wkwebview(d: dict, app_marker: str) -> str:
+    """Build an offer-page iOS WKWebView UA with no Safari browser token."""
+    return (
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPhone' if d['brand']=='iPhone' else 'iPad'} "
+        f"OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"(KHTML, like Gecko) Mobile/15E148 {app_marker}"
+    )
+
 
 def _ua_instagram_android(d: dict, app_ver: str, chrome_ver: str, region: Optional[dict] = None, resolution: Optional[str] = None) -> str:
     locale = (region or {}).get("posix_locale", "en_US")
@@ -13941,86 +14074,20 @@ def _ua_tiktok_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
 
 
 def _ua_tiktok_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real 2025-2026 TikTok Android UA — Cronet-based format.
+    """TikTok Android offer-page navigation UA.
 
-    v2.6.22 REBUILD: earlier v2.1.28 shipped a WebView-style shell
-    ("Chrome/{ver} Mobile Safari/537.36 trill_… musical_ly …"). While
-    that shape appears in some Chrome-DevTools TikTok captures, the
-    REAL TikTok Android app installed from Play Store uses Cronet, NOT
-    a WebView, so advertiser UA parsers (Traxun / Voluum / RedTrack /
-    Binom / IPQS) that read left-to-right ranked the `Chrome/xxx`
-    token above the trailing musical_ly marker and labelled visits
-    as "Chrome" — the customer's "mix browser" complaint on TikTok
-    RUT jobs.
-
-    New (Cronet) shape mirrors the string real TikTok emits:
-
-      Mozilla/5.0 (Linux; U; Android 14; en_US; SM-S928B;
-                  Build/UP1A.231005.007; Cronet/58.0.2991.0)
-                  musical_ly_2024105080 JsSdk/1.0 NetType/WIFI
-                  Channel/googleplay AppName/musical_ly
-                  app_version/34.9.5 ByteLocale/en_US
-                  ByteFullLocale/en_US Region/US
-                  BytedanceWebview/d8a21c6 ttwebview/05080411
-
-    `musical_ly_NNNNNNNNNN` = 10-digit numeric build code derived from
-    app_ver (digits-only, zero-padded/truncated). `Channel/googleplay`
-    is constant for Play Store installs. Matches the safety guard in
-    referrer_pro._rebuild_tiktok_android_ua_base so downstream coerce
-    is a no-op for our own generator output.
+    TikTok's native API stack may use Cronet, but generated UAs are consumed
+    by Playwright for browser-page navigation.  The generated identity must
+    therefore be Android WebView-compatible while retaining TikTok markers.
     """
     webview_hash = ''.join(random.choices('abcdef0123456789', k=7))
-    # 10-digit musical_ly build code (real app format)
     ml_build = (app_ver.replace(".", "") + "0000000000")[:10]
     ttwv = ''.join(random.choices('0123456789', k=8))
     r = region or _pick_region(None)
     byte_locale = r["byte_locale"]
     region_code = r["code"]
-    posix_locale = r.get("posix_locale", "en_US")
     net_type = random.choices(["WIFI", "4G", "5G"], weights=[70, 25, 5], k=1)[0]
-    # Cronet version pool — matches referrer_pro._TIKTOK_CRONET_VERSIONS
-    # so both generator and coerce emit realistic same-family versions.
-    try:
-        from referrer_pro import _TIKTOK_CRONET_VERSIONS as _cronet_pool
-        cronet_ver = random.choice(list(_cronet_pool))
-    except Exception:
-        cronet_ver = random.choice([
-            "58.0.2991.0", "100.0.4896.127", "104.0.5112.114",
-            "115.0.5790.169", "118.0.5993.117",
-        ])
-    # v2.6.26: added explicit `TikTok/{app_ver}` marker between the
-    # Cronet closing paren and `musical_ly_{ml_build}`. Real 2026 TikTok
-    # Android in-app captures carry BOTH tokens — `TikTok/34.9.5` is the
-    # canonical browser identifier that advertiser UA parsers
-    # (ua-parser-js, ua-parser-cpp / uap-core, Everflow, Voluum, RedTrack)
-    # key on via the rule `TikTok\/([\d.]+)`, while `musical_ly_<build>`
-    # is the fraud-scanner (Anura / IPQS / Forensiq) marker for real-app
-    # shape verification. Prior to v2.6.26 our Cronet UA only carried
-    # `musical_ly_<build>` — parsers whose TikTok rule requires the
-    # explicit `TikTok/` slug (as most modern libs do) fell through to
-    # the generic `Android` rule and mis-labelled our clicks as
-    # `Browser=<empty>` (customer's clicks (4).csv confirmed 100% Android
-    # TikTok visits had empty Browser column vs 100% iOS TikTok correctly
-    # detected). The new token sits INSIDE the coerce/strip range
-    # (`\s+musical_ly[_A-Za-z0-9]*\s+.*?BytedanceWebview/\S+` in
-    # `_FOREIGN_INAPP_STRIP_PATTERNS['tiktok']`) so coercing to any other
-    # platform still cleanly removes it.
-    # v2.6.27: appended `[FB_IAB/;FBAN/TikTokAndroid;FBAV/{app_ver};…]`
-    # bracket at the END of the UA. Customer's clicks (4).csv follow-up
-    # analysis confirmed our v2.6.26 `TikTok/{app_ver}` marker is NOT in
-    # advertiser UA parsers' rule DB (uap-core / user_agents lib parse
-    # this UA as `family='Android'`). The FB_IAB bracket format is
-    # UNIVERSAL — every major tracker (Everflow, Voluum, RedTrack,
-    # Binom) has a rule that keys on the bracket contents. Setting
-    # `FBAN=TikTokAndroid` triggers their "TikTok for Android" branch.
-    # Real modern TikTok Android in-app browser captures do carry this
-    # exact bracket shape, so fraud scanners remain happy. The bracket
-    # sits AFTER `com.zhiliaoapp.musically/…` and is captured by the
-    # updated `_FOREIGN_INAPP_STRIP_PATTERNS['tiktok']` regex when the
-    # UA is coerced away from tiktok.
-    return (
-        f"Mozilla/5.0 (Linux; U; Android {d['and_ver']}; {posix_locale}; "
-        f"{d['model']}; Build/{d['build']}; Cronet/{cronet_ver}) "
+    marker = (
         f"TikTok/{app_ver} musical_ly_{ml_build} JsSdk/1.0 NetType/{net_type} Channel/googleplay "
         f"AppName/musical_ly app_version/{app_ver} "
         f"ByteLocale/{byte_locale} ByteFullLocale/{byte_locale} Region/{region_code} "
@@ -14028,84 +14095,92 @@ def _ua_tiktok_android(d: dict, app_ver: str, region: Optional[dict] = None) -> 
         f"com.zhiliaoapp.musically/{ml_build} "
         f"[FB_IAB/;FBAN/TikTokAndroid;FBAV/{app_ver};IABMV/1;FBBV/{ml_build};FBOP/19;]"
     )
+    return _ua_android_webview(d, random.choice(_CHROME_VERSIONS), marker)
 
 # ─── YouTube in-app UAs ──────────────────────────────────────────────
 def _ua_youtube_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real YouTube iOS in-app UA format.
-    Example: com.google.ios.youtube/20.15.3 (iPhone17,2; U; CPU iOS 26_4_1 like Mac OS X; en_US)
-    """
+    """YouTube offer-page navigation inside an iOS WKWebView."""
     locale = (region or {}).get("posix_locale", "en_US")
-    return (
-        f"com.google.ios.youtube/{app_ver} ({d['model']}; U; CPU iOS {d['ios']} "
-        f"like Mac OS X; {locale})"
+    return _ua_ios_wkwebview(
+        d,
+        f"com.google.ios.youtube/{app_ver} ({d['model']}; {locale})",
     )
 
 def _ua_youtube_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real YouTube Android in-app UA.
-    Example: com.google.android.youtube/20.15.3 (Linux; U; Android 16; SM-S928B) gzip
-    """
-    return (
-        f"com.google.android.youtube/{app_ver} (Linux; U; Android {d['and_ver']}; "
-        f"{d['model']} Build/{d['build']}) gzip"
+    """YouTube offer-page navigation inside an Android WebView."""
+    return _ua_android_webview(
+        d,
+        random.choice(_CHROME_VERSIONS),
+        f"com.google.android.youtube/{app_ver}",
     )
 
 # ─── WhatsApp in-app UAs ─────────────────────────────────────────────
 def _ua_whatsapp_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real WhatsApp iOS UA uses CFNetwork/Darwin — not Mozilla-style.
-    Example: WhatsApp/25.4.82 CFNetwork/3826.500.131 Darwin/24.5.0
-
-    Darwin → iOS mapping (2026 reality, post-WWDC-2025 year renaming):
-      iOS 17.x → Darwin 23.x   (XNU 23, Sept 2023)
-      iOS 18.x → Darwin 24.x   (XNU 24, Sept 2024)
-      iOS 26.x → Darwin 25.x   (XNU 25 / xnu-12377.x, Sept 2025;
-                                Apple jumped marketing "iOS 19" → "iOS 26"
-                                to align with calendar year; Darwin
-                                continued its real +1 cadence so iOS 26
-                                ships on Darwin 25, not Darwin 26 or 32)
-    """
-    ios_major_str = d["ios"].split("_")[0]
-    try:
-        ios_major = int(ios_major_str)
-    except (ValueError, TypeError):
-        ios_major = 26
-    # iOS 26+ ride Darwin 25+ (year-rename gap). iOS 17/18 still Darwin
-    # 23/24. Real captures from iPhone 16 Pro on iOS 26.4 show
-    # Darwin/25.4.0 + xnu-12377.x.
-    if ios_major >= 26:
-        darwin_major = 25 + (ios_major - 26)
-    else:
-        # iOS 11 = Darwin 17 → ios_major + 6 holds for 11-18
-        darwin_major = ios_major + 6
-    darwin = f"{darwin_major}.{random.randint(1,6)}.0"
-    cfnet = f"{3700 + random.randint(100,900)}.{random.randint(100,600)}.{random.randint(10,99)}"
-    return f"WhatsApp/{app_ver} CFNetwork/{cfnet} Darwin/{darwin}"
+    """WhatsApp offer-page navigation inside an iOS WKWebView."""
+    return _ua_ios_wkwebview(d, f"WhatsApp/{app_ver}")
 
 def _ua_whatsapp_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real WhatsApp Android UA."""
-    chrome_ver = random.choice(_CHROME_VERSIONS)
-    return (
-        f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
-        f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
-        f"WhatsApp/{app_ver}/A"
+    """WhatsApp offer-page navigation inside an Android WebView."""
+    return _ua_android_webview(
+        d, random.choice(_CHROME_VERSIONS), f"WhatsApp/{app_ver}/A"
     )
+
+
+def _ua_linkedin_android(d: dict, app_ver: str) -> str:
+    return _ua_android_webview(
+        d, random.choice(_CHROME_VERSIONS), f"com.linkedin.android/{app_ver}"
+    )
+
+
+def _ua_linkedin_ios(d: dict, app_ver: str) -> str:
+    return _ua_ios_wkwebview(d, f"LinkedInApp/{app_ver}")
+
+
+def _ua_twitter_android(d: dict, app_ver: str) -> str:
+    return _ua_android_webview(
+        d, random.choice(_CHROME_VERSIONS), f"TwitterAndroid/{app_ver}"
+    )
+
+
+def _ua_twitter_ios(d: dict, app_ver: str) -> str:
+    return _ua_ios_wkwebview(d, f"TwitterIOS/{app_ver}")
+
+
+def _ua_reddit_android(d: dict, app_ver: str) -> str:
+    build = random.randint(15_000_000, 15_999_999)
+    return _ua_android_webview(
+        d,
+        random.choice(_CHROME_VERSIONS),
+        f"Reddit/Version {app_ver}/Build {build}/Android {d['and_ver']}",
+    )
+
+
+def _ua_reddit_ios(d: dict, app_ver: str) -> str:
+    build = random.randint(15_000_000, 15_999_999)
+    return _ua_ios_wkwebview(d, f"Reddit/Version {app_ver}/Build {build}")
+
+
+def _ua_telegram_android(d: dict, app_ver: str) -> str:
+    return _ua_android_webview(
+        d, random.choice(_CHROME_VERSIONS), f"TelegramAndroid/{app_ver}"
+    )
+
+
+def _ua_telegram_ios(d: dict, app_ver: str) -> str:
+    return _ua_ios_wkwebview(d, f"TelegramIOS/{app_ver}")
+
 
 # ─── Google Search (GSA) in-app UAs ──────────────────────────────────
 def _ua_gsearch_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real Google Search iOS app UA (uses GSA/ token)."""
-    return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 GSA/{app_ver} Mobile/15E148 Safari/604.1"
-    )
+    """Google Search offer-page navigation inside an iOS WKWebView."""
+    return _ua_ios_wkwebview(d, f"GSA/{app_ver}")
 
 def _ua_gsearch_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real Google Search Android (GSA) app UA."""
+    """Google Search offer-page navigation inside an Android WebView."""
     chrome_ver = random.choice(_CHROME_VERSIONS)
     major = app_ver.split(".")[0] if app_ver else "16"
     gsa_android = f"{major}.{random.randint(10,20)}.{random.randint(20,40)}.{random.randint(20,40)}.arm64"
-    return (
-        f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']}) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{chrome_ver} Mobile Safari/537.36 GSA/{gsa_android}"
-    )
+    return _ua_android_webview(d, chrome_ver, f"GSA/{gsa_android}")
 
 # ─── Google Chrome mobile ("Google Native" browser) ──────────────────
 def _ua_gchrome_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
@@ -14181,7 +14256,11 @@ async def get_ua_options(user: dict = Depends(get_current_user)):
     """Return the list of available apps, platforms, devices and versions so the UI can show pickers."""
     check_user_feature(user, "ua_generator")
     return {
-        "apps": ["instagram", "facebook", "tiktok", "pinterest", "snapchat", "youtube", "whatsapp", "gsearch", "gchrome", "chrome"],
+        "apps": [
+            "instagram", "facebook", "tiktok", "pinterest", "snapchat",
+            "youtube", "whatsapp", "linkedin", "twitter", "reddit",
+            "telegram", "gsearch", "gchrome", "chrome",
+        ],
         "platforms": ["any", "android", "ios", "desktop"],
         "app_versions": _APP_VERSIONS,
         "android_devices": [
@@ -14212,7 +14291,7 @@ async def get_ua_options(user: dict = Depends(get_current_user)):
 # ---------- User Agent CHECKER (analyze / summarise a pasted UA) ----------
 
 class UACheckRequest(BaseModel):
-    user_agent: str
+    user_agent: Optional[str] = None
     # When a list is provided we return one analysis per UA (bulk).
     user_agents: Optional[List[str]] = None
 
@@ -14353,27 +14432,25 @@ def _analyze_ua(ua: str) -> dict:
         result["flags"] = {}
         result["parse_error"] = str(e)
 
-    # 2. In-app detection
-    inapp = _detect_inapp(ua)
+    # 2. Shared engine/profile detection.  This is also used by generation,
+    # so checker verdicts cannot drift from generated metadata.
+    inapp = detect_profile_app(ua)
     result["app"] = inapp
+    profile = validate_user_agent(ua)
+    result["profile"] = profile
+    result["engine"] = profile["engine"]
+    result["profile_type"] = profile["profile_type"]
+    result["runtime"] = profile["runtime"]
+    result["runtime_compatible"] = profile["runtime_compatible"]
+    result["valid"] = profile["valid"]
 
     # 3. TikTok-specific metadata (NetType / Region / Locale / Channel)
     if inapp.get("app") == "tiktok":
         result["tiktok_metadata"] = _detect_tiktok_metadata(ua)
 
     # 4. Normalised platform label
-    os_family = (result.get("os", {}).get("family") or "").lower()
-    if "ios" in os_family or "iphone" in ua.lower() or "ipad" in ua.lower():
-        platform = "iOS"
-    elif "android" in os_family or "android" in ua.lower():
-        platform = "Android"
-    elif "windows" in os_family:
-        platform = "Windows"
-    elif "mac" in os_family:
-        platform = "macOS"
-    elif "linux" in os_family:
-        platform = "Linux"
-    else:
+    platform = profile["platform"]
+    if platform == "Unknown":
         platform = result.get("os", {}).get("family") or "Unknown"
     result["platform"] = platform
 
@@ -14382,35 +14459,19 @@ def _analyze_ua(ua: str) -> dict:
     source_map = {
         "tiktok": "TikTok", "instagram": "Instagram", "facebook": "Facebook",
         "pinterest": "Pinterest", "snapchat": "Snapchat", "twitter": "Twitter/X",
-        "linkedin": "LinkedIn",
+        "linkedin": "LinkedIn", "reddit": "Reddit", "telegram": "Telegram",
         "youtube": "YouTube", "whatsapp": "WhatsApp",
         "gsearch": "Google Search", "gchrome": "Google Chrome",
         "browser": "Direct / Browser",
     }
     result["traffic_source_guess"] = source_map.get(source_guess, source_guess.title())
 
-    # 6. Verdict — does the UA "look real"?
-    issues = []
-    if not ua.startswith("Mozilla/"):
-        issues.append("UA does not start with 'Mozilla/5.0' — most real apps do.")
-    if len(ua) < 40:
-        issues.append("UA is suspiciously short (< 40 chars).")
-    if inapp["is_inapp"] and inapp["app"] == "tiktok":
-        # TikTok UA should have musical_ly_ and JsSdk/ and Channel/
-        if "JsSdk/" not in ua:
-            issues.append("TikTok iOS UA missing `JsSdk/` — real app always includes it.")
-        if "Channel/" not in ua:
-            issues.append("TikTok UA missing `Channel/` — real app always includes it.")
-    if platform == "iOS" and "AppleWebKit/605.1.15" not in ua:
-        issues.append("iOS UA missing `AppleWebKit/605.1.15` — Safari/WebKit signature.")
-    if platform == "Android" and "Mobile Safari/537.36" not in ua and "Android" in ua:
-        # Only flag webview-style UAs (FB_IAB etc.)
-        if any(x in ua for x in ["FB_IAB", "Instagram", "musical_ly", "Pinterest", "Snapchat"]):
-            issues.append("Android webview UA missing `Mobile Safari/537.36` — unusual.")
-
+    # 6. Verdict — engine-aware; native/Cronet identities are not WebViews.
+    issues = list(profile["issues"])
     result["verdict"] = {
         "looks_realistic": len(issues) == 0,
         "issues": issues,
+        "warnings": list(profile["warnings"]),
     }
 
     # 7. Human-readable one-line summary
@@ -14466,8 +14527,11 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
     # ── 2026-06-11: Multi-app + Multi-platform Mix Mode ──────────────────
     # Validate `apps` pool (if provided). Falls back to single `app` mode
     # silently on empty / all-invalid input — never breaks existing flow.
-    _ALLOWED_APPS = {"instagram","facebook","tiktok","pinterest","snapchat",
-                     "youtube","whatsapp","gsearch","gchrome","chrome"}
+    _ALLOWED_APPS = {
+        "instagram", "facebook", "tiktok", "pinterest", "snapchat",
+        "youtube", "whatsapp", "linkedin", "twitter", "reddit",
+        "telegram", "gsearch", "gchrome", "chrome",
+    }
     apps_pool: Optional[List[str]] = None
     if payload.apps:
         cleaned = [a.lower().strip() for a in payload.apps if a and a.lower().strip() in _ALLOWED_APPS]
@@ -14621,6 +14685,42 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
 
     # Multi-app version pool
     app_versions_pool = list(payload.app_versions) if payload.app_versions else None
+    response_warnings: List[str] = []
+    ignored_os_overrides: Set[Tuple[str, str]] = set()
+    if apps_pool and (payload.app_version or app_versions_pool):
+        # A scalar/list version selection has no app key, so applying it to
+        # multiple app families creates impossible cross-app combinations.
+        response_warnings.append(
+            "App version overrides were ignored in multi-app mode because versions are app-specific."
+        )
+        app_versions_pool = None
+
+    def _pick_compatible_os_override(kind_value: str) -> Optional[str]:
+        if pinned_os:
+            major = pinned_os.replace("_", ".").split(".", 1)[0]
+            is_compatible = (
+                kind_value == "android"
+                and any(x["version"] == major for x in _ANDROID_OS_VERSIONS)
+            ) or (
+                kind_value == "ios"
+                and any(v.split("_", 1)[0] == major for v in _IOS_OS_VERSIONS)
+            )
+            if not is_compatible:
+                ignored_os_overrides.add((kind_value, pinned_os))
+                return None
+            candidate = pinned_os
+        elif os_versions_pool:
+            compatible = []
+            for value in os_versions_pool:
+                major = (value or "").replace("_", ".").split(".", 1)[0]
+                if kind_value == "android" and any(x["version"] == major for x in _ANDROID_OS_VERSIONS):
+                    compatible.append(value)
+                elif kind_value == "ios" and any(v.split("_", 1)[0] == major for v in _IOS_OS_VERSIONS):
+                    compatible.append(value)
+            candidate = random.choice(compatible) if compatible else None
+        else:
+            candidate = None
+        return candidate
 
     # Resolve pinned region (if any) — else it's picked per-UA at random
     pinned_region = None
@@ -14676,13 +14776,11 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             kind = pinned_kind
 
         # Per-UA OS version: pinned > pool > device default
-        per_ua_os = pinned_os
-        if not per_ua_os and os_versions_pool:
-            per_ua_os = random.choice(os_versions_pool)
+        per_ua_os = _pick_compatible_os_override(kind)
         device = _apply_os_version_override(device, kind, per_ua_os)
 
         # Per-UA app version: pinned > pool > random from master list
-        if payload.app_version:
+        if payload.app_version and not apps_pool:
             app_ver = payload.app_version
         elif app_versions_pool:
             app_ver = random.choice(app_versions_pool)
@@ -14718,10 +14816,20 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                 ua = _ua_youtube_android(device, app_ver, region=region_for_ua)
             elif current_app == "whatsapp":
                 ua = _ua_whatsapp_android(device, app_ver, region=region_for_ua)
+            elif current_app == "linkedin":
+                ua = _ua_linkedin_android(device, app_ver)
+            elif current_app == "twitter":
+                ua = _ua_twitter_android(device, app_ver)
+            elif current_app == "reddit":
+                ua = _ua_reddit_android(device, app_ver)
+            elif current_app == "telegram":
+                ua = _ua_telegram_android(device, app_ver)
             elif current_app == "gsearch":
                 ua = _ua_gsearch_android(device, app_ver, region=region_for_ua)
             elif current_app == "gchrome":
-                ua = _ua_gchrome_android(device, app_ver, region=region_for_ua)
+                # Android Chrome follows the Chromium pool; gchrome's app
+                # version pool is sourced from iOS and must not cross over.
+                ua = _ua_gchrome_android(device, chrome_ver, region=region_for_ua)
             else:
                 ua = _ua_chrome_android(device, chrome_ver)
             device_label = f"{device['brand']} {device['model']}"
@@ -14740,6 +14848,14 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                 ua = _ua_youtube_ios(device, app_ver, region=region_for_ua)
             elif current_app == "whatsapp":
                 ua = _ua_whatsapp_ios(device, app_ver, region=region_for_ua)
+            elif current_app == "linkedin":
+                ua = _ua_linkedin_ios(device, app_ver)
+            elif current_app == "twitter":
+                ua = _ua_twitter_ios(device, app_ver)
+            elif current_app == "reddit":
+                ua = _ua_reddit_ios(device, app_ver)
+            elif current_app == "telegram":
+                ua = _ua_telegram_ios(device, app_ver)
             elif current_app == "gsearch":
                 ua = _ua_gsearch_ios(device, app_ver, region=region_for_ua)
             elif current_app == "gchrome":
@@ -14767,17 +14883,36 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         else:
             os_version_display = None
 
+        expected_app = (
+            current_app
+            if kind != "desktop" and current_app not in {"chrome", "gchrome"}
+            else None
+        )
+        profile = validate_user_agent(ua, expected_app=expected_app)
         results.append({
             "user_agent": ua,
             "device": device_label,
             "platform": kind,
-            "app": current_app,
-            "app_version": app_ver if current_app in _APP_VERSIONS else None,
+            "app": profile["app"],
+            "requested_app": current_app,
+            "app_version": profile["app_version"],
             "os_version": os_version_display,
             "region": region_for_ua["code"],
             "country": region_for_ua["country"],
             "resolution": per_ua_resolution or (device.get("res") if kind != "desktop" else None),
+            "engine": profile["engine"],
+            "profile_type": profile["profile_type"],
+            "runtime": profile["runtime"],
+            "runtime_compatible": profile["runtime_compatible"],
+            "issues": profile["issues"],
+            "warnings": profile["warnings"],
+            "profile": profile,
         })
+
+    if ignored_os_overrides:
+        response_warnings.append(
+            "OS version override was ignored where it did not match the generated platform."
+        )
 
     # ── 2026-06-11: Final shuffle so MIX-mode output is truly random,
     # NOT grouped by app/platform. In single-app/single-platform mode
@@ -14807,7 +14942,11 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
     if want_format == "xlsx":
         import pandas as pd
         import io
-        df = pd.DataFrame(results, columns=["user_agent","device","platform","app","app_version","os_version","region","country","resolution"])
+        df = pd.DataFrame(results, columns=[
+            "user_agent", "device", "platform", "app", "requested_app", "app_version",
+            "os_version", "region", "country", "resolution", "engine",
+            "profile_type", "runtime", "runtime_compatible", "issues", "warnings",
+        ])
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='User Agents', index=False)
@@ -14824,7 +14963,11 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         )
 
     return {
-        "user_agents": results,
+        # Backwards-compatible transport contract: this field is always a
+        # plain string list.  Rich per-UA records live in profiles/results.
+        "user_agents": [r["user_agent"] for r in results],
+        "profiles": results,
+        "results": results,
         "count": len(results),
         "app": app_label_for_file,
         "platform": platform_label_for_file,
@@ -14836,6 +14979,7 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             "by_app": breakdown_apps,
             "by_platform": breakdown_platforms,
         },
+        "warnings": response_warnings,
     }
 
 
@@ -15326,8 +15470,10 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "referrer_pro_social_wrapper": bool(link.referrer_pro_social_wrapper),
         "referrer_pro_inapp_deep_path": bool(link.referrer_pro_inapp_deep_path),
         "referrer_pro_strip_search_path": bool(link.referrer_pro_strip_search_path),
-        "referrer_pro_network_click_chain": bool(link.referrer_pro_network_click_chain),
-        "referrer_pro_network_click_host": link.referrer_pro_network_click_host,
+        # Synthetic affiliate-network hops are retired. Keep response/model
+        # fields for old clients, but never persist an active chain.
+        "referrer_pro_network_click_chain": False,
+        "referrer_pro_network_click_host": None,
         "referrer_pro_wrapper_redirect": bool(link.referrer_pro_wrapper_redirect),
         # v2.1.83 — International guardrail persistence. Quality tier
         # is applied as a *default template* here: if the customer set
@@ -15420,6 +15566,9 @@ async def update_link(link_id: str, link_update: LinkUpdate, user: dict = Depend
     for k, v in link_update.model_dump().items():
         if v is not None and k not in ["custom_short_code"]:  # Skip custom_short_code as we handle it above
             update_data[k] = v
+    # Retired synthetic network chain cannot be re-enabled by older clients.
+    update_data["referrer_pro_network_click_chain"] = False
+    update_data["referrer_pro_network_click_host"] = None
 
     if link_update.referrer_pro_quality_tier is not None:
         try:
@@ -15522,8 +15671,8 @@ async def preview_referrer_settings(
                 social_wrapper_enabled=bool(req.referrer_pro_social_wrapper),
                 inapp_deep_path_enabled=bool(req.referrer_pro_inapp_deep_path),
                 strip_search_path=bool(req.referrer_pro_strip_search_path),
-                network_click_chain_enabled=bool(req.referrer_pro_network_click_chain),
-                network_click_host=req.referrer_pro_network_click_host or None,
+                network_click_chain_enabled=False,
+                network_click_host=None,
                 lang_match=bool(req.referrer_pro_lang_match),
                 visitor_is_mobile=_visitor_is_mobile,
                 device_mode=str(req.referrer_pro_device_mode or "auto"),
@@ -15761,8 +15910,8 @@ async def qa_check_link(link_id: str, user: dict = Depends(get_current_user_with
                     social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
                     inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
                     strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
-                    network_click_chain_enabled=bool(link.get("referrer_pro_network_click_chain", False)),
-                    network_click_host=link.get("referrer_pro_network_click_host") or None,
+                    network_click_chain_enabled=False,
+                    network_click_host=None,
                     lang_match=bool(link.get("referrer_pro_lang_match", True)),
                     visitor_is_mobile=_mob,
                     device_mode=str(link.get("referrer_pro_device_mode") or "auto"),
@@ -18540,6 +18689,21 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     
     # Get the main user's database
     user_db = get_user_db(main_user_id)
+
+    # Exact underlying-offer identity. Different short links (office01 /
+    # office02) intentionally converge when their configured offer_url is the
+    # same. Never derive this from the short tracker URL or dynamic clickid.
+    try:
+        from cross_user_ip_isolation import canonical_offer_identity
+        _offer_url_normalized, _offer_scope_key = canonical_offer_identity(
+            str(link.get("offer_url") or "")
+        )
+    except Exception:
+        logger.exception("[dup-check] configured offer identity is invalid")
+        raise HTTPException(
+            status_code=503,
+            detail="Duplicate validation temporarily unavailable; retry",
+        )
     
     # Get all client IPs (IPv4 and IPv6)
     client_ips = get_all_client_ips(request)
@@ -18697,7 +18861,39 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         # 2026-08: IP-only duplicate check. Cookie / browser fingerprint
         # intentionally NOT used for blocking so a fresh proxy exit IP
         # always opens even on the same browser/device.
-        duplicate_query = {"$or": ip_conditions}
+        # New rows carry offer_scope_key. Legacy rows are admitted only when
+        # their link_id belongs to a configured link canonicalizing to this
+        # exact offer, preventing unrelated-offer history from false-blocking.
+        try:
+            _configured_links = await db.links.find(
+                {}, {"id": 1, "user_id": 1, "offer_url": 1, "_id": 0}
+            ).to_list(100000)
+            _same_offer_link_ids_by_user = {}
+            for _owner_link in _configured_links:
+                try:
+                    if canonical_offer_identity(str(_owner_link.get("offer_url") or ""))[1] == _offer_scope_key:
+                        _link_owner = str(_owner_link.get("user_id") or "")
+                        _same_offer_link_ids_by_user.setdefault(_link_owner, []).append(
+                            _owner_link.get("id")
+                        )
+                except ValueError:
+                    continue
+            _same_offer_link_ids = _same_offer_link_ids_by_user.get(
+                str(link.get("user_id") or ""), []
+            )
+            _offer_history_scope = {
+                "$or": [
+                    {"offer_scope_key": _offer_scope_key},
+                    {"offer_scope_key": {"$exists": False}, "link_id": {"$in": _same_offer_link_ids}},
+                ]
+            }
+            duplicate_query = {"$and": [{"$or": ip_conditions}, _offer_history_scope]}
+        except Exception:
+            logger.exception("[dup-check] exact offer history scope failed")
+            raise HTTPException(
+                status_code=503,
+                detail="Duplicate validation temporarily unavailable; retry",
+            )
 
         existing_click = None
 
@@ -18771,8 +18967,18 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 for _peer_uid in _peer_uids:
                     try:
                         _peer_db = get_user_db(_peer_uid)
+                        _peer_offer_scope = {
+                            "$or": [
+                                {"offer_scope_key": _offer_scope_key},
+                                {
+                                    "offer_scope_key": {"$exists": False},
+                                    "link_id": {"$in": _same_offer_link_ids_by_user.get(_peer_uid, [])},
+                                },
+                            ]
+                        }
                         existing_click = await _peer_db.clicks.find_one(
-                            duplicate_query, _DUP_PROJECTION
+                            {"$and": [{"$or": ip_conditions}, _peer_offer_scope]},
+                            _DUP_PROJECTION,
                         )
                         if existing_click:
                             existing_click = dict(existing_click)
@@ -18793,6 +18999,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                             {
                                 "ip": {"$in": _cand_ips},
                                 "user_ids": {"$in": _ledger_uids},
+                                "offer_scope_key": _offer_scope_key,
                             },
                             {"_id": 0, "ip": 1},
                         )
@@ -18808,16 +19015,11 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             except Exception as _vps_dup_err:
                 logger.warning(f"[dup-check] VPS ledger peer scan failed: {_vps_dup_err}")
 
-    # 2026-08 — Same-second atomic IP claim.
-    # Historical click scans alone leave a race: two teammates can both
-    # pass find_one, then both spend 1–3s on geo/VPN before either
-    # insert_one runs. Claim (unique ledger_key+ip) + optional early
-    # stub click closes that window immediately on first open.
+    # Legacy pre-validation ledger/stub intentionally disabled. It claimed
+    # before geo/VPN/country/OS checks and permanently poisoned failed visits.
+    # The exact offer-scoped pending claim is acquired below after validation.
     _early_stub_id = None
-    if (
-        existing_click is None
-        and link.get("strict_duplicate_check", True)
-    ):
+    if False:
         # Claim CURRENT primary IPs only (same set as dup check).
         _claim_ips: list = list(_dup_check_ips)
         if _claim_ips:
@@ -19545,6 +19747,64 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         primary_ip_for_storage = client_ip
     else:
         primary_ip_for_storage = None
+
+    # Atomic exact-offer reservation occurs only after all request validation
+    # above has passed, but before click persistence / redirect construction.
+    _team_claim = None
+    _claim_visit_token = ""
+    try:
+        from cross_user_ip_isolation import (
+            acquire_team_offer_ip_claim,
+            canonical_primary_ip,
+            resolve_isolation_scope,
+            team_offer_claim_required,
+        )
+        _canonical_claim_ip = canonical_primary_ip(
+            client_ip, primary_ip_for_storage, ipv4, ipv6
+        )
+        _scope_info = await resolve_isolation_scope(db, main_user_id)
+        _deferred_rut = _should_defer_click_log_to_rut(request)
+        _qp = dict(request.query_params)
+        if _deferred_rut:
+            _claim_visit_token = (_qp.get("_kx_visit_token") or "").strip()
+            if not _kx_rut_defer_verify(
+                _claim_visit_token, _qp.get("_kx_rut_defer_sig") or ""
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Duplicate validation temporarily unavailable; retry",
+                )
+        else:
+            _claim_visit_token = str(uuid.uuid4())
+        # Grouped DB-VPS isolation cannot be bypassed by a per-link strict
+        # toggle. Outside a shared scope, the existing opt-out remains.
+        if _canonical_claim_ip and team_offer_claim_required(
+            _scope_info, link.get("strict_duplicate_check", True)
+        ):
+            _team_claim = await acquire_team_offer_ip_claim(
+                db, main_user_id, _offer_url_normalized,
+                _canonical_claim_ip, _claim_visit_token,
+            )
+            if not _team_claim.get("acquired"):
+                return Response(
+                    content="This IP is already in the database for this offer.",
+                    media_type="text/plain",
+                    status_code=403,
+                )
+            request.state.team_offer_pending_claim = {
+                "user_id": main_user_id,
+                "offer_url": _offer_url_normalized,
+                "ip": _canonical_claim_ip,
+                "visit_token": _claim_visit_token,
+            }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("[dup-check] team offer claim unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Duplicate validation temporarily unavailable; retry",
+        )
     
     # Get all URL parameters for referrer detection
     url_params = dict(request.query_params)
@@ -19567,6 +19827,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "id": str(uuid.uuid4()),
         "click_id": click_id,
         "link_id": link["id"],
+        "offer_scope_key": _offer_scope_key,
+        "offer_url_normalized": _offer_url_normalized,
         "user_id": main_user_id,
         "created_by": link_created_by,
         "ip_address": primary_ip_for_storage,  # Store IPv4 as primary (IPv6 fallback for v6-only visitors)
@@ -19632,16 +19894,26 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     # If an early IP stub was written at claim-time, upgrade it in place
     # so the same-second IP is already visible to peer duplicate scans.
     if not _defer_click_to_rut:
-        if _early_stub_id:
-            click_doc["id"] = _early_stub_id
-            click_doc["click_id"] = _early_stub_id
-            click_doc.pop("early_ip_stub", None)
-            await user_db.clicks.update_one(
-                {"id": _early_stub_id},
-                {"$set": click_doc, "$unset": {"early_ip_stub": ""}},
-            )
-        else:
-            await user_db.clicks.insert_one(click_doc)
+        try:
+            if _early_stub_id:
+                click_doc["id"] = _early_stub_id
+                click_doc["click_id"] = _early_stub_id
+                click_doc.pop("early_ip_stub", None)
+                await user_db.clicks.update_one(
+                    {"id": _early_stub_id},
+                    {"$set": click_doc, "$unset": {"early_ip_stub": ""}},
+                )
+            else:
+                await user_db.clicks.insert_one(click_doc)
+        except Exception:
+            if _team_claim:
+                from cross_user_ip_isolation import release_team_offer_ip_claim
+                await release_team_offer_ip_claim(
+                    db, main_user_id, _offer_url_normalized,
+                    _canonical_claim_ip, _claim_visit_token,
+                )
+                request.state.team_offer_pending_claim = None
+            raise
         
         # Update link click count in main database (where links are stored)
         # v2.1.83 Feature 10 — Also increment `consecutive_no_conversions`
@@ -19747,12 +20019,21 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         _kx_brand   = (url_params or {}).pop("_kx_brand",   None) if isinstance(url_params, dict) else None
         _kx_tt      = (url_params or {}).pop("_kx_traffic_type", None) if isinstance(url_params, dict) else None
         _kx_tt_sig  = (url_params or {}).pop("_kx_tt_sig",  None) if isinstance(url_params, dict) else None
+        if isinstance(url_params, dict):
+            for _internal_claim_key in (
+                "_kx_rut_defer", "_kx_rut_defer_sig", "_kx_visit_token"
+            ):
+                url_params.pop(_internal_claim_key, None)
         if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
             simulate_platform = _kx_src
             _kx_src_was_verified = True
             # Also drop them from custom_params if echoed there.
             if isinstance(custom_params, dict):
-                for _k in ("_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand", "_kx_traffic_type", "_kx_tt_sig"):
+                for _k in (
+                    "_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand",
+                    "_kx_traffic_type", "_kx_tt_sig", "_kx_rut_defer",
+                    "_kx_rut_defer_sig", "_kx_visit_token",
+                ):
                     custom_params.pop(_k, None)
             # Force the chosen ESP for email visits if signature checks.
             if (_kx_src == "email" and _kx_esp and _kx_esp_sig
@@ -19813,8 +20094,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
                 inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
                 strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
-                network_click_chain_enabled=bool(link.get("referrer_pro_network_click_chain", False)),
-                network_click_host=(link.get("referrer_pro_network_click_host") or None),
+                network_click_chain_enabled=False,
+                network_click_host=None,
                 # v2.1.83 — International guardrail params
                 lang_match=bool(link.get("referrer_pro_lang_match", True)),
                 visitor_is_mobile=_visitor_is_mobile,
@@ -20270,6 +20551,23 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 )
     except Exception as _pixel_err:
         logger.debug(f"[fb-pixel-cookie] set failed (non-blocking): {_pixel_err}")
+
+    if _team_claim and not _defer_click_to_rut:
+        try:
+            from cross_user_ip_isolation import complete_team_offer_ip_claim
+            completed = await complete_team_offer_ip_claim(
+                db, main_user_id, _offer_url_normalized,
+                _canonical_claim_ip, _claim_visit_token,
+            )
+            if not completed:
+                raise RuntimeError("pending claim completion did not match")
+            request.state.team_offer_pending_claim = None
+        except Exception:
+            logger.exception("[dup-check] claim completion unavailable")
+            raise HTTPException(
+                status_code=503,
+                detail="Duplicate validation temporarily unavailable; retry",
+            )
 
     return resp
 
@@ -21961,6 +22259,11 @@ class VRSettingsReq(BaseModel):
     stage_markers_enabled: Optional[bool] = None
 
 
+class VRInsertionPositionReq(BaseModel):
+    # A zero-based gap index in 0..len(steps). null exits insert mode.
+    position: Optional[int] = None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 2026-06 — Visual Recorder: AI-assisted step generation.
 # User ask (Roman Urdu): "Visual recorder mein AI integration ka option
@@ -22805,6 +23108,7 @@ async def vr_state(session_id: str, user: dict = Depends(get_current_user)):
         "auto_insert_waits": bool(getattr(sess, "auto_insert_waits", False)),
         "stage_markers_enabled": bool(getattr(sess, "stage_markers_enabled", False)),
         "current_stage": getattr(sess, "current_stage", "") or "",
+        "insertion_position": getattr(sess, "insertion_position", None),
         "target_screenshot_set": bool(sess.target_screenshot_path),
         "final_url": sess.final_url,
         "idle_seconds": int(time.time() - sess.last_activity),
@@ -22824,6 +23128,30 @@ async def vr_settings(session_id: str, req: VRSettingsReq, user: dict = Depends(
         auto_insert_waits=req.auto_insert_waits,
         stage_markers_enabled=req.stage_markers_enabled,
     )
+
+
+@api_router.post("/visual-recorder/{session_id}/insertion-position")
+async def vr_insertion_position(
+    session_id: str,
+    req: VRInsertionPositionReq,
+    user: dict = Depends(get_current_user),
+):
+    """Set the zero-based recording gap, or clear insert mode with null."""
+    if vr is None:
+        raise HTTPException(status_code=500, detail="Visual recorder unavailable")
+    try:
+        sess = vr.get_session(session_id, user["id"])
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        position = sess.set_insertion_position(req.position)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    sess.touch()
+    return {
+        "insertion_position": position,
+        "step_count": len(sess.steps),
+    }
 
 
 class VRClickReq(BaseModel):
@@ -25887,12 +26215,15 @@ async def startup_db_indexes():
         # Compound index for fast duplicate checking
         await db.clicks.create_index([("ip_address", 1), ("created_at", -1)])
 
-        # Same-second VPS / self IP claims (tracker race lock)
-        try:
-            from cross_user_ip_isolation import ensure_vps_ip_claim_indexes
-            await ensure_vps_ip_claim_indexes(db)
-        except Exception as _claim_idx_err:
-            logger.warning(f"vps_ip_claims index ensure failed: {_claim_idx_err}")
+        # Duplicate isolation is a fail-closed security boundary. Startup must
+        # fail loudly if its unique/TTL indexes cannot be guaranteed.
+        from cross_user_ip_isolation import (
+            ensure_team_offer_claim_indexes,
+            ensure_vps_ip_claim_indexes,
+        )
+        await ensure_vps_ip_claim_indexes(db)  # legacy compatibility
+        await ensure_team_offer_claim_indexes(db)
+        logger.info("team_offer_ip_claims unique + TTL indexes ready")
         
         # Links collection indexes - short_code is critical for redirects
         await db.links.create_index([("user_id", 1)])
@@ -25928,7 +26259,8 @@ async def startup_db_indexes():
 
         logger.info("Database indexes created successfully")
     except Exception as e:
-        logger.error(f"Error creating indexes: {e}")
+        logger.exception(f"Error creating required database indexes: {e}")
+        raise
 
     # Kick off the UA-versions auto-refresh background task
     try:
@@ -26507,6 +26839,11 @@ async def _krexion_customer_startup_tasks():
         await db.rut_burnt_ips.create_index([("user_ids", 1)])
         await db.rut_burnt_ips.create_index([("offer_urls", 1)])
         await db.rut_burnt_ips.create_index([("user_ids", 1), ("offer_urls", 1)])
+        await db.rut_burnt_offer_ips.create_index(
+            [("user_id", 1), ("offer_scope_key", 1), ("ip", 1)],
+            unique=True,
+            name="uniq_user_offer_burnt_ip",
+        )
         await db.rut_burnt_ips.create_index(
             "last_detected_dt", expireAfterSeconds=_ttl_seconds,
         )

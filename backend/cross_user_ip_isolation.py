@@ -14,13 +14,18 @@ either finishes the slow geo/VPN path and writes a full click row.
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 COLLECTION = "cross_user_ip_groups"
 CLAIMS_COLLECTION = "vps_ip_claims"
+TEAM_OFFER_CLAIMS_COLLECTION = "team_offer_ip_claims"
+PENDING_CLAIM_SECONDS = 240
 
 _PLACEHOLDER_IPS = frozenset(
     {"", "unknown", "Unknown", "no-ipv4-detected", "no-ip-detected"}
@@ -28,6 +33,253 @@ _PLACEHOLDER_IPS = frozenset(
 
 _GROUP_CACHE: Dict[str, Any] = {"at": 0.0, "user_to_peers": {}}
 _GROUP_CACHE_TTL = 60.0
+
+
+def canonicalize_ip(raw: Any) -> Optional[str]:
+    """Return one database-safe IP spelling, or None for invalid input."""
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value or value.lower() in {str(v).lower() for v in _PLACEHOLDER_IPS}:
+        return None
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        return str(parsed.ipv4_mapped)
+    return parsed.compressed
+
+
+def canonical_primary_ip(*candidates: Any) -> Optional[str]:
+    """Choose exactly one authoritative IP; never create partial multi-IP claims."""
+    for candidate in candidates:
+        canonical = canonicalize_ip(candidate)
+        if canonical:
+            return canonical
+    return None
+
+
+def canonical_offer_identity(url: str) -> tuple[str, str]:
+    """Normalize an underlying offer URL and return (URL, stable SHA-256 key).
+
+    Business query parameters are preserved. Only per-click/internal parameters
+    are removed, so two tracker records pointing at the same offer share scope.
+    """
+    raw = (url or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("offer URL must be absolute http(s)")
+        host_raw = parsed.hostname
+        try:
+            host = str(ipaddress.ip_address(host_raw))
+        except ValueError:
+            host = host_raw.encode("idna").decode("ascii").lower()
+        port = parsed.port
+        if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        else:
+            netloc = f"[{host}]" if ":" in host else host
+        if parsed.username or parsed.password:
+            raise ValueError("offer URL credentials are not supported")
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/") or "/"
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in {"clickid", "click_id"} and not key.lower().startswith("_kx_")
+        ]
+        query.sort(key=lambda item: (item[0], item[1]))
+        normalized = urlunsplit((scheme, netloc, path, urlencode(query, doseq=True), ""))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid offer URL") from exc
+    return normalized, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+async def resolve_isolation_scope(db, user_id: str) -> Dict[str, Any]:
+    """Resolve membership live for the critical claim path.
+
+    One user should belong to at most one enabled group. Admin writes enforce a
+    conflict check; if legacy corruption exists, claims fail closed.
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        raise ValueError("user_id is required")
+    if not await _user_vps_ip_db_enabled(db, uid):
+        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
+    groups = await db[COLLECTION].find(
+        {"enabled": True, "user_ids": uid}, {"id": 1, "user_ids": 1, "_id": 0}
+    ).to_list(2)
+    if len(groups) > 1:
+        raise RuntimeError("user belongs to multiple enabled isolation groups")
+    if not groups:
+        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
+    group = groups[0]
+    gid = str(group.get("id") or "").strip()
+    if not gid:
+        raise RuntimeError("enabled isolation group has no stable id")
+    candidates = sorted({str(v).strip() for v in group.get("user_ids") or [] if str(v).strip()})
+    eligible: Set[str] = set()
+    async for doc in db.users.find(
+        {"id": {"$in": candidates}, "vps_ip_db_enabled": True}, {"id": 1, "_id": 0}
+    ):
+        if doc.get("id"):
+            eligible.add(str(doc["id"]))
+    if uid not in eligible or len(eligible) < 2:
+        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
+    return {
+        "scope_key": f"group:{gid}",
+        "group_id": gid,
+        "member_ids": sorted(eligible),
+        "shared": True,
+    }
+
+
+def team_offer_claim_required(scope: Dict[str, Any], duplicate_opt_in: bool) -> bool:
+    """Shared DB-VPS isolation is mandatory; solo users retain their opt-out."""
+    return bool(scope.get("shared")) or bool(duplicate_opt_in)
+
+
+async def ensure_team_offer_claim_indexes(db) -> None:
+    await db[TEAM_OFFER_CLAIMS_COLLECTION].create_index(
+        [("scope_key", 1), ("offer_key", 1), ("ip", 1)],
+        unique=True,
+        name="uniq_scope_offer_ip",
+    )
+    await db[TEAM_OFFER_CLAIMS_COLLECTION].create_index(
+        [("expires_at", 1)], expireAfterSeconds=0, name="pending_expiry"
+    )
+    await db[TEAM_OFFER_CLAIMS_COLLECTION].create_index(
+        [("visit_token", 1), ("scope_key", 1)], name="visit_scope_lookup"
+    )
+    await db[COLLECTION].create_index("id", unique=True, name="uniq_isolation_group_id")
+    await db[COLLECTION].create_index([("enabled", 1), ("user_ids", 1)], name="enabled_group_members")
+
+
+async def acquire_team_offer_ip_claim(
+    db, user_id: str, offer_url: str, ip: str, visit_token: str
+) -> Dict[str, Any]:
+    """Atomically reserve exact (stable scope, offer, canonical IP)."""
+    token = (visit_token or "").strip()
+    canonical_ip = canonicalize_ip(ip)
+    normalized_url, offer_key = canonical_offer_identity(offer_url)
+    if not token or len(token) > 256:
+        raise ValueError("visit_token is required")
+    if not canonical_ip:
+        raise ValueError("valid canonical IP is required")
+    scope = await resolve_isolation_scope(db, user_id)
+    now = datetime.now(timezone.utc)
+    doc = {
+        "id": str(uuid.uuid4()),
+        "scope_key": scope["scope_key"],
+        "group_id": scope["group_id"],
+        "offer_key": offer_key,
+        "offer_url_normalized": normalized_url,
+        "ip": canonical_ip,
+        "visit_token": token,
+        "user_id": str(user_id).strip(),
+        "status": "pending",
+        "claimed_at": now,
+        "expires_at": now + timedelta(seconds=PENDING_CLAIM_SECONDS),
+    }
+    try:
+        await db[TEAM_OFFER_CLAIMS_COLLECTION].insert_one(doc)
+        return {"status": "acquired", "acquired": True, **{k: doc[k] for k in (
+            "scope_key", "offer_key", "offer_url_normalized", "ip", "visit_token"
+        )}}
+    except Exception as exc:
+        try:
+            from pymongo.errors import DuplicateKeyError
+        except Exception:  # pragma: no cover
+            DuplicateKeyError = ()  # type: ignore[assignment]
+        if DuplicateKeyError and not isinstance(exc, DuplicateKeyError):
+            raise
+        existing = await db[TEAM_OFFER_CLAIMS_COLLECTION].find_one(
+            {"scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip},
+            {"_id": 0},
+        )
+        if not existing:
+            raise
+        if existing.get("visit_token") == token:
+            return {
+                "status": "idempotent", "acquired": True,
+                "scope_key": scope["scope_key"], "offer_key": offer_key,
+                "offer_url_normalized": normalized_url, "ip": canonical_ip,
+                "visit_token": token,
+            }
+        return {
+            "status": "conflict", "acquired": False,
+            "scope_key": scope["scope_key"], "offer_key": offer_key,
+            "offer_url_normalized": normalized_url, "ip": canonical_ip,
+        }
+
+
+async def complete_team_offer_ip_claim(
+    db, user_id: str, offer_url: str, ip: str, visit_token: str
+) -> bool:
+    scope = await resolve_isolation_scope(db, user_id)
+    _, offer_key = canonical_offer_identity(offer_url)
+    canonical_ip = canonicalize_ip(ip)
+    if not canonical_ip:
+        return False
+    result = await db[TEAM_OFFER_CLAIMS_COLLECTION].update_one(
+        {
+            "scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip,
+            "visit_token": (visit_token or "").strip(), "status": "pending",
+        },
+        {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)},
+         "$unset": {"expires_at": ""}},
+    )
+    if result.modified_count:
+        return True
+    existing = await db[TEAM_OFFER_CLAIMS_COLLECTION].find_one({
+        "scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip,
+        "visit_token": (visit_token or "").strip(), "status": "completed",
+    })
+    return bool(existing)
+
+
+async def release_team_offer_ip_claim(
+    db, user_id: str, offer_url: str, ip: str, visit_token: str
+) -> bool:
+    scope = await resolve_isolation_scope(db, user_id)
+    _, offer_key = canonical_offer_identity(offer_url)
+    canonical_ip = canonicalize_ip(ip)
+    if not canonical_ip:
+        return False
+    result = await db[TEAM_OFFER_CLAIMS_COLLECTION].delete_one({
+        "scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip,
+        "visit_token": (visit_token or "").strip(), "status": "pending",
+    })
+    return bool(result.deleted_count)
+
+
+async def find_team_offer_ip_conflict(db, user_id: str, offer_url: str, ip: str) -> Optional[Dict[str, Any]]:
+    scope = await resolve_isolation_scope(db, user_id)
+    _, offer_key = canonical_offer_identity(offer_url)
+    canonical_ip = canonicalize_ip(ip)
+    if not canonical_ip:
+        return None
+    return await db[TEAM_OFFER_CLAIMS_COLLECTION].find_one(
+        {"scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip},
+        {"_id": 0},
+    )
+
+
+async def list_team_offer_claimed_ips(db, user_id: str, offer_url: str) -> Set[str]:
+    scope = await resolve_isolation_scope(db, user_id)
+    _, offer_key = canonical_offer_identity(offer_url)
+    out: Set[str] = set()
+    async for doc in db[TEAM_OFFER_CLAIMS_COLLECTION].find(
+        {"scope_key": scope["scope_key"], "offer_key": offer_key}, {"ip": 1, "_id": 0}
+    ):
+        canonical = canonicalize_ip(doc.get("ip"))
+        if canonical:
+            out.add(canonical)
+    return out
 
 
 def invalidate_group_cache() -> None:
@@ -268,13 +520,30 @@ async def _remove_users_from_other_groups(db, user_ids: List[str], except_group_
         )
 
 
+async def _assert_no_enabled_group_conflict(
+    db, user_ids: List[str], *, except_group_id: Optional[str] = None
+) -> None:
+    """Admin-write guard for the one-user-one-enabled-group invariant.
+
+    The live claim path independently detects legacy/concurrent corruption and
+    fails closed; this check prevents an admin request knowingly creating it.
+    """
+    query: Dict[str, Any] = {"enabled": True, "user_ids": {"$in": user_ids}}
+    if except_group_id:
+        query["id"] = {"$ne": except_group_id}
+    conflict = await db[COLLECTION].find_one(query, {"id": 1, "name": 1, "_id": 0})
+    if conflict:
+        raise ValueError("One or more users already belong to another enabled isolation group")
+
+
 async def create_group(db, *, name: str, user_ids: List[str], enabled: bool = True) -> Dict[str, Any]:
     clean_ids = sorted({str(u).strip() for u in user_ids if str(u).strip()})
     if len(clean_ids) < 2:
         raise ValueError("Select at least 2 users for an isolation group")
     nm = (name or "").strip() or "Isolation Group"
     now = datetime.now(timezone.utc).isoformat()
-    await _remove_users_from_other_groups(db, clean_ids)
+    if enabled:
+        await _assert_no_enabled_group_conflict(db, clean_ids)
     doc = {
         "id": str(uuid.uuid4()),
         "name": nm[:120],
@@ -311,10 +580,14 @@ async def update_group(
         clean_ids = sorted({str(u).strip() for u in user_ids if str(u).strip()})
         if len(clean_ids) < 2:
             raise ValueError("Select at least 2 users for an isolation group")
-        await _remove_users_from_other_groups(db, clean_ids, except_group_id=gid)
         patch["user_ids"] = clean_ids
     if enabled is not None:
         patch["enabled"] = bool(enabled)
+
+    resulting_users = patch.get("user_ids", existing.get("user_ids") or [])
+    resulting_enabled = patch.get("enabled", existing.get("enabled", True))
+    if resulting_enabled:
+        await _assert_no_enabled_group_conflict(db, resulting_users, except_group_id=gid)
 
     await db[COLLECTION].update_one({"id": gid}, {"$set": patch})
     invalidate_group_cache()

@@ -234,10 +234,10 @@ class TestParallelLoggingPresent:
 # ─────────────────────── Bug #5 — ctx_args F821 fix ───────────────────────
 class TestCtxArgsFix:
     def test_v230_block_uses_ctx_headers(self):
-        src_lines = inspect.getsource(rut).splitlines()
-        # window: 8780..8830 — check ctx_args not referenced in v230 apply block
-        v230_block = "\n".join(src_lines[8778:8830])
-        assert "_ctx_headers" in v230_block, "expected _ctx_headers in v230 stealth block"
+        # Inspect the helper by symbol instead of brittle whole-file line
+        # offsets, which move whenever lifecycle/reporting code is added.
+        v230_block = inspect.getsource(rut._rut_apply_context_stealth)
+        assert "ctx_headers" in v230_block, "expected ctx_headers in v230 stealth helper"
         # No live reference to ctx_args (only comment mentioning history is OK,
         # but no code path should reference the undefined variable)
         code_only = "\n".join(

@@ -1451,14 +1451,13 @@ def _with_traffic_type_extras(
     """Merge paid/organic verdict + Sec-Fetch + network-click into referer extras."""
     merged = dict(extras or {})
     merged.update(_referer_extras_for_traffic_type(cfg, platform))
+    # Force this before optional imports so even a degraded referrer_pro
+    # environment cannot retain a stale synthetic network Referer.
+    merged["network_click_referer"] = ""
     try:
-        from referrer_pro import build_sec_fetch_headers as _bsf, build_network_click_referer as _bnc
+        from referrer_pro import build_sec_fetch_headers as _bsf
         if not merged.get("sec_fetch"):
             merged["sec_fetch"] = _bsf(referer_url or "", is_navigation=True)
-        if cfg.get("network_click_chain") and not merged.get("network_click_referer"):
-            _ncr = _bnc()
-            if _ncr:
-                merged["network_click_referer"] = _ncr
     except Exception:
         merged.setdefault("sec_fetch", {})
     return merged
@@ -1572,7 +1571,7 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     social_wrapper_enabled=bool(cfg.get("social_wrapper", True)),
                     inapp_deep_path_enabled=bool(cfg.get("inapp_deep_path", True)),
                     strip_search_path=bool(cfg.get("strip_search_path", True)),
-                    network_click_chain_enabled=bool(cfg.get("network_click_chain", False)),
+                    network_click_chain_enabled=False,
                     # v2.6.24 — Paid vs Organic split (auto|paid|organic|mixed)
                     traffic_type=str(cfg.get("traffic_type") or "auto"),
                     campaign_type=str(cfg.get("campaign_type") or "auto"),
@@ -6637,6 +6636,14 @@ async def _persist_burnt_ip(
     if not ip or not isinstance(ip, str):
         return
     try:
+        from cross_user_ip_isolation import canonical_offer_identity, canonicalize_ip
+        canonical_ip = canonicalize_ip(ip)
+        if not canonical_ip:
+            return
+        normalized_offer = ""
+        offer_scope_key = ""
+        if offer_url:
+            normalized_offer, offer_scope_key = canonical_offer_identity(offer_url)
         _now_dt = datetime.now(timezone.utc)
         _user_ids_to_tag: List[str] = []
         if user_id:
@@ -6645,11 +6652,32 @@ async def _persist_burnt_ip(
                 _user_ids_to_tag = await _iso_members(db, user_id)
             except Exception:
                 _user_ids_to_tag = [user_id]
+        # Exact new ledger avoids the legacy raw-URL array cross-product.
+        if offer_scope_key:
+            await db.rut_burnt_offer_ips.update_one(
+                {
+                    "ip": canonical_ip,
+                    "offer_scope_key": offer_scope_key,
+                    "user_id": user_id,
+                },
+                {
+                    "$set": {
+                        "offer_url_normalized": normalized_offer,
+                        "last_reason": reason or "unknown",
+                        "last_detected_at": _now_dt,
+                    },
+                    "$setOnInsert": {"first_detected_at": _now_dt},
+                    "$inc": {"hit_count": 1},
+                },
+                upsert=True,
+            )
         await db.rut_burnt_ips.update_one(
-            {"ip": ip.strip()},
+            {"ip": canonical_ip},
             {
                 "$set": {
-                    "ip": ip.strip(),
+                    "ip": canonical_ip,
+                    **({"offer_scope_key": offer_scope_key} if offer_scope_key else {}),
+                    **({"offer_url_normalized": normalized_offer} if normalized_offer else {}),
                     "last_reason": reason or "unknown",
                     "last_detected_at": _now_dt.isoformat(),
                     "last_detected_dt": _now_dt,  # BSON Date — feeds TTL index
@@ -7164,18 +7192,24 @@ def _normalize_unresolvable_tracker_host(url: str) -> str:
 _NORMALIZE_TRACKER_CACHE: Dict[str, str] = {}
 
 
-def _append_rut_defer_click_qs(url: str) -> str:
-    """Tell tracker to skip click insert — RUT early log owns the row."""
+def _append_rut_defer_click_qs(url: str, visit_token: str = "") -> str:
+    """Tell tracker to defer using an HMAC bound to one attempted visit."""
+    token = (visit_token or "").strip()
+    if not token:
+        raise ValueError("visit token required")
     try:
         import hmac as _hmac
         import hashlib as _hashlib
         from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
         key_raw = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY") or "krexion-default-cookie-key"
         key = key_raw.encode("utf-8") if isinstance(key_raw, str) else bytes(key_raw)
-        sig = _hmac.new(key, b"rut_defer_click", _hashlib.sha256).hexdigest()[:16]
+        sig = _hmac.new(
+            key, f"rut_defer_click:{token}".encode("utf-8"), _hashlib.sha256
+        ).hexdigest()[:32]
         parsed = urlparse(url)
         q = dict(parse_qsl(parsed.query, keep_blank_values=True))
         q["_kx_rut_defer"] = "1"
+        q["_kx_visit_token"] = token
         q["_kx_rut_defer_sig"] = sig
         return urlunparse((
             parsed.scheme, parsed.netloc, parsed.path, parsed.params,
@@ -7183,6 +7217,25 @@ def _append_rut_defer_click_qs(url: str) -> str:
         ))
     except Exception:
         return url
+
+
+def _click_id_from_resolved_url(url: str) -> str:
+    """Safely extract a tracker click identity from a resolved destination."""
+    try:
+        from urllib.parse import parse_qsl, urlparse
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return ""
+        query = {str(k).lower(): str(v) for k, v in parse_qsl(
+            parsed.query, keep_blank_values=False,
+        )}
+        for key in ("clickid", "click_id"):
+            value = (query.get(key) or "").strip()
+            if value and len(value) <= 256:
+                return value
+    except (TypeError, ValueError, UnicodeError):
+        pass
+    return ""
 
 
 async def _resolve_tracker_via_localhost(
@@ -7193,6 +7246,7 @@ async def _resolve_tracker_via_localhost(
     referer: str = "",
     accept_language: str = "",
     sec_ch_ua_headers: Optional[Dict[str, str]] = None,
+    visit_token: str = "",
 ) -> Optional[str]:
     """Resolve the tracker server-side WITHOUT going through the
     residential proxy, while still recording the click as the
@@ -7225,7 +7279,7 @@ async def _resolve_tracker_via_localhost(
     """
     if not (target_url and exit_ip):
         return None
-    target_url = _append_rut_defer_click_qs(target_url)
+    target_url = _append_rut_defer_click_qs(target_url, visit_token)
 
     # ── 2026-06-15 (UA-leak defence): refuse to fire the server-side
     # tracker resolve with a suspicious / empty / dot-only UA. Earlier
@@ -7543,8 +7597,8 @@ async def run_real_user_traffic_job(
     # `ad_chain_simulation_enabled` — when True, fire platform pixel
     # preflight pings + 1 intermediate redirect hop before the offer
     # navigation so the session looks like a real ad-click journey.
-    # v2.6.35: default ON.
-    ad_chain_simulation_enabled: bool = True,
+    # Compatibility input only; integrity policy forces it OFF.
+    ad_chain_simulation_enabled: bool = False,
     # v2.6.35 — Block datacenter / high fraud-score exit IPs before the
     # visit loads. Uses ISP/org heuristics + premium fraud APIs already
     # wired into `_probe_proxy_geo`. Complements skip_vpn.
@@ -7653,6 +7707,12 @@ async def run_real_user_traffic_job(
     """
     Main orchestrator. Emits progress into RUT_JOBS[job_id].
     """
+    # Integrity policy is global, including stale/resumed submit_params.
+    # These compatibility arguments remain accepted, but can never activate
+    # either synthetic ad-chain implementation.
+    ad_chain_simulation_enabled = False
+    referer_network_click_chain = False
+
     # v2.6.35 — Auto identity persistence when operator leaves field blank.
     if not (identity_label or "").strip():
         identity_label = _auto_identity_label(job_id)
@@ -7818,7 +7878,7 @@ async def run_real_user_traffic_job(
         "search_engine": (referer_search_engine or "google").strip().lower(),
         "search_keywords": referer_search_keywords or "",
         "strip_search_path": bool(referer_strip_search_path),
-        "network_click_chain": bool(referer_network_click_chain),
+        "network_click_chain": False,
         # v2.6.24 — Paid vs Organic referer split
         "traffic_type": (referer_traffic_type or "auto").strip().lower(),
         "campaign_type": (referer_campaign_type or "auto").strip().lower(),
@@ -8002,6 +8062,8 @@ async def run_real_user_traffic_job(
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "total": total,
+        "attempts_started": 0,
+        "in_flight": 0,
         "processed": 0,
         "succeeded": 0,
         "conversions": 0,
@@ -8013,6 +8075,8 @@ async def run_real_user_traffic_job(
         "skipped_state_mismatch": 0,
         "skipped_no_unique_ip": 0,
         "skipped_dead_proxy": 0,
+        "skipped": _skipped_os_prefilter,
+        "cancelled": 0,
         "invalid_data": 0,
         "failed": 0,
         "events": [],
@@ -8040,6 +8104,7 @@ async def run_real_user_traffic_job(
         "silent_skip_burnt_ip": bool(_use_row_first),
         "silent_skip_count": 0,
         "silent_skip_breakdown": {},
+        "leads_remaining": len(rows) if rows else 0,
     })
     if db is not None:
         await _persist(db, job_id)
@@ -8151,6 +8216,15 @@ async def run_real_user_traffic_job(
     used_ua_set: set = set()  # distinct UA strings actually picked for visits
     consumed_row_indices: set = set()   # rows OK-submitted — NOT reused, removed from pending_leads
     invalid_row_indices: set = set()    # rows that triggered a validation error — ALSO removed from pending_leads
+
+    def _update_leads_remaining() -> None:
+        RUT_JOBS[job_id]["leads_remaining"] = max(
+            (len(rows) if rows else 0)
+            - len(consumed_row_indices)
+            - len(invalid_row_indices),
+            0,
+        )
+
     state = {"proxy_idx": 0, "ua_idx": 0, "row_idx": 0, "start_time": time.time()}
     report: List[Dict[str, Any]] = []
     report_lock = asyncio.Lock()
@@ -8743,6 +8817,28 @@ async def run_real_user_traffic_job(
             "screenshot": "",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        # One token spans tracker resolve + direct browser acquire. Retries of
+        # the same attempted visit are idempotent; another visit cannot reuse it.
+        _visit_claim_token = str(uuid.uuid4())
+        entry["visit_claim_token"] = _visit_claim_token
+        _team_claim_acquired = False
+        _team_claim_completed = False
+        _team_claim_released = False
+        _underlying_offer_url = str(
+            (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
+            or (RUT_JOBS.get(job_id) or {}).get("offer_url")
+            or ""
+        )
+        if not _underlying_offer_url and db is not None:
+            _offer_meta = await db.real_user_traffic_jobs.find_one(
+                {"job_id": job_id},
+                {"offer_url_normalized": 1, "offer_url": 1, "_id": 0},
+            )
+            _underlying_offer_url = str(
+                (_offer_meta or {}).get("offer_url_normalized")
+                or (_offer_meta or {}).get("offer_url")
+                or ""
+            )
 
         # ── 2026-01 ROW-FIRST on-demand sequence ──────────────────────
         # When ProxyJet on-demand mode is on we INVERT the order:
@@ -9013,7 +9109,7 @@ async def run_real_user_traffic_job(
                         ip=exit_ip,
                         reason="proxyjet_picked",
                         user_id=engine_user_id or "",
-                        offer_url=target_url or "",
+                        offer_url=_underlying_offer_url or target_url or "",
                         state=row_state_code or "",
                         job_id=job_id or "",
                     ))
@@ -9406,7 +9502,7 @@ async def run_real_user_traffic_job(
                         ip=_burned_ip_pre,
                         reason=_pre_reason,
                         user_id=engine_user_id or "",
-                        offer_url=target_url or "",
+                        offer_url=_underlying_offer_url or target_url or "",
                         state=(entry.get("lead_state") or "").upper(),
                         job_id=job_id or "",
                     ))
@@ -9608,6 +9704,58 @@ async def run_real_user_traffic_job(
                 logger.debug(f"identity load failed: {_id_err}")
 
         try:
+            # DB-backed team invariant is mandatory for active shared scopes,
+            # even if the operator disabled the legacy per-job duplicate set.
+            _claim_offer_url = str(
+                (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
+                or (RUT_JOBS.get(job_id) or {}).get("offer_url")
+            )
+            if not _claim_offer_url and db is not None:
+                _claim_job_doc = await db.real_user_traffic_jobs.find_one(
+                    {"job_id": job_id},
+                    {"offer_url_normalized": 1, "offer_url": 1, "_id": 0},
+                )
+                _claim_offer_url = str(
+                    (_claim_job_doc or {}).get("offer_url_normalized")
+                    or (_claim_job_doc or {}).get("offer_url")
+                    or ""
+                )
+            if not _claim_offer_url:
+                # Direct-offer jobs can safely use target_url. Tracker jobs
+                # must have persisted underlying offer metadata and fail closed.
+                if _is_tracker_target:
+                    raise RuntimeError("underlying offer scope unavailable")
+                _claim_offer_url = target_url
+            if db is not None and engine_user_id and geo.get("exit_ip"):
+                from cross_user_ip_isolation import (
+                    acquire_team_offer_ip_claim,
+                    canonicalize_ip,
+                    resolve_isolation_scope,
+                    team_offer_claim_required,
+                )
+                _claim_ip = canonicalize_ip(geo.get("exit_ip"))
+                _claim_scope = await resolve_isolation_scope(db, engine_user_id)
+                if _claim_ip and team_offer_claim_required(
+                    _claim_scope, bool(skip_duplicate_ip)
+                ):
+                    _claim_result = await acquire_team_offer_ip_claim(
+                        db, engine_user_id, _claim_offer_url,
+                        _claim_ip, _visit_claim_token,
+                    )
+                    if not _claim_result.get("acquired"):
+                        entry["status"] = "skipped_duplicate_ip"
+                        entry["error"] = "Exit IP already used by a teammate for this offer"
+                        push_live_step(
+                            job_id, i + 1, "filter", "skipped",
+                            f"Team offer duplicate IP {_claim_ip}",
+                        )
+                        return await _record(job_id, entry, report, report_lock, db)
+                    _team_claim_acquired = True
+                    entry["offer_scope_key"] = _claim_result.get("offer_key") or ""
+                    entry["offer_url_normalized"] = _claim_result.get(
+                        "offer_url_normalized"
+                    ) or ""
+
             # Use the SHARED browser launched once at job start. Per-visit
             # isolation comes from a fresh BrowserContext with its own proxy,
             # cookies, storage, fingerprint, locale, timezone, viewport — which
@@ -9831,15 +9979,9 @@ async def run_real_user_traffic_job(
                 _network_click_ref = str(
                     (_pro_extras or {}).get("network_click_referer") or ""
                 ).strip()
-                if _referer_cfg.get("network_click_chain") and _network_click_ref:
-                    _ua_referer = _network_click_ref
-                    try:
-                        push_live_step(
-                            job_id, i + 1, "referer", "info",
-                            f"Network Click Chain: outbound Referer → ad-network host {_network_click_ref[:80]}",
-                        )
-                    except Exception:
-                        pass
+                # Network Click Chain is intentionally disabled. In
+                # particular, never overwrite the resolved platform/custom
+                # Referer with an artificial affiliate-network hostname.
                 _goto_referer_kw: Dict[str, Any] = {}
                 if _ua_referer:
                     _goto_referer_kw["referer"] = _ua_referer
@@ -9874,6 +10016,10 @@ async def run_real_user_traffic_job(
                         traffic_type=str((_pro_extras or {}).get("traffic_type") or ""),
                     ),
                 )
+                if _is_tracker_target:
+                    _visit_target_url = _append_rut_defer_click_qs(
+                        _visit_target_url, _visit_claim_token
+                    )
 
                 # 2026-06-14: APPEND REALISTIC UTM/CAMPAIGN TAGS TO URL.
                 # 2026-07 v2.6.9 CUSTOMER FIX F: If the operator's URL
@@ -9986,9 +10132,13 @@ async def run_real_user_traffic_job(
                                 k: v for k, v in _ctx_headers.items()
                                 if k.lower().startswith("sec-ch-")
                             },
+                            visit_token=_visit_claim_token,
                         )
                         if _resolved_offer_direct:
                             _visit_target_url = _resolved_offer_direct
+                            entry["_tracker_click_id"] = _click_id_from_resolved_url(
+                                _resolved_offer_direct
+                            )
                             _ptro_swapped = True
                             # ── 2026-06-15 (anti-tracker-leak): Now that
                             # we know the FINAL offer URL, rebuild the
@@ -10302,7 +10452,7 @@ async def run_real_user_traffic_job(
                                 ip=_dup_hit,
                                 reason="tracker_duplicate_ip",
                                 user_id=engine_user_id or "",
-                                offer_url=target_url or "",
+                                offer_url=_underlying_offer_url or target_url or "",
                                 state=(entry.get("lead_state") or "").upper(),
                                 job_id=job_id or "",
                             ))
@@ -10404,6 +10554,7 @@ async def run_real_user_traffic_job(
                                     k: v for k, v in (_ctx_headers or {}).items()
                                     if k.lower().startswith("sec-ch-")
                                 },
+                                visit_token=_visit_claim_token,
                             )
                             if _resolved_offer_prewarm:
                                 _prewarm_url = _resolved_offer_prewarm
@@ -10469,7 +10620,7 @@ async def run_real_user_traffic_job(
                         logger.debug(f"tls prewarm exception: {_pw_err}")
 
                 # ── 2026-07 v2.6.35 — Ad chain simulation (pixel + hops) ─
-                if ad_chain_simulation_enabled:
+                if False:  # globally disabled: no pixel prefire/intermediate hop
                     try:
                         from anti_detect_v230 import (
                             fire_pixel_prefire as _fire_pixels,
@@ -10859,7 +11010,8 @@ async def run_real_user_traffic_job(
                             _exit_ip_for_bypass = await _get_exit_ip_via_proxy(proxy)
                             if _exit_ip_for_bypass:
                                 _bypass_offer_url = await _resolve_tracker_via_localhost(
-                                    target_url, _exit_ip_for_bypass, ua
+                                    target_url, _exit_ip_for_bypass, ua,
+                                    visit_token=_visit_claim_token,
                                 )
                                 if _bypass_offer_url:
                                     push_live_step(
@@ -11044,6 +11196,17 @@ async def run_real_user_traffic_job(
                     # fields (visit_status, final_url, conversion). No
                     # double-counting, no double-insert.
                     try:
+                        # Browser redirects can expose a tracker-generated
+                        # clickid even when server-side pass-to-offer was off.
+                        # Capture it before the pending row is inserted.
+                        try:
+                            _resolved_browser_url = str(page.url or "")
+                        except Exception:
+                            _resolved_browser_url = ""
+                        entry["_tracker_click_id"] = (
+                            entry.get("_tracker_click_id")
+                            or _click_id_from_resolved_url(_resolved_browser_url)
+                        )
                         _j_for_log = RUT_JOBS.get(job_id, {})
                         await _log_click_for_link(entry, _j_for_log, db, early=True)
                     except Exception as _ele:
@@ -11224,7 +11387,7 @@ async def run_real_user_traffic_job(
                             ip=_burned_ip,
                             reason=_block_reason,
                             user_id=engine_user_id or "",
-                            offer_url=target_url or "",
+                            offer_url=_underlying_offer_url or target_url or "",
                             state=(entry.get("lead_state") or "").upper(),
                             job_id=job_id or "",
                         ))
@@ -11312,6 +11475,18 @@ async def run_real_user_traffic_job(
                         )
                     return await _record(job_id, entry, report, report_lock, db)
 
+                # Browser reached a real, non-block landing. This is the visit
+                # success boundary for isolation; later form/conversion failure
+                # must not free an IP that already touched the offer.
+                if _team_claim_acquired and not _team_claim_completed:
+                    from cross_user_ip_isolation import complete_team_offer_ip_claim
+                    _team_claim_completed = await complete_team_offer_ip_claim(
+                        db, engine_user_id or "", _claim_offer_url,
+                        _claim_ip, _visit_claim_token,
+                    )
+                    if not _team_claim_completed:
+                        raise RuntimeError("team offer claim completion failed")
+
                 # No form fill AND no custom automation JSON → plain
                 # real click, just screenshot. If a custom automation
                 # JSON is present we MUST still execute it even when
@@ -11370,6 +11545,7 @@ async def run_real_user_traffic_job(
                             return
                         async with report_lock:
                             consumed_row_indices.add(row_index)
+                            _update_leads_remaining()
                         push_live_step(
                             job_id, i + 1, "submit", "ok",
                             f"Lead row #{row_index + 1} used ({reason}) — removed from Uploaded Things",
@@ -12002,6 +12178,7 @@ async def run_real_user_traffic_job(
                         # Mark the CURRENT row as invalid (drops from pending_leads)
                         async with report_lock:
                             invalid_row_indices.add(row_index)
+                            _update_leads_remaining()
                         # Per-use immediate deletion from saved data file
                         _spawn_live(_live_remove_data_row(row_index))
 
@@ -12085,6 +12262,7 @@ async def run_real_user_traffic_job(
                 if entry["status"] == "ok" and row_index is not None:
                     async with report_lock:
                         consumed_row_indices.add(row_index)
+                        _update_leads_remaining()
                     # IMMEDIATE per-use deletion from saved data file
                     _spawn_live(_live_remove_data_row(row_index))
 
@@ -12531,6 +12709,22 @@ async def run_real_user_traffic_job(
             entry["status"] = "failed"
             entry["error"] = f"{type(e).__name__}: {str(e)[:180]}"
         finally:
+            if (
+                _team_claim_acquired
+                and not _team_claim_completed
+                and not _team_claim_released
+            ):
+                try:
+                    from cross_user_ip_isolation import release_team_offer_ip_claim
+                    _team_claim_released = await release_team_offer_ip_claim(
+                        db, engine_user_id or "", _claim_offer_url,
+                        _claim_ip, _visit_claim_token,
+                    )
+                except Exception as _release_err:
+                    logger.error(
+                        "RUT pending team-offer claim release failed: %s",
+                        _release_err,
+                    )
             # 2026-06 — Live Visual Grid cleanup: clear this visit's
             # entry from the manual-takeover registries so any in-
             # flight pause flag is dropped (otherwise a "Stop job"
@@ -12596,7 +12790,7 @@ async def run_real_user_traffic_job(
         f"(env_cap={_rut_hard_cap}, lightweight_reporting={lightweight_reporting_enabled()})"
     )
 
-    async def worker(i: int, shared_browser: Browser):
+    async def _worker_body(i: int, shared_browser: Browser):
         # Per-visit pacing: target time for this visit = i * delay_between
         # When PacingEngine is on (`_pacing_offsets` populated), use its
         # per-index cumulative offset instead so visits don't arrive at
@@ -12735,6 +12929,34 @@ async def run_real_user_traffic_job(
                     if cancel_event.is_set() or target_drain_event.is_set():
                         return
                     continue
+
+    async def worker(i: int, shared_browser: Browser):
+        """Canonical attempt lifecycle wrapper for every dispatcher mode."""
+        j = RUT_JOBS[job_id]
+        _mark_attempt_started(j)
+        processed_before = int(j.get("processed") or 0)
+        was_task_cancelled = False
+        try:
+            await _worker_body(i, shared_browser)
+        except asyncio.CancelledError:
+            was_task_cancelled = True
+            raise
+        finally:
+            _mark_attempt_terminal(
+                j,
+                cancelled=(
+                    was_task_cancelled
+                    or (
+                        cancel_event.is_set()
+                        and int(j.get("processed") or 0) == processed_before
+                    )
+                ),
+            )
+            if db is not None:
+                try:
+                    await _persist(db, job_id)
+                except Exception:
+                    pass
 
     # ── Launch ONE shared Chromium browser for the WHOLE job ─────────
     # All visits create their own isolated BrowserContext from this single
@@ -13391,7 +13613,13 @@ async def run_real_user_traffic_job(
     # surface a one-line explanation. This is the difference between
     # "stopped 0/100 ¯\_(ツ)_/¯" and "stopped: cancelled by user 3s into
     # the run — no proxies were tried yet" (or whatever actually happened).
-    final_status = "stopped" if was_cancelled else "completed"
+    final_status = _canonical_terminal_status(
+        RUT_JOBS.get(job_id, {}),
+        target_mode=target_mode,
+        requested_total=total_clicks,
+        target_conversions=target_conversions,
+        was_cancelled=was_cancelled,
+    )
     self_diagnosis = ""
     processed = int(RUT_JOBS.get(job_id, {}).get("processed") or 0)
     if processed == 0:
@@ -13433,6 +13661,7 @@ async def run_real_user_traffic_job(
         "report": report[-200:],  # keep last 200 in memory
         "zip_path": str(zip_path),
         "leftover_leads_count": (len(rows) - len(consumed_row_indices) - len(invalid_row_indices)) if rows else 0,
+        "leads_remaining": (len(rows) - len(consumed_row_indices) - len(invalid_row_indices)) if rows else 0,
         "consumed_leads_count": len(consumed_row_indices),
         "invalid_leads_count": len(invalid_row_indices),
         # Self-diagnosis — empty when the run produced visits.
@@ -15642,6 +15871,31 @@ async def _execute_automation_steps(
                         "note": f"stage_markers enabled={_stage_gate_on}",
                         "optional": True,
                     })
+                continue
+            if action_peek == "stage_end":
+                # Explicit boundary must execute even when the active stage is
+                # being skipped, otherwise that skip leaks into later steps.
+                _stage_skip_active = False
+                executed += 1
+                if collect_timings:
+                    step_results.append({
+                        "idx": idx, "action": "stage_end", "selector": "",
+                        "ok": True, "error": None, "ms": 0,
+                        "note": (
+                            f"stage '{step.get('stage') or step.get('name') or ''}' ended"
+                        ).strip(),
+                        "optional": True,
+                    })
+                if on_step_progress is not None:
+                    try:
+                        await on_step_progress({
+                            "idx": idx,
+                            "action": "stage_end",
+                            "status": "ok",
+                            "detail": "Stage ended",
+                        })
+                    except Exception:
+                        pass
                 continue
             if _stage_gate_on and _stage_skip_active and action_peek not in ("stage", "stage_markers"):
                 # Instant skip — no per-step timeout (the whole pain point).
@@ -18444,10 +18698,15 @@ async def _log_click_for_link(
         if (not early) and early_id:
             try:
                 _final_st = (entry.get("status") or "").strip().lower()
-                await user_db.clicks.update_one(
-                    {"id": early_id},
+                transition = await user_db.clicks.update_one(
+                    {
+                        "id": early_id,
+                        "click_id": early_id,
+                        "click_status": "pending",
+                    },
                     {"$set": {
                         "visit_status": entry.get("status") or "",
+                        "click_status": "completed" if _final_st == "ok" else "failed",
                         "final_url": entry.get("final_url") or "",
                         "conversion_page_reached": bool(entry.get("conversion_page_reached")),
                         "is_vpn": is_vpn,
@@ -18455,12 +18714,13 @@ async def _log_click_for_link(
                         **({"ipv4": exit_ip} if exit_ip and ":" not in exit_ip else {}),
                     }},
                 )
-                # Roll back link counter when visit failed after early log (keep row for dup detection)
-                if _final_st != "ok":
-                    try:
-                        await main_db.links.update_one({"id": link_id}, {"$inc": {"clicks": -1}})
-                    except Exception:
-                        pass
+                # A pending row is not a completed click. Aggregate only
+                # after the browser visit reaches its successful terminal.
+                if _final_st == "ok" and int(getattr(transition, "matched_count", 0) or 0) == 1:
+                    await main_db.links.update_one(
+                        {"id": link_id},
+                        {"$inc": {"clicks": 1, "consecutive_no_conversions": 1}},
+                    )
             except Exception as _ue:
                 logger.warning(f"RUT click UPDATE failed: {_ue}")
             return
@@ -18508,12 +18768,27 @@ async def _log_click_for_link(
                     pass
                 return
 
-        new_id = str(_uuid.uuid4())
+        new_id = (
+            str(entry.get("_tracker_click_id") or "").strip()
+            or str(_uuid.uuid4())
+        )
         click_doc = {
             "id": new_id,
-            "click_id": str(_uuid.uuid4()),
+            "click_id": new_id,
             "link_id": link_id,
+            "offer_scope_key": (
+                entry.get("offer_scope_key")
+                or job_info.get("offer_scope_key")
+                or ""
+            ),
+            "offer_url_normalized": (
+                entry.get("offer_url_normalized")
+                or job_info.get("offer_url_normalized")
+                or ""
+            ),
             "user_id": owner_id,
+            "job_id": job_info.get("job_id") or "",
+            "visit_id": str(entry.get("visit_index") or ""),
             "short_code": short_code,
             "ip_address": exit_ip or "unknown",
             "ipv4": exit_ip if exit_ip and ":" not in exit_ip else "",
@@ -18539,6 +18814,7 @@ async def _log_click_for_link(
             "referrer_source_name": "Real User Traffic",
             "source": "real_user_traffic",
             "visit_status": ("pending" if early else (entry.get("status") or "")),
+            "click_status": ("pending" if early else "completed"),
             "final_url": entry.get("final_url") or "",
             "conversion_page_reached": bool(entry.get("conversion_page_reached")),
             "created_at": entry.get("timestamp") or datetime.now(timezone.utc).isoformat(),
@@ -18546,8 +18822,9 @@ async def _log_click_for_link(
         await user_db.clicks.insert_one(click_doc)
         if early:
             entry["_early_click_id"] = new_id
-        _link_inc: Dict[str, Any] = {"clicks": 1, "consecutive_no_conversions": 1}
-        await main_db.links.update_one({"id": link_id}, {"$inc": _link_inc})
+        else:
+            _link_inc: Dict[str, Any] = {"clicks": 1, "consecutive_no_conversions": 1}
+            await main_db.links.update_one({"id": link_id}, {"$inc": _link_inc})
     except Exception as e:
         # Best-effort — never crash the visit because click logging failed
         logger.warning(f"RUT click log failed (job_id-unknown, early={early}): {e}")
@@ -18597,7 +18874,7 @@ async def _record(
             and bool(j.get("silent_skip_burnt_ip"))
         )
         if silent_skip:
-            # Tear down the early-logged click_doc + counter bump
+            # Tear down the early-logged pending click_doc
             # (only burnt-IP visits get an early click_doc — the
             # dead-proxy / no-unique-IP paths bail out before
             # page.goto so they don't have one. Safe to attempt
@@ -18614,20 +18891,22 @@ async def _record(
                     await user_db.clicks.delete_one({"id": _early_id})
                 except Exception as _de:
                     logger.debug(f"silent-skip click delete failed: {_de}")
-                try:
-                    await db.links.update_one(
-                        {"id": _link_id}, {"$inc": {"clicks": -1}}
-                    )
-                except Exception as _de2:
-                    logger.debug(f"silent-skip link counter decrement failed: {_de2}")
+                # Pending rows no longer increment the link aggregate, so
+                # deleting one must not decrement the aggregate either.
             # Bump diagnostics counter only.
             j["silent_skip_count"] = int(j.get("silent_skip_count") or 0) + 1
+            j["skipped"] = int(j.get("skipped") or 0) + 1
             # Also keep a breakdown (helpful in Diagnostics panel).
             _bd = j.setdefault("silent_skip_breakdown", {})
             _bd[s] = int(_bd.get(s) or 0) + 1
             # NOTE: We intentionally skip processed++, counter_key++,
             # report.append, events.append. The visit is invisible
             # from the UI but its IP burn IS persistent.
+            if db is not None:
+                try:
+                    await _persist(db, job_id)
+                except Exception:
+                    pass
             return
 
         # ── Visible visit accounting (original logic, unchanged) ─────────
@@ -18653,6 +18932,8 @@ async def _record(
         if counter_key is None:
             counter_key = "failed"
         j[counter_key] = int(j.get(counter_key) or 0) + 1
+        if isinstance(s, str) and s.startswith("skipped"):
+            j["skipped"] = int(j.get("skipped") or 0) + 1
         # Conversion counter: visits where final URL redirected OFF the form page
         if entry.get("conversion_page_reached"):
             j["conversions"] = int(j.get("conversions") or 0) + 1
@@ -18690,7 +18971,8 @@ async def _record(
         })
         if len(events) > 80:
             del events[:-80]
-        if db is not None and j["processed"] % 5 == 0:
+        # Every visible terminal transition is recoverable immediately.
+        if db is not None:
             try:
                 await _persist(db, job_id)
             except Exception:
@@ -18911,6 +19193,48 @@ def _finalise(job_id: str, status: str, error: str = ""):
     j["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
+def _canonical_terminal_status(
+    job: Dict[str, Any],
+    *,
+    target_mode: str,
+    requested_total: int,
+    target_conversions: int,
+    was_cancelled: bool = False,
+) -> str:
+    """Return completed only when the requested success target was met."""
+    if was_cancelled:
+        return "stopped"
+    succeeded = int(job.get("succeeded") or 0)
+    conversions = int(job.get("conversions") or 0)
+    attempts = int(job.get("attempts_started") or 0)
+    if target_mode == "conversions":
+        target = max(int(target_conversions or 0), 1)
+        if conversions >= target:
+            return "completed"
+        max_attempts = int(job.get("max_attempts") or 0)
+        if max_attempts and attempts >= max_attempts:
+            return "exhausted"
+        return "partial" if succeeded > 0 else "failed"
+    target = max(int(requested_total or 0), 1)
+    if succeeded >= target:
+        return "completed"
+    if succeeded > 0:
+        return "partial"
+    hard_cap = int(job.get("hard_cap") or 0)
+    return "exhausted" if hard_cap and attempts >= hard_cap else "failed"
+
+
+def _mark_attempt_started(job: Dict[str, Any]) -> None:
+    job["attempts_started"] = int(job.get("attempts_started") or 0) + 1
+    job["in_flight"] = int(job.get("in_flight") or 0) + 1
+
+
+def _mark_attempt_terminal(job: Dict[str, Any], *, cancelled: bool = False) -> None:
+    job["in_flight"] = max(int(job.get("in_flight") or 0) - 1, 0)
+    if cancelled:
+        job["cancelled"] = int(job.get("cancelled") or 0) + 1
+
+
 async def _finalise_and_persist(db, job_id: str, status: str, error: str = ""):
     """Same as _finalise but ALSO writes the failed/stopped state to MongoDB
     so the Past Jobs row + REST endpoint reflect the error message instead
@@ -18998,6 +19322,8 @@ def create_rut_job(
         "total": total,
         "form_fill_enabled": form_fill_enabled,
         "status": "queued",
+        "attempts_started": 0,
+        "in_flight": 0,
         "processed": 0,
         "succeeded": 0,
         "skipped_captcha": 0,
@@ -19008,6 +19334,9 @@ def create_rut_job(
         "skipped_state_mismatch": 0,
         "skipped_no_unique_ip": 0,
         "skipped_dead_proxy": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "leads_remaining": 0,
         "failed": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -19033,8 +19362,10 @@ def push_live_step(job_id: str, visit: int, stage: str, status: str, detail: str
     if j is None:
         return
     buf = j.setdefault("live_steps", [])
+    next_idx = int(j.get("live_step_cursor") or 0) + 1
+    j["live_step_cursor"] = next_idx
     buf.append({
-        "idx": len(buf) + 1,
+        "idx": next_idx,
         "visit": visit,
         "stage": stage,              # "setup" | "geo" | "filter" | "browser" | "form" | "submit" | "done"
         "status": status,            # "info" | "ok" | "skipped" | "failed"

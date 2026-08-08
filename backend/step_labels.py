@@ -113,6 +113,9 @@ def friendly_step_label(step: Optional[Dict[str, Any]], *, max_len: int = 72) ->
         return _clip(f"Screenshot: {step.get('name') or 'capture'}", max_len)
     if action == "stage":
         return _clip(f"Stage: {step.get('name') or step.get('stage') or 'unnamed'}", max_len)
+    if action == "stage_end":
+        stage = step.get("stage") or step.get("name")
+        return _clip(f"Stage End: {stage}" if stage else "Stage End", max_len)
     if action == "stage_markers":
         return "Stage markers ON" if step.get("enabled", True) else "Stage markers OFF"
     if action == "branch":

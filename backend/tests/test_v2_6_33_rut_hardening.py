@@ -42,7 +42,7 @@ def test_legacy_auto_mode_sec_fetch_in_with_traffic_type_extras():
     src = _rut_source()
     assert "def _with_traffic_type_extras(" in src
     assert "build_sec_fetch_headers" in src
-    assert "build_network_click_referer" in src
+    assert 'merged["network_click_referer"] = ""' in src
     assert "referer_url: str = \"\"" in src
 
 

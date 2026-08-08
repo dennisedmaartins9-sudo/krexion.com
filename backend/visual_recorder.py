@@ -1991,6 +1991,9 @@ class RecorderSession:
     # Counter that {{counter}} dynamic template increments per use.
     template_counter: int = 0
     steps: List[Dict[str, Any]] = field(default_factory=list)
+    # Optional gap index (0..len(steps)) where newly recorded steps are
+    # inserted. None preserves the original append-only recorder behavior.
+    insertion_position: Optional[int] = None
     last_activity: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
     target_screenshot_path: Optional[str] = None
@@ -2062,8 +2065,37 @@ class RecorderSession:
     def touch(self):
         self.last_activity = time.time()
 
+    def set_insertion_position(self, position: Optional[int]) -> Optional[int]:
+        """Select a recording gap, or clear insert mode with ``None``."""
+        if position is None:
+            self.insertion_position = None
+            return None
+        position = int(position)
+        if not 0 <= position <= len(self.steps):
+            raise ValueError(
+                f"insertion_position must be between 0 and {len(self.steps)}"
+            )
+        self.insertion_position = position
+        return position
+
+    def clear_insertion_position(self) -> None:
+        self.insertion_position = None
+
+    def _write_recorded_step(self, step: Dict[str, Any]) -> int:
+        """Write one emitted step and advance an active insertion cursor."""
+        if self.insertion_position is None:
+            self.steps.append(step)
+            return len(self.steps) - 1
+        idx = self.insertion_position
+        # Defensive clamp protects long-lived sessions from stale external
+        # mutations while the public setter still rejects invalid positions.
+        idx = max(0, min(int(idx), len(self.steps)))
+        self.steps.insert(idx, step)
+        self.insertion_position = idx + 1
+        return idx
+
     def append_step(self, step: Optional[Dict[str, Any]], *, allow_auto_waits: bool = True) -> None:
-        """Append a recorded step and optionally auto-insert settle waits."""
+        """Write a recorded step and optional waits at append/cursor position."""
         if not step:
             return
         try:
@@ -2083,17 +2115,25 @@ class RecorderSession:
             if (
                 getattr(self, "stage_markers_enabled", False)
                 and getattr(self, "current_stage", "")
-                and (step.get("action") or "").strip().lower() not in ("stage", "stage_markers")
+                and (step.get("action") or "").strip().lower() not in ("stage", "stage_end", "stage_markers")
             ):
                 step.setdefault("stage", self.current_stage)
         except Exception:
             pass
-        if (step.get("action") or "").strip().lower() == "stage":
+        action = (step.get("action") or "").strip().lower()
+        if action == "stage":
             try:
                 self.current_stage = (step.get("name") or step.get("stage") or "").strip()
             except Exception:
                 pass
-        self.steps.append(step)
+        elif action == "stage_end":
+            try:
+                if self.current_stage:
+                    step.setdefault("stage", self.current_stage)
+                self.current_stage = ""
+            except Exception:
+                pass
+        self._write_recorded_step(step)
         if not allow_auto_waits or not self.auto_insert_waits:
             return
         if step.get("source") == "auto_wait":
@@ -2109,7 +2149,7 @@ class RecorderSession:
                 pass
             if getattr(self, "stage_markers_enabled", False) and getattr(self, "current_stage", ""):
                 auto.setdefault("stage", self.current_stage)
-            self.steps.append(auto)
+            self._write_recorded_step(auto)
 
 
 # Global registry
@@ -5088,8 +5128,18 @@ def remove_step(sess: RecorderSession, index: int) -> Dict[str, Any]:
     sess.touch()
     if 0 <= index < len(sess.steps):
         removed = sess.steps.pop(index)
-        return {"removed": removed, "remaining": len(sess.steps)}
-    return {"removed": None, "remaining": len(sess.steps)}
+        if sess.insertion_position is not None and index < sess.insertion_position:
+            sess.insertion_position -= 1
+        return {
+            "removed": removed,
+            "remaining": len(sess.steps),
+            "insertion_position": sess.insertion_position,
+        }
+    return {
+        "removed": None,
+        "remaining": len(sess.steps),
+        "insertion_position": sess.insertion_position,
+    }
 
 
 def move_step(sess: RecorderSession, index: int, direction: str) -> Dict[str, Any]:
@@ -5103,6 +5153,9 @@ def move_step(sess: RecorderSession, index: int, direction: str) -> Dict[str, An
     if not (0 <= target < n):
         return {"moved": False, "reason": "edge"}
     sess.steps[index], sess.steps[target] = sess.steps[target], sess.steps[index]
+    # A reorder changes what an existing gap means; require the operator to
+    # choose the insertion point again instead of silently targeting it wrong.
+    sess.clear_insertion_position()
     return {"moved": True, "from": index, "to": target}
 
 
@@ -5121,6 +5174,7 @@ def move_step_to(sess: RecorderSession, from_index: int, to_index: int) -> Dict[
         return {"moved": False, "reason": "from == to"}
     step = sess.steps.pop(from_index)
     sess.steps.insert(to_idx, step)
+    sess.clear_insertion_position()
     return {"moved": True, "from": from_index, "to": to_idx, "total": len(sess.steps)}
 
 
@@ -5131,8 +5185,16 @@ def duplicate_step(sess: RecorderSession, index: int) -> Dict[str, Any]:
         return {"duplicated": False, "reason": "index out of range"}
     import copy as _copy
     clone = _copy.deepcopy(sess.steps[index])
-    sess.steps.insert(index + 1, clone)
-    return {"duplicated": True, "step": clone, "new_index": index + 1}
+    new_index = index + 1
+    sess.steps.insert(new_index, clone)
+    if sess.insertion_position is not None and new_index <= sess.insertion_position:
+        sess.insertion_position += 1
+    return {
+        "duplicated": True,
+        "step": clone,
+        "new_index": new_index,
+        "insertion_position": sess.insertion_position,
+    }
 
 
 def rename_step(sess: RecorderSession, index: int, name: str) -> Dict[str, Any]:
@@ -5373,7 +5435,7 @@ _MANUAL_STEP_ACTIONS = {
     # up the per-deal popup before moving on.
     "switch_tab", "close_tab",
     # 2026-08 — stage markers (path groups + open_when gate)
-    "stage", "stage_markers",
+    "stage", "stage_end", "stage_markers",
     # 2026-08 — early Uploaded Things row delete after form submit
     "consume_lead", "mark_lead_used", "lead_used",
 }
@@ -5463,6 +5525,14 @@ def add_manual_step(sess: RecorderSession, step: Dict[str, Any], position: Optio
             sess.stage_markers_enabled = True
         except Exception:
             pass
+    if action == "stage_end":
+        if step.get("stage"):
+            clean["stage"] = str(step.get("stage")).strip()
+        if not clean.get("stage") and getattr(sess, "current_stage", ""):
+            clean["stage"] = sess.current_stage
+        if not clean.get("name") and clean.get("stage"):
+            clean["name"] = f"End {clean['stage']}"
+        sess.current_stage = ""
     if action in ("consume_lead", "mark_lead_used", "lead_used"):
         clean["action"] = "consume_lead"
         if step.get("name"):
@@ -5487,14 +5557,23 @@ def add_manual_step(sess: RecorderSession, step: Dict[str, Any], position: Optio
     if action in ("wait_for_text", "wait_for_url", "extract") and "timeout" not in clean:
         clean["timeout"] = 15000
 
-    # Insert at position (clamped to valid range) or append.
+    # Explicit positional insertion remains backwards compatible. Without an
+    # explicit position, manual/toolbar steps participate in active insert mode.
     n = len(sess.steps)
     if position is None or not isinstance(position, int):
-        idx = n
+        idx = sess._write_recorded_step(clean)
     else:
         idx = max(0, min(int(position), n))
-    sess.steps.insert(idx, clean)
-    return {"added": True, "step": clean, "index": idx, "total": len(sess.steps)}
+        sess.steps.insert(idx, clean)
+        if sess.insertion_position is not None and idx <= sess.insertion_position:
+            sess.insertion_position += 1
+    return {
+        "added": True,
+        "step": clean,
+        "index": idx,
+        "total": len(sess.steps),
+        "insertion_position": sess.insertion_position,
+    }
 
 
 def import_steps(sess: RecorderSession, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -5520,7 +5599,14 @@ def import_steps(sess: RecorderSession, steps: List[Dict[str, Any]]) -> Dict[str
         # Copy the step so we don't mutate the caller's data
         cleaned.append(dict(s))
     sess.steps = cleaned
-    return {"imported": True, "total": len(cleaned)}
+    # Loading an existing recording never implicitly enables insert mode.
+    sess.clear_insertion_position()
+    sess.current_stage = ""
+    return {
+        "imported": True,
+        "total": len(cleaned),
+        "insertion_position": None,
+    }
 
 
 def update_session_data(sess: RecorderSession, *, sample_row: Optional[Dict[str, Any]] = None,
@@ -6791,6 +6877,7 @@ def set_session_settings(
     *,
     auto_insert_waits: Optional[bool] = None,
     stage_markers_enabled: Optional[bool] = None,
+    insertion_position: Any = ...,
 ) -> Dict[str, Any]:
     """Update live recorder preferences (e.g. auto wait insertion)."""
     sess.touch()
@@ -6800,10 +6887,13 @@ def set_session_settings(
         sess.stage_markers_enabled = bool(stage_markers_enabled)
         if not sess.stage_markers_enabled:
             sess.current_stage = ""
+    if insertion_position is not ...:
+        sess.set_insertion_position(insertion_position)
     return {
         "auto_insert_waits": sess.auto_insert_waits,
         "stage_markers_enabled": bool(getattr(sess, "stage_markers_enabled", False)),
         "current_stage": getattr(sess, "current_stage", "") or "",
+        "insertion_position": sess.insertion_position,
     }
 
 
