@@ -121,7 +121,13 @@ jobs:
           COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
         run: |
           cd /opt/krexion
-          docker compose -f "$COMPOSE_FILE" up -d backend frontend
+          if ! docker compose -f "$COMPOSE_FILE" up -d backend frontend; then
+            echo "::group::Backend startup diagnostics"
+            docker compose -f "$COMPOSE_FILE" ps backend || true
+            docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 backend || true
+            echo "::endgroup::"
+            exit 1
+          fi
           echo ">> Containers started"
 
       - name: Health check + version report
