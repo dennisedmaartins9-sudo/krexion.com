@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 
 from referrer_pro import is_non_chrome_inapp_ua, coerce_ua_for_platform
-from ua_profile_contract import validate_user_agent
+from ua_profile_contract import client_hint_headers_for_ua, validate_user_agent
 
 
 BASE_ANDROID = ("Mozilla/5.0 (Linux; Android 15; SM-S931B Build/AP3A.240905.015; wv) "
@@ -22,9 +22,9 @@ BASE_IOS = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
 EXTERNAL_CRONET = (
     "Mozilla/5.0 (Linux; U; Android 14; en_US; SM-S928B; "
     "Build/UP1A.231005.007; Cronet/118.0.5993.117) "
-    "TikTok/44.7.0 musical_ly_4470000000 JsSdk/1.0 NetType/WIFI "
-    "Channel/googleplay AppName/musical_ly app_version/44.7.0 "
-    "ByteLocale/en-US ByteFullLocale/en-US Region/US"
+    "TikTok/45.8.2 musical_ly_2024508020 JsSdk/1.0 NetType/WIFI "
+    "Channel/googleplay AppName/musical_ly app_version/45.8.2 "
+    "ByteLocale/en ByteFullLocale/en_US Region/US"
 )
 
 
@@ -46,6 +46,15 @@ def _server_templates():
             "random": random,
             "Optional": Optional,
             "_CHROME_VERSIONS": ["149.0.7827.114"],
+            "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
+            "_APP_RELEASES_RUNTIME": {
+                "tiktok": {
+                    "android": [{
+                        "version": "45.8.2",
+                        "version_code": "2024508020",
+                    }]
+                }
+            },
             "_pick_region": lambda _code: {
                 "code": "US", "byte_locale": "en-US", "posix_locale": "en_US",
             },
@@ -59,6 +68,7 @@ def _client_hint_builder():
         {"_extract_chrome_version", "_build_client_hint_headers"},
         {
             "random": random, "re": re, "Any": Any, "Dict": Dict, "Tuple": Tuple,
+            "client_hint_headers_for_ua": client_hint_headers_for_ua,
             "_CHROME_VERSION_RE": re.compile(
                 r"(?:Chrome|CriOS|Edg|EdgA|EdgiOS|Chromium)/(\d+)(?:\.(\d+))?",
                 re.IGNORECASE,
@@ -108,9 +118,10 @@ def test_tiktok_android_contains_zhiliaoapp_marker():
     tt = coerce_ua_for_platform(BASE_ANDROID, "tiktok")
     assert "com.zhiliaoapp.musically/" in tt
 
-def test_tiktok_ios_contains_zhiliaoapp_marker():
+def test_tiktok_ios_uses_wkwebview_without_android_package_marker():
     tt = coerce_ua_for_platform(BASE_IOS, "tiktok")
-    assert "com.zhiliaoapp.musically/" in tt
+    assert "com.zhiliaoapp.musically/" not in tt
+    assert "WKWebView/1" in tt
 
 
 # ── Server-side UA generator matches new format ────────────────
@@ -120,7 +131,7 @@ def test_server_ua_tiktok_android_generator_has_zhiliaoapp():
         "and_ver": "14", "model": "SM-S928B",
         "build": "UP1A.231005.007",
     }
-    ua = _server_templates()._ua_tiktok_android(d, "34.9.5")
+    ua = _server_templates()._ua_tiktok_android(d, "45.8.2")
     assert "com.zhiliaoapp.musically/" in ua
     assert "musical_ly_" in ua
     for token in ("; wv)", "AppleWebKit/537.36", "Version/4.0", "Chrome/", "Mobile Safari/537.36"):
@@ -135,12 +146,19 @@ def test_client_hint_headers_match_tiktok_android_webview():
     tt_ua = coerce_ua_for_platform(BASE_ANDROID, "tiktok")
     fp = {"os": "android", "is_mobile": True}
     h = _build_client_hint_headers(fp, tt_ua)
+    assert h == {
+        {
+            "sec-ch-ua": "Sec-CH-UA",
+            "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+            "sec-ch-ua-platform": "Sec-CH-UA-Platform",
+        }[key]: value
+        for key, value in client_hint_headers_for_ua(tt_ua).items()
+    }
     major = re.search(r"Chrome/(\d+)", tt_ua).group(1)
-    assert f'"Chromium";v="{major}"' in h["Sec-CH-UA"]
-    assert f'"Google Chrome";v="{major}"' in h["Sec-CH-UA"]
+    assert f'"Android WebView";v="{major}"' in h["Sec-CH-UA"]
     assert h.get("Sec-CH-UA-Mobile") == "?1"
     assert h.get("Sec-CH-UA-Platform") == '"Android"'
-    assert h.get("Sec-CH-UA-Platform-Version") == '"15.0.0"'
+    assert "Sec-CH-UA-Platform-Version" not in h
 
 def test_client_hint_headers_normal_chrome_unchanged():
     _build_client_hint_headers = _client_hint_builder()
@@ -155,9 +173,7 @@ def test_client_hint_headers_tiktok_ios_no_brand_leak():
     tt_ua = coerce_ua_for_platform(BASE_IOS, "tiktok")
     fp = {"os": "ios", "is_mobile": True}
     h = _build_client_hint_headers(fp, tt_ua)
-    assert h.get("Sec-CH-UA") == ""
-    assert h.get("Sec-CH-UA-Platform") == '"iOS"'
-    assert h.get("Sec-CH-UA-Mobile") == "?1"
+    assert h == {}
 
 
 # ── Advertiser UA parser sees TikTok now (com.zhiliaoapp.musically trigger) ──
@@ -174,9 +190,8 @@ def test_ua_parser_libs_recognize_com_zhiliaoapp_musically():
         f"Missing com.zhiliaoapp.musically/<code> marker in Android TikTok UA: {tt_a}"
     )
     tt_i = coerce_ua_for_platform(BASE_IOS, "tiktok")
-    assert re.search(r"\bcom\.zhiliaoapp\.musically/\d+", tt_i), (
-        f"Missing marker in iOS TikTok UA: {tt_i}"
-    )
+    assert "com.zhiliaoapp.musically/" not in tt_i
+    assert "WKWebView/1" in tt_i
 
 
 # ── Regression: v2.6.22 fixes still hold ───────────────────────
@@ -193,6 +208,7 @@ def test_regression_tiktok_ios_no_trailing_safari():
     assert "Version/26.4" not in tt
     profile = validate_user_agent(tt, expected_app="tiktok")
     assert profile["profile_type"] == "ios_wkwebview"
+    assert profile["valid"]
     assert profile["issues"] == []
 
 def test_regression_facebook_target_keeps_chrome_webview():

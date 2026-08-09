@@ -45,6 +45,7 @@ from typing import Optional
 import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ua_profile_contract import (
+    APP_RELEASES_BY_PLATFORM,
     client_hint_headers_for_ua,
     validate_header_coherence,
     validate_user_agent,
@@ -71,7 +72,9 @@ def _get_server():
     ns = {
         "random": random,
         "Optional": Optional,
+        "_APP_RELEASES_RUNTIME": APP_RELEASES_BY_PLATFORM,
         "_CHROME_VERSIONS": ["149.0.7827.114"],
+        "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
         "_pick_region": lambda _code: {
             "code": "US", "country": "United States",
             "byte_locale": "en-US", "posix_locale": "en_US", "lang_tag": "en-US",
@@ -110,13 +113,8 @@ def test_bug_a_musical_ly_plus_fbav_stripped_on_tiktok_coerce():
     """Hybrid TikTok+Facebook UA → tiktok target must produce a clean
     TikTok UA with NO Facebook-specific markers left.
     
-    v2.6.27 update: coerce now ADDS a `[FB_IAB/;FBAN/TikTokAndroid;
-    FBAV/{ver};IABMV/1;FBBV/{code};FBOP/19;]` trailer (advertiser
-    trackers use this bracket format universally to detect TikTok
-    Android). So the assertion is now: any pre-existing FACEBOOK-
-    specific bracket (`FB_IAB/FB4A`, `FBAN/FB4A`, `FBAN/FBIOS`) or
-    the specific INPUT `FBAV/450.0.0.34.109` must be gone — but a
-    FRESH TikTok-signed bracket with its own FBAV is allowed."""
+    Foreign Facebook brackets must be removed; TikTok keeps only its
+    verified release markers in a browser-page WebView shell."""
     rp = _get_rp()
     input_ua = (
         "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
@@ -130,10 +128,7 @@ def test_bug_a_musical_ly_plus_fbav_stripped_on_tiktok_coerce():
     assert "FB_IAB/FB4A" not in out, f"FB4A bracket leaked: {out}"
     assert "FBAN/FB4A" not in out, f"FBAN/FB4A slug leaked: {out}"
     assert "FBAN/FBIOS" not in out, f"FBAN/FBIOS slug leaked: {out}"
-    # Positive: our v2.6.27 TikTokAndroid bracket must be present
-    assert "FBAN/TikTokAndroid" in out, (
-        f"v2.6.27 TikTokAndroid bracket missing: {out}"
-    )
+    assert "FBAN/TikTokAndroid" not in out
     assert "musical_ly" in out.lower(), f"musical_ly missing: {out}"
     _assert_tiktok_android_page_ua(out)
 
@@ -155,12 +150,7 @@ def test_bug_b_musical_ly_webview_stays_browser_compatible():
 def test_musical_ly_plus_instagram_tokens_stripped():
     """Hybrid TikTok+Instagram Android UA → tiktok target strips IG tokens.
     
-    v2.6.27 update: our TikTokAndroid FB_IAB bracket contains IABMV/1,
-    so we can no longer assert 'IABMV not in out'. Instead we assert
-    the IG-specific `Instagram <ver> Android (...)` block is stripped
-    AND the FB_IAB bracket that IS present carries FBAN/TikTokAndroid
-    (proving IABMV came from OUR tiktok-signed bracket, not a leaked
-    Instagram/Facebook one)."""
+    The IG-specific block and all Facebook-shaped markers are stripped."""
     rp = _get_rp()
     input_ua = (
         "Mozilla/5.0 (Linux; Android 14; SM-A546B Build/UP1A.231005.007; wv) "
@@ -170,12 +160,8 @@ def test_musical_ly_plus_instagram_tokens_stripped():
     )
     out = rp.coerce_ua_for_platform(input_ua, "tiktok")
     assert "Instagram" not in out, f"Instagram token leaked: {out}"
-    # v2.6.27 — IABMV/1 IS present (inside our new TikTokAndroid bracket)
-    # but must come from a TikTokAndroid-signed bracket, NOT a leaked IG one
-    if "IABMV" in out:
-        assert "FBAN/TikTokAndroid" in out, (
-            f"IABMV present but not inside a TikTokAndroid bracket: {out}"
-        )
+    assert "IABMV" not in out
+    assert "FBAN/TikTokAndroid" not in out
     assert "musical_ly" in out.lower(), f"musical_ly missing: {out}"
 
 
@@ -204,9 +190,8 @@ def test_external_tiktok_cronet_converts_to_page_webview():
     )
     out = rp.coerce_ua_for_platform(clean, "tiktok")
     assert out.lower().count("musical_ly_") == 1, f"duplicate musical_ly_: {out}"
-    assert "FBAN/TikTokAndroid" in out, (
-        f"external native UA must gain page-navigation identity: {out}"
-    )
+    assert "FBAN/TikTokAndroid" not in out
+    assert "BytedanceWebview" not in out
     _assert_tiktok_android_page_ua(out)
 
 
@@ -258,8 +243,8 @@ def test_ua_tiktok_android_generator_is_webview_shape():
             "dpi": "505dpi", "and_ver": "14", "sdk": "34",
             "build": "UP1A.231005.007",
         }
-        ua = srv._ua_tiktok_android(d, "34.9.5")
-        assert "BytedanceWebview/" in ua, f"BytedanceWebview/ missing: {ua}"
+        ua = srv._ua_tiktok_android(d, "45.8.2")
+        assert "BytedanceWebview/" not in ua
         _assert_tiktok_android_page_ua(ua)
 
 
@@ -274,7 +259,7 @@ def test_ua_tiktok_ios_generator_has_musical_ly_and_no_safari():
             "brand": "iPhone", "model": "iPhone15,2", "name": "iPhone 14 Pro",
             "ios": "18_6", "res": "1179x2556", "scale": "3.00",
         }
-        ua = srv._ua_tiktok_ios(d, "34.9.5")
+        ua = srv._ua_tiktok_ios(d, "44.7.0")
         assert "musical_ly_" in ua, f"musical_ly_ missing: {ua}"
         # No trailing Safari/<ver> token — the real TikTok iOS UA
         # ends with WKWebView / BytedanceWebview / PIA, not Safari/.
@@ -296,7 +281,7 @@ def test_generator_output_is_idempotent_through_coerce():
         "dpi": "505dpi", "and_ver": "14", "sdk": "34",
         "build": "UP1A.231005.007",
     }
-    ua = srv._ua_tiktok_android(d, "34.9.5")
+    ua = srv._ua_tiktok_android(d, "45.8.2")
     coerced = rp.coerce_ua_for_platform(ua, "tiktok")
     # Downstream coerce must not corrupt or double-append.
     assert coerced.count("musical_ly_") == 1, f"musical_ly_ duplicated: {coerced}"

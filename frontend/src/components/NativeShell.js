@@ -42,7 +42,7 @@ const API = `${BACKEND_URL}/api`;
 
 /* ── Feature → access-flag helpers (same rules as DashboardLayout) ──── */
 const LEGACY_IMPORT_GROUP = new Set([
-  "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator",
+  "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator", "ua_checker",
 ]);
 
 function hasFeature(features, key) {
@@ -94,7 +94,7 @@ const NAV_GROUPS = [
       { name: "Separate Data",  path: "/separate-data",  icon: Filter,   feature: "separate_data" },
       // v2.6.1 — Import Traffic removed (already inside Real-User Traffic)
       { name: "UA Generator",   path: "/ua-generator",   icon: Smartphone, feature: "ua_generator" },
-      { name: "UA Checker",     path: "/ua-checker",     icon: Search,   feature: "ua_generator" },
+      { name: "UA Checker",     path: "/ua-checker",     icon: Search,   feature: "ua_checker" },
     ],
   },
   {

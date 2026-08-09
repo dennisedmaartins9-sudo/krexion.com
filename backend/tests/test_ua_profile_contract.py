@@ -1,250 +1,307 @@
-import ast
-import random
-import re
 import sys
 from pathlib import Path
-from typing import Optional
-
-import pytest
 
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 from ua_profile_contract import (  # noqa: E402
+    ANDROID_DEVICE_SNAPSHOTS,
+    APP_RELEASES_BY_PLATFORM,
+    APP_SUPPORT_MATRIX,
     APP_VERSION_POOLS,
     classify_user_agent,
     client_hint_headers_for_ua,
+    detect_app,
+    replace_verified_app_releases,
     validate_header_coherence,
     validate_user_agent,
 )
 
 
-TIKTOK_CRONET = (
-    "Mozilla/5.0 (Linux; U; Android 14; en_GB; SM-S928B; "
-    "Build/UP1A.231005.007; Cronet/118.0.5993.117) "
-    "TikTok/44.7.0 musical_ly_4470000000 JsSdk/1.0 NetType/WIFI "
-    "Channel/googleplay AppName/musical_ly app_version/44.7.0 "
-    "ByteLocale/en-GB ByteFullLocale/en-GB Region/GB "
-    "BytedanceWebview/abc1234 ttwebview/12345678"
-)
-
-GOOD_WEBVIEW = (
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
+ANDROID_WEBVIEW = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/AP1A.240505.005; wv) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
-    "Chrome/149.0.7827.114 Mobile Safari/537.36 Instagram 425.0.0 Android"
+    "Chrome/149.0.7827.114 Mobile Safari/537.36 "
+)
+ANDROID_CHROME = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.7827.114 Mobile Safari/537.36"
+)
+IOS_WEBVIEW = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+)
+IOS_SAFARI = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
+    "Mobile/15E148 Safari/604.1"
+)
+INSTAGRAM_ANDROID = (
+    ANDROID_WEBVIEW
+    + "Instagram 437.0.0.33.78 Android "
+    "(34/14; 420dpi; 1080x2400; google; Pixel 8; husky; tensor; en_US; "
+    "1011909233; IABMV/1)"
+)
+FACEBOOK_ANDROID = (
+    ANDROID_WEBVIEW
+    + "[FB_IAB/FB4A;FBAV/556.0.0.59.68;"
+    "IABMV/1;FBBV/681204512;]"
+)
+TIKTOK_ANDROID = (
+    ANDROID_WEBVIEW
+    + "TikTok/45.8.2 musical_ly_2024508020 JsSdk/1.0 NetType/WIFI "
+    "Channel/googleplay AppName/musical_ly app_version/45.8.2 "
+    "ByteLocale/en ByteFullLocale/en_GB Region/GB "
+    "com.zhiliaoapp.musically/2024508020"
 )
 
 
-def test_cronet_is_native_not_android_webview():
-    profile = validate_user_agent(TIKTOK_CRONET, expected_app="tiktok")
-    assert profile["engine"] == "cronet"
-    assert profile["profile_type"] == "native_network"
-    assert profile["runtime_compatible"] is False
-    assert profile["issues"] == []
-    assert all("Mobile Safari" not in issue for issue in profile["issues"])
-    assert profile["warnings"]
+def test_platform_release_contract_and_legacy_pools_are_exported():
+    assert APP_RELEASES_BY_PLATFORM["instagram"]["android"] == [
+        {"version": "437.0.0.33.78", "version_code": "1011909233"}
+    ]
+    assert APP_RELEASES_BY_PLATFORM["tiktok"]["android"][0] == {
+        "version": "45.8.2",
+        "version_code": "2024508020",
+    }
+    assert APP_RELEASES_BY_PLATFORM["linkedin"]["android"][0]["package_build"] == "212600"
+    assert APP_RELEASES_BY_PLATFORM["reddit"]["android"][0]["build"] == "2618090"
+    assert APP_RELEASES_BY_PLATFORM["telegram"]["android"][0]["version"] == "12.9.2"
+    assert APP_RELEASES_BY_PLATFORM["instagram"]["ios"][0]["version"] == "425.0.0"
+    assert APP_VERSION_POOLS["instagram"][0] == "437.0.0.33.78"
+    assert APP_SUPPORT_MATRIX["youtube"] == {"android": "fallback", "ios": "fallback"}
+    assert APP_SUPPORT_MATRIX["whatsapp"]["ios"] == "fallback"
+    assert APP_SUPPORT_MATRIX["reddit"]["ios"] == "fallback"
+    assert APP_SUPPORT_MATRIX["telegram"]["ios"] == "fallback"
+    assert APP_SUPPORT_MATRIX["gchrome"]["android"] == "fallback"
 
 
-def test_actual_malformed_android_webview_is_flagged():
-    malformed = GOOD_WEBVIEW.replace(" Mobile Safari/537.36", "")
-    profile = validate_user_agent(malformed, expected_app="instagram")
-    assert profile["engine"] == "android_webview"
-    assert any("mobile safari/537.36" in issue.lower() for issue in profile["issues"])
+def test_verified_android_records_validate_without_authenticity_claim():
+    linkedin = (
+        ANDROID_WEBVIEW
+        + "[LinkedInApp]/2.286.33 com.linkedin.android/212600"
+    )
+    reddit = ANDROID_WEBVIEW + "Reddit/Version 2026.18.0/Build 2618090/Android 14"
+    samples = {
+        "instagram": INSTAGRAM_ANDROID,
+        "facebook": FACEBOOK_ANDROID,
+        "tiktok": TIKTOK_ANDROID,
+        "whatsapp": ANDROID_WEBVIEW + "WhatsApp/2.26.5.10 A",
+        "linkedin": linkedin,
+        "twitter": ANDROID_WEBVIEW + "TwitterAndroid/11.95.1",
+        "reddit": reddit,
+        "telegram": ANDROID_WEBVIEW + "Telegram-Android/12.9.2",
+    }
+    for app, ua in samples.items():
+        result = validate_user_agent(ua, expected_app=app)
+        assert result["valid"], (app, result)
+        assert result["support_state"] == "supported"
 
-    badly_malformed = GOOD_WEBVIEW.replace("; wv)", ")").replace("Version/4.0 ", "")
-    profile = validate_user_agent(badly_malformed, expected_app="instagram")
-    assert profile["engine"] == "android_webview"
-    assert any("version/4.0" in issue.lower() for issue in profile["issues"])
+
+def test_detect_app_collects_every_identity_and_observed_markers():
+    hybrid = INSTAGRAM_ANDROID + " Snapchat/13.88.0.56"
+    detected = detect_app(hybrid)
+    assert detected["app"] == "instagram"
+    assert detected["identities"] == ["instagram", "snapchat"]
+
+    cases = {
+        "[LinkedInApp]/2.286.33": ("linkedin", "2.286.33"),
+        "Twitter for iPhone/10.98.0": ("twitter", "10.98.0"),
+        "Telegram-Android/12.9.2": ("telegram", "12.9.2"),
+        "[Pinterest/Android]": ("pinterest", None),
+        "GoogleApp/332.0.755318947": ("gsearch", "332.0.755318947"),
+        "GSA/332.0.755318947": ("gsearch", "332.0.755318947"),
+        "musical_ly_44.7.0": ("tiktok", "44.7.0"),
+    }
+    for marker, expected in cases.items():
+        result = detect_app(marker)
+        assert (result["app"], result["app_version"]) == expected
 
 
-def test_header_contract_emits_only_for_chromium_profiles():
-    hints = client_hint_headers_for_ua(GOOD_WEBVIEW)
-    assert '"149"' in hints["sec-ch-ua"]
-    assert hints["sec-ch-ua-platform"] == '"Android"'
-    assert hints["sec-ch-ua-mobile"] == "?1"
-    assert validate_header_coherence(GOOD_WEBVIEW, hints) == []
+def test_hybrids_duplicate_blocks_and_expected_mismatch_are_rejected():
+    hybrid = validate_user_agent(
+        INSTAGRAM_ANDROID + " Snapchat/13.88.0.56",
+        expected_app="instagram",
+    )
+    assert any("multiple foreign app identities" in issue for issue in hybrid["issues"])
 
-    assert client_hint_headers_for_ua(TIKTOK_CRONET) == {}
-    assert validate_header_coherence(TIKTOK_CRONET, hints)
+    duplicate = validate_user_agent(INSTAGRAM_ANDROID + " Instagram 437.0.0.33.78 Android")
+    assert any("duplicate instagram" in issue.lower() for issue in duplicate["issues"])
 
-    safari = (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 26_4 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 "
+    mismatch = validate_user_agent(INSTAGRAM_ANDROID, expected_app="facebook")
+    assert any("recognizable facebook" in issue.lower() for issue in mismatch["issues"])
+
+
+def test_incompatible_apple_device_claims_are_rejected():
+    bad = IOS_SAFARI.replace("(iPhone;", "(iPad;").replace(
+        "CPU iPhone OS", "CPU iPhone OS"
+    ) + " iPhone"
+    result = validate_user_agent(bad)
+    assert any("incompatible" in issue.lower() for issue in result["issues"])
+
+
+def test_tiktok_release_fields_must_all_agree():
+    assert validate_user_agent(TIKTOK_ANDROID, expected_app="tiktok")["valid"]
+    for bad in (
+        TIKTOK_ANDROID.replace("app_version/45.8.2", "app_version/45.8.1"),
+        TIKTOK_ANDROID.replace("musical_ly_2024508020", "musical_ly_2024508021"),
+        TIKTOK_ANDROID.replace(
+            "com.zhiliaoapp.musically/2024508020",
+            "com.zhiliaoapp.musically/2024508021",
+        ),
+    ):
+        result = validate_user_agent(bad, expected_app="tiktok")
+        assert any("conflict" in issue.lower() for issue in result["issues"])
+
+
+def test_facebook_requires_one_full_verified_android_block():
+    truncated = FACEBOOK_ANDROID.replace("556.0.0.59.68", "556.0.0")
+    result = validate_user_agent(truncated, expected_app="facebook")
+    assert any("five-part" in issue or "verified release" in issue for issue in result["issues"])
+
+    duplicate = validate_user_agent(
+        FACEBOOK_ANDROID + " "
+        "[FB_IAB/FB4A;FBAV/556.0.0.59.68;"
+        "IABMV/1;FBBV/681204512;]",
+        expected_app="facebook",
+    )
+    assert any("duplicate facebook" in issue.lower() for issue in duplicate["issues"])
+    assert any("exactly one" in issue.lower() for issue in duplicate["issues"])
+
+
+def test_malformed_linkedin_telegram_and_twitter_formats_are_rejected():
+    malformed = {
+        "linkedin": ANDROID_WEBVIEW + "LinkedInApp/2.286.33",
+        "telegram": ANDROID_WEBVIEW + "TelegramAndroid/12.9.2",
+        "twitter": IOS_WEBVIEW + "TwitterIOS/10.98.0",
+    }
+    for app, ua in malformed.items():
+        result = validate_user_agent(ua, expected_app=app)
+        assert not result["valid"], (app, result)
+        assert any(app in issue.lower() or "package" in issue.lower() for issue in result["issues"])
+
+
+def test_known_oem_firmware_requires_exact_snapshot_tuple():
+    bad = INSTAGRAM_ANDROID.replace("Android 14", "Android 13")
+    result = validate_user_agent(
+        bad,
+        expected_app="instagram",
+        require_verified_device=True,
+    )
+    assert any("verified device snapshot" in issue.lower() for issue in result["issues"])
+
+
+def test_unknown_external_oem_build_warns_instead_of_false_failure():
+    external = INSTAGRAM_ANDROID.replace("Pixel 8", "OEM-X", 1)
+    result = validate_user_agent(external, expected_app="instagram")
+    assert result["valid"], result
+    assert any("could not be verified" in warning.lower() for warning in result["warnings"])
+
+
+def test_android_16_capture_tuples_validate():
+    for model, build in (
+        ("Pixel 9", "CP1A.260505.005"),
+        ("2510ERA8BG", "BP2A.250605.031.A3"),
+    ):
+        ua = (
+            f"Mozilla/5.0 (Linux; Android 16; {model} Build/{build}; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+            "Chrome/151.0.7922.83 Mobile Safari/537.36 "
+            "[Pinterest/Android]"
+        )
+        result = validate_user_agent(ua, expected_app="pinterest")
+        assert result["valid"], result
+    assert {row["and_ver"] for row in ANDROID_DEVICE_SNAPSHOTS} == {
+        "13", "14", "15", "16"
+    }
+
+
+def test_trusted_ios_refresh_updates_shared_validation_contract():
+    original = [
+        dict(record) for record in APP_RELEASES_BY_PLATFORM["instagram"]["ios"]
+    ]
+    refreshed = "999.1.2"
+    ua = IOS_WEBVIEW + f"Instagram {refreshed}"
+    try:
+        assert not validate_user_agent(ua, expected_app="instagram")["valid"]
+        replace_verified_app_releases(
+            "instagram",
+            "ios",
+            [{"version": refreshed}, *original],
+        )
+        result = validate_user_agent(ua, expected_app="instagram")
+        assert result["valid"], result
+        assert result["identity_supported"] is True
+        assert result["support_state"] == "supported"
+    finally:
+        replace_verified_app_releases("instagram", "ios", original)
+
+
+def test_unsupported_expected_app_accepts_generic_fallback_with_warning():
+    result = validate_user_agent(IOS_SAFARI, expected_app="whatsapp")
+    assert result["valid"]
+    assert result["app"] == "browser"
+    assert result["support_state"] == "fallback"
+    assert result["identity_supported"] is False
+    assert any("generic browser fallback" in warning.lower() for warning in result["warnings"])
+
+    youtube = validate_user_agent(ANDROID_CHROME, expected_app="youtube")
+    assert youtube["valid"]
+    assert youtube["support_state"] == "fallback"
+
+
+def test_android_webview_and_chrome_get_distinct_exact_hints():
+    webview_hints = client_hint_headers_for_ua(INSTAGRAM_ANDROID)
+    assert webview_hints["sec-ch-ua"] == (
+        '"Android WebView";v="149", "Chromium";v="149", "Not=A?Brand";v="24"'
+    )
+    assert validate_header_coherence(
+        INSTAGRAM_ANDROID,
+        {key.upper(): value for key, value in webview_hints.items()},
+    ) == []
+
+    chrome_hints = client_hint_headers_for_ua(ANDROID_CHROME)
+    assert chrome_hints["sec-ch-ua"] == (
+        '"Google Chrome";v="149", "Chromium";v="149", "Not=A?Brand";v="24"'
+    )
+    assert validate_header_coherence(ANDROID_CHROME, chrome_hints) == []
+    assert validate_header_coherence(
+        ANDROID_CHROME,
+        {"Sec-CH-UA": chrome_hints["sec-ch-ua"]},
+    )
+
+
+def test_crios_webkit_and_gecko_emit_no_hints_and_reject_them():
+    crios = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/147.0.7727.102 "
         "Mobile/15E148 Safari/604.1"
     )
-    assert classify_user_agent(safari)["engine"] == "webkit"
-    assert client_hint_headers_for_ua(safari) == {}
-    assert validate_header_coherence(safari, hints)
-
-
-def test_locale_region_mismatch_is_not_false_green():
-    bad = TIKTOK_CRONET.replace("ByteFullLocale/en-GB", "ByteFullLocale/en-US")
-    profile = validate_user_agent(bad)
-    assert any("locale region" in issue.lower() for issue in profile["issues"])
-
-
-def test_supported_app_markers_share_one_detection_contract():
-    android_base = (
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UP1A; wv) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
-        "Chrome/149.0.7827.114 Mobile Safari/537.36 "
+    firefox = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) "
+        "Gecko/20100101 Firefox/141.0"
     )
-    ios_base = (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 26_4 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+    fake_hints = {
+        "sec-ch-ua": '"Google Chrome";v="149"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+    assert classify_user_agent(crios)["engine"] == "webkit"
+    assert client_hint_headers_for_ua(crios) == {}
+    assert client_hint_headers_for_ua(firefox) == {}
+    assert validate_header_coherence(crios, fake_hints)
+    assert validate_header_coherence(firefox, fake_hints)
+
+
+def test_cronet_remains_native_and_tiktok_consistent():
+    cronet = TIKTOK_ANDROID.replace(
+        "; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+        "Chrome/149.0.7827.114 Mobile Safari/537.36 ",
+        "; Cronet/118.0.5993.117) ",
     )
-    samples = {
-        "facebook": android_base + "[FB_IAB/FB4A;FBAV/557.0.0;]",
-        "instagram": android_base + "Instagram 425.0.0 Android",
-        "pinterest": android_base + "Pinterest/14.14",
-        "snapchat": android_base + "Snapchat/13.88.0.56",
-        "linkedin": android_base + "com.linkedin.android/9.32.512",
-        "twitter": android_base + "TwitterAndroid/12345678",
-        "reddit": android_base + "Reddit/Version 2024.28.0/Build 1502487",
-        "telegram": android_base + "TelegramAndroid/11.12.0",
-        "youtube": "com.google.android.youtube/20.15.3 (Linux; U; Android 14; Pixel 8) gzip",
-        "whatsapp": "WhatsApp/25.4.82 CFNetwork/3826.500.131 Darwin/24.5.0",
-        "tiktok": TIKTOK_CRONET,
-        "ios-wkwebview": ios_base + "Instagram 425.0.0",
-    }
-    for expected, ua in samples.items():
-        profile = validate_user_agent(ua)
-        if expected != "ios-wkwebview":
-            assert profile["app"] == expected
-        assert profile["engine"] != "unknown"
-        if not profile["runtime_compatible"]:
-            assert profile["warnings"]
-
-
-def test_server_wires_shared_contract_and_compatible_response_schema():
-    source = (BACKEND / "server.py").read_text(encoding="utf-8")
-    assert "user_agent: Optional[str] = None" in source
-    assert "validate_user_agent(ua" in source
-    assert '"user_agents": [r["user_agent"] for r in results]' in source
-    assert '"profiles": results' in source
-    assert '"results": results' in source
-    assert '"engine": profile["engine"]' in source
-    assert '"runtime_compatible": profile["runtime_compatible"]' in source
-
-
-def _load_server_template_namespace():
-    source = (BACKEND / "server.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    wanted = {
-        "_rand_build_id", "_ua_android_webview", "_ua_ios_wkwebview",
-        "_ua_instagram_android", "_ua_instagram_ios", "_fbav_3part",
-        "_ua_facebook_android", "_ua_facebook_ios",
-        "_ua_pinterest_android", "_ua_pinterest_ios",
-        "_ua_snapchat_android", "_ua_snapchat_ios",
-        "_ua_tiktok_android", "_ua_tiktok_ios",
-        "_ua_youtube_android", "_ua_youtube_ios",
-        "_ua_whatsapp_android", "_ua_whatsapp_ios",
-        "_ua_linkedin_android", "_ua_linkedin_ios",
-        "_ua_twitter_android", "_ua_twitter_ios",
-        "_ua_reddit_android", "_ua_reddit_ios",
-        "_ua_telegram_android", "_ua_telegram_ios",
-        "_ua_gsearch_android", "_ua_gsearch_ios",
-        "_ua_gchrome_android", "_ua_gchrome_ios",
-        "_ua_chrome_android", "_ua_safari_ios",
-    }
-    selected = [
-        node for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in wanted
-    ]
-    namespace = {
-        "random": random,
-        "re": re,
-        "Optional": Optional,
-        "_CHROME_VERSIONS": ["149.0.7827.114"],
-    }
-    exec(compile(ast.Module(body=selected, type_ignores=[]), "server.py", "exec"), namespace)
-    return namespace
-
-
-SUPPORTED_GENERATOR_APPS = [
-    "instagram", "facebook", "tiktok", "pinterest", "snapchat",
-    "youtube", "whatsapp", "linkedin", "twitter", "reddit",
-    "telegram", "gsearch", "gchrome", "chrome",
-]
-
-
-@pytest.mark.parametrize("app", SUPPORTED_GENERATOR_APPS)
-@pytest.mark.parametrize("platform", ["android", "ios"])
-def test_all_generated_mobile_templates_round_trip_cleanly(app, platform):
-    ns = _load_server_template_namespace()
-    android = {
-        "brand": "Samsung", "model": "SM-S928B", "vendor": "samsung",
-        "chipset": "qcom", "soc": "pineapple", "res": "1440x3120",
-        "dpi": "505dpi", "and_ver": "14", "sdk": "34",
-        "build": "UP1A.231005.007",
-    }
-    ios = {
-        "brand": "iPhone", "model": "iPhone17,2",
-        "name": "iPhone 16 Pro Max", "ios": "26_4_1",
-        "res": "1320x2868", "scale": "3.00",
-    }
-    region = {
-        "code": "GB", "country": "United Kingdom", "byte_locale": "en-GB",
-        "posix_locale": "en_GB", "lang_tag": "en-GB",
-    }
-    version = APP_VERSION_POOLS.get(app, ["1.0.0"])[0]
-    chrome = "149.0.7827.114"
-
-    if app == "instagram":
-        ua = ns[f"_ua_instagram_{platform}"](
-            android if platform == "android" else ios,
-            version,
-            chrome if platform == "android" else region,
-            region if platform == "android" else None,
-        )
-    elif app == "facebook":
-        args = [android if platform == "android" else ios, version]
-        if platform == "android":
-            args.extend([chrome, region])
-        else:
-            args.append(region)
-        ua = ns[f"_ua_facebook_{platform}"](*args)
-    elif app in {"tiktok", "youtube", "whatsapp", "gsearch", "gchrome"}:
-        ua = ns[f"_ua_{app}_{platform}"](
-            android if platform == "android" else ios, version, region
-        )
-    elif app in {"pinterest", "snapchat", "linkedin", "twitter", "reddit", "telegram"}:
-        ua = ns[f"_ua_{app}_{platform}"](
-            android if platform == "android" else ios, version
-        )
-    elif app == "chrome" and platform == "android":
-        ua = ns["_ua_chrome_android"](android, chrome)
-    else:
-        ua = ns["_ua_safari_ios"](ios)
-
-    expected_app = None if app in {"chrome", "gchrome"} else app
-    profile = validate_user_agent(ua, expected_app=expected_app)
-    assert profile["runtime_compatible"] is True, (app, platform, profile)
-    assert profile["issues"] == [], (app, platform, profile, ua)
-    if platform == "android" and app not in {"chrome", "gchrome"}:
-        assert profile["engine"] == "android_webview"
-    if platform == "ios" and app not in {"chrome"}:
-        assert profile["profile_type"] in {"ios_wkwebview", "browser"}
-
-
-def test_tiktok_coercion_uses_webview_for_page_navigation():
-    import referrer_pro
-
-    plain = (
-        "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.114 "
-        "Mobile Safari/537.36"
-    )
-    for source in (plain, TIKTOK_CRONET):
-        coerced = referrer_pro.coerce_ua_for_platform(source, "tiktok")
-        profile = validate_user_agent(coerced, expected_app="tiktok")
-        assert "Cronet/" not in coerced
-        assert "; wv)" in coerced
-        assert "Version/4.0" in coerced
-        assert profile["engine"] == "android_webview"
-        assert profile["runtime_compatible"] is True
-        assert profile["issues"] == []
-        assert referrer_pro.is_non_chrome_inapp_ua(coerced) is False
-        assert referrer_pro.coerce_ua_for_platform(coerced, "tiktok") == coerced
+    result = validate_user_agent(cronet, expected_app="tiktok")
+    assert result["valid"]
+    assert result["engine"] == "cronet"
+    assert result["runtime_compatible"] is False
+    assert result["warnings"]

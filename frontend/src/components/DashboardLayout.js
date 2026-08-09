@@ -86,7 +86,7 @@ export default function DashboardLayout({ children }) {
     { name: "Phone Checker", path: "/phone-checker", icon: Phone, feature: "phone_checker" },
     { name: "Separate Data", path: "/separate-data", icon: Filter, feature: "separate_data" },
     { name: "UA Generator", path: "/ua-generator", icon: Smartphone, feature: "ua_generator" },
-    { name: "UA Checker", path: "/ua-checker", icon: Search, feature: "ua_generator" },
+    { name: "UA Checker", path: "/ua-checker", icon: Search, feature: "ua_checker" },
     { name: "Real User Traffic", path: "/real-user-traffic", icon: Fingerprint, feature: "real_user_traffic" },
     { name: "Browser Profiles", path: "/browser-profiles", icon: Globe, feature: "real_user_traffic" },
     { name: "Visual Recorder", path: "/visual-recorder", icon: Camera, feature: "real_user_traffic" },
@@ -98,7 +98,7 @@ export default function DashboardLayout({ children }) {
 
   // Backward compat: new granular features fall back to "import_data" legacy flag
   const LEGACY_IMPORT_GROUP = new Set([
-    "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator"
+    "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator", "ua_checker"
   ]);
 
   // Filter navigation: show only enabled features (groups + flat items)

@@ -11,7 +11,12 @@ Covers:
      tid / gclid / fbclid / ttclid / etc. to the destination URL.
 """
 
+import ast
+import random
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, List, Tuple
 
 import pytest
 
@@ -54,10 +59,22 @@ def test_third_party_browser_scrub_in_preset_gate():
 def test_apply_inapp_preset_replaces_third_party_browsers():
     """Empirical: calling _apply_inapp_preset_to_uas with tiktok preset
     and a mixed pool must strip all third-party markers."""
-    import importlib
-    import sys
     sys.path.insert(0, str(RUT_FILE.parent))
-    rut = importlib.import_module("real_user_traffic")
+    tree = ast.parse(RUT_FILE.read_text(encoding="utf-8"))
+    wanted_functions = {"_mobile_ua_for_inapp", "_apply_inapp_preset_to_uas"}
+    wanted_constants = {"_MOBILE_UA_POOL_IOS", "_MOBILE_UA_POOL_ANDROID"}
+    nodes = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted_functions:
+            nodes.append(node)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.target.id in wanted_constants:
+                nodes.append(node)
+    namespace = {
+        "random": random, "Dict": Dict, "List": List, "Tuple": Tuple,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RUT_FILE), "exec"), namespace)
+    rut = SimpleNamespace(**namespace)
 
     input_uas = [
         # WeChat iOS mobile UA

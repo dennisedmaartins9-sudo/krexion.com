@@ -82,7 +82,7 @@ const APPS = [
 ];
 
 const PLATFORMS = [
-  { key: "any",     label: "Any", icon: null },
+  { key: "any",     label: "Android + iOS", icon: null },
   { key: "android", label: "Android", icon: Smartphone },
   { key: "ios",     label: "iOS", icon: Smartphone },
   { key: "desktop", label: "Desktop", icon: Monitor },
@@ -128,6 +128,7 @@ export default function UserAgentGeneratorPage() {
   const [results, setResults] = useState([]);
   // ── 2026-06-11: Mix-mode metadata returned by backend ────────────
   const [mixMeta, setMixMeta] = useState(null); // {mix_mode, apps_pool, platforms_pool, breakdown}
+  const [responseWarnings, setResponseWarnings] = useState([]);
   const [options, setOptions] = useState(null);
   const [refreshingVersions, setRefreshingVersions] = useState(false);
 
@@ -191,44 +192,117 @@ export default function UserAgentGeneratorPage() {
     setAppVersionsPool([]);
   }, [app]);
 
+  const activeApps = appMode === "many" && appsPool.length > 0 ? appsPool : [app];
+  const activePlatforms =
+    platformMode === "many" && platformsPool.length > 0
+      ? platformsPool
+      : platform === "any"
+      ? ["android", "ios"]
+      : [platform];
+  const isMixMode = activeApps.length > 1 || activePlatforms.length > 1;
+  const desktopAllowed = activeApps.every((key) => key === "chrome" || key === "gchrome");
+  const scalarOverridesLocked =
+    isMixMode || appMode === "many" || platformMode === "many";
+
+  useEffect(() => {
+    if (!desktopAllowed && platform === "desktop") {
+      setPlatform("android");
+      toast.info("Desktop was changed to Android because the selected app has no desktop identity.");
+    }
+    if (!desktopAllowed && platformsPool.includes("desktop")) {
+      setPlatformsPool((values) => values.filter((value) => value !== "desktop"));
+      toast.info("Desktop was removed because named app identities are mobile-only.");
+    }
+  }, [desktopAllowed, platform, platformsPool]);
+
+  useEffect(() => {
+    if (!scalarOverridesLocked) return;
+    const hadOverrides =
+      deviceId || deviceIdsPool.length || appVersion || appVersionsPool.length ||
+      osVersion || osVersionsPool.length || resolution || resolutionsPool.length;
+    if (hadOverrides) {
+      setDeviceId("");
+      setDeviceIdsPool([]);
+      setAppVersion("");
+      setAppVersionsPool([]);
+      setOsVersion("");
+      setOsVersionsPool([]);
+      setResolution("");
+      setResolutionsPool([]);
+      toast.info("Device, firmware, resolution and app-version overrides were cleared for mix mode.");
+    }
+  }, [
+    scalarOverridesLocked, deviceId, deviceIdsPool.length, appVersion,
+    appVersionsPool.length, osVersion, osVersionsPool.length, resolution,
+    resolutionsPool.length,
+  ]);
+
   const devicesForPlatform = () => {
     if (!options) return [];
     if (platform === "android") return options.android_devices;
     if (platform === "ios") return options.ios_devices;
     if (platform === "desktop") return options.desktop_devices;
-    // any -> show all
+    // "any" is explicitly the mobile union; desktop must be selected separately.
     return [
       ...options.android_devices,
       ...options.ios_devices,
-      ...options.desktop_devices,
     ];
   };
 
   const versionsForApp = () => {
-    if (!options) return [];
-    return options.app_versions?.[app] || [];
+    if (!options || scalarOverridesLocked || !["android", "ios"].includes(platform)) return [];
+    if (app === "chrome") return [];
+    if (app === "gchrome" && platform === "android") {
+      return (options.chrome_versions || []).map((version) => ({
+        value: version,
+        label: `${version} (Android Chrome)`,
+      }));
+    }
+    return (options.app_versions_by_platform?.[app]?.[platform] || []).map((record) => ({
+      value: typeof record === "string" ? record : record.version,
+      label: `${typeof record === "string" ? record : record.version} (${platform === "ios" ? "iOS" : "Android"})`,
+    }));
   };
 
   const regionList = () => options?.regions || [];
-  const resolutionList = () => options?.resolutions || [];
+  const resolutionList = () =>
+    app === "instagram" && !deviceId && !scalarOverridesLocked
+      ? options?.resolutions || []
+      : [];
   const osVersionList = () => {
-    if (!options) return [];
-    if (platform === "ios") return options.ios_os_versions || [];
+    if (!options || scalarOverridesLocked || deviceId || deviceIdsPool.length) return [];
+    // Android generation selects an immutable compatible device snapshot.
+    // iOS device records currently expose no per-device compatibility list.
     if (platform === "android") return options.android_os_versions || [];
     return [];
   };
 
-  // Resolution is only embedded in Instagram UAs; for others it's informational.
   const resolutionHelp =
-    app === "instagram"
-      ? "Used in Instagram UA string."
-      : platform === "desktop"
-      ? "Not used for desktop UAs."
-      : `Not embedded in ${app} UA (stored only in metadata)`;
+    app !== "instagram"
+      ? "Unavailable: this app does not encode screen resolution in its UA."
+      : deviceId
+      ? "Locked to the selected device's immutable display profile."
+      : scalarOverridesLocked
+      ? "Unavailable in mix mode; each generated device keeps its own display profile."
+      : "Selecting a value restricts generation to compatible device profiles.";
+
+  const selectedSupportState = (() => {
+    if (activeApps.length !== 1 || activePlatforms.length !== 1) return null;
+    const [selectedApp] = activeApps;
+    const [selectedPlatform] = activePlatforms;
+    if (selectedApp === "chrome") return "generic";
+    if (selectedApp === "gchrome" && selectedPlatform === "android") return "fallback";
+    if (selectedPlatform === "desktop") return selectedApp === "gchrome" ? "fallback" : "generic";
+    return options?.app_support_matrix?.[selectedApp]?.[selectedPlatform] || "unknown";
+  })();
+  const appVersionOverrideDisabled =
+    scalarOverridesLocked ||
+    versionsForApp().length === 0 ||
+    (app === "gchrome" && platform === "android");
 
   const buildBody = () => ({
-    app,
-    platform,
+    app: appMode === "many" && appsPool.length === 1 ? appsPool[0] : app,
+    platform: platformMode === "many" && platformsPool.length === 1 ? platformsPool[0] : platform,
     // ── 2026-06-11: Multi-app + Multi-platform mix pools ─────────
     // Only sent when "Multi" mode is ON and at least 2 selected.
     // Backend auto-degrades single-entry pools to scalar mode and
@@ -256,6 +330,7 @@ export default function UserAgentGeneratorPage() {
       toast.error("Count must be 1 - 50,000");
       return;
     }
+    setResponseWarnings([]);
     setLoading(true);
     try {
       const token = localStorage.getItem("token");
@@ -284,6 +359,7 @@ export default function UserAgentGeneratorPage() {
         platforms_pool: data.platforms_pool || [],
         breakdown: data.breakdown || { by_app: {}, by_platform: {} },
       });
+      setResponseWarnings(data.warnings || []);
       const mixSuffix = data.mix_mode ? " (mix mode)" : "";
       toast.success(`Generated ${data.count} user agents${mixSuffix}`);
     } catch (e) {
@@ -298,6 +374,7 @@ export default function UserAgentGeneratorPage() {
       toast.error("Count must be 1 - 50,000");
       return;
     }
+    setResponseWarnings([]);
     setDownloadingXlsx(true);
     try {
       const token = localStorage.getItem("token");
@@ -366,9 +443,8 @@ export default function UserAgentGeneratorPage() {
       <div>
         <h1 className="text-2xl font-bold text-white">User Agent Generator</h1>
         <p className="text-zinc-400">
-          Generate realistic in-app UAs — Instagram, Facebook, TikTok, Pinterest,
-          Snapchat, browsers, and desktop. Pick a specific device &amp; version,
-          or randomise. Export to TXT or Excel.
+          Generate coherent, verified-sample-based app and browser profiles.
+          Public captures guide the contract but are not authenticity guarantees.
         </p>
       </div>
 
@@ -379,8 +455,8 @@ export default function UserAgentGeneratorPage() {
             Choose app, device and version
           </CardTitle>
           <CardDescription>
-            Each generated UA uses realistic device specs (screen size, DPI, SoC,
-            build id). On desktop, regular Chrome/Firefox/Safari UAs are emitted.
+            Mobile profiles preserve compatible device, firmware, screen and release
+            records. Desktop is available only as a generic browser profile.
           </CardDescription>
           {/* Auto-update status row */}
           {options?.versions_meta && (
@@ -388,7 +464,7 @@ export default function UserAgentGeneratorPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <Clock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span className="text-xs text-zinc-400">
-                  Everything auto-refreshes every 24h from live sources ·
+                  Version records are refreshed from configured public sources when available ·
                 </span>
                 <span className="text-xs text-emerald-300" data-testid="versions-last-updated">
                   {options.versions_meta.last_refreshed_at
@@ -495,12 +571,18 @@ export default function UserAgentGeneratorPage() {
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
               {APPS.map((a) => {
                 const Icon = a.icon;
+                const appDisabled =
+                  platformMode === "one" &&
+                  platform === "desktop" &&
+                  a.key !== "chrome" &&
+                  a.key !== "gchrome";
                 const active = appMode === "many"
                   ? appsPool.includes(a.key)
                   : app === a.key;
                 return (
                   <button
                     key={a.key}
+                    disabled={appDisabled}
                     onClick={() => {
                       if (appMode === "many") {
                         setAppsPool((prev) =>
@@ -512,7 +594,7 @@ export default function UserAgentGeneratorPage() {
                         setApp(a.key);
                       }
                     }}
-                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-sm transition ${
+                    className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-sm transition disabled:opacity-35 disabled:cursor-not-allowed ${
                       active
                         ? `${a.color} border-white/20 text-white`
                         : "bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"
@@ -545,6 +627,20 @@ export default function UserAgentGeneratorPage() {
                 </button>
               </div>
             )}
+            {selectedSupportState && (
+              <div className={`mt-2 text-xs rounded border px-3 py-2 ${
+                selectedSupportState === "fallback"
+                  ? "bg-amber-950/30 border-amber-800 text-amber-200"
+                  : "bg-zinc-950 border-zinc-800 text-zinc-400"
+              }`}>
+                Support: <span className="font-semibold">{selectedSupportState}</span>
+                {selectedSupportState === "fallback"
+                  ? " — generation returns a visibly labeled generic browser fallback, not an app identity."
+                  : selectedSupportState === "supported"
+                  ? " — a verified-sample-based app identity is available for this platform."
+                  : " — generic browser behavior is used."}
+              </div>
+            )}
           </div>
 
           {/* OS picker */}
@@ -573,12 +669,14 @@ export default function UserAgentGeneratorPage() {
             <div className="flex gap-2 flex-wrap">
               {PLATFORMS.filter((p) => platformMode === "one" || p.key !== "any").map((p) => {
                 const Icon = p.icon;
+                const platformDisabled = p.key === "desktop" && !desktopAllowed;
                 const active = platformMode === "many"
                   ? platformsPool.includes(p.key)
                   : platform === p.key;
                 return (
                   <button
                     key={p.key}
+                    disabled={platformDisabled}
                     onClick={() => {
                       if (platformMode === "many") {
                         setPlatformsPool((prev) =>
@@ -590,7 +688,7 @@ export default function UserAgentGeneratorPage() {
                         setPlatform(p.key);
                       }
                     }}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition ${
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition disabled:opacity-35 disabled:cursor-not-allowed ${
                       active
                         ? "bg-blue-600 border-blue-500 text-white"
                         : "bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700"
@@ -607,7 +705,7 @@ export default function UserAgentGeneratorPage() {
               <div className="mt-2 flex items-center gap-2 text-[11px] text-zinc-400">
                 <button
                   type="button"
-                  onClick={() => setPlatformsPool(["android", "ios", "desktop"])}
+                  onClick={() => setPlatformsPool(desktopAllowed ? ["android", "ios", "desktop"] : ["android", "ios"])}
                   className="px-2 py-0.5 rounded bg-zinc-800 border border-zinc-700 hover:bg-zinc-700"
                   data-testid="platforms-select-all"
                 >
@@ -623,6 +721,9 @@ export default function UserAgentGeneratorPage() {
                 </button>
               </div>
             )}
+            <p className="text-zinc-500 text-xs mt-2">
+              Android + iOS means the mobile union only. Desktop is never included unless selected explicitly.
+            </p>
           </div>
 
           {/* Device + version pickers */}
@@ -632,13 +733,14 @@ export default function UserAgentGeneratorPage() {
                 <Label className="text-zinc-300">
                   Device <span className="text-zinc-500 text-xs">(leave on "Random")</span>
                 </Label>
-                <ModePill mode={deviceMode} onChange={setDeviceMode} testId="device-mode" />
+                <ModePill mode={deviceMode} onChange={setDeviceMode} disabled={scalarOverridesLocked} testId="device-mode" />
               </div>
               {deviceMode === "one" ? (
                 <select
                   value={deviceId}
                   onChange={(e) => setDeviceId(e.target.value)}
-                  className="w-full bg-zinc-800 border border-zinc-700 text-white text-sm rounded-lg px-3 py-2"
+                  disabled={scalarOverridesLocked}
+                  className="w-full bg-zinc-800 border border-zinc-700 text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50"
                   data-testid="device-select"
                 >
                   <option value="">🎲 Random device from pool</option>
@@ -652,6 +754,7 @@ export default function UserAgentGeneratorPage() {
                   values={deviceIdsPool}
                   onChange={setDeviceIdsPool}
                   placeholder="Pick 2–5 specific devices"
+                  disabled={scalarOverridesLocked}
                   testId="device-multiselect"
                 />
               )}
@@ -661,34 +764,41 @@ export default function UserAgentGeneratorPage() {
                 <Label className="text-zinc-300">
                   App Version <span className="text-zinc-500 text-xs">(leave on "Random")</span>
                 </Label>
-                <ModePill mode={appVersionMode} onChange={setAppVersionMode} testId="appver-mode" />
+                <ModePill mode={appVersionMode} onChange={setAppVersionMode} disabled={appVersionOverrideDisabled} testId="appver-mode" />
               </div>
               {appVersionMode === "one" ? (
                 <select
                   value={appVersion}
                   onChange={(e) => setAppVersion(e.target.value)}
-                  disabled={versionsForApp().length === 0}
+                  disabled={appVersionOverrideDisabled}
                   className="w-full bg-zinc-800 border border-zinc-700 text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50"
                   data-testid="version-select"
                 >
                   <option value="">🎲 Random version</option>
                   {versionsForApp().map((v) => (
-                    <option key={v} value={v}>{v}</option>
+                    <option key={v.value} value={v.value}>{v.label}</option>
                   ))}
                 </select>
               ) : (
                 <MultiSelectChips
-                  options={versionsForApp().map((v) => ({ value: v, label: v }))}
+                  options={versionsForApp()}
                   values={appVersionsPool}
                   onChange={setAppVersionsPool}
                   placeholder="Pick 2–5 specific versions"
-                  disabled={versionsForApp().length === 0}
+                  disabled={appVersionOverrideDisabled}
                   testId="version-multiselect"
                 />
               )}
               {versionsForApp().length === 0 && (
                 <p className="text-zinc-500 text-xs mt-1">
-                  (Browser/desktop has no app version)
+                  {scalarOverridesLocked
+                    ? "Use Single mode for both app and platform before pinning an app version."
+                    : "No app-version override is available for this selection."}
+                </p>
+              )}
+              {app === "gchrome" && platform === "android" && !isMixMode && (
+                <p className="text-amber-300 text-xs mt-1" data-testid="gchrome-android-fallback-note">
+                  Android Google Chrome uses a clearly labeled generic browser fallback. Its Chrome version is selected automatically and cannot be pinned.
                 </p>
               )}
             </div>
@@ -742,7 +852,7 @@ export default function UserAgentGeneratorPage() {
                 <ModePill
                   mode={osVersionMode}
                   onChange={setOsVersionMode}
-                  disabled={platform === "desktop" || platform === "any"}
+                  disabled={osVersionList().length === 0}
                   testId="osver-mode"
                 />
               </div>
@@ -750,12 +860,16 @@ export default function UserAgentGeneratorPage() {
                 <select
                   value={osVersion}
                   onChange={(e) => setOsVersion(e.target.value)}
-                  disabled={platform === "desktop" || platform === "any"}
+                  disabled={osVersionList().length === 0}
                   className="w-full bg-zinc-800 border border-zinc-700 text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50"
                   data-testid="os-version-select"
                 >
                   <option value="">
-                    {platform === "ios" ? "📱 Device default iOS" : platform === "android" ? "📱 Device default Android" : "N/A"}
+                    {deviceId || deviceIdsPool.length
+                      ? "🔒 Selected device firmware"
+                      : platform === "android"
+                      ? "📱 Compatible device firmware"
+                      : "N/A"}
                   </option>
                   {osVersionList().map((v) => (
                     <option key={v} value={v}>
@@ -772,16 +886,16 @@ export default function UserAgentGeneratorPage() {
                   values={osVersionsPool}
                   onChange={setOsVersionsPool}
                   placeholder="Pick 2–5 specific OS versions"
-                  disabled={platform === "desktop" || platform === "any"}
+                  disabled={osVersionList().length === 0}
                   testId="os-version-multiselect"
                 />
               )}
               <p className="text-zinc-500 text-xs mt-1">
-                {platform === "ios"
-                  ? "Overrides iOS version in the UA string."
-                  : platform === "android"
-                  ? "Overrides Android version (SDK adjusted automatically)."
-                  : "Pick Android or iOS first."}
+                {deviceId || deviceIdsPool.length
+                  ? "Firmware is immutable for a selected device; it cannot be freely rewritten."
+                  : platform === "android" && !isMixMode
+                  ? "Selecting Android limits generation to device snapshots with compatible firmware and build data."
+                  : "Choose one Android platform to filter by compatible firmware."}
               </p>
             </div>
             <div>
@@ -792,7 +906,7 @@ export default function UserAgentGeneratorPage() {
                 <ModePill
                   mode={resolutionMode}
                   onChange={setResolutionMode}
-                  disabled={platform === "desktop"}
+                  disabled={resolutionList().length === 0}
                   testId="res-mode"
                 />
               </div>
@@ -802,7 +916,7 @@ export default function UserAgentGeneratorPage() {
                   onChange={(e) => setResolution(e.target.value)}
                   className="w-full bg-zinc-800 border border-zinc-700 text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50"
                   data-testid="resolution-select"
-                  disabled={platform === "desktop"}
+                  disabled={resolutionList().length === 0}
                 >
                   <option value="">📱 Device default resolution</option>
                   {resolutionList().map((r) => (
@@ -815,7 +929,7 @@ export default function UserAgentGeneratorPage() {
                   values={resolutionsPool}
                   onChange={setResolutionsPool}
                   placeholder="Pick 2–5 specific resolutions"
-                  disabled={platform === "desktop"}
+                  disabled={resolutionList().length === 0}
                   testId="resolution-multiselect"
                 />
               )}
@@ -883,6 +997,19 @@ export default function UserAgentGeneratorPage() {
         </CardContent>
       </Card>
 
+      {responseWarnings.length > 0 && (
+        <Card className="bg-amber-950/30 border-amber-800" data-testid="ua-response-warnings">
+          <CardContent className="py-4">
+            <div className="text-sm font-semibold text-amber-200 mb-2">Generation warnings</div>
+            <ul className="space-y-1 text-xs text-amber-100">
+              {responseWarnings.map((warning, index) => (
+                <li key={`${warning}-${index}`}>• {warning}</li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Results */}
       {results.length > 0 && (
         <Card className="bg-zinc-900 border-zinc-800">
@@ -898,7 +1025,18 @@ export default function UserAgentGeneratorPage() {
               </CardTitle>
               <CardDescription>
                 {mixMeta?.mix_mode ? (
-                  <span className="flex flex-wrap gap-1 mt-1" data-testid="ua-mix-breakdown">
+                  <span className="flex flex-wrap items-center gap-1 mt-1" data-testid="ua-mix-breakdown">
+                    <span className="text-[11px] text-zinc-500">Requested apps:</span>
+                    {Object.entries(results.reduce((counts, item) => {
+                      const key = item.requested_app || "unknown";
+                      counts[key] = (counts[key] || 0) + 1;
+                      return counts;
+                    }, {})).map(([k, v]) => (
+                      <span key={`requested-${k}`} className="text-[11px] bg-blue-950 border border-blue-800 rounded px-2 py-0.5 text-blue-200">
+                        {k}: <span className="font-semibold">{v}</span>
+                      </span>
+                    ))}
+                    <span className="text-[11px] text-zinc-500 ml-1">Detected:</span>
                     {Object.entries(mixMeta.breakdown?.by_app || {}).map(([k, v]) => (
                       <span key={`app-${k}`} className="text-[11px] bg-zinc-800 border border-zinc-700 rounded px-2 py-0.5 text-zinc-300">
                         {k}: <span className="text-blue-300 font-semibold">{v}</span>
@@ -919,8 +1057,10 @@ export default function UserAgentGeneratorPage() {
               <Button
                 variant="outline"
                 onClick={copyAll}
-                className="border-zinc-700 text-zinc-300"
+                className="border-zinc-700 text-zinc-300 focus-visible:ring-2 focus-visible:ring-blue-400"
                 data-testid="ua-copy-all"
+                aria-label={`Copy all ${results.length} generated user agents`}
+                title={`Copy all ${results.length} generated user agents`}
               >
                 <CheckCheck className="w-4 h-4 mr-2" /> Copy all
               </Button>
@@ -944,46 +1084,65 @@ export default function UserAgentGeneratorPage() {
           <CardContent>
             <div className="space-y-1 max-h-[500px] overflow-auto">
               {results.slice(0, 1000).map((r, i) => (
-                <div
+                <button
+                  type="button"
                   key={i}
                   onClick={() => copyOne(r.user_agent)}
-                  className="group flex items-start gap-3 p-2 rounded bg-zinc-950 hover:bg-zinc-800 cursor-pointer border border-zinc-800"
-                  title="Click to copy"
+                  className={`group block w-full p-3 rounded border text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-900 ${
+                    r.support_state === "fallback"
+                      ? "bg-amber-950/20 hover:bg-amber-950/35 border-amber-800/70"
+                      : "bg-zinc-950 hover:bg-zinc-800 border-zinc-800"
+                  }`}
+                  aria-label={`Copy generated user agent ${i + 1}`}
+                  title={`Copy generated user agent ${i + 1}`}
+                  data-testid={`ua-copy-row-${i}`}
                 >
-                  <Badge
-                    className={`${
-                      r.platform === "ios"
-                        ? "bg-zinc-700 text-zinc-100"
-                        : r.platform === "desktop"
-                        ? "bg-indigo-700 text-white"
-                        : "bg-green-700 text-green-100"
-                    } text-[10px] shrink-0`}
-                  >
-                    {r.platform === "ios" ? "iOS" : r.platform === "desktop" ? "Desktop" : "Android"}
-                  </Badge>
-                  <Badge className="bg-zinc-700 text-zinc-200 text-[10px] shrink-0 truncate max-w-[180px]">
-                    {r.device}
-                  </Badge>
-                  {r.os_version && (
-                    <Badge className="bg-emerald-900/50 text-emerald-200 text-[10px] shrink-0 font-mono">
-                      {r.platform === "ios" ? `iOS ${r.os_version}` : `A${r.os_version}`}
-                    </Badge>
+                  <div className="flex flex-wrap items-center gap-1.5 mb-2">
+                    {r.requested_app && (
+                      <Badge className="bg-blue-900/50 text-blue-200 text-[10px]">
+                        Requested: {r.requested_app}
+                      </Badge>
+                    )}
+                    {r.app && (
+                      <Badge className="bg-zinc-700 text-zinc-200 text-[10px]">
+                        Detected: {r.app}
+                      </Badge>
+                    )}
+                    {r.platform && <Badge className="bg-zinc-800 text-zinc-300 text-[10px]">{r.platform}</Badge>}
+                    {r.app_version && <Badge className="bg-fuchsia-950 text-fuchsia-200 text-[10px]">v{r.app_version}</Badge>}
+                    {r.os_version && <Badge className="bg-emerald-950 text-emerald-200 text-[10px]">OS {r.os_version}</Badge>}
+                    {r.region && <Badge className="bg-blue-950 text-blue-200 text-[10px]">Region: {r.region}</Badge>}
+                    {r.country && <Badge className="bg-cyan-950 text-cyan-200 text-[10px]">Country: {r.country}</Badge>}
+                    {r.resolution && <Badge className="bg-purple-950 text-purple-200 text-[10px]">{r.resolution}</Badge>}
+                    {r.engine && <Badge className="bg-zinc-800 text-zinc-300 text-[10px]">{r.engine}</Badge>}
+                    {r.profile_type && <Badge className="bg-zinc-800 text-zinc-300 text-[10px]">{r.profile_type}</Badge>}
+                    {r.runtime && <Badge className="bg-zinc-800 text-zinc-300 text-[10px]">{r.runtime}</Badge>}
+                    {typeof r.runtime_compatible === "boolean" && (
+                      <Badge className={r.runtime_compatible ? "bg-emerald-900/60 text-emerald-200 text-[10px]" : "bg-amber-900/60 text-amber-200 text-[10px]"}>
+                        Runtime {r.runtime_compatible ? "compatible" : "not browser-compatible"}
+                      </Badge>
+                    )}
+                    {r.support_state && (
+                      <Badge className={r.support_state === "fallback" ? "bg-amber-700 text-white text-[10px]" : "bg-emerald-900/60 text-emerald-200 text-[10px]"}>
+                        {r.support_state === "fallback" ? "GENERIC BROWSER FALLBACK" : `Support: ${r.support_state}`}
+                      </Badge>
+                    )}
+                    {r.device && <span className="text-[10px] text-zinc-500">{r.device}</span>}
+                    <Copy className="w-3.5 h-3.5 text-zinc-600 group-hover:text-white ml-auto" />
+                  </div>
+                  <div className="text-zinc-300 text-xs font-mono break-all group-hover:text-white">{r.user_agent}</div>
+                  {(r.profile?.identities || []).length > 0 && (
+                    <div className="text-[11px] text-zinc-400 mt-2">
+                      Identities: {(r.profile.identities || []).join(", ")}
+                    </div>
                   )}
-                  {r.region && (
-                    <Badge className="bg-blue-900/50 text-blue-200 text-[10px] shrink-0" title={r.country}>
-                      {r.region}
-                    </Badge>
-                  )}
-                  {r.resolution && (
-                    <Badge className="bg-purple-900/50 text-purple-200 text-[10px] shrink-0 font-mono">
-                      {r.resolution}
-                    </Badge>
-                  )}
-                  <span className="text-zinc-300 text-xs font-mono truncate flex-1 group-hover:text-white">
-                    {r.user_agent}
-                  </span>
-                  <Copy className="w-3.5 h-3.5 text-zinc-600 group-hover:text-white shrink-0 mt-0.5" />
-                </div>
+                  {(r.issues || []).map((issue, index) => (
+                    <div key={`issue-${index}`} className="text-[11px] text-red-300 mt-1">Issue: {issue}</div>
+                  ))}
+                  {(r.warnings || []).map((warning, index) => (
+                    <div key={`warning-${index}`} className="text-[11px] text-amber-300 mt-1">Warning: {warning}</div>
+                  ))}
+                </button>
               ))}
               {results.length > 1000 && (
                 <div className="text-center text-zinc-500 text-xs py-2">

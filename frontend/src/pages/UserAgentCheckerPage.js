@@ -29,20 +29,20 @@ const API_URL = process.env.REACT_APP_BACKEND_URL;
 
 const SAMPLE_UAS = [
   {
-    label: "TikTok iOS",
-    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 musical_ly_40.3.0 JsSdk/2.0 NetType/WIFI Channel/App Store ByteLocale/en-US Region/US",
+    label: "TikTok Android",
+    ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.114 Mobile Safari/537.36 TikTok/45.8.2 musical_ly_2024508020 JsSdk/1.0 NetType/WIFI Channel/googleplay AppName/musical_ly app_version/45.8.2 ByteLocale/en-GB ByteFullLocale/en-GB Region/GB com.zhiliaoapp.musically/2024508020",
   },
   {
     label: "Instagram Android",
-    ua: "Mozilla/5.0 (Linux; Android 14; SM-S918B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.63 Mobile Safari/537.36 Instagram 412.0.0.35.87 Android (34/14; 420dpi; 1080x2340; samsung; SM-S918B; kalama; qcom; en_US; 589412678; IABMV/1)",
+    ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.114 Mobile Safari/537.36 Instagram 437.0.0.33.78 Android (34/14; 420dpi; 1080x2400; google; Pixel 8; husky; tensor; en_US; 1011909233; IABMV/1)",
   },
   {
-    label: "Facebook iOS",
-    ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBDV/iPhone16,1;FBMD/iPhone;FBSN/iOS;FBSV/18.2;FBSS/3;FBID/phone;FBLC/en_US;FBOP/5;FBRV/789456123;IABMV/1]",
+    label: "Facebook Android",
+    ua: "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.114 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;]",
   },
   {
     label: "Chrome Desktop",
-    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7559.63 Safari/537.36",
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.114 Safari/537.36",
   },
 ];
 
@@ -140,7 +140,8 @@ export default function UserAgentCheckerPage() {
         <p className="text-zinc-400">
           Paste any user agent and get a full breakdown — browser, OS, device,
           in-app detection, TikTok metadata (locale / region / net type),
-          realism verdict, and a one-line human summary.
+          engine/runtime compatibility, support state, identities and contract warnings.
+          Results check coherence against verified samples; they do not guarantee authenticity.
         </p>
       </div>
 
@@ -224,9 +225,9 @@ export default function UserAgentCheckerPage() {
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {result.verdict?.looks_realistic ? (
+                  {result.valid ? (
                     <Badge className="bg-green-900/40 text-green-300 border border-green-800" data-testid="ua-verdict">
-                      <CheckCircle2 className="w-3 h-3 mr-1" /> Looks realistic
+                      <CheckCircle2 className="w-3 h-3 mr-1" /> Contract coherent
                     </Badge>
                   ) : (
                     <Badge className="bg-amber-900/40 text-amber-300 border border-amber-800" data-testid="ua-verdict">
@@ -237,8 +238,10 @@ export default function UserAgentCheckerPage() {
                     size="sm"
                     variant="outline"
                     onClick={copyRawJson}
-                    className="border-zinc-700 text-zinc-300"
+                    className="border-zinc-700 text-zinc-300 focus-visible:ring-2 focus-visible:ring-blue-400"
                     data-testid="ua-copy-json-btn"
+                    aria-label="Copy full user agent analysis as JSON"
+                    title="Copy full user agent analysis as JSON"
                   >
                     <Copy className="w-3.5 h-3.5 mr-1" /> JSON
                   </Button>
@@ -255,7 +258,13 @@ export default function UserAgentCheckerPage() {
                 <SectionHeader icon={Tag} title={result.app?.is_inapp ? "In-App Browser" : "Browser"} accent="text-pink-400" />
                 <Row icon={Tag} label="App / Browser" value={result.app?.app_name || result.browser?.family} testId="ua-row-app" />
                 <Row icon={Tag} label="App version" value={result.app?.app_version} mono testId="ua-row-appver" />
-                <Row icon={Tag} label="Engine version" value={result.browser?.version} mono testId="ua-row-browserver" />
+                <Row icon={Cpu} label="Engine" value={result.engine} testId="ua-row-engine" />
+                <Row icon={Tag} label="Browser version" value={result.browser?.version} mono testId="ua-row-browserver" />
+                <Row icon={Tag} label="Profile type" value={result.profile_type} testId="ua-row-profile-type" />
+                <Row icon={Tag} label="Runtime" value={result.runtime} testId="ua-row-runtime" />
+                <Row icon={Tag} label="Runtime compatible" value={typeof result.runtime_compatible === "boolean" ? (result.runtime_compatible ? "Yes" : "No") : null} testId="ua-row-runtime-compatible" />
+                <Row icon={Tag} label="Support state" value={result.profile?.support_state} testId="ua-row-support-state" />
+                <Row icon={Tag} label="Identities" value={(result.app?.identities || result.profile?.identities || []).join(", ")} testId="ua-row-identities" />
                 <Row icon={Tag} label="Is in-app webview" value={result.app?.is_inapp ? "Yes" : "No"} testId="ua-row-inapp" />
                 <Row icon={Tag} label="Traffic source guess" value={result.traffic_source_guess} testId="ua-row-source" />
               </CardContent>
@@ -281,6 +290,7 @@ export default function UserAgentCheckerPage() {
                 <Row icon={Smartphone} label="Is mobile" value={result.flags?.is_mobile ? "Yes" : "No"} testId="ua-row-ismobile" />
                 <Row icon={Smartphone} label="Is tablet" value={result.flags?.is_tablet ? "Yes" : "No"} testId="ua-row-istablet" />
                 <Row icon={Monitor} label="Is desktop / PC" value={result.flags?.is_pc ? "Yes" : "No"} testId="ua-row-ispc" />
+                <Row icon={Smartphone} label="Touch capable" value={result.flags?.is_touch_capable ? "Yes" : "No"} testId="ua-row-touch" />
                 <Row icon={AlertTriangle} label="Is bot" value={result.flags?.is_bot ? "Yes" : "No"} testId="ua-row-isbot" />
               </CardContent>
             </Card>
@@ -300,7 +310,7 @@ export default function UserAgentCheckerPage() {
             )}
 
             {/* Issues — always visible when present */}
-            {result.verdict && !result.verdict.looks_realistic && (
+            {(result.verdict?.issues || []).length > 0 && (
               <Card className="bg-amber-950/30 border-amber-900 lg:col-span-2">
                 <CardContent className="py-4">
                   <SectionHeader icon={AlertTriangle} title="Issues detected" accent="text-amber-400" />
@@ -309,6 +319,22 @@ export default function UserAgentCheckerPage() {
                       <li key={i} className="flex gap-2">
                         <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                         <span>{issue}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </CardContent>
+              </Card>
+            )}
+
+            {(result.verdict?.warnings || []).length > 0 && (
+              <Card className="bg-blue-950/30 border-blue-900 lg:col-span-2">
+                <CardContent className="py-4">
+                  <SectionHeader icon={AlertTriangle} title="Warnings" accent="text-blue-400" />
+                  <ul className="space-y-1.5 text-sm text-blue-200">
+                    {result.verdict.warnings.map((warning, i) => (
+                      <li key={i} className="flex gap-2">
+                        <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>{warning}</span>
                       </li>
                     ))}
                   </ul>

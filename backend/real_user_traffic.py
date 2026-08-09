@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
+from ua_profile_contract import client_hint_headers_for_ua
+
 if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH") and os.path.isdir("/pw-browsers"):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/pw-browsers"
 
@@ -176,6 +178,7 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
     """
     try:
         from referrer_pro import _is_mobile_ua as _is_mob  # type: ignore
+        from ua_profile_contract import validate_user_agent as _validate_ua
     except Exception:
         # Fallback (should never happen — referrer_pro ships alongside)
         def _is_mob(u: str) -> str:  # type: ignore
@@ -185,6 +188,7 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
             if "android" in ul:
                 return "android"
             return ""
+        _validate_ua = None
 
     # 2026-07 fix C: strict in-app preset — foreign markers get scrubbed.
     # 2026-02 v2.6.18 EXPANDED: the customer's Traxun report labelled
@@ -227,6 +231,14 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
         "silk-accelerated", # Amazon Silk
     ]
     _pp = (preset_platform or "").strip().lower()
+    if _pp == "messenger" and user_agents:
+        # Messenger has no verified in-app UA contract. Preserve supplied
+        # browser identities here (including desktop/custom mobile UAs);
+        # coerce_ua_for_platform() will clean an app-marked/invalid value later.
+        preserved = [ua for ua in user_agents if ua]
+        if preserved:
+            return preserved
+
     _FOREIGN_MARKERS: Dict[str, List[str]] = {
         "tiktok":    ["fban", "fbav", "fb_iab", "fb4a", "instagram", "linkedinapp", "snapchat", "twitter"] + _THIRD_PARTY_MOBILE_BROWSERS,
         "facebook":  ["musical_ly", "aweme", "trill_", "bytedancewebview", "instagram", "linkedinapp", "snapchat"] + _THIRD_PARTY_MOBILE_BROWSERS,
@@ -245,7 +257,7 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
         return any(n in ul for n in _foreign_needles)
 
     def _is_incomplete_tiktok_android(u: str) -> bool:
-        """Legacy/partial TikTok Android UAs that lack FBAN/TikTokAndroid."""
+        """Reject native, partial, duplicated, or unsupported TikTok UAs."""
         if (_pp or "").lower() != "tiktok":
             return False
         ul = (u or "").lower()
@@ -257,7 +269,14 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
         )
         if not has_tt_tail:
             return False
-        return "fban/tiktokandroid" not in ul
+        if _validate_ua is None:
+            return "cronet/" in ul or "; wv)" not in ul
+        verdict = _validate_ua(u, expected_app="tiktok")
+        return not (
+            verdict["valid"]
+            and verdict["engine"] == "android_webview"
+            and verdict["runtime_compatible"]
+        )
 
     if not user_agents:
         n = max(1, min(int(want_count or 20), 500))
@@ -2135,105 +2154,42 @@ _OS_FONTS = {
 
 
 def _build_client_hint_headers(fp: Dict[str, Any], ua: str) -> Dict[str, str]:
-    """Build Sec-CH-UA / Sec-CH-UA-Mobile / Sec-CH-UA-Platform headers
-    that match the user-agent's Chrome version and OS. Modern fraud
-    detectors cross-check these against the UA string — a mismatch is
-    a HARD bot signal. Returns {} for non-Chromium UAs so the existing
-    Playwright defaults remain untouched.
-    """
-    headers: Dict[str, str] = {}
-    os_key = fp.get("os", "")
-    ua_l = (ua or "").lower()
+    """Return the shared contract's exact low-entropy hints in Playwright casing."""
+    del fp  # The UA contract, not a separately-derived fingerprint, owns hints.
+    casing = {
+        "sec-ch-ua": "Sec-CH-UA",
+        "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+        "sec-ch-ua-platform": "Sec-CH-UA-Platform",
+    }
+    return {
+        casing[key]: value
+        for key, value in client_hint_headers_for_ua(ua).items()
+    }
 
-    # v2.6.23 — non-Chrome in-app UAs (TikTok Cronet, native FB iOS,
-    # native Instagram iOS, native Snapchat) MUST NOT carry any
-    # Sec-CH-UA-* headers.  Real device WebViews don't send them —
-    # advertiser trackers (Everflow / Voluum) that see them treat the
-    # visit as Chrome, ignoring the tail app marker in the UA string.
-    # Returning {} here also lets the route interceptor STRIP the
-    # Chromium-emitted default sec-ch-ua before the request goes out.
-    try:
-        from referrer_pro import is_non_chrome_inapp_ua as _is_non_chrome_inapp
-        if _is_non_chrome_inapp(ua):
-            # Keep Sec-CH-UA-Mobile + Platform because real WebViews DO
-            # emit these two low-entropy hints. Only the branded
-            # Sec-CH-UA + Sec-CH-UA-Platform-Version leak the parent
-            # Chromium identity, so we omit those.
-            platform_label = {
-                "windows": "Windows", "macos": "macOS", "ios": "iOS",
-                "android": "Android", "linux": "Linux",
-            }.get(os_key, "")
-            if platform_label:
-                headers["Sec-CH-UA-Platform"] = f'"{platform_label}"'
-            headers["Sec-CH-UA-Mobile"] = "?1" if fp.get("is_mobile") else "?0"
-            # Empty Sec-CH-UA overrides Chromium's default (Playwright
-            # extra_http_headers replaces the built-in on match).
-            headers["Sec-CH-UA"] = ""
-            return headers
-    except Exception:
-        pass
 
-    platform_label = {
-        "windows": "Windows", "macos": "macOS", "ios": "iOS",
-        "android": "Android", "linux": "Linux",
-    }.get(os_key, "")
-    if platform_label:
-        headers["Sec-CH-UA-Platform"] = f'"{platform_label}"'
+def _apply_contract_client_hints(headers: Dict[str, str], ua: str) -> Dict[str, str]:
+    """Reconcile low-entropy hints without discarding negotiated Chromium hints."""
+    contract_hints = _build_client_hint_headers({}, ua)
+    low_entropy = {"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+    if contract_hints:
+        # Chromium may add model/platform-version/architecture/full-version-list
+        # after Accept-CH. Preserve those negotiated high-entropy values and only
+        # replace the three low-entropy keys owned by the shared UA contract.
+        result = {
+            key: value for key, value in (headers or {}).items()
+            if key.lower() not in low_entropy
+        }
+        result.update(contract_hints)
+        return result
 
-    headers["Sec-CH-UA-Mobile"] = "?1" if fp.get("is_mobile") else "?0"
-
-    is_chromium = any(tok in ua_l for tok in (
-        "chrome/", "crios/", "edg/", "edga/", "edgios/", "chromium/"
-    ))
-    if is_chromium:
-        chrome_major, _ = _extract_chrome_version(ua)
-        not_brand_variants = [
-            '"Not_A Brand";v="24"',
-            '"Not(A:Brand";v="24"',
-            '"Not.A/Brand";v="24"',
-            '" Not;A=Brand";v="99"',
-        ]
-        not_brand = random.choice(not_brand_variants)
-        headers["Sec-CH-UA"] = (
-            f'"Chromium";v="{chrome_major}", '
-            f'"Google Chrome";v="{chrome_major}", '
-            f'{not_brand}'
-        )
-        # 2026-06-14: Sec-CH-UA-Platform-Version derived from the ACTUAL
-        # UA string instead of hardcoded per-OS values. Trackers like
-        # FingerprintJS Pro / IPQS / Anura cross-check Sec-CH-UA-Platform-
-        # Version against the UA's OS major/minor — hardcoded "17.4.0"
-        # when UA says iOS 18.5 was an instant fraud flag.
-        platform_version = ""
-        if os_key == "ios":
-            m = re.search(r"iphone os ([\d_]+)", ua_l)
-            if m:
-                platform_version = m.group(1).replace("_", ".")
-            else:
-                platform_version = "18.5"
-        elif os_key == "android":
-            m = re.search(r"android (\d+(?:\.\d+)?)", ua_l)
-            if m:
-                ver = m.group(1)
-                platform_version = ver if "." in ver else f"{ver}.0.0"
-            else:
-                platform_version = "14.0.0"
-        elif os_key == "windows":
-            # Sec-CH-UA-Platform-Version for Windows 11 is "15.0.0"
-            # (kernel-level version, frozen since Win 8 era).
-            platform_version = "15.0.0"
-        elif os_key == "macos":
-            m = re.search(r"mac os x (\d+[_\d]*)", ua_l)
-            if m:
-                platform_version = m.group(1).replace("_", ".")
-            else:
-                platform_version = "14.5.0"
-        elif os_key == "linux":
-            platform_version = "6.5.0"
-        if platform_version:
-            headers["Sec-CH-UA-Platform-Version"] = f'"{platform_version}"'
-
-    return headers
+    # WebKit/Gecko do not emit Chromium UA client hints. Strip both low- and
+    # high-entropy Sec-CH-UA-* values if a redirected/retried request inherited
+    # them from an earlier Chromium profile.
+    result = {
+        key: value for key, value in (headers or {}).items()
+        if not key.lower().startswith("sec-ch-ua")
+    }
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2769,20 +2725,71 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
     is_mobile = bool(ua and ua.is_mobile)
     is_tablet = bool(ua and ua.is_tablet)
 
-    # Plausible ranges per OS — picked FRESH each visit for true uniqueness.
+    # Generated mobile UAs encode immutable hardware claims. Keep the screen
+    # and DPR deterministic; randomization is reserved for compatible desktop
+    # profiles where the UA does not identify a physical device.
     if os_key == "ios":
         platform = "iPhone" if not is_tablet else "iPad"
         vendor = "Apple Computer, Inc."
-        viewport = {"width": 390, "height": 844} if not is_tablet else {"width": 820, "height": 1180}
-        dpr = 3 if not is_tablet else 2
+        ios_profiles = {
+            "iphone12,1": (414, 896, 2.0),
+            "iphone12,3": (375, 812, 3.0),
+            "iphone13,2": (390, 844, 3.0),
+            "iphone14,5": (390, 844, 3.0),
+            "iphone15,2": (393, 852, 3.0),
+            "iphone15,3": (430, 932, 3.0),
+            "iphone16,1": (393, 852, 3.0),
+            "iphone17,2": (440, 956, 3.0),
+            "ipad13,1": (820, 1180, 2.0),
+            "ipad14,3": (834, 1194, 2.0),
+            "ipad14,5": (1024, 1366, 2.0),
+        }
+        model_match = re.search(r"\b(iPhone\d+,\d+|iPad\d+,\d+)\b", ua_str or "", re.I)
+        model_key = model_match.group(1).lower() if model_match else ""
+        width, height, dpr = ios_profiles.get(
+            model_key,
+            (820, 1180, 2.0) if is_tablet or "ipad" in (ua_str or "").lower()
+            else (390, 844, 3.0),
+        )
+        viewport = {"width": width, "height": height}
         # 2026-06-14: device-coupled GPU + memory (was random — caused
         # WebGL renderer ≠ UA device mismatch flagged by FingerprintJS).
         webgl_vendor, webgl_renderer, hc, dm = _pick_ios_gpu_from_ua(ua_str)
     elif os_key == "android":
         platform = "Linux armv8l"
         vendor = "Google Inc."
-        viewport = {"width": 412, "height": 915} if not is_tablet else {"width": 800, "height": 1280}
-        dpr = random.choice([2.0, 2.625, 3.0])
+        android_profiles = {
+            "moto g 5g - 2024": (360, 806, 2.0),
+            "sm-s918b": (412, 892, 2.625),
+            "sm-s928b": (456, 989, 3.157),
+            "sm-a546b": (412, 892, 2.625),
+            "sm-g991b": (412, 915, 2.625),
+            "pixel 8 pro": (448, 997, 3.0),
+            "pixel 8": (412, 915, 2.625),
+            "pixel 7": (412, 915, 2.625),
+            "cph2449": (441, 986, 2.8125),
+            "cph2581": (427, 953, 2.53125),
+            "23049pcd8g": (393, 873, 2.75),
+            "2311drk48g": (441, 981, 3.265),
+        }
+        model_match = re.search(
+            r"\bAndroid\s+[\d.]+\s*;\s*([^;)]+?)(?:\s+Build/|;\s*wv\))",
+            ua_str or "", re.I,
+        )
+        model_key = model_match.group(1).strip().lower() if model_match else ""
+        width, height, dpr = android_profiles.get(
+            model_key, (800, 1280, 2.0) if is_tablet else (412, 915, 2.625)
+        )
+        # Instagram carries physical resolution and density explicitly.
+        ig_hw = re.search(
+            r"Instagram\s+[\d.]+\s+Android\s+\([^;]+;\s*(\d+)dpi;\s*(\d+)x(\d+);",
+            ua_str or "", re.I,
+        )
+        if ig_hw:
+            dpr = int(ig_hw.group(1)) / 160.0
+            width = round(int(ig_hw.group(2)) / dpr)
+            height = round(int(ig_hw.group(3)) / dpr)
+        viewport = {"width": width, "height": height}
         # 2026-06-14: device-coupled GPU + memory.
         webgl_vendor, webgl_renderer, hc, dm = _pick_android_gpu_from_ua(ua_str)
     elif os_key == "windows":
@@ -2839,11 +2846,11 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         webgl_vendor = "Google Inc."
         webgl_renderer = "ANGLE (Intel, Mesa Intel(R) HD Graphics)"
 
-    # Small jitter on top so even two visits from the same preset look distinct
-    viewport = {
-        "width": max(320, viewport["width"] + random.randint(-4, 4)),
-        "height": max(568, viewport["height"] + random.randint(-8, 8)),
-    }
+    if os_key not in ("android", "ios"):
+        viewport = {
+            "width": max(320, viewport["width"] + random.randint(-4, 4)),
+            "height": max(568, viewport["height"] + random.randint(-8, 8)),
+        }
 
     # ── 2026-01: extra fingerprint fields for deep anti-detect ──
     # All ADDITIVE — existing callers that only read the old keys are
@@ -2935,6 +2942,17 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         os_key, webgl_vendor, webgl_renderer,
     )
 
+    locale_match = re.search(
+        r"\b(?:ByteFullLocale|ByteLocale)/([A-Za-z]{2}(?:[-_][A-Za-z]{2})?)\b",
+        ua_str or "",
+    )
+    if not locale_match:
+        locale_match = re.search(
+            r"\bInstagram\s+[\d.]+.*?;\s*([a-z]{2}[_-][A-Z]{2})\s*;",
+            ua_str or "", re.I,
+        )
+    explicit_locale = locale_match.group(1).replace("_", "-") if locale_match else ""
+
     return {
         "os": os_key,
         "platform": platform,
@@ -2974,6 +2992,8 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         "battery_level": battery_level,
         "battery_charging": battery_charging,
         "fonts": _OS_FONTS.get(os_key, _OS_FONTS["windows"]),
+        "explicit_locale": explicit_locale,
+        "client_hints": client_hint_headers_for_ua(ua_str),
     }
 
 
@@ -3465,25 +3485,8 @@ def _make_macro_guard(job_id: str, visit_index: int, force_referer: str = "", ta
                         # capitalised variant that might have been added.
                         _hdrs.pop("Referer", None)
                         _hdrs["referer"] = force_referer
-                        # v2.6.23 — Strip sec-ch-ua* for non-Chrome in-app
-                        # UAs (see is_non_chrome_inapp_ua). Real TikTok /
-                        # native FB iOS / IG iOS / Snapchat WebViews DO
-                        # NOT send these headers — Chromium's defaults
-                        # leak Chrome identity to advertiser trackers.
-                        try:
-                            _req_ua = _hdrs.get("user-agent") or _hdrs.get("User-Agent") or ""
-                            from referrer_pro import is_non_chrome_inapp_ua as _is_nci
-                            if _is_nci(_req_ua):
-                                for _k in list(_hdrs.keys()):
-                                    if _k.lower().startswith("sec-ch-ua"):
-                                        # Preserve mobile + platform (low-entropy,
-                                        # real WebViews DO emit these).
-                                        _kl = _k.lower()
-                                        if _kl in ("sec-ch-ua-mobile", "sec-ch-ua-platform"):
-                                            continue
-                                        _hdrs.pop(_k, None)
-                        except Exception:
-                            pass
+                        _req_ua = _hdrs.get("user-agent") or _hdrs.get("User-Agent") or ""
+                        _hdrs = _apply_contract_client_hints(_hdrs, _req_ua)
                         await route.continue_(headers=_hdrs)
                         return
                     except Exception:
@@ -3492,23 +3495,12 @@ def _make_macro_guard(job_id: str, visit_index: int, force_referer: str = "", ta
                         # of referer-injection edge cases.
                         pass
 
-            # v2.6.23 — sec-ch-ua strip path (even when force_referer is
-            # off). Applies to ALL requests from a non-Chrome in-app UA
-            # context so no leak survives sub-resource loads either.
             try:
                 _req_ua = request.headers.get("user-agent") or request.headers.get("User-Agent") or ""
-                from referrer_pro import is_non_chrome_inapp_ua as _is_nci
-                if _is_nci(_req_ua):
-                    _hdrs = dict(request.headers or {})
-                    _changed = False
-                    for _k in list(_hdrs.keys()):
-                        _kl = _k.lower()
-                        if _kl.startswith("sec-ch-ua") and _kl not in ("sec-ch-ua-mobile", "sec-ch-ua-platform"):
-                            _hdrs.pop(_k, None)
-                            _changed = True
-                    if _changed:
-                        await route.continue_(headers=_hdrs)
-                        return
+                _hdrs = _apply_contract_client_hints(dict(request.headers or {}), _req_ua)
+                if _hdrs != dict(request.headers or {}):
+                    await route.continue_(headers=_hdrs)
+                    return
             except Exception:
                 pass
 
@@ -4448,9 +4440,24 @@ async def _probe_proxy_target_reachable(
 # same OS+UA still get different audio/canvas/font fingerprints.
 def _build_stealth_script(fp: Dict[str, Any], geo: Dict[str, Any], *, fp_hash_override: Optional[int] = None) -> str:
     import json as _json
-    langs = [s.split(";")[0].strip() for s in geo["accept_language"].split(",") if s.strip()]
+    explicit_locale = str(fp.get("explicit_locale") or "").strip()
+    language_source = explicit_locale or geo["accept_language"]
+    langs = [s.split(";")[0].strip() for s in language_source.split(",") if s.strip()]
     langs = [lg for lg in langs if lg]
+    if explicit_locale:
+        base_language = explicit_locale.split("-", 1)[0]
+        langs = [explicit_locale] + ([base_language] if base_language != explicit_locale else [])
     langs = langs[:4] or ["en-US", "en"]
+
+    raw_hints = fp.get("client_hints") or {}
+    brand_pairs = re.findall(
+        r'"([^"]+)";v="([^"]+)"', str(raw_hints.get("sec-ch-ua") or "")
+    )
+    js_client_hints = {
+        "brands": [{"brand": brand, "version": version} for brand, version in brand_pairs],
+        "mobile": raw_hints.get("sec-ch-ua-mobile") == "?1",
+        "platform": str(raw_hints.get("sec-ch-ua-platform") or "").strip('"'),
+    } if raw_hints else None
 
     # Inject all per-visit constants into a single __KX namespace at the top
     # of the JS so the rest of the script is a normal raw JS string (no
@@ -4499,6 +4506,7 @@ def _build_stealth_script(fp: Dict[str, Any], geo: Dict[str, Any], *, fp_hash_ov
         "platformVersion": str(fp.get("platform_version") or "15.0.0"),
         "uaArchitecture": str(fp.get("ua_architecture") or "x86"),
         "uaModel": str(fp.get("ua_model") or ""),
+        "clientHints": js_client_hints,
         # 2026-02 Step 4 (P0 #4): deterministic per-fingerprint seed for
         # the ClientRects sub-pixel noise patch. Derives from the UA +
         # chrome version + timezone so the noise is stable across the
@@ -4742,49 +4750,30 @@ safe(() => safeDefine(window, 'devicePixelRatio', () => __KX.dpr));
 
 // ── userAgentData (Sec-CH-UA equivalent in JS) ─────────────────
 safe(() => {
-  // v2.6.23 — Non-Chrome in-app UAs (TikTok Cronet, native FB iOS,
-  // Instagram iOS, Snapchat) must NOT expose navigator.userAgentData.
-  // Real device WebViews don't expose it — advertiser trackers that
-  // read it see "Google Chrome" (Chromium's default) and label the
-  // click Chrome, ignoring the TikTok/FB/IG marker in the UA string.
-  const _ua_l = String(navigator.userAgent || '').toLowerCase();
-  const _is_non_chrome_inapp = (
-    _ua_l.indexOf('musical_ly') !== -1 ||
-    _ua_l.indexOf('bytedancewebview') !== -1 ||
-    _ua_l.indexOf('com.zhiliaoapp.musically') !== -1 ||
-    _ua_l.indexOf('fban/fbios') !== -1 ||
-    (_ua_l.indexOf('fbav/') !== -1 && _ua_l.indexOf('chrome/') === -1) ||
-    (_ua_l.indexOf('instagram ') !== -1 && _ua_l.indexOf('iphone') !== -1) ||
-    (_ua_l.indexOf('snapchat/') !== -1 && _ua_l.indexOf('chrome/') === -1)
-  );
-  if (_is_non_chrome_inapp) {
+  if (!__KX.clientHints) {
     try { safeDefine(navigator, 'userAgentData', () => undefined); } catch (e) {}
     return;
   }
-  if (navigator.userAgent && /Chrome\//.test(navigator.userAgent)) {
+  if (__KX.clientHints) {
     const cv = String(__KX.chromeVersion);
     const cvFull = String(__KX.chromeFullVersion || cv);
-    const platformName = ({ windows: 'Windows', macos: 'macOS', ios: 'iOS', android: 'Android', linux: 'Linux' })[__KX.os] || 'Windows';
+    const platformName = __KX.clientHints.platform;
     const arch = (__KX.uaArchitecture === 'arm') ? 'arm' : 'x86';
-    const brands = [
-      { brand: 'Chromium', version: cv },
-      { brand: 'Google Chrome', version: cv },
-      { brand: 'Not_A Brand', version: '24' },
-    ];
+    const brands = __KX.clientHints.brands;
     const uaData = {
       brands: brands,
-      mobile: __KX.isMobile,
+      mobile: __KX.clientHints.mobile,
       platform: platformName,
       getHighEntropyValues: function (hints) {
         return Promise.resolve({
           architecture: arch, bitness: '64', brands: brands,
           fullVersionList: brands.map((b) => ({ brand: b.brand, version: cvFull })),
-          mobile: __KX.isMobile, model: __KX.uaModel || '', platform: platformName,
+          mobile: __KX.clientHints.mobile, model: __KX.uaModel || '', platform: platformName,
           platformVersion: __KX.platformVersion || '15.0.0',
           uaFullVersion: cvFull, wow64: false,
         });
       },
-      toJSON: function () { return { brands: brands, mobile: __KX.isMobile, platform: platformName }; },
+      toJSON: function () { return { brands: brands, mobile: __KX.clientHints.mobile, platform: platformName }; },
     };
     safeDefine(navigator, 'userAgentData', () => uaData);
   }
@@ -9878,7 +9867,7 @@ async def run_real_user_traffic_job(
                         # will then detect.
                         _MOBILE_ONLY_PLATFORMS = {
                             "tiktok", "instagram", "snapchat",
-                            "facebook", "messenger", "pinterest",
+                            "facebook", "pinterest",
                             "linkedin", "twitter",
                         }
                         if _kx_platform in _MOBILE_ONLY_PLATFORMS:
@@ -9894,7 +9883,18 @@ async def run_real_user_traffic_job(
                                         )
                             except Exception:
                                 pass
-                        _coerced_ua = _coerce_ua(ua, _kx_platform)
+                        _coerced_ua = _coerce_ua(
+                            ua, _kx_platform, str(geo.get("locale") or "")
+                        )
+                        if _kx_platform == "messenger":
+                            try:
+                                push_live_step(
+                                    job_id, i + 1, "ua", "warn",
+                                    "Messenger UA is fallback-only: using a clean generic "
+                                    "browser identity (no fabricated Facebook/Messenger marker)",
+                                )
+                            except Exception:
+                                pass
                         if _coerced_ua and _coerced_ua != ua:
                             ua = _coerced_ua
                         elif _coerced_ua:
@@ -9985,7 +9985,14 @@ async def run_real_user_traffic_job(
                 _goto_referer_kw: Dict[str, Any] = {}
                 if _ua_referer:
                     _goto_referer_kw["referer"] = _ua_referer
-                _ctx_headers = {"Accept-Language": geo["accept_language"]}
+                _explicit_ua_locale = str(fp.get("explicit_locale") or "").strip()
+                _context_locale = _explicit_ua_locale or geo["locale"]
+                _context_accept_language = (
+                    f"{_explicit_ua_locale},{_explicit_ua_locale.split('-', 1)[0]};q=0.9"
+                    if _explicit_ua_locale
+                    else geo["accept_language"]
+                )
+                _ctx_headers = {"Accept-Language": _context_accept_language}
                 if _ua_referer:
                     _ctx_headers["Referer"] = _ua_referer
 
@@ -10127,7 +10134,7 @@ async def run_real_user_traffic_job(
                             # its actual navigation. Eliminates the "empty
                             # UA / empty browser" bot-tell on offer dashboard.
                             referer=_ua_referer or "",
-                            accept_language=geo.get("accept_language") or "",
+                            accept_language=_context_accept_language,
                             sec_ch_ua_headers={
                                 k: v for k, v in _ctx_headers.items()
                                 if k.lower().startswith("sec-ch-")
@@ -10204,7 +10211,7 @@ async def run_real_user_traffic_job(
                 # Chrome version + OS. MaxMind / IPQS / Anura cross-check
                 # these against the UA — a mismatch is a HARD bot signal.
                 try:
-                    _ctx_headers.update(_build_client_hint_headers(fp, ua))
+                    _ctx_headers = _apply_contract_client_hints(_ctx_headers, ua)
                 except Exception:
                     pass
                 context = await browser.new_context(
@@ -10218,7 +10225,7 @@ async def run_real_user_traffic_job(
                     device_scale_factor=fp["device_scale_factor"],
                     is_mobile=fp["is_mobile"],
                     has_touch=fp["has_touch"],
-                    locale=geo["locale"],
+                    locale=_context_locale,
                     timezone_id=geo["timezone"],
                     geolocation={"latitude": geo["lat"], "longitude": geo["lon"]},
                     permissions=["geolocation"],
@@ -10239,7 +10246,9 @@ async def run_real_user_traffic_job(
                     # the Referer the browser actually sends.
                     _ctx_headers_retry = dict(_ctx_headers)
                     try:
-                        _ctx_headers_retry.update(_build_client_hint_headers(fp, ua))
+                        _ctx_headers_retry = _apply_contract_client_hints(
+                            _ctx_headers_retry, ua
+                        )
                     except Exception:
                         pass
                     context = await browser.new_context(
@@ -10253,7 +10262,7 @@ async def run_real_user_traffic_job(
                         device_scale_factor=fp["device_scale_factor"],
                         is_mobile=fp["is_mobile"],
                         has_touch=fp["has_touch"],
-                        locale=geo["locale"],
+                        locale=_context_locale,
                         timezone_id=geo["timezone"],
                         geolocation={"latitude": geo["lat"], "longitude": geo["lon"]},
                         permissions=["geolocation"],
@@ -10549,7 +10558,7 @@ async def run_real_user_traffic_job(
                                 ua,
                                 timeout=8.0,
                                 referer=_ua_referer or "",
-                                accept_language=geo.get("accept_language") or "",
+                                accept_language=_context_accept_language,
                                 sec_ch_ua_headers={
                                     k: v for k, v in (_ctx_headers or {}).items()
                                     if k.lower().startswith("sec-ch-")
@@ -10578,7 +10587,7 @@ async def run_real_user_traffic_job(
                             proxy=proxy,
                             ua=ua,
                             timeout=20.0,
-                            accept_language=geo.get("accept_language") or "en-US,en;q=0.9",
+                            accept_language=_context_accept_language,
                             sec_fetch_kind="ad_click",
                         )
                         if _pw_res and _pw_res.get("ok") and _pw_res.get("cookies"):
@@ -10601,7 +10610,7 @@ async def run_real_user_traffic_job(
                                 proxy=proxy,
                                 ua=ua,
                                 timeout=12.0,
-                                accept_language=geo.get("accept_language") or "en-US,en;q=0.9",
+                                accept_language=_context_accept_language,
                             )
                             if _companion:
                                 await context.add_cookies(_companion)
@@ -10902,7 +10911,13 @@ async def run_real_user_traffic_job(
                                 entry["city"] = geo.get("city") or entry.get("city", "")
                                 entry["timezone"] = geo.get("timezone") or entry.get("timezone", "")
                                 entry["locale"] = geo.get("locale") or entry.get("locale", "")
-                                _ctx_headers["Accept-Language"] = geo.get("accept_language") or _ctx_headers.get("Accept-Language", "en-US,en;q=0.9")
+                                if not _explicit_ua_locale:
+                                    _context_locale = geo.get("locale") or _context_locale
+                                    _context_accept_language = (
+                                        geo.get("accept_language")
+                                        or _context_accept_language
+                                    )
+                                    _ctx_headers["Accept-Language"] = _context_accept_language
                             if _chain_handle is None:
                                 _effective_proxy = dict(proxy)
                             context = await browser.new_context(
@@ -10916,7 +10931,7 @@ async def run_real_user_traffic_job(
                                 device_scale_factor=fp["device_scale_factor"],
                                 is_mobile=fp["is_mobile"],
                                 has_touch=fp["has_touch"],
-                                locale=geo["locale"],
+                                locale=_context_locale,
                                 timezone_id=geo["timezone"],
                                 geolocation={"latitude": geo["lat"], "longitude": geo["lon"]},
                                 permissions=["geolocation"],

@@ -25,10 +25,16 @@ def test_messenger_inapp_detected_before_facebook():
     assert rp.is_inapp_browser_ua(ua) == "messenger"
 
 
-def test_twitter_ios_inapp_detected():
+def test_twitter_ios_coercion_uses_canonical_marker():
     rp = _rp()
-    ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) TwitterIOS/12345678"
-    assert rp.is_inapp_browser_ua(ua) == "twitter"
+    base = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 "
+        "Mobile/15E148 Safari/604.1"
+    )
+    ua = rp.coerce_ua_for_platform(base, "twitter")
+    assert "Twitter for iPhone/10.98.0" in ua
+    assert "TwitterIOS/" not in ua
 
 
 def test_linkedin_android_inapp_detected():
@@ -93,7 +99,7 @@ def test_brave_build_search_referer():
     assert "affiliate" in ref
 
 
-def test_youtube_ios_coerce_strips_safari():
+def test_youtube_ios_coerce_uses_clean_safari_fallback():
     rp = _rp()
     ua = (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
@@ -101,8 +107,9 @@ def test_youtube_ios_coerce_strips_safari():
         "Mobile/15E148 Safari/604.1"
     )
     out = rp.coerce_ua_for_platform(ua, "youtube")
-    assert "Safari/" not in out
-    assert "com.google.ios.youtube" in out
+    assert "Safari/" in out
+    assert "Version/" in out
+    assert "com.google.ios.youtube" not in out
 
 
 def test_messenger_deep_referer_legacy():

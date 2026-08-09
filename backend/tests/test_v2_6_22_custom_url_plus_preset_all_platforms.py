@@ -19,12 +19,14 @@ the engine produces:
   1. Referer sent to advertiser tracker  = operator's landing URL (unchanged)
   2. Platform tag                        = <platform> (not derived from
                                             landing URL)
-  3. UA coerced with platform-specific   = per-platform marker present
+  3. UA coerced with platform-specific   = canonical per-platform marker,
+     identity                              except Messenger (fallback-only
+                                           generic browser; no fabricated marker)
      in-app marker                         (musical_ly / FBAV / Instagram /
-                                            Snapchat / LinkedInApp / etc.)
+                                            Snapchat / [LinkedInApp] / etc.)
   4. No foreign in-app markers leak      = no cross-platform contamination
-  5. TikTok Android specifically         = Cronet base, no Chrome/Safari
-     leak
+  5. TikTok Android specifically         = browser-page WebView shell,
+                                            never a Cronet/native-network UA
 
 The pure-function pipeline exercised is exactly what real_user_traffic.py
 runs per-visit at run() line 8587 → 8675, minus the Playwright launch:
@@ -36,18 +38,64 @@ runs per-visit at run() line 8587 → 8675, minus the Playwright launch:
 No DB / network / browser required — all pure functions.
 """
 
+import ast
+import random
 import re
 import sys
-import os
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 # Add backend to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from real_user_traffic import _resolve_visit_referer
 from referrer_pro import coerce_ua_for_platform
+
+
+RUT_FILE = Path(__file__).parent.parent / "real_user_traffic.py"
+
+
+def _extract_resolver():
+    """Load only the pure referer resolver graph, without Playwright."""
+    names = {
+        "_UA_REFERER_MAP",
+        "_PLATFORM_REFERER_POOL",
+        "_ESP_HOST_TO_NAME",
+        "_REFERER_HOST_TO_PLATFORM",
+        "_get_referer_from_ua",
+        "_referer_extras_for_traffic_type",
+        "_with_traffic_type_extras",
+        "_resolve_visit_referer",
+        "_esp_from_referer_url",
+        "_platform_from_referer_url",
+    }
+    tree = ast.parse(RUT_FILE.read_text(encoding="utf-8"))
+    nodes = []
+    for node in tree.body:
+        defined = set()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+        if defined & names:
+            nodes.append(node)
+    namespace = {
+        "Any": Any,
+        "Dict": Dict,
+        "Optional": Optional,
+        "Tuple": Tuple,
+        "random": random,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RUT_FILE), "exec"), namespace)
+    return namespace["_resolve_visit_referer"]
+
+
+_resolve_visit_referer = _extract_resolver()
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -68,17 +116,15 @@ BASE_IOS_UA = (
     "(KHTML, like Gecko) Version/26.4 Mobile/15E148 Safari/604.1"
 )
 
-# Per-platform markers we expect after coerce.
-# Keys must match the `_INAPP_CAPABLE_PLATFORMS` names in referrer_pro.py.
+# Canonical markers after coercion, split by platform family.
 PLATFORM_UA_MARKERS = {
-    "facebook":  ["FB_IAB/FB4A", "FBAV/"],
-    "messenger": ["FBAN/", "FBAV/"],
-    "instagram": ["Instagram "],
-    "tiktok":    ["musical_ly", "BytedanceWebview/"],
-    "snapchat":  ["Snapchat/"],
-    "linkedin":  ["LinkedInApp/", "com.linkedin.android/"],  # either iOS or Android form
-    "twitter":   ["TwitterAndroid/", "TwitterIOS/"],          # either form
-    "pinterest": ["Pinterest/"],
+    "facebook":  {"android": ["FB_IAB/FB4A", "FBAV/"], "ios": ["FBAN/FBIOS", "FBAV/"]},
+    "instagram": {"android": ["Instagram "], "ios": ["Instagram "]},
+    "tiktok":    {"android": ["musical_ly_2024508020", "app_version/45.8.2"], "ios": ["musical_ly_", "app_version/"]},
+    "snapchat":  {"android": ["Snapchat/"], "ios": ["Snapchat/"]},
+    "linkedin":  {"android": ["[LinkedInApp]/", "com.linkedin.android/"], "ios": ["[LinkedInApp]/"]},
+    "twitter":   {"android": ["TwitterAndroid/"], "ios": ["Twitter for iPhone/"]},
+    "pinterest": {"android": ["[Pinterest/Android]"], "ios": ["[Pinterest/iOS]"]},
 }
 
 
@@ -147,14 +193,13 @@ def test_custom_url_plus_preset_sets_platform_tag(preset_platform):
 @pytest.mark.parametrize(
     "preset_platform,expected_markers",
     [
-        ("facebook",  PLATFORM_UA_MARKERS["facebook"]),
-        ("messenger", PLATFORM_UA_MARKERS["messenger"]),
-        ("instagram", PLATFORM_UA_MARKERS["instagram"]),
-        ("tiktok",    PLATFORM_UA_MARKERS["tiktok"]),
-        ("snapchat",  PLATFORM_UA_MARKERS["snapchat"]),
-        ("linkedin",  PLATFORM_UA_MARKERS["linkedin"]),
-        ("twitter",   PLATFORM_UA_MARKERS["twitter"]),
-        ("pinterest", PLATFORM_UA_MARKERS["pinterest"]),
+        ("facebook",  PLATFORM_UA_MARKERS["facebook"]["android"]),
+        ("instagram", PLATFORM_UA_MARKERS["instagram"]["android"]),
+        ("tiktok",    PLATFORM_UA_MARKERS["tiktok"]["android"]),
+        ("snapchat",  PLATFORM_UA_MARKERS["snapchat"]["android"]),
+        ("linkedin",  PLATFORM_UA_MARKERS["linkedin"]["android"]),
+        ("twitter",   PLATFORM_UA_MARKERS["twitter"]["android"]),
+        ("pinterest", PLATFORM_UA_MARKERS["pinterest"]["android"]),
     ],
 )
 def test_ua_coerced_carries_platform_marker_android(preset_platform, expected_markers):
@@ -169,14 +214,13 @@ def test_ua_coerced_carries_platform_marker_android(preset_platform, expected_ma
 @pytest.mark.parametrize(
     "preset_platform,expected_markers",
     [
-        ("facebook",  PLATFORM_UA_MARKERS["facebook"]),
-        ("messenger", PLATFORM_UA_MARKERS["messenger"]),
-        ("instagram", PLATFORM_UA_MARKERS["instagram"]),
-        ("tiktok",    PLATFORM_UA_MARKERS["tiktok"]),
-        ("snapchat",  PLATFORM_UA_MARKERS["snapchat"]),
-        ("linkedin",  PLATFORM_UA_MARKERS["linkedin"]),
-        ("twitter",   PLATFORM_UA_MARKERS["twitter"]),
-        ("pinterest", PLATFORM_UA_MARKERS["pinterest"]),
+        ("facebook",  PLATFORM_UA_MARKERS["facebook"]["ios"]),
+        ("instagram", PLATFORM_UA_MARKERS["instagram"]["ios"]),
+        ("tiktok",    PLATFORM_UA_MARKERS["tiktok"]["ios"]),
+        ("snapchat",  PLATFORM_UA_MARKERS["snapchat"]["ios"]),
+        ("linkedin",  PLATFORM_UA_MARKERS["linkedin"]["ios"]),
+        ("twitter",   PLATFORM_UA_MARKERS["twitter"]["ios"]),
+        ("pinterest", PLATFORM_UA_MARKERS["pinterest"]["ios"]),
     ],
 )
 def test_ua_coerced_carries_platform_marker_ios(preset_platform, expected_markers):
@@ -187,6 +231,16 @@ def test_ua_coerced_carries_platform_marker_ios(preset_platform, expected_marker
         f"After iOS coerce for '{preset_platform}', expected one of {expected_markers} in UA. "
         f"Got: {ua_out}"
     )
+
+
+@pytest.mark.parametrize("base_ua", [BASE_ANDROID_UA, BASE_IOS_UA])
+def test_messenger_uses_clean_generic_browser_fallback(base_ua):
+    ua_out = coerce_ua_for_platform(base_ua, "messenger")
+    assert "FB_IAB/" not in ua_out
+    assert "FBAN/" not in ua_out
+    assert "FBAV/" not in ua_out
+    assert "MESSENGER" not in ua_out.upper()
+    assert "Mozilla/5.0" in ua_out
 
 
 # ── Cross-platform contamination checks ────────────────────────────────
@@ -224,17 +278,22 @@ def test_no_foreign_platform_markers_after_coerce(target, foreign_markers):
         )
 
 
-# ── TikTok Android Cronet-leak specific ────────────────────────────────
+# ── TikTok Android browser-page shell contract ────────────────────────
 
-def test_tiktok_android_no_chrome_or_safari_after_coerce():
-    """TikTok Android UA must NEVER carry `Chrome/` or `Mobile Safari/`
-    tokens — advertiser parsers latch on those and mis-label the
-    click as Chrome."""
+def test_tiktok_android_keeps_webview_shell_after_coerce():
+    """Offer-page navigation must remain compatible with Android WebView."""
     ua_out = coerce_ua_for_platform(BASE_ANDROID_UA, "tiktok")
-    assert "Chrome/" not in ua_out, f"Chrome/ leaked in TikTok Android UA: {ua_out}"
-    assert "Mobile Safari" not in ua_out, f"Mobile Safari leaked in TikTok Android UA: {ua_out}"
-    assert "Cronet/" in ua_out, f"Cronet/ missing after rebuild: {ua_out}"
-    assert "musical_ly" in ua_out, f"musical_ly missing after coerce: {ua_out}"
+    assert "; wv)" in ua_out
+    assert "Version/4.0" in ua_out
+    assert "Chrome/" in ua_out
+    assert "Mobile Safari/537.36" in ua_out
+    assert "Cronet/" not in ua_out
+    assert "musical_ly_2024508020" in ua_out
+    assert "app_version/45.8.2" in ua_out
+    assert "com.zhiliaoapp.musically/2024508020" in ua_out
+    assert "FBAN/TikTokAndroid" not in ua_out
+    assert "BytedanceWebview/" not in ua_out
+    assert "ttwebview/" not in ua_out
 
 
 def test_tiktok_ios_no_trailing_safari_after_coerce():
@@ -311,14 +370,14 @@ def test_full_pipeline_referer_and_ua_consistent(preset_platform):
     assert plat == preset_platform
 
     ua_final = coerce_ua_for_platform(BASE_ANDROID_UA, plat)
-    expected = PLATFORM_UA_MARKERS[preset_platform]
+    expected = PLATFORM_UA_MARKERS[preset_platform]["android"]
     assert _has_any_marker(ua_final, expected), (
         f"[{preset_platform}] UA missing expected marker(s) {expected}. UA: {ua_final}"
     )
-    # TikTok specifically: guarantee no Chrome leak
+    # TikTok specifically: guarantee the browser-page WebView runtime.
     if preset_platform == "tiktok":
-        assert "Chrome/" not in ua_final
-        assert "Cronet/" in ua_final
+        assert "Chrome/" in ua_final
+        assert "Cronet/" not in ua_final
 
 
 # ── Mix-mode (pro-mode) sanity: platform pool picks only from listed set

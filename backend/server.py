@@ -63,8 +63,11 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from ua_profile_contract import (
-    APP_VERSION_POOLS,
+    ANDROID_DEVICE_SNAPSHOTS,
+    APP_RELEASES_BY_PLATFORM,
+    APP_SUPPORT_MATRIX,
     detect_app as detect_profile_app,
+    replace_verified_app_releases,
     validate_user_agent,
 )
 
@@ -2052,6 +2055,7 @@ DEFAULT_FEATURES = {
     "import_traffic": True,
     "real_traffic": True,
     "ua_generator": True,
+    "ua_checker": True,
     "email_checker": True,
     "phone_checker": True,
     "separate_data": True,
@@ -2089,6 +2093,7 @@ SUB_USER_PERMISSION_MAP = {
     "import_traffic":       "import_traffic",
     "real_traffic":         "real_traffic",
     "ua_generator":         "ua_generator",
+    "ua_checker":           "ua_checker",
     "email_checker":        "email_checker",
     "phone_checker":        "phone_checker",
     "separate_data":        "separate_data",
@@ -2298,6 +2303,7 @@ class UserFeatures(BaseModel):
     import_traffic: bool = False
     real_traffic: bool = False
     ua_generator: bool = False
+    ua_checker: bool = False
     email_checker: bool = False
     phone_checker: bool = False
     separate_data: bool = False
@@ -4270,9 +4276,13 @@ def check_user_feature(user: dict, feature: str):
                 pass
             return True
     # Backward compat: new granular features (email_checker, separate_data, import_traffic,
-    # real_traffic, ua_generator) fall back to the legacy "import_data" flag when not set
+    # real_traffic, ua_generator, ua_checker) fall back to the legacy
+    # "import_data" flag when not set
     # explicitly. That way users created before these features existed keep access.
-    LEGACY_IMPORT_GROUP = {"email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator"}
+    LEGACY_IMPORT_GROUP = {
+        "email_checker", "phone_checker", "separate_data", "import_traffic",
+        "real_traffic", "ua_generator", "ua_checker",
+    }
     if feature not in features and feature in LEGACY_IMPORT_GROUP:
         if features.get("import_data", False):
             return True
@@ -7336,6 +7346,7 @@ async def admin_get_ua_versions(admin: dict = Depends(get_current_admin)):
         "ios_os_versions": [v.replace("_", ".") for v in _IOS_OS_VERSIONS],
         "android_os_versions": [v["version"] for v in _ANDROID_OS_VERSIONS],
         "chrome_versions": list(_CHROME_VERSIONS),
+        "android_webview_versions": list(_ANDROID_WEBVIEW_VERSIONS),
         "firefox_versions": list(_FIREFOX_VERSIONS),
         "meta": _UA_VERSIONS_META,
     }
@@ -13312,26 +13323,10 @@ class UAGenerateRequest(BaseModel):
     count: int = 10                  # up to 50,000
     format: Optional[str] = "json"   # "json" or "xlsx"
 
-# Realistic Android device pool — each entry has everything Instagram/FB templates need.
-_ANDROID_DEVICES = [
-    {"brand":"Motorola","model":"moto g 5G - 2024","vendor":"motorola","chipset":"qcom","soc":"fogo","res":"720x1612","dpi":"306dpi","and_ver":"14","sdk":"34","build":"U1UFNS34.41-98-10-5-4"},
-    {"brand":"Motorola","model":"moto g power (2024)","vendor":"motorola","chipset":"mt6789","soc":"penang","res":"1080x2400","dpi":"420dpi","and_ver":"14","sdk":"34","build":"U1UHNS34.41-13-8-4"},
-    {"brand":"Samsung","model":"SM-S918B","vendor":"samsung","chipset":"qcom","soc":"kalama","res":"1080x2340","dpi":"420dpi","and_ver":"14","sdk":"34","build":"UP1A.231005.007"},
-    {"brand":"Samsung","model":"SM-S928B","vendor":"samsung","chipset":"qcom","soc":"pineapple","res":"1440x3120","dpi":"505dpi","and_ver":"14","sdk":"34","build":"UP1A.231005.007"},
-    {"brand":"Samsung","model":"SM-A546B","vendor":"samsung","chipset":"mt6833","soc":"a54x","res":"1080x2340","dpi":"420dpi","and_ver":"13","sdk":"33","build":"TP1A.220624.014"},
-    {"brand":"Samsung","model":"SM-G991B","vendor":"samsung","chipset":"qcom","soc":"exynos2100","res":"1080x2400","dpi":"420dpi","and_ver":"13","sdk":"33","build":"TP1A.220624.014"},
-    {"brand":"Google","model":"Pixel 8 Pro","vendor":"google","chipset":"tensor","soc":"husky","res":"1344x2992","dpi":"490dpi","and_ver":"14","sdk":"34","build":"UP1A.231105.003"},
-    {"brand":"Google","model":"Pixel 8","vendor":"google","chipset":"tensor","soc":"shiba","res":"1080x2400","dpi":"420dpi","and_ver":"14","sdk":"34","build":"UP1A.231105.003"},
-    {"brand":"Google","model":"Pixel 7","vendor":"google","chipset":"tensor","soc":"panther","res":"1080x2400","dpi":"420dpi","and_ver":"14","sdk":"34","build":"UP1A.231105.003"},
-    {"brand":"OnePlus","model":"CPH2449","vendor":"OnePlus","chipset":"qcom","soc":"waffle","res":"1240x2772","dpi":"450dpi","and_ver":"14","sdk":"34","build":"UKQ1.230924.001"},
-    {"brand":"OnePlus","model":"CPH2581","vendor":"OnePlus","chipset":"qcom","soc":"corvette","res":"1080x2412","dpi":"405dpi","and_ver":"14","sdk":"34","build":"UKQ1.230924.001"},
-    {"brand":"Xiaomi","model":"23049PCD8G","vendor":"Xiaomi","chipset":"qcom","soc":"renoir","res":"1080x2400","dpi":"440dpi","and_ver":"13","sdk":"33","build":"TKQ1.221114.001"},
-    {"brand":"Xiaomi","model":"2311DRK48G","vendor":"Xiaomi","chipset":"qcom","soc":"pineapple","res":"1440x3200","dpi":"522dpi","and_ver":"14","sdk":"34","build":"UKQ1.230917.001"},
-    {"brand":"Realme","model":"RMX3834","vendor":"realme","chipset":"qcom","soc":"giza","res":"1080x2400","dpi":"480dpi","and_ver":"14","sdk":"34","build":"SP2A.220405.004"},
-    {"brand":"Realme","model":"RMX3710","vendor":"realme","chipset":"mt6877v","soc":"pike","res":"1080x2412","dpi":"400dpi","and_ver":"13","sdk":"33","build":"SP1A.210812.016"},
-    {"brand":"Oppo","model":"CPH2423","vendor":"OPPO","chipset":"mt6983","soc":"redwood","res":"1240x2772","dpi":"450dpi","and_ver":"13","sdk":"33","build":"SP1A.210812.016"},
-    {"brand":"Vivo","model":"V2312A","vendor":"vivo","chipset":"mt6896","soc":"pyrite","res":"1260x2800","dpi":"453dpi","and_ver":"14","sdk":"34","build":"UP1A.231005.007"},
-]
+# Capture-backed Android device/firmware snapshots shared with the validator.
+# Rows with unknown hardware fields remain selectable for templates that do
+# not encode those fields; missing values are never guessed.
+_ANDROID_DEVICES = [dict(snapshot) for snapshot in ANDROID_DEVICE_SNAPSHOTS]
 
 # Curated iOS device/OS compatibility snapshot.  Values are candidates,
 # not a claim that every device is currently running the newest release.
@@ -13367,9 +13362,36 @@ _IOS_DEVICES = [
 # Backwards-compat alias — some older code paths reference this name.
 _IOS_DEVICES_MODERN = [d for d in _IOS_DEVICES if d["brand"] == "iPhone"]
 
-# Mutable runtime copy of the shared cold-start pools.  Refresh tasks update
-# this copy only; the shared contract remains deterministic for validation.
-_APP_VERSIONS = {key: list(values) for key, values in APP_VERSION_POOLS.items()}
+# Mutable runtime copy of platform-specific release records. iTunes refreshes
+# update only the iOS side. Android metadata (including mapped build fields)
+# must never be replaced by an iOS release.
+_APP_RELEASES_RUNTIME = {
+    app_key: {
+        platform_key: [dict(record) for record in records]
+        for platform_key, records in platform_records.items()
+    }
+    for app_key, platform_records in APP_RELEASES_BY_PLATFORM.items()
+}
+# Contract follow-up: 332.x is an iOS GSA record. Keep this endpoint's Android
+# release locally coherent until the shared contract can be corrected.
+_APP_RELEASES_RUNTIME["gsearch"]["android"] = [{"version": "17.36.15"}]
+
+
+def _legacy_app_versions() -> Dict[str, List[str]]:
+    """Flatten runtime platform pools for the backwards-compatible field."""
+    flattened: Dict[str, List[str]] = {}
+    for app_key, platform_records in _APP_RELEASES_RUNTIME.items():
+        values: List[str] = []
+        for platform_key in ("android", "ios"):
+            for record in platform_records.get(platform_key, []):
+                version = record["version"]
+                if version not in values:
+                    values.append(version)
+        flattened[app_key] = values
+    return flattened
+
+
+_APP_VERSIONS = _legacy_app_versions()
 
 # iTunes app-store IDs for pulling the *current* live version of each app.
 # iTunes Lookup API is free, unauthenticated, and extremely stable.
@@ -13484,9 +13506,7 @@ _MOBILE_RESOLUTIONS = [
     "1440x3088", "1440x3120", "1440x3200",
 ]
 
-# Supported OS-version snapshot for user selection. Runtime refreshes record
-# their source in `_UA_VERSIONS_META`; cold-start values do not claim to be
-# live/latest.
+# Supported OS versions are derived from selectable immutable snapshots.
 #
 # WHY iOS 26 IS CORRECT IN 2026:
 #   At WWDC 2025 Apple announced year-aligned OS versioning — the version
@@ -13498,16 +13518,15 @@ _IOS_OS_VERSIONS = [
     "26_4_1", "26_4", "26_3_1", "26_3", "26_2_1", "26_2", "26_1",
 ]
 
-# Android versions + their SDK/API levels (used in Instagram UA `sdk/ver`).
-# Android 16 (SDK 36) is the current stable (Android 16 QPR1 released Sep 2025).
 _ANDROID_OS_VERSIONS = [
-    {"version": "16", "sdk": "36"},
-    {"version": "15", "sdk": "35"},
-    {"version": "14", "sdk": "34"},
-    {"version": "13", "sdk": "33"},
-    {"version": "12", "sdk": "31"},
-    {"version": "11", "sdk": "30"},
-    {"version": "10", "sdk": "29"},
+    {"version": version, "sdk": next(
+        device["sdk"] for device in _ANDROID_DEVICES if device["and_ver"] == version
+    )}
+    for version in sorted(
+        {device["and_ver"] for device in _ANDROID_DEVICES},
+        key=int,
+        reverse=True,
+    )
 ]
 
 def _normalize_ios_version(v: str) -> str:
@@ -13515,10 +13534,7 @@ def _normalize_ios_version(v: str) -> str:
     return (v or "").replace(".", "_").strip()
 
 def _apply_os_version_override(device: dict, platform: str, os_version: Optional[str]) -> dict:
-    """
-    Return a shallow copy of `device` with iOS or Android version overridden
-    if the caller asked for a specific OS version.
-    """
+    """Apply iOS-only display overrides; Android records are immutable."""
     if not os_version:
         return device
     d = dict(device)
@@ -13526,14 +13542,7 @@ def _apply_os_version_override(device: dict, platform: str, os_version: Optional
         norm = _normalize_ios_version(os_version)
         d["ios"] = norm
     elif platform == "android" or "and_ver" in d:
-        # Match to our SDK table
-        ver = os_version.strip()
-        match = next((x for x in _ANDROID_OS_VERSIONS if x["version"] == ver), None)
-        if match:
-            d["and_ver"] = match["version"]
-            d["sdk"] = match["sdk"]
-        else:
-            d["and_ver"] = ver  # allow arbitrary, keep device's sdk
+        return device
     return d
 
 
@@ -13626,6 +13635,28 @@ async def _fetch_latest_chrome_versions(limit: int = 7) -> List[str]:
         return []
 
 
+async def _fetch_latest_webview_versions(limit: int = 7) -> List[str]:
+    """Fetch Android System WebView stable versions, never desktop patches."""
+    try:
+        async with httpx.AsyncClient(timeout=_UA_REFRESH_TIMEOUT) as cli:
+            r = await cli.get(
+                "https://versionhistory.googleapis.com/v1/chrome/platforms/webview/channels/stable/versions"
+            )
+            if r.status_code != 200:
+                return []
+            seen, out = set(), []
+            for item in r.json().get("versions", []):
+                version = (item.get("version") or "").strip()
+                if version and version not in seen:
+                    seen.add(version)
+                    out.append(version)
+                if len(out) >= limit:
+                    break
+            return out
+    except Exception:
+        return []
+
+
 async def _fetch_latest_firefox_versions(limit: int = 7) -> List[str]:
     """Fetch latest Firefox stable + older stable versions from Mozilla."""
     try:
@@ -13637,15 +13668,7 @@ async def _fetch_latest_firefox_versions(limit: int = 7) -> List[str]:
             latest = (data.get("LATEST_FIREFOX_VERSION") or "").strip()
             devedition = (data.get("FIREFOX_DEVEDITION") or "").strip()
             esr = (data.get("FIREFOX_ESR") or "").strip()
-            # Build realistic list with recent minor releases
             candidates = [latest]
-            # Add implicit previous versions by decrementing major
-            try:
-                major = int(latest.split(".")[0])
-                for i in range(1, 7):
-                    candidates.append(f"{major - i}.0")
-            except Exception:
-                pass
             if devedition and devedition not in candidates:
                 candidates.append(devedition)
             if esr and esr not in candidates:
@@ -13665,24 +13688,17 @@ async def _fetch_latest_firefox_versions(limit: int = 7) -> List[str]:
 
 
 async def _fetch_latest_android_versions() -> List[dict]:
-    """
-    Android releases are stable (one major/year) and Google doesn't expose a
-    live version API. We derive the latest list from the current Chrome major
-    version as a ceiling — Chrome on Android is always in lock-step with
-    AOSP, and we bump the Android major yearly to match real-world rollout.
-    Returns list of {"version": "16", "sdk": "36"} dicts.
-    """
-    # Updated ceiling. Android 16 (SDK 36) is the current stable build
-    # (released via Android 16 QPR1 in September 2025). This list is the
-    # "supported in the field" set — bumping a new entry as each major ships.
+    """Derive selectable releases only from capture-backed device profiles."""
     return [
-        {"version": "16", "sdk": "36"},
-        {"version": "15", "sdk": "35"},
-        {"version": "14", "sdk": "34"},
-        {"version": "13", "sdk": "33"},
-        {"version": "12", "sdk": "31"},
-        {"version": "11", "sdk": "30"},
-        {"version": "10", "sdk": "29"},
+        {"version": version, "sdk": next(
+            device["sdk"] for device in _ANDROID_DEVICES
+            if device["and_ver"] == version
+        )}
+        for version in sorted(
+            {device["and_ver"] for device in _ANDROID_DEVICES},
+            key=int,
+            reverse=True,
+        )
     ]
 
 
@@ -13706,10 +13722,22 @@ async def refresh_ua_versions() -> dict:
             if not latest:
                 failures.append(app_key)
                 continue
-            old_head = _APP_VERSIONS.get(app_key, [None])[0]
-            _APP_VERSIONS[app_key] = _prepend_and_trim(
-                list(_APP_VERSIONS.get(app_key, [])), latest, max_len=7,
+            ios_records = _APP_RELEASES_RUNTIME.get(app_key, {}).get("ios", [])
+            old_head = ios_records[0]["version"] if ios_records else None
+            ios_versions = _prepend_and_trim(
+                [record["version"] for record in ios_records], latest, max_len=7,
             )
+            trusted_records = [
+                {"version": version} for version in ios_versions
+            ]
+            # No await occurs between these assignments: generation and the
+            # shared validator switch to the same trusted iTunes set together.
+            replace_verified_app_releases(app_key, "ios", trusted_records)
+            _APP_RELEASES_RUNTIME[app_key]["ios"] = (
+                APP_RELEASES_BY_PLATFORM[app_key]["ios"]
+            )
+            _APP_VERSIONS.clear()
+            _APP_VERSIONS.update(_legacy_app_versions())
             sources[app_key] = "iTunes Lookup"
             if latest != old_head:
                 updated.append(f"{app_key}:{latest}")
@@ -13749,7 +13777,26 @@ async def refresh_ua_versions() -> dict:
         logger.warning(f"refresh_ua_versions[chrome] failed: {e}")
         failures.append("chrome")
 
-    # ─── 4. Firefox desktop versions (Mozilla product-details) ───────
+    # ─── 4. Android System WebView versions (Google Version History) ─
+    try:
+        latest_webview = await _fetch_latest_webview_versions(limit=7)
+        if latest_webview:
+            old_head = (
+                _ANDROID_WEBVIEW_VERSIONS[0]
+                if _ANDROID_WEBVIEW_VERSIONS else None
+            )
+            _ANDROID_WEBVIEW_VERSIONS.clear()
+            _ANDROID_WEBVIEW_VERSIONS.extend(latest_webview)
+            sources["android_webview"] = "Google Version History (WebView)"
+            if latest_webview[0] != old_head:
+                updated.append(f"android_webview:{latest_webview[0]}")
+        else:
+            failures.append("android_webview")
+    except Exception as e:
+        logger.warning(f"refresh_ua_versions[android_webview] failed: {e}")
+        failures.append("android_webview")
+
+    # ─── 5. Firefox desktop versions (Mozilla product-details) ───────
     try:
         latest_ff = await _fetch_latest_firefox_versions(limit=7)
         if latest_ff:
@@ -13765,21 +13812,21 @@ async def refresh_ua_versions() -> dict:
         logger.warning(f"refresh_ua_versions[firefox] failed: {e}")
         failures.append("firefox")
 
-    # ─── 5. Android OS versions (curated ceiling) ────────────────────
+    # ─── 6. Android OS versions (device snapshots) ───────────────────
     try:
         latest_android = await _fetch_latest_android_versions()
         if latest_android:
             old_head = _ANDROID_OS_VERSIONS[0]["version"] if _ANDROID_OS_VERSIONS else None
             _ANDROID_OS_VERSIONS.clear()
             _ANDROID_OS_VERSIONS.extend(latest_android)
-            sources["android_os"] = "Curated (AOSP ceiling)"
+            sources["android_os"] = "Capture-backed device snapshots"
             if latest_android[0]["version"] != old_head:
                 updated.append(f"android_os:{latest_android[0]['version']}")
     except Exception as e:
         logger.warning(f"refresh_ua_versions[android_os] failed: {e}")
         failures.append("android_os")
 
-    # ─── 6. Update metadata ──────────────────────────────────────────
+    # ─── 7. Update metadata ──────────────────────────────────────────
     _UA_VERSIONS_META["last_refreshed_at"] = datetime.now(timezone.utc).isoformat()
     _UA_VERSIONS_META["last_refresh_ok"] = len(failures) == 0
     _UA_VERSIONS_META["last_refresh_note"] = (
@@ -13789,16 +13836,18 @@ async def refresh_ua_versions() -> dict:
     )
     _UA_VERSIONS_META["sources"].update(sources)
 
-    # ─── 7. Persist snapshot so it survives restarts ─────────────────
+    # ─── 8. Persist snapshot so it survives restarts ─────────────────
     try:
         await main_db.settings.update_one(
             {"key": "ua_versions_snapshot"},
             {"$set": {
                 "key": "ua_versions_snapshot",
                 "app_versions": _APP_VERSIONS,
+                "app_versions_by_platform": _APP_RELEASES_RUNTIME,
                 "ios_os_versions": list(_IOS_OS_VERSIONS),
                 "android_os_versions": list(_ANDROID_OS_VERSIONS),
                 "chrome_versions": list(_CHROME_VERSIONS),
+                "android_webview_versions": list(_ANDROID_WEBVIEW_VERSIONS),
                 "firefox_versions": list(_FIREFOX_VERSIONS),
                 "meta": _UA_VERSIONS_META,
             }},
@@ -13817,22 +13866,44 @@ async def _load_ua_versions_snapshot():
         doc = await main_db.settings.find_one({"key": "ua_versions_snapshot"}, {"_id": 0})
         if not doc:
             return
-        stored = doc.get("app_versions") or {}
-        for k, v in stored.items():
-            if isinstance(v, list) and v:
-                _APP_VERSIONS[k] = v[:7]
+        stored_by_platform = doc.get("app_versions_by_platform") or {}
+        for app_key, platform_records in stored_by_platform.items():
+            ios_records = platform_records.get("ios") if isinstance(platform_records, dict) else None
+            if app_key in _APP_RELEASES_RUNTIME and isinstance(ios_records, list) and ios_records:
+                verified_versions = {
+                    record["version"]
+                    for record in APP_RELEASES_BY_PLATFORM[app_key]["ios"]
+                }
+                _APP_RELEASES_RUNTIME[app_key]["ios"] = [
+                    {"version": str(record["version"])}
+                    for record in ios_records[:7]
+                    if (
+                        isinstance(record, dict)
+                        and record.get("version")
+                        and str(record["version"]) in verified_versions
+                    )
+                ]
+                if not _APP_RELEASES_RUNTIME[app_key]["ios"]:
+                    _APP_RELEASES_RUNTIME[app_key]["ios"] = [
+                        dict(record)
+                        for record in APP_RELEASES_BY_PLATFORM[app_key]["ios"]
+                    ]
+        # The flattened legacy `app_versions` field mixes Android and iOS.
+        # It is display metadata only and is never loaded into either contract.
+        _APP_VERSIONS.clear()
+        _APP_VERSIONS.update(_legacy_app_versions())
         ios_stored = doc.get("ios_os_versions") or []
         if isinstance(ios_stored, list) and ios_stored:
             _IOS_OS_VERSIONS.clear()
             _IOS_OS_VERSIONS.extend(ios_stored[:7])
-        android_stored = doc.get("android_os_versions") or []
-        if isinstance(android_stored, list) and android_stored:
-            _ANDROID_OS_VERSIONS.clear()
-            _ANDROID_OS_VERSIONS.extend(android_stored[:7])
         chrome_stored = doc.get("chrome_versions") or []
         if isinstance(chrome_stored, list) and chrome_stored:
             _CHROME_VERSIONS.clear()
             _CHROME_VERSIONS.extend(chrome_stored[:7])
+        webview_stored = doc.get("android_webview_versions") or []
+        if isinstance(webview_stored, list) and webview_stored:
+            _ANDROID_WEBVIEW_VERSIONS.clear()
+            _ANDROID_WEBVIEW_VERSIONS.extend(webview_stored[:7])
         firefox_stored = doc.get("firefox_versions") or []
         if isinstance(firefox_stored, list) and firefox_stored:
             _FIREFOX_VERSIONS.clear()
@@ -13861,11 +13932,18 @@ async def _auto_refresh_ua_versions_task():
 
 # Modern iOS-only device pool alias — kept for references elsewhere. Now just
 # the iPhone subset of the main iOS pool (which is fully modernised).
-# (See `_IOS_DEVICES` above — every entry runs iOS 18.x in 2026 anyway.)
+# (See `_IOS_DEVICES` above.)
 
 # Browser-version cold-start snapshots. Runtime refreshes can replace these
 # from the recorded upstream source; hardcoded values are not labelled live.
-_CHROME_VERSIONS = ["149.0.7827.114", "149.0.7827.104", "148.0.7752.93", "148.0.7752.80", "147.0.7727.102", "146.0.7680.177", "145.0.7600.130"]
+_CHROME_VERSIONS = [
+    "151.0.7922.109", "151.0.7922.108", "151.0.7922.77",
+    "151.0.7922.76", "151.0.7922.75",
+]
+_ANDROID_WEBVIEW_VERSIONS = [
+    "151.0.7922.83", "151.0.7922.71", "151.0.7922.47",
+    "151.0.7922.29", "150.0.7871.183",
+]
 # Firefox — June 2026 stable around 140-141, ESR 128.x for slow tail.
 _FIREFOX_VERSIONS = ["141.0.2", "141.0", "140.0.4", "140.0.1", "139.0.4", "139.0", "128.12.0esr"]
 
@@ -13878,10 +13956,6 @@ _DESKTOP_DEVICES = [
     {"brand":"Linux","model":"x64","name":"Linux PC","os":"X11; Linux x86_64"},
     {"brand":"Linux","model":"Ubuntu","name":"Ubuntu PC","os":"X11; Ubuntu; Linux x86_64"},
 ]
-
-def _rand_build_id() -> int:
-    return random.randint(100_000_000, 999_999_999)
-
 
 def _ua_android_webview(d: dict, chrome_ver: str, app_marker: str) -> str:
     """Build an offer-page Android WebView UA with an app identity marker."""
@@ -13902,13 +13976,18 @@ def _ua_ios_wkwebview(d: dict, app_marker: str) -> str:
 
 
 def _ua_instagram_android(d: dict, app_ver: str, chrome_ver: str, region: Optional[dict] = None, resolution: Optional[str] = None) -> str:
+    release = next(
+        record for record in _APP_RELEASES_RUNTIME["instagram"]["android"]
+        if record["version"] == app_ver
+    )
     locale = (region or {}).get("posix_locale", "en_US")
     res = resolution or d["res"]
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
         f"Instagram {app_ver} Android ({d['sdk']}/{d['and_ver']}; {d['dpi']}; {res}; "
-        f"{d['vendor']}; {d['model']}; {d['soc']}; {d['chipset']}; {locale}; {_rand_build_id()}; IABMV/1)"
+        f"{d['vendor']}; {d['model']}; {d['soc']}; {d['chipset']}; {locale}; "
+        f"{release['version_code']}; IABMV/1)"
     )
 
 def _ua_instagram_ios(d: dict, app_ver: str, region: Optional[dict] = None, resolution: Optional[str] = None) -> str:
@@ -13918,79 +13997,29 @@ def _ua_instagram_ios(d: dict, app_ver: str, region: Optional[dict] = None, reso
     return (
         f"Mozilla/5.0 ({d['brand']}; CPU {'iPhone' if d['brand']=='iPhone' else 'iPad'} OS {d['ios']} like Mac OS X) "
         f"AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram {app_ver} "
-        f"({d['model']}; iOS {d['ios']}; {posix}; {lang}; scale={d['scale']}; {res}; {_rand_build_id()})"
+        f"({d['model']}; iOS {d['ios']}; {posix}; {lang}; scale={d['scale']}; {res})"
     )
 
-def _fbav_3part(app_ver: str) -> str:
-    """Return the first three dot-separated groups of a Facebook / IG /
-    other in-app version string, in canonical `X.Y.Z` form.
-
-    v2.6.27 — customer's tracker report (clicks (4).csv follow-up)
-    showed `Facebook for iOS (Unknown)` + `Facebook for Android (Unknown)`
-    on 100% of FB clicks even though the browser was correctly detected.
-    Root cause: many advertiser UA parsers (Everflow, Voluum, RedTrack)
-    use a version-extraction regex that expects EXACTLY `X.Y.Z` after
-    `FBAV/`. Our upstream `_APP_VERSIONS['facebook']` pool mixes 2-part
-    (`557.0`) and 5-part (`550.0.0.45.102`) shapes — neither matches
-    that regex → parser returns `Unknown`.
-
-    Examples::
-        _fbav_3part("557.0")            -> "557.0.0"
-        _fbav_3part("550.0.0.45.102")   -> "550.0.0"
-        _fbav_3part("461.0.0")          -> "461.0.0"
-        _fbav_3part("")                 -> "0.0.0"
-    """
-    try:
-        parts = [p for p in str(app_ver or "").split(".") if p.isdigit()]
-    except Exception:
-        parts = []
-    parts = (parts + ["0", "0", "0"])[:3]
-    return ".".join(parts)
-
-
 def _ua_facebook_android(d: dict, app_ver: str, chrome_ver: str, region: Optional[dict] = None) -> str:
-    # 2026-06: Full FB4A marker block — real captures from FB 553+ include
-    # FBBV (build version), IABMV (in-app webview version), FBOP (Facebook
-    # OP code). Anura/IPQS/Forensiq's "synthetic FB UA" detector keys on
-    # the ABSENCE of these three. Sample real UA:
-    #   ...Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/556.0.0.59.68;
-    #   IABMV/1;FBBV/681204512;FBOP/19;]
-    # v2.6.27: Added FBAN/FB4A slug alongside FB_IAB/FB4A — real modern
-    # (2024+) captures include BOTH. Advertiser UA parsers (Everflow /
-    # Voluum / RedTrack) key on FBAN for the "Facebook" family match
-    # and FBAV for the version. Normalising FBAV via _fbav_3part
-    # (see comment there) fixes the "(Unknown)" version issue reported
-    # by the customer.
-    fbbv = random.randint(620_000_000, 700_000_000)
-    fbop = random.choice([1, 5, 19, 25])  # Real FBOP distribution
-    fbav = _fbav_3part(app_ver)
+    release = next(
+        record for record in _APP_RELEASES_RUNTIME["facebook"]["android"]
+        if record["version"] == app_ver
+    )
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
-        f"[FB_IAB/FB4A;FBAN/FB4A;FBAV/{fbav};IABMV/1;FBBV/{fbbv};FBOP/{fbop};]"
+        f"[FB_IAB/FB4A;FBAV/{app_ver};IABMV/1;FBBV/{release['build']};]"
     )
 
 def _ua_facebook_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    # 2026-06 BUGFIX: previously this generator OMITTED the FBAV/<version>
-    # marker entirely. Real Facebook iOS UAs always carry the app version
-    # via FBAV — its absence is THE single biggest "synthetic UA" signal
-    # for affiliate fraud scanners (Anura / IPQS / Forensiq). Without it,
-    # the user_agents library still recognised browser.family="Facebook"
-    # but reported version="" → advertiser dashboards rendered as
-    # "Facebook for iOS (Unknown)" (exactly the customer screenshot).
-    # We now place FBAV right after FBAN/FBIOS to match the real-capture
-    # ordering documented in build_inapp_ua_suffix.
-    # v2.6.27: Normalised FBAV to 3-part `X.Y.Z` via _fbav_3part — the
-    # customer's follow-up screenshots showed FB iOS ALSO reporting
-    # `Facebook for iOS (Unknown)` because our upstream _APP_VERSIONS
-    # pool emits mixed 2-part / 5-part shapes that Everflow can't parse.
-    fbbv = random.randint(500_000_000, 999_999_999)
     fblc = (region or {}).get("posix_locale", "en_US")
-    fbav = _fbav_3part(app_ver)
+    is_ipad = d["brand"] == "iPad"
+    family = "iPad" if is_ipad else "iPhone"
     return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/{fbav};FBBV/{fbbv};FBDV/{d['model']};FBMD/iPhone;FBSN/iOS;"
-        f"FBSV/{d['ios'].replace('_','.')};FBSS/{int(float(d['scale']))};FBID/phone;FBLC/{fblc};FBOP/5;FBRV/{fbbv};IABMV/1]"
+        f"Mozilla/5.0 ({d['brand']}; CPU {family} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"(KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/{app_ver};FBDV/{d['model']};"
+        f"FBMD/{family};FBSN/iOS;FBSV/{d['ios'].replace('_','.')};"
+        f"FBSS/{int(float(d['scale']))};FBID/{'tablet' if is_ipad else 'phone'};FBLC/{fblc};IABMV/1]"
     )
 
 def _ua_pinterest_android(d: dict, app_ver: str) -> str:
@@ -14000,11 +14029,11 @@ def _ua_pinterest_android(d: dict, app_ver: str) -> str:
              (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.63 Mobile Safari/537.36
              [Pinterest/Android]
     """
-    chrome_ver = random.choice(_CHROME_VERSIONS)
+    chrome_ver = random.choice(_ANDROID_WEBVIEW_VERSIONS)
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
-        f"[Pinterest/Android] Pinterest/{app_ver}"
+        "[Pinterest/Android]"
     )
 
 def _ua_pinterest_ios(d: dict, app_ver: str) -> str:
@@ -14014,15 +14043,15 @@ def _ua_pinterest_ios(d: dict, app_ver: str) -> str:
              (KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS] Pinterest/11.37.0
     """
     return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS] Pinterest/{app_ver}"
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS]"
     )
 
 def _ua_snapchat_android(d: dict, app_ver: str) -> str:
     """
     In-app webview format (same shape as Instagram/Facebook).
     """
-    chrome_ver = random.choice(_CHROME_VERSIONS)
+    chrome_ver = random.choice(_ANDROID_WEBVIEW_VERSIONS)
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
@@ -14034,42 +14063,23 @@ def _ua_snapchat_ios(d: dict, app_ver: str) -> str:
     In-app webview format for iOS Snapchat.
     """
     return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
         f"(KHTML, like Gecko) Mobile/15E148 Snapchat/{app_ver} ({d['model']}; iOS {d['ios'].replace('_','.')}; gzip)"
     )
 
 def _ua_tiktok_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """
-    Real TikTok iOS in-app UA format (`musical_ly_` only).
-
-    v2.1.28: Added the missing tail tokens that the real TikTok iOS app
-    sends in 2025-2026 builds. Pre-2.1.28 our UA was an early-2024 shape
-    which TikTok's bot-detector now flags as "outdated client" and
-    silently drops impressions. New tail:
-      AppId/1233 RevealType/Dialog isDarkMode/<0|1> WKWebView/1
-      BytedanceWebview/0.0.<rev> PIA/2.1.0
-
-    Captured from the actual TikTok-iOS-app HTTP traffic (charles-proxy
-    samples on v34.5+ builds). `AppId/1233` is TikTok's iTunes App ID
-    and is identical on every device — NOT a randomised field.
-    """
+    """TikTok iOS WKWebView marker without unverified internal revisions."""
     r = region or _pick_region(None)
-    byte_locale = r["byte_locale"]
+    byte_locale = r["posix_locale"].split("_", 1)[0]
+    full_locale = r["posix_locale"]
     region_code = r["code"]
-    # Real-world NetType distribution: WIFI ~70%, 4G ~25%, 5G ~5%
     net_type = random.choices(["WIFI", "4G", "5G"], weights=[70, 25, 5], k=1)[0]
-    # 2025-2026 distribution: ~60% light mode, ~40% dark mode
-    is_dark_mode = random.choices([0, 1], weights=[60, 40], k=1)[0]
-    # Bytedance internal webview revision — 3-digit patch number
-    bdwv_rev = random.randint(95, 145)
-    # Channel is always "App Store" on iOS (TikTok isn't side-loaded).
     return (
-        f"Mozilla/5.0 (iPhone; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 musical_ly_{app_ver} JsSdk/2.0 "
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"(KHTML, like Gecko) Mobile/15E148 musical_ly_{app_ver} app_version/{app_ver} JsSdk/2.0 "
         f"NetType/{net_type} Channel/App Store "
-        f"ByteLocale/{byte_locale} Region/{region_code} "
-        f"AppId/1233 RevealType/Dialog isDarkMode/{is_dark_mode} "
-        f"WKWebView/1 BytedanceWebview/0.0.{bdwv_rev} PIA/2.1.0"
+        f"ByteLocale/{byte_locale} ByteFullLocale/{full_locale} Region/{region_code} "
+        "AppId/1233 WKWebView/1"
     )
 
 
@@ -14080,94 +14090,97 @@ def _ua_tiktok_android(d: dict, app_ver: str, region: Optional[dict] = None) -> 
     by Playwright for browser-page navigation.  The generated identity must
     therefore be Android WebView-compatible while retaining TikTok markers.
     """
-    webview_hash = ''.join(random.choices('abcdef0123456789', k=7))
-    ml_build = (app_ver.replace(".", "") + "0000000000")[:10]
-    ttwv = ''.join(random.choices('0123456789', k=8))
+    release = next(
+        record for record in _APP_RELEASES_RUNTIME["tiktok"]["android"]
+        if record["version"] == app_ver
+    )
+    version_code = release["version_code"]
     r = region or _pick_region(None)
-    byte_locale = r["byte_locale"]
+    byte_locale = r["posix_locale"].split("_", 1)[0]
+    full_locale = r["posix_locale"]
     region_code = r["code"]
     net_type = random.choices(["WIFI", "4G", "5G"], weights=[70, 25, 5], k=1)[0]
     marker = (
-        f"TikTok/{app_ver} musical_ly_{ml_build} JsSdk/1.0 NetType/{net_type} Channel/googleplay "
+        f"TikTok/{app_ver} musical_ly_{version_code} JsSdk/1.0 NetType/{net_type} Channel/googleplay "
         f"AppName/musical_ly app_version/{app_ver} "
-        f"ByteLocale/{byte_locale} ByteFullLocale/{byte_locale} Region/{region_code} "
-        f"BytedanceWebview/{webview_hash} ttwebview/{ttwv} "
-        f"com.zhiliaoapp.musically/{ml_build} "
-        f"[FB_IAB/;FBAN/TikTokAndroid;FBAV/{app_ver};IABMV/1;FBBV/{ml_build};FBOP/19;]"
+        f"ByteLocale/{byte_locale} ByteFullLocale/{full_locale} Region/{region_code} "
+        f"com.zhiliaoapp.musically/{version_code}"
     )
-    return _ua_android_webview(d, random.choice(_CHROME_VERSIONS), marker)
+    return _ua_android_webview(d, random.choice(_ANDROID_WEBVIEW_VERSIONS), marker)
 
 # ─── YouTube in-app UAs ──────────────────────────────────────────────
 def _ua_youtube_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """YouTube offer-page navigation inside an iOS WKWebView."""
-    locale = (region or {}).get("posix_locale", "en_US")
-    return _ua_ios_wkwebview(
-        d,
-        f"com.google.ios.youtube/{app_ver} ({d['model']}; {locale})",
-    )
+    """YouTube iOS has no verified browser-UA marker; use Safari fallback."""
+    return _ua_safari_ios(d)
 
 def _ua_youtube_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """YouTube offer-page navigation inside an Android WebView."""
-    return _ua_android_webview(
-        d,
-        random.choice(_CHROME_VERSIONS),
-        f"com.google.android.youtube/{app_ver}",
-    )
+    """YouTube Android has no verified browser-UA marker; use Chrome fallback."""
+    return _ua_chrome_android(d, _CHROME_VERSIONS[0])
 
 # ─── WhatsApp in-app UAs ─────────────────────────────────────────────
 def _ua_whatsapp_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """WhatsApp offer-page navigation inside an iOS WKWebView."""
-    return _ua_ios_wkwebview(d, f"WhatsApp/{app_ver}")
+    """WhatsApp iOS has no verified browser-UA marker; use Safari fallback."""
+    return _ua_safari_ios(d)
 
 def _ua_whatsapp_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
     """WhatsApp offer-page navigation inside an Android WebView."""
     return _ua_android_webview(
-        d, random.choice(_CHROME_VERSIONS), f"WhatsApp/{app_ver}/A"
+        d, random.choice(_ANDROID_WEBVIEW_VERSIONS), f"WhatsApp/{app_ver} A"
     )
 
 
 def _ua_linkedin_android(d: dict, app_ver: str) -> str:
+    release = next(
+        record for record in _APP_RELEASES_RUNTIME["linkedin"]["android"]
+        if record["version"] == app_ver
+    )
     return _ua_android_webview(
-        d, random.choice(_CHROME_VERSIONS), f"com.linkedin.android/{app_ver}"
+        d, random.choice(_ANDROID_WEBVIEW_VERSIONS),
+        f"[LinkedInApp]/{app_ver} com.linkedin.android/{release['package_build']}"
     )
 
 
 def _ua_linkedin_ios(d: dict, app_ver: str) -> str:
-    return _ua_ios_wkwebview(d, f"LinkedInApp/{app_ver}")
+    return _ua_ios_wkwebview(d, f"[LinkedInApp]/{app_ver}")
 
 
 def _ua_twitter_android(d: dict, app_ver: str) -> str:
     return _ua_android_webview(
-        d, random.choice(_CHROME_VERSIONS), f"TwitterAndroid/{app_ver}"
+        d, random.choice(_ANDROID_WEBVIEW_VERSIONS), f"TwitterAndroid/{app_ver}-release.0"
     )
 
 
 def _ua_twitter_ios(d: dict, app_ver: str) -> str:
-    return _ua_ios_wkwebview(d, f"TwitterIOS/{app_ver}")
+    if d.get("brand") == "iPad":
+        return _ua_safari_ios(d)
+    return _ua_ios_wkwebview(d, f"Twitter for iPhone/{app_ver}")
 
 
 def _ua_reddit_android(d: dict, app_ver: str) -> str:
-    build = random.randint(15_000_000, 15_999_999)
+    release = next(
+        record for record in _APP_RELEASES_RUNTIME["reddit"]["android"]
+        if record["version"] == app_ver
+    )
     return _ua_android_webview(
         d,
-        random.choice(_CHROME_VERSIONS),
-        f"Reddit/Version {app_ver}/Build {build}/Android {d['and_ver']}",
+        random.choice(_ANDROID_WEBVIEW_VERSIONS),
+        f"Reddit/Version {app_ver}/Build {release['build']}/Android {d['and_ver']}",
     )
 
 
 def _ua_reddit_ios(d: dict, app_ver: str) -> str:
-    build = random.randint(15_000_000, 15_999_999)
-    return _ua_ios_wkwebview(d, f"Reddit/Version {app_ver}/Build {build}")
+    return _ua_safari_ios(d)
 
 
 def _ua_telegram_android(d: dict, app_ver: str) -> str:
     return _ua_android_webview(
-        d, random.choice(_CHROME_VERSIONS), f"TelegramAndroid/{app_ver}"
+        d, random.choice(_ANDROID_WEBVIEW_VERSIONS),
+        f"Telegram-Android/{app_ver} (Android {d['and_ver']}; {d['model']}; en-US)"
     )
 
 
 def _ua_telegram_ios(d: dict, app_ver: str) -> str:
-    return _ua_ios_wkwebview(d, f"TelegramIOS/{app_ver}")
+    return _ua_safari_ios(d)
 
 
 # ─── Google Search (GSA) in-app UAs ──────────────────────────────────
@@ -14177,38 +14190,38 @@ def _ua_gsearch_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str
 
 def _ua_gsearch_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
     """Google Search offer-page navigation inside an Android WebView."""
-    chrome_ver = random.choice(_CHROME_VERSIONS)
-    major = app_ver.split(".")[0] if app_ver else "16"
-    gsa_android = f"{major}.{random.randint(10,20)}.{random.randint(20,40)}.{random.randint(20,40)}.arm64"
-    return _ua_android_webview(d, chrome_ver, f"GSA/{gsa_android}")
+    chrome_ver = random.choice(_ANDROID_WEBVIEW_VERSIONS)
+    return _ua_android_webview(d, chrome_ver, f"GoogleApp/{app_ver}")
 
 # ─── Google Chrome mobile ("Google Native" browser) ──────────────────
 def _ua_gchrome_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real Chrome for iOS UA (uses `CriOS/` token)."""
+    """Chrome for iOS UA using the platform's CriOS token."""
     return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
         f"(KHTML, like Gecko) CriOS/{app_ver} Mobile/15E148 Safari/604.1"
     )
 
 def _ua_gchrome_android(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """Real Chrome for Android mobile UA."""
+    """Modern reduced Chrome for Android standalone-browser UA."""
+    major = _CHROME_VERSIONS[0].split(".", 1)[0]
     return (
-        f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']}) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{app_ver} Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36"
     )
 
 
 
 def _ua_chrome_android(d: dict, chrome_ver: str) -> str:
+    major = _CHROME_VERSIONS[0].split(".", 1)[0]
     return (
-        f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']}) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{chrome_ver} Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36"
     )
 
 def _ua_safari_ios(d: dict) -> str:
     major = d["ios"].split("_")[0]
     return (
-        f"Mozilla/5.0 ({d['brand']}; CPU iPhone OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
+        f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
         f"(KHTML, like Gecko) Version/{major}.0 Mobile/15E148 Safari/604.1"
     )
 
@@ -14219,7 +14232,7 @@ def _ua_chrome_desktop(d: dict, chrome_ver: str) -> str:
     )
 
 def _ua_firefox_desktop(d: dict) -> str:
-    ff_ver = random.choice(["132.0","131.0","130.0.1","129.0"])
+    ff_ver = random.choice(_FIREFOX_VERSIONS).replace("esr", "")
     os_for_ff = d['os'].replace("; Win64; x64", "; Win64; x64; rv:" + ff_ver)
     if "rv:" not in os_for_ff:
         os_for_ff = d['os'] + f"; rv:{ff_ver}"
@@ -14251,6 +14264,29 @@ def _find_device_by_id(device_id: str):
             return d, "desktop"
     return None, None
 
+
+def _selected_platforms_for_pins(
+    platform: str,
+    platforms_pool: Optional[List[str]],
+    pinned_kind: Optional[str],
+    multi_device_kinds: Set[str],
+) -> Set[str]:
+    """Resolve platform scope while preserving scalar `any` pin precedence."""
+    if platforms_pool and (pinned_kind or multi_device_kinds):
+        raise HTTPException(
+            status_code=400,
+            detail="Pinned device selection cannot be combined with multiple platforms.",
+        )
+    if platform == "any" and not platforms_pool and pinned_kind:
+        return {pinned_kind}
+    if platform == "any" and not platforms_pool and multi_device_kinds:
+        return set(multi_device_kinds)
+    return set(
+        platforms_pool
+        or (["android", "ios"] if platform == "any" else [platform])
+    )
+
+
 @api_router.get("/user-agents/options")
 async def get_ua_options(user: dict = Depends(get_current_user)):
     """Return the list of available apps, platforms, devices and versions so the UI can show pickers."""
@@ -14263,6 +14299,8 @@ async def get_ua_options(user: dict = Depends(get_current_user)):
         ],
         "platforms": ["any", "android", "ios", "desktop"],
         "app_versions": _APP_VERSIONS,
+        "app_versions_by_platform": _APP_RELEASES_RUNTIME,
+        "app_support_matrix": APP_SUPPORT_MATRIX,
         "android_devices": [
             {"id": f"{d['brand']}|{d['model']}", "label": f"{d['brand']} {d['model']}", "os": "android"}
             for d in _ANDROID_DEVICES
@@ -14283,6 +14321,7 @@ async def get_ua_options(user: dict = Depends(get_current_user)):
         "ios_os_versions": [v.replace("_", ".") for v in _IOS_OS_VERSIONS],
         "android_os_versions": [v["version"] for v in _ANDROID_OS_VERSIONS],
         "chrome_versions": list(_CHROME_VERSIONS),
+        "android_webview_versions": list(_ANDROID_WEBVIEW_VERSIONS),
         "firefox_versions": list(_FIREFOX_VERSIONS),
         "versions_meta": _UA_VERSIONS_META,
     }
@@ -14297,84 +14336,8 @@ class UACheckRequest(BaseModel):
 
 
 def _detect_inapp(ua: str) -> dict:
-    """
-    Detect in-app webviews / native-app UAs that the `user_agents` library
-    doesn't recognise (TikTok, Instagram, Facebook, Pinterest, Snapchat).
-    Returns {"app": str or None, "app_name": str, "app_version": str or None, "is_inapp": bool}
-    """
-    import re
-    ua_low = ua or ""
-    ual = ua_low.lower()
-    # TikTok Android — FB_IAB TikTokAndroid bracket (check BEFORE generic FB_IAB).
-    if "fban/tiktokandroid" in ual:
-        m_av = re.search(r"fbav/([\d.]+)", ua_low, flags=re.IGNORECASE)
-        if not m_av:
-            m_av = re.search(r"app_version/([\d.]+)", ua_low, flags=re.IGNORECASE)
-        ver = m_av.group(1) if m_av else None
-        return {"app": "tiktok", "app_name": "TikTok", "app_version": ver, "is_inapp": True}
-    # TikTok  →  musical_ly_XX.X.X   or   trill_XX.X.X
-    # 2026-06 BUGFIX: musical_ly_NNNNN / trill_NNNNNN is a BUILD CODE,
-    # not the human app version. Real TikTok UAs always also carry an
-    # `app_version/<X.X.X>` token (e.g. `app_version/34.5.1`). Prefer that
-    # for display since the build code (e.g. "2034050010") looks like
-    # garbage on the analytics page.
-    m_av = re.search(r"app_version/([\d.]+)", ua_low)
-    m = re.search(r"(?:musical_ly|trill)_([\d.]+)", ua_low)
-    if m:
-        ver = (m_av.group(1) if m_av else m.group(1))
-        return {"app": "tiktok", "app_name": "TikTok", "app_version": ver, "is_inapp": True}
-    # Instagram  →  Instagram 412.0.0.35.87
-    m = re.search(r"Instagram\s+([\d.]+)", ua_low)
-    if m:
-        return {"app": "instagram", "app_name": "Instagram", "app_version": m.group(1), "is_inapp": True}
-    # Facebook  →  FBAV/556.0.0.59.68  or  FB_IAB
-    m = re.search(r"FBAV/([\d.]+)", ua_low)
-    if m:
-        return {"app": "facebook", "app_name": "Facebook", "app_version": m.group(1), "is_inapp": True}
-    if "FB_IAB" in ua_low or "FBAN/FBIOS" in ua_low:
-        # Exclude TikTok Android FB_IAB bracket (FBAN/TikTokAndroid handled above).
-        if "fban/tiktokandroid" not in ual:
-            return {"app": "facebook", "app_name": "Facebook", "app_version": None, "is_inapp": True}
-    # Pinterest
-    m = re.search(r"Pinterest/([\d.]+)", ua_low)
-    if m:
-        return {"app": "pinterest", "app_name": "Pinterest", "app_version": m.group(1), "is_inapp": True}
-    if "[Pinterest/" in ua_low:
-        return {"app": "pinterest", "app_name": "Pinterest", "app_version": None, "is_inapp": True}
-    # Snapchat
-    m = re.search(r"Snapchat/([\d.]+)", ua_low)
-    if m:
-        return {"app": "snapchat", "app_name": "Snapchat", "app_version": m.group(1), "is_inapp": True}
-    # YouTube (iOS uses com.google.ios.youtube/; Android uses com.google.android.youtube/)
-    m = re.search(r"com\.google\.(?:ios|android)\.youtube/([\d.]+)", ua_low)
-    if m:
-        return {"app": "youtube", "app_name": "YouTube", "app_version": m.group(1), "is_inapp": True}
-    # WhatsApp
-    m = re.search(r"WhatsApp/([\d.]+)", ua_low)
-    if m:
-        return {"app": "whatsapp", "app_name": "WhatsApp", "app_version": m.group(1), "is_inapp": True}
-    # Google Search App (GSA)
-    m = re.search(r"GSA/([\d.]+)", ua_low)
-    if m:
-        return {"app": "gsearch", "app_name": "Google Search", "app_version": m.group(1), "is_inapp": True}
-    # Chrome on iOS ("Google Native" browser)
-    m = re.search(r"CriOS/([\d.]+)", ua_low)
-    if m:
-        return {"app": "gchrome", "app_name": "Google Chrome (iOS)", "app_version": m.group(1), "is_inapp": True}
-    # Twitter  →  TwitterAndroid/<ver|rev>  |  TwitterIOS/<rev>  |  Twitter for iPhone/<ver>
-    # 2026-06 BUGFIX: coerce_ua_for_platform emits `TwitterIOS/<rev>` for
-    # iOS coercions, but the previous regex only matched `Twitter for
-    # iPhone/<ver>` so iOS coerced UAs were missed entirely.
-    m = re.search(r"TwitterAndroid/([\d.]+)|TwitterIOS/([\d.]+)|Twitter for iPhone/([\d.]+)", ua_low)
-    if m:
-        ver = m.group(1) or m.group(2) or m.group(3)
-        return {"app": "twitter", "app_name": "Twitter/X", "app_version": ver, "is_inapp": True}
-    # LinkedIn  →  LinkedInApp/<ver>  or  com.linkedin.android/<ver>
-    m = re.search(r"LinkedInApp/([\d.]+)|com\.linkedin\.android/([\d.]+)", ua_low)
-    if m:
-        ver = m.group(1) or m.group(2)
-        return {"app": "linkedin", "app_name": "LinkedIn", "app_version": ver, "is_inapp": True}
-    return {"app": None, "app_name": "Browser", "app_version": None, "is_inapp": False}
+    """Compatibility wrapper around the shared UA identity detector."""
+    return detect_profile_app(ua)
 
 
 def _detect_tiktok_metadata(ua: str) -> dict:
@@ -14497,7 +14460,7 @@ async def check_user_agent(payload: UACheckRequest, user: dict = Depends(get_cur
     browser, OS, device, in-app detection, TikTok metadata, realism verdict,
     and a one-line human summary.
     """
-    check_user_feature(user, "ua_generator")
+    check_user_feature(user, "ua_checker")
     # Bulk mode
     if payload.user_agents:
         uas = [u for u in payload.user_agents if u and u.strip()]
@@ -14516,7 +14479,7 @@ async def check_user_agent(payload: UACheckRequest, user: dict = Depends(get_cur
 
 @api_router.post("/user-agents/generate")
 async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(get_current_user)):
-    """Generate realistic user agents. Returns JSON or XLSX based on payload.format."""
+    """Generate contract-validated user agents with compatible device records."""
     check_user_feature(user, "ua_generator")
     count = max(1, min(int(payload.count or 10), 50000))
     app = (payload.app or "instagram").lower().strip()
@@ -14532,9 +14495,17 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         "youtube", "whatsapp", "linkedin", "twitter", "reddit",
         "telegram", "gsearch", "gchrome", "chrome",
     }
+    if app not in _ALLOWED_APPS:
+        raise HTTPException(status_code=400, detail=f"Unknown app: {payload.app}")
+    if platform not in {"any", "android", "ios", "desktop"}:
+        raise HTTPException(status_code=400, detail=f"Unknown platform: {payload.platform}")
     apps_pool: Optional[List[str]] = None
     if payload.apps:
-        cleaned = [a.lower().strip() for a in payload.apps if a and a.lower().strip() in _ALLOWED_APPS]
+        requested_apps = [a.lower().strip() for a in payload.apps if a and a.strip()]
+        unknown_apps = [a for a in requested_apps if a not in _ALLOWED_APPS]
+        if unknown_apps:
+            raise HTTPException(status_code=400, detail=f"Unknown apps: {', '.join(unknown_apps)}")
+        cleaned = requested_apps
         # dedupe while preserving order
         seen = set()
         cleaned = [a for a in cleaned if not (a in seen or seen.add(a))]
@@ -14549,7 +14520,14 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                                                      # ["android","ios","desktop"]
     platforms_pool: Optional[List[str]] = None
     if payload.platforms:
-        cleaned_p = [p.lower().strip() for p in payload.platforms if p and p.lower().strip() in _ALLOWED_PLATFORMS]
+        requested_platforms = [p.lower().strip() for p in payload.platforms if p and p.strip()]
+        unknown_platforms = [p for p in requested_platforms if p not in _ALLOWED_PLATFORMS]
+        if unknown_platforms:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown platforms: {', '.join(unknown_platforms)}",
+            )
+        cleaned_p = requested_platforms
         seen_p = set()
         cleaned_p = [p for p in cleaned_p if not (p in seen_p or seen_p.add(p))]
         if len(cleaned_p) >= 2:
@@ -14582,6 +14560,38 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             # if all same kind use that; else "mixed"
             multi_device_kind = (list(kinds_seen)[0] if len(kinds_seen) == 1 else "mixed")
 
+    multi_device_kinds = (
+        {
+            "android" if "and_ver" in device
+            else "ios" if "ios" in device
+            else "desktop"
+            for device in multi_device_pool
+        }
+        if multi_device_pool else set()
+    )
+    selected_platforms = _selected_platforms_for_pins(
+        platform,
+        platforms_pool,
+        pinned_kind,
+        multi_device_kinds,
+    )
+    if pinned_kind and pinned_kind not in selected_platforms:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pinned device is {pinned_kind}, outside selected platforms.",
+        )
+    if multi_device_pool:
+        incompatible_kinds = {
+            ("android" if "and_ver" in device else "ios" if "ios" in device else "desktop")
+            for device in multi_device_pool
+        } - selected_platforms
+        if incompatible_kinds:
+            raise HTTPException(
+                status_code=400,
+                detail="Pinned device pool contradicts selected platforms: "
+                + ", ".join(sorted(incompatible_kinds)),
+            )
+
     def _pick_device_pool_for(platform_value: str):
         """Returns (base_pool, pool_kind) for the given platform value.
         Honours pinned_device / multi_device_pool overrides exactly like
@@ -14602,8 +14612,7 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
 
     base_pool, pool_kind = _pick_device_pool_for(platform)
 
-    # TikTok iOS runs on iPhone much more than iPad — stick to iPhones only so
-    # every generated UA feels authentic to the platform.
+    # Keep the existing TikTok iOS device policy: random selection uses iPhones.
     # NOTE: in mix mode (apps_pool / platforms_pool) this filter is applied
     # per-UA below instead, so the rule still holds when tiktok is picked.
     if app == "tiktok" and not pinned_device and not apps_pool:
@@ -14654,6 +14663,14 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         import re
         if not re.match(r"^\d{3,5}x\d{3,5}$", pinned_resolution):
             raise HTTPException(status_code=400, detail=f"Invalid resolution format (expected e.g. '1080x2340'): {pinned_resolution}")
+        if pinned_device and pinned_kind in {"android", "ios"} and pinned_device.get("res") != pinned_resolution:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Resolution {pinned_resolution} is incompatible with pinned device "
+                    f"{payload.device_id} ({pinned_device.get('res')})."
+                ),
+            )
 
     # Multi-resolution pool
     resolutions_pool = None
@@ -14673,6 +14690,16 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                 status_code=400,
                 detail=f"Invalid OS version (expected e.g. '18_3', '18.3', '14'): {pinned_os}",
             )
+        if pinned_device and pinned_kind == "android":
+            requested_major = pinned_os.replace("_", ".").split(".", 1)[0]
+            if pinned_device["and_ver"] != requested_major:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Android {pinned_os} conflicts with pinned device firmware "
+                        f"Android {pinned_device['and_ver']} / Build {pinned_device['build']}."
+                    ),
+                )
 
     # Multi-OS version pool
     os_versions_pool = None
@@ -14682,6 +14709,19 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             if not re.match(r"^\d{1,2}(?:[._]\d{1,2}){0,2}$", ov or ""):
                 raise HTTPException(status_code=400, detail=f"Invalid OS version: {ov}")
         os_versions_pool = list(payload.os_versions)
+        if pinned_device and pinned_kind == "android":
+            incompatible = [
+                value for value in os_versions_pool
+                if value.replace("_", ".").split(".", 1)[0] != pinned_device["and_ver"]
+            ]
+            if incompatible:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Android OS pool conflicts with pinned device firmware: "
+                        + ", ".join(incompatible)
+                    ),
+                )
 
     # Multi-app version pool
     app_versions_pool = list(payload.app_versions) if payload.app_versions else None
@@ -14721,6 +14761,34 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         else:
             candidate = None
         return candidate
+
+    def _release_for(app_key: str, platform_key: str) -> Optional[dict]:
+        """Select one exact release record, respecting legacy overrides."""
+        if app_key == "chrome" or platform_key == "desktop":
+            return None
+        records = _APP_RELEASES_RUNTIME.get(app_key, {}).get(platform_key, [])
+        if app_key == "gchrome" and platform_key == "android":
+            return {"version": _CHROME_VERSIONS[0]}
+        requested_versions: Optional[List[str]] = None
+        if payload.app_version and not apps_pool:
+            requested_versions = [payload.app_version]
+        elif app_versions_pool:
+            requested_versions = app_versions_pool
+        if requested_versions:
+            compatible = [
+                record for record in records
+                if record["version"] in requested_versions
+            ]
+            if not compatible:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"App version override is not valid for "
+                        f"{app_key} on {platform_key}."
+                    ),
+                )
+            return random.choice(compatible)
+        return random.choice(records) if records else None
 
     # Resolve pinned region (if any) — else it's picked per-UA at random
     pinned_region = None
@@ -14770,23 +14838,73 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                 if _filtered:
                     current_pool = _filtered
 
-        device = random.choice(current_pool)
-        kind = current_kind if current_kind != "mixed" else ("android" if "and_ver" in device else "ios")
+        # Resolve a platform before filtering immutable device snapshots.
+        if current_kind == "mixed":
+            candidate_kinds = {
+                "android" if "and_ver" in candidate else "ios"
+                for candidate in current_pool
+            }
+            kind = random.choice(sorted(candidate_kinds))
+            current_pool = [
+                candidate for candidate in current_pool
+                if ("android" if "and_ver" in candidate else "ios") == kind
+            ]
+        else:
+            kind = current_kind
         if pinned_device:
             kind = pinned_kind
 
-        # Per-UA OS version: pinned > pool > device default
+        if kind == "android" and current_app == "instagram":
+            required_hardware = {"res", "dpi", "vendor", "soc", "chipset"}
+            current_pool = [
+                candidate for candidate in current_pool
+                if required_hardware.issubset(candidate)
+            ]
+            if not current_pool:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pinned Android device lacks captured Instagram hardware fields.",
+                )
+
+        # Per-UA OS version: select a compatible Android snapshot instead of
+        # rewriting only OS/SDK on unrelated firmware.
         per_ua_os = _pick_compatible_os_override(kind)
+        if kind == "android" and per_ua_os:
+            requested_major = per_ua_os.replace("_", ".").split(".", 1)[0]
+            compatible_devices = [
+                candidate for candidate in current_pool
+                if candidate.get("and_ver") == requested_major
+            ]
+            if not compatible_devices:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No compatible Android device profile exists for Android {requested_major}.",
+                )
+            current_pool = compatible_devices
+
+        # Per-UA resolution: choose a matching profile, never rewrite hardware.
+        per_ua_resolution = pinned_resolution
+        if not per_ua_resolution and resolutions_pool:
+            per_ua_resolution = random.choice(resolutions_pool)
+        if kind in {"android", "ios"} and per_ua_resolution:
+            resolution_devices = [
+                candidate for candidate in current_pool
+                if candidate.get("res") == per_ua_resolution
+            ]
+            if not resolution_devices:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No compatible {kind} device profile has resolution {per_ua_resolution}.",
+                )
+            current_pool = resolution_devices
+
+        device = random.choice(current_pool)
         device = _apply_os_version_override(device, kind, per_ua_os)
 
-        # Per-UA app version: pinned > pool > random from master list
-        if payload.app_version and not apps_pool:
-            app_ver = payload.app_version
-        elif app_versions_pool:
-            app_ver = random.choice(app_versions_pool)
-        else:
-            app_ver = random.choice(_APP_VERSIONS.get(current_app, ["1.0.0"]))
-        chrome_ver = random.choice(_CHROME_VERSIONS)
+        release = _release_for(current_app, kind)
+        app_ver = release["version"] if release else None
+        chrome_ver = _CHROME_VERSIONS[0]
+        webview_ver = random.choice(_ANDROID_WEBVIEW_VERSIONS)
 
         # Per-UA region: pinned > pool > random
         if pinned_region:
@@ -14796,16 +14914,19 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
         else:
             region_for_ua = _pick_region(None)
 
-        # Per-UA resolution: pinned > pool > device default
-        per_ua_resolution = pinned_resolution
-        if not per_ua_resolution and resolutions_pool:
-            per_ua_resolution = random.choice(resolutions_pool)
-
+        result_warnings: List[str] = []
+        is_generic_fallback = False
+        resolution_is_encoded = current_app == "instagram" and kind in {"android", "ios"}
+        if per_ua_resolution and not resolution_is_encoded:
+            result_warnings.append(
+                f"Resolution override was used only to select a compatible device; "
+                f"{current_app} does not encode resolution in this UA."
+            )
         if kind == "android":
             if current_app == "instagram":
-                ua = _ua_instagram_android(device, app_ver, chrome_ver, region=region_for_ua, resolution=per_ua_resolution)
+                ua = _ua_instagram_android(device, app_ver, webview_ver, region=region_for_ua, resolution=per_ua_resolution)
             elif current_app == "facebook":
-                ua = _ua_facebook_android(device, app_ver, chrome_ver, region=region_for_ua)
+                ua = _ua_facebook_android(device, app_ver, webview_ver, region=region_for_ua)
             elif current_app == "tiktok":
                 ua = _ua_tiktok_android(device, app_ver, region=region_for_ua)
             elif current_app == "pinterest":
@@ -14813,7 +14934,8 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             elif current_app == "snapchat":
                 ua = _ua_snapchat_android(device, app_ver)
             elif current_app == "youtube":
-                ua = _ua_youtube_android(device, app_ver, region=region_for_ua)
+                ua = _ua_chrome_android(device, chrome_ver)
+                is_generic_fallback = True
             elif current_app == "whatsapp":
                 ua = _ua_whatsapp_android(device, app_ver, region=region_for_ua)
             elif current_app == "linkedin":
@@ -14830,12 +14952,18 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
                 # Android Chrome follows the Chromium pool; gchrome's app
                 # version pool is sourced from iOS and must not cross over.
                 ua = _ua_gchrome_android(device, chrome_ver, region=region_for_ua)
+                is_generic_fallback = True
             else:
                 ua = _ua_chrome_android(device, chrome_ver)
             device_label = f"{device['brand']} {device['model']}"
+            if current_app in {"youtube", "gchrome", "chrome"}:
+                device_label = "Android device (reduced UA)"
         elif kind == "ios":
             if current_app == "instagram":
                 ua = _ua_instagram_ios(device, app_ver, region=region_for_ua, resolution=per_ua_resolution)
+                result_warnings.append(
+                    "Instagram iOS has no verified build mapping; no internal build number was emitted."
+                )
             elif current_app == "facebook":
                 ua = _ua_facebook_ios(device, app_ver, region=region_for_ua)
             elif current_app == "tiktok":
@@ -14845,17 +14973,26 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             elif current_app == "snapchat":
                 ua = _ua_snapchat_ios(device, app_ver)
             elif current_app == "youtube":
-                ua = _ua_youtube_ios(device, app_ver, region=region_for_ua)
+                ua = _ua_safari_ios(device)
+                is_generic_fallback = True
             elif current_app == "whatsapp":
-                ua = _ua_whatsapp_ios(device, app_ver, region=region_for_ua)
+                ua = _ua_safari_ios(device)
+                is_generic_fallback = True
             elif current_app == "linkedin":
                 ua = _ua_linkedin_ios(device, app_ver)
             elif current_app == "twitter":
                 ua = _ua_twitter_ios(device, app_ver)
+                if device.get("brand") == "iPad":
+                    is_generic_fallback = True
+                    result_warnings.append(
+                        "Twitter for iPhone is not an iPad identity; emitted a generic Safari fallback."
+                    )
             elif current_app == "reddit":
-                ua = _ua_reddit_ios(device, app_ver)
+                ua = _ua_safari_ios(device)
+                is_generic_fallback = True
             elif current_app == "telegram":
-                ua = _ua_telegram_ios(device, app_ver)
+                ua = _ua_safari_ios(device)
+                is_generic_fallback = True
             elif current_app == "gsearch":
                 ua = _ua_gsearch_ios(device, app_ver, region=region_for_ua)
             elif current_app == "gchrome":
@@ -14874,21 +15011,59 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             else:
                 ua = _ua_firefox_desktop(device)
             device_label = device.get("name", "Desktop")
+            if current_app != "chrome":
+                is_generic_fallback = True
+                result_warnings.append(
+                    f"{current_app} has no verified desktop app UA; emitted a generic browser fallback."
+                )
 
         # Derive displayable OS version from the (possibly overridden) device
         if kind == "ios":
             os_version_display = device.get("ios", "").replace("_", ".")
         elif kind == "android":
-            os_version_display = device.get("and_ver")
+            os_version_display = (
+                "10"
+                if "Android 10; K" in ua
+                else device.get("and_ver")
+            )
         else:
             os_version_display = None
 
         expected_app = (
             current_app
-            if kind != "desktop" and current_app not in {"chrome", "gchrome"}
+            if (
+                kind != "desktop"
+                and current_app not in {"chrome", "gchrome"}
+                and not is_generic_fallback
+            )
             else None
         )
-        profile = validate_user_agent(ua, expected_app=expected_app)
+        if is_generic_fallback and not any("fallback" in warning.lower() for warning in result_warnings):
+            result_warnings.append(
+                f"{current_app} {kind} has no verified app identity; emitted a generic browser fallback."
+            )
+        profile = validate_user_agent(
+            ua,
+            expected_app=expected_app,
+            require_verified_device=(kind == "android" and "Build/" in ua),
+        )
+        if is_generic_fallback:
+            profile = {
+                **profile,
+                "support_state": "fallback",
+                "identity_supported": False,
+                "warnings": list(profile["warnings"]) + result_warnings,
+            }
+        elif result_warnings:
+            profile = {
+                **profile,
+                "warnings": list(profile["warnings"]) + result_warnings,
+            }
+        reported_resolution = (
+            per_ua_resolution or device.get("res")
+            if resolution_is_encoded
+            else None
+        )
         results.append({
             "user_agent": ua,
             "device": device_label,
@@ -14899,15 +15074,20 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             "os_version": os_version_display,
             "region": region_for_ua["code"],
             "country": region_for_ua["country"],
-            "resolution": per_ua_resolution or (device.get("res") if kind != "desktop" else None),
+            "resolution": reported_resolution,
             "engine": profile["engine"],
             "profile_type": profile["profile_type"],
             "runtime": profile["runtime"],
             "runtime_compatible": profile["runtime_compatible"],
+            "support_state": profile["support_state"],
+            "valid": profile["valid"],
             "issues": profile["issues"],
             "warnings": profile["warnings"],
             "profile": profile,
         })
+        for warning in profile["warnings"]:
+            if warning not in response_warnings:
+                response_warnings.append(warning)
 
     if ignored_os_overrides:
         response_warnings.append(
@@ -14919,7 +15099,7 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
     # this is a no-op (the loop already varies device/version per UA),
     # so existing customers see exactly the same kind of pool — just
     # with the previously-implicit ordering randomised, which removes
-    # one more pattern signal. Safe + backwards-compatible.
+    # preserve the backwards-compatible shuffled response ordering.
     random.shuffle(results)
 
     # ── 2026-06-11: Build mix-mode display labels + per-app/platform

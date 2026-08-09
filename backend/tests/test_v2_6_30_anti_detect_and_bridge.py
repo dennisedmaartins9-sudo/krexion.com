@@ -5,20 +5,20 @@ from anti_detect_v230 import full_client_hints
 from referrer_pro import is_non_chrome_inapp_ua
 
 TIKTOK_UA = (
-    "Mozilla/5.0 (Linux; Android 13; SM-S918B Build/TP1A.220624.014; wv) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/128.0.6613.146 "
-    "Mobile Safari/537.36 musical_ly_2024109030 JsSdk/1.0 NetType/WIFI Channel/googleplay "
-    "AppName/musical_ly app_version/40.9.3 ByteLocale/en ByteFullLocale/en Region/US "
-    "AppId/1233 Spark/1.7.2 AppVersion/40.9.3 PIA/2.5.3 RevealType/Dialog "
-    "BytedanceWebView/d8a21c6 RevealType/Dialog"
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A.240905.015; wv) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.114 "
+    "Mobile Safari/537.36 TikTok/45.8.2 musical_ly_2024508020 JsSdk/1.0 "
+    "NetType/WIFI Channel/googleplay AppName/musical_ly app_version/45.8.2 "
+    "ByteLocale/en ByteFullLocale/en Region/US "
+    "com.zhiliaoapp.musically/2024508020"
 )
 
 
-def test_full_client_hints_suppresses_tiktok_brands():
-    assert is_non_chrome_inapp_ua(TIKTOK_UA) is True
+def test_full_client_hints_keeps_tiktok_browser_runtime():
+    assert is_non_chrome_inapp_ua(TIKTOK_UA) is False
     hints = full_client_hints(TIKTOK_UA)
-    assert hints.get("Sec-CH-UA") == ""
-    assert "Google Chrome" not in str(hints.values())
+    assert "Chromium" in hints.get("Sec-CH-UA", "")
+    assert hints.get("Sec-CH-UA-Mobile") == "?1"
 
 
 def test_full_client_hints_chrome_still_emits_brands():

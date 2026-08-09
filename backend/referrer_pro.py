@@ -40,6 +40,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse
 
+from ua_profile_contract import (
+    ANDROID_DEVICE_SNAPSHOTS,
+    APP_RELEASES_BY_PLATFORM,
+    APP_SUPPORT_MATRIX,
+    classify_user_agent,
+    client_hint_headers_for_ua,
+    validate_user_agent,
+)
+
 logger = logging.getLogger("referrer_pro")
 
 
@@ -1761,976 +1770,419 @@ def resolve_pro_visit(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# M) UA ↔ Referer consistency coercion (2026-06-14 — anti-fraud closure)
-# ══════════════════════════════════════════════════════════════════════
-# Background: when the operator picks a referer for an in-app platform
-# (facebook / tiktok / instagram / snapchat / messenger / linkedin /
-# twitter) but the rotating UA list contains plain Chrome / Safari mobile
-# UAs, fraud-detection networks (Anura, IPQS, Forensiq, Singular,
-# AppsFlyer Protect360, Adjust, Forter) flag the visit as bot because
-# a real user clicking an FB / TikTok ad on a phone ALWAYS opens the
-# landing page inside the in-app webview, which appends platform-
-# specific markers to the UA (FB_IAB, FBAN, BytedanceWebview, Instagram,
-# Snapchat, etc.).
-#
-# This module coerces the per-visit UA so the FULL signature (referer +
-# UA + Sec-Fetch + URL params) is internally consistent with real-world
-# captures.
-#
-# Design contract:
-#   * Pure functions — no I/O, no globals mutated, safe under concurrency.
-#   * NEVER raises — any unexpected input returns the original UA.
-#   * Backwards-compatible — desktop UAs are left untouched (real desktop
-#     users on FB.com / TikTok.com / Instagram.com DO see the link open
-#     in their actual browser, not an in-app webview, so the plain
-#     desktop UA is the LEGIT signature).
-#   * Idempotent — calling coerce twice on a coerced UA returns the same
-#     string (suffix detection short-circuits).
-#
-# Realistic version pools — refreshed June 2026, sourced from public UA
-# corpuses (useragents.io, user-agents.net, whatmyuseragent.com) and
-# Meta / TikTok / Instagram release notes. Each visit picks a random
-# version from the pool so traffic isn't fingerprintable by repetition.
-# ══════════════════════════════════════════════════════════════════════
-
-# Facebook for Android (FB4A) app versions — last 12 months.
-# Source: play.google.com Facebook app release history, useragents.io.
-_FBAV_ANDROID_VERSIONS: List[str] = [
-    "515.1.0.62.90", "514.0.0.45.96", "512.0.0.51.90", "510.0.0.43.95",
-    "508.0.0.44.91", "505.0.0.46.91", "502.0.0.40.86", "499.0.0.48.95",
-    "497.0.0.47.36", "495.0.0.49.94", "492.0.0.45.79", "490.0.0.41.71",
-    "487.0.0.48.85", "485.0.0.45.94", "482.0.0.43.79",
-]
-
-# Facebook for iOS (FBIOS) app versions — same window.
-_FBAV_IOS_VERSIONS: List[str] = [
-    "515.0.0.43.108", "513.1.0.40.74", "510.2.0.36.94", "508.0.0.40.96",
-    "505.0.0.31.103", "502.0.0.42.71", "499.0.0.34.99", "496.0.0.23.103",
-    "493.0.0.46.108", "490.0.0.40.71", "487.0.0.42.108", "485.0.0.36.70",
-]
-
-# Facebook iOS FBBV (build version) — pairs roughly with FBAV.
-_FBBV_IOS_RANGE: Tuple[int, int] = (680_000_000, 695_000_000)
-
-# Facebook iOS FBRV (release version) — pairs roughly with FBBV.
-_FBRV_IOS_RANGE: Tuple[int, int] = (681_000_000, 696_000_000)
-
-# Instagram app versions (Android + iOS share major numbers).
-_IG_APP_VERSIONS: List[str] = [
-    "354.0.0.45.81", "352.0.0.42.78", "350.0.0.40.86", "348.0.0.46.88",
-    "346.0.0.42.77", "344.0.0.41.80", "342.0.0.39.74", "340.0.0.36.71",
-]
-_IG_BUILD_RANGE: Tuple[int, int] = (620_000_000, 690_000_000)
-
-# TikTok / musical_ly app versions (iOS + Android share major numbers).
-_TIKTOK_APP_VERSIONS: List[str] = [
-    "34.5.1", "34.4.0", "34.3.2", "34.2.1", "34.1.0",
-    "33.9.4", "33.8.1", "33.7.0", "33.6.2", "33.5.0",
-    "33.4.1", "33.3.0", "33.2.0", "33.1.2", "32.9.0",
-]
-
-# BytedanceWebview short hash (changes per app release).
-_BYTEDANCE_WV_HASHES: List[str] = [
-    "d8a21c6", "c4f12e8", "a93b7d2", "f1e84a5", "b27c9d6",
-    "e35f7c1", "d61a8b9", "9c4e2f7", "7d5b3a4", "5e9f1c8",
-]
-
-# TikTok Region pool — biased toward English-speaking markets but covers
-# the major monetised geographies so a per-visit pick stays plausible.
-_TIKTOK_REGIONS: List[str] = [
-    "US", "US", "US", "GB", "CA", "AU", "DE", "FR", "BR", "MX",
-    "IT", "ES", "JP", "ID", "PH", "TH", "IN", "TR", "SA", "AE",
-]
-
-# Locale is selected from the same region entry, never independently.
-_TIKTOK_REGION_LOCALES: Dict[str, str] = {
-    "US": "en-US", "GB": "en-GB", "CA": "en-CA", "AU": "en-AU",
-    "DE": "de-DE", "FR": "fr-FR", "BR": "pt-BR", "MX": "es-MX",
-    "IT": "it-IT", "ES": "es-ES", "JP": "ja-JP", "ID": "id-ID",
-    "PH": "en-PH", "TH": "th-TH", "IN": "en-IN", "TR": "tr-TR",
-    "SA": "ar-SA", "AE": "ar-AE",
-}
-
-# Snapchat app versions (Android + iOS).
-_SNAPCHAT_APP_VERSIONS: List[str] = [
-    "12.95.0.41", "12.93.0.50", "12.91.0.45", "12.89.0.40", "12.87.0.43",
-]
-
-# LinkedIn mobile-app build numbers.
-_LINKEDIN_APP_VERSIONS: List[str] = [
-    "9.32.512", "9.31.482", "9.30.451", "9.29.421", "9.28.395",
-]
-
-# 2026-07 v2.2.5 — Search / video / discovery in-app browser versions.
-# Sampled from live production traffic captures June-July 2026.
-_YOUTUBE_APP_VERSIONS: List[str] = [
-    "20.15.36", "20.15.3", "20.14.5", "20.13.2", "20.12.4", "20.11.1",
-]
-_GSA_APP_VERSIONS: List[str] = [
-    # Google Search / GSA app on iOS + Android. Same numeric shape.
-    "424.0.578291269", "423.0.577234512", "422.0.575891234",
-    "421.0.574512837", "420.0.573124658",
-]
-_REDDIT_APP_VERSIONS: List[str] = [
-    "2024.28.0", "2024.27.1", "2024.26.0", "2024.25.0", "2024.24.1",
-]
-_PINTEREST_APP_VERSIONS: List[str] = [
-    "11.34", "11.33", "11.32", "11.31", "11.30",
-]
-
-# TikTok native API/network captures may use Google's Cronet stack. Keep
-# these versions for parsing/back-compat helpers only; offer-page navigation
-# generated/coerced for RUT uses an Android WebView UA instead.
-# Native shape:
-#   • `Linux; U; Android <ver>; <locale>; <device>; Build/<id>; Cronet/<ver>)`
-# instead of the WebView-style:
-#   • `Linux; Android <ver>; <device> Build/<id>; wv) AppleWebKit/… Chrome/… Mobile Safari/…`
-_TIKTOK_CRONET_VERSIONS: List[str] = [
-    # Sampled from real 2025-2026 TikTok Android app captures.
-    "128.0.6613.113", "127.0.6533.99",
-    "122.0.6261.128", "121.0.6167.164",
-    "118.0.5993.65",  "115.0.5790.169",
-    "110.0.5481.100", "104.0.5112.114",
-    "100.0.4896.127", "94.0.4606.85",
-    "88.0.4324.152",  "80.0.3987.163",
-    "72.0.3626.121",  "66.0.3359.181",
-    "58.0.2991.0",
-]
-
-
-
-
-
-# Markers that mean "this UA is already in-app". When ANY of these
-# substrings appear in a UA, we treat it as already-coerced and DO NOT
-# re-append anything (idempotent guarantee).
-_INAPP_MARKER_LOOKUP: Dict[str, Tuple[str, ...]] = {
-    "facebook":  ("fb_iab", "fban/", "fbav/", "fb4a", "fbios"),
-    "messenger": ("messenger", "fbms"),
-    "instagram": ("instagram/", "instagram "),
-    # 2026-06-14 fix: UA Gen emits TikTok Android as `trill_NNNNNN ...
-    # AppName/musical_ly app_version/X ... BytedanceWebview/HASH` and
-    # TikTok iOS as `musical_ly_X JsSdk/2.0 ...`. Earlier marker set
-    # missed `trill_` and `appname/musical_ly` → coerce re-appended its
-    # own TikTok suffix → DOUBLE BytedanceWebview/, DOUBLE Region/, etc.
-    # = instant fraud flag. Now we catch every real TT marker.
-    "tiktok":    ("musical_ly", "musically", "tiktok", "ttwebview",
-                  "bytedancewebview", "aweme", "trill_", "appname/musical_ly"),
-    "snapchat":  ("snapchat",),
-    "linkedin":  ("linkedinapp", "linkedin/"),
-    "twitter":   ("twitterandroid", "twitterios", "twitter/"),
-    # 2026-07 v2.2.5 — search / video / discovery platforms.
-    # Customer report: running a "YouTube" RUT job produced clicks
-    # where the offer's dashboard showed the Referer as
-    # `youtube.com/redirect?...&q=krexion.com/...` (origin leak) and
-    # the Browser column as "Google for iOS (424)" because the UA
-    # carried a GSA/424 marker (Google Search app) that never got
-    # stripped, and no YouTube coerce was ever attempted (youtube
-    # was absent from _INAPP_CAPABLE_PLATFORMS below). Adding the
-    # markers + coerce handlers below closes both leaks.
-    "youtube":   ("com.google.ios.youtube", "com.google.android.youtube", "youtubeapp"),
-    "google":    ("gsa/", "googleapp/", "com.google.googlemobile", "chrome/mobile googlebot"),
-    "reddit":    ("reddit/version", "redditandroid", "redditios", "reddit ios"),
-    "pinterest": ("pinterest/", "pinterestandroid", "pinterestios"),
-}
-
-# Platforms that have an in-app webview surface on MOBILE. Desktop
-# browsing of these sites stays in the host browser so coerce is a
-# no-op for desktop UAs.
-_INAPP_CAPABLE_PLATFORMS: Tuple[str, ...] = (
-    "facebook", "messenger", "instagram", "tiktok",
-    "snapchat", "linkedin", "twitter",
-    # 2026-07 v2.2.5 — closes the "koi platform k liye chalao sab
-    # perfect chalna chahye" gap: YouTube / Google Search / Reddit /
-    # Pinterest also ship first-party in-app browsers on mobile, and
-    # advertiser dashboards report them by their own UA markers
-    # (com.google.ios.youtube/, GSA/, Reddit/Version, Pinterest/).
-    "youtube", "google", "reddit", "pinterest",
-)
-
-
+# UA/referrer consistency uses the shared profile contract as its single source
+# of supported app/platform identities, versions, and validation rules.
 def _is_mobile_ua(ua: str) -> str:
-    """Return "android" | "ios" | "" — detects mobile UA family.
-
-    "" means desktop / bot / unparseable → caller should NOT coerce.
-
-    2026-06 hardening (Bug F): the Android branch used to require BOTH
-    the `android` keyword AND one of `Mobile` / `; wv)` / `Build/`. That
-    rejected the common "Linux; Android 14) Chrome/128.0 Safari" shape
-    that customers paste from public UA lists — those UAs silently
-    skipped coercion and hit advertiser dashboards as a "Chrome on
-    Android with TikTok referer" mismatch (instant fraud-flag).
-    We now accept the `android` keyword by itself; tablet-only / TV
-    UAs are filtered out by the absence of any phone-shape token.
-    """
-    if not ua:
-        return ""
-    ual = ua.lower()
-    # iOS — must come before generic mobile check because some iPhone
-    # UAs include "android" inside a webview profile name (rare but real).
-    if ("iphone" in ual or "ipad" in ual or "ipod" in ual) and "like mac os x" in ual:
+    low = (ua or "").lower()
+    if any(token in low for token in ("iphone", "ipad", "ipod")) and "like mac os x" in low:
         return "ios"
-    if "android" in ual:
-        # Exclude obvious TV / desktop-mode UAs.
-        if "android tv" in ual or "smart-tv" in ual or "googletv" in ual:
-            return ""
-        # Anything else with `android` is treated as Android mobile — we
-        # CAN'T tell phone vs tablet from UA reliably and the in-app
-        # webview suffix is correct for both surfaces.
+    if "android" in low and not any(token in low for token in ("android tv", "smart-tv", "googletv")):
         return "android"
     return ""
 
 
-def _ensure_android_device_token(ua: str) -> str:
-    """When a coerced Android UA lacks the `; <model> Build/<id>` token
-    (advertiser parsers need it to populate the Device column with a
-    real brand/model — without it dashboards render "Unknown Generic
-    Android"), inject a realistic recent device. Idempotent: returns
-    `ua` unchanged when a Build/ token is already present.
+# Authoritative profile-contract implementation. Public helper names remain
+# stable, while identity/version decisions come only from the shared contract.
+_PLATFORM_TO_APP = {
+    "facebook": "facebook",
+    "instagram": "instagram", "tiktok": "tiktok", "snapchat": "snapchat",
+    "youtube": "youtube", "whatsapp": "whatsapp", "telegram": "telegram",
+    "linkedin": "linkedin", "twitter": "twitter", "reddit": "reddit",
+    "pinterest": "pinterest", "google": "gsearch", "gsearch": "gsearch",
+}
+# Messenger referrers remain supported, but no verified Messenger browser-UA
+# contract exists. It must therefore never borrow Facebook's FB4A/FBIOS identity.
+_FALLBACK_ONLY_PLATFORMS = {"messenger"}
+_INAPP_CAPABLE_PLATFORMS = tuple(_PLATFORM_TO_APP) + tuple(_FALLBACK_ONLY_PLATFORMS)
 
-    2026-06 BUG-G FIX (paired with Bug F coercion broadening).
-    """
-    if not ua:
-        return ua or ""
-    if re.search(r"Build/[A-Za-z0-9.\-_]+", ua):
-        return ua
-    # Pool of recent real Android phone tokens captured in 2025–2026.
-    pool = [
-        ("SM-S928U",  "UP1A.231005.007"),  # Galaxy S24 Ultra
-        ("SM-S928B",  "UP1A.231005.007"),
-        ("SM-S921U",  "UP1A.231005.007"),  # Galaxy S24
-        ("SM-A546U",  "UP1A.231005.007"),  # Galaxy A54
-        ("Pixel 8",    "AP2A.240805.005"),
-        ("Pixel 8 Pro","AP2A.240805.005"),
-        ("Pixel 7",    "UD2A.240805.003"),
-        ("CPH2423",    "RKQ1.211119.001"),  # OnePlus Nord
-        ("SM-G991B",   "TP1A.220624.014"),  # Galaxy S21
-        ("SM-A536U",   "TP1A.220624.014"),  # Galaxy A53
-        ("23021RAA2Y", "TP1A.220624.014"),  # Redmi Note 12
-    ]
-    model, build = random.choice(pool)
-    # Match `Linux; Android <ver>)` and inject `; <model> Build/<id>)`
-    # before the closing paren. Falls back unchanged if no match.
-    pattern = r"(Linux;\s*Android\s+[\d.]+)\s*\)"
-    if not re.search(pattern, ua, flags=re.IGNORECASE):
-        return ua
-    return re.sub(
-        pattern,
-        lambda m: f"{m.group(1)}; {model} Build/{build})",
-        ua,
-        count=1,
-        flags=re.IGNORECASE,
+# Retained for callers that introspect the historical strip registry. Coercion
+# itself rebuilds a clean browser shell, which also removes partial markers.
+_FOREIGN_INAPP_STRIP_PATTERNS: Dict[str, str] = {
+    "wechat": r"\s+MicroMessenger/\S+",
+    "firefox_mobile": r"\s+FxiOS/\S+",
+    "firefox_focus": r"\s+Focus/\S+",
+    "whale": r"\s+(?:Whale|NaverW)/\S+",
+    "ucbrowser": r"\s+(?:UCBrowser|UCWEB|UCTurbo)/\S+",
+    "samsung_internet": r"\s+SamsungBrowser/\S+",
+    "opera_mobile": r"\s+(?:OPR|Opera(?:Mini|Mobi)?)/\S+",
+    "edge_mobile": r"\s+(?:EdgA|EdgiOS|EdgeIOS|Edge)/\S+",
+    "line_browser": r"\s+Line/\S+",
+    "kakao": r"\s+KAKAOTALK/\S+",
+    "qq": r"\s+(?:MQQBrowser|QQBrowser|QQ)/\S+",
+    "yandex": r"\s+(?:YaBrowser|YandexSearchBrowser|YandexSearch)/\S+",
+    "brave_mobile": r"\s+Brave/\S+",
+    "duckduckgo": r"\s+DuckDuckGo/\S+",
+    "puffin": r"\s+Puffin/\S+",
+    "silk": r"\s+Silk(?:-Accelerated=[^ ]+)?(?:/\S+)?",
+    "miui": r"\s+MiuiBrowser/\S+",
+    "huawei": r"\s+HuaweiBrowser/\S+",
+    "vivo": r"\s+VivoBrowser/\S+",
+    "oppo": r"\s+(?:HeyTapBrowser|OppoBrowser)/\S+",
+    "baidu": r"\s+baiduboxapp/\S+",
+    "sogou": r"\s+SogouMobileBrowser/\S+",
+    "coc_coc": r"\s+coc_coc_browser/\S+",
+}
+
+_ANDROID_HARDWARE = {
+    "moto g 5g - 2024": ("306dpi", "720x1612", "motorola", "fogo", "qcom"),
+    "moto g power (2024)": ("420dpi", "1080x2400", "motorola", "penang", "mt6789"),
+    "sm-s918b": ("420dpi", "1080x2340", "samsung", "kalama", "qcom"),
+    "sm-s928b": ("505dpi", "1440x3120", "samsung", "pineapple", "qcom"),
+    "sm-a546b": ("420dpi", "1080x2340", "samsung", "a54x", "mt6833"),
+    "sm-g991b": ("420dpi", "1080x2400", "samsung", "exynos2100", "qcom"),
+    "pixel 8 pro": ("490dpi", "1344x2992", "google", "husky", "tensor"),
+    "pixel 8": ("420dpi", "1080x2400", "google", "shiba", "tensor"),
+    "pixel 7": ("420dpi", "1080x2400", "google", "panther", "tensor"),
+    "cph2449": ("450dpi", "1240x2772", "OnePlus", "waffle", "qcom"),
+    "cph2581": ("405dpi", "1080x2412", "OnePlus", "corvette", "qcom"),
+    "23049pcd8g": ("440dpi", "1080x2400", "Xiaomi", "renoir", "qcom"),
+}
+_IOS_HARDWARE = {
+    "iphone12,1": ("2.00", "828x1792"),
+    "iphone12,3": ("3.00", "1125x2436"),
+    "iphone13,2": ("3.00", "1170x2532"),
+    "iphone14,5": ("3.00", "1170x2532"),
+    "iphone15,2": ("3.00", "1179x2556"),
+    "iphone15,3": ("3.00", "1290x2796"),
+    "iphone16,1": ("3.00", "1179x2556"),
+    "iphone17,2": ("3.00", "1320x2868"),
+    "ipad13,1": ("2.00", "1640x2360"),
+    "ipad14,3": ("2.00", "1668x2388"),
+    "ipad14,5": ("2.00", "2048x2732"),
+}
+
+
+def _explicit_app_locale(ua: str, requested: str = "") -> str:
+    match = re.search(
+        r"\b(?:ByteFullLocale|ByteLocale)/([A-Za-z]{2}(?:[-_][A-Za-z]{2})?)\b",
+        ua or "",
+    )
+    if not match:
+        match = re.search(
+            r"\bInstagram\s+[\d.]+.*?;\s*([a-z]{2}[_-][A-Z]{2})\s*;",
+            ua or "",
+            re.I,
+        )
+    value = match.group(1) if match else (requested or "").strip()
+    return value.replace("_", "-")
+
+
+def _android_parts(ua: str) -> Dict[str, str]:
+    version = (re.search(r"\bAndroid\s+([\d.]+)", ua or "", re.I) or [None, "14"])[1]
+    device = re.search(
+        r"\bAndroid\s+[\d.]+\s*;\s*(?:[A-Za-z]{2}[_-][A-Za-z]{2}\s*;\s*)?"
+        r"([^;)]+?)(?:\s*;\s*|\s+)Build/",
+        ua or "", re.I,
+    )
+    if not device:
+        device = re.search(
+            r"\bAndroid\s+[\d.]+\s*;\s*([^;)]+?);\s*wv\)",
+            ua or "",
+            re.I,
+        )
+    build = re.search(r"\bBuild/([^;)\s]+)", ua or "", re.I)
+    chrome = re.search(r"\bChrome/([\d.]+)", ua or "", re.I)
+    model = device.group(1).strip() if device else "Pixel 8"
+    build_id = build.group(1) if build else "UP1A.231105.003"
+    chrome_version = chrome.group(1) if chrome else "149.0.7827.114"
+    snapshot = next(
+        (
+            record for record in ANDROID_DEVICE_SNAPSHOTS
+            if record["model"].lower() == model.lower()
+        ),
+        None,
+    )
+    if snapshot and (
+        snapshot["and_ver"] != version.split(".", 1)[0]
+        or snapshot["build"] != build_id
+    ):
+        version = snapshot["and_ver"]
+        build_id = snapshot["build"]
+    return {
+        "version": version, "model": model, "build": build_id,
+        "chrome": chrome_version,
+    }
+
+
+def _ios_parts(ua: str) -> Dict[str, str]:
+    is_ipad = bool(re.search(r"\biPad\b", ua or "", re.I))
+    version_match = re.search(
+        r"\bCPU\s+(?:iPhone|iPad)?\s*OS\s+([\d_]+)", ua or "", re.I
+    )
+    model_match = re.search(r"\b(iPhone\d+,\d+|iPad\d+,\d+)\b", ua or "", re.I)
+    family = "iPad" if is_ipad else "iPhone"
+    default_model = "iPad14,3" if is_ipad else "iPhone15,2"
+    return {
+        "family": family,
+        "version": version_match.group(1) if version_match else "18_6",
+        "model": model_match.group(1) if model_match else default_model,
+    }
+
+
+def _android_webview_base(parts: Dict[str, str]) -> str:
+    return (
+        f"Mozilla/5.0 (Linux; Android {parts['version']}; {parts['model']} "
+        f"Build/{parts['build']}; wv) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Version/4.0 Chrome/{parts['chrome']} Mobile Safari/537.36"
     )
 
 
-def _extract_android_build_token(ua: str) -> str:
-    """Pull the `Build/XXX` token from an Android UA, or return "" when
-    the UA doesn't carry one (older / synthetic UAs). The build id is
-    part of the in-app suffix realism, so we preserve it when present.
-    """
-    m = re.search(r"Build/([A-Za-z0-9_.\-]+)", ua or "")
-    return m.group(1) if m else ""
+def _ios_webview_base(parts: Dict[str, str]) -> str:
+    family = parts["family"]
+    return (
+        f"Mozilla/5.0 ({family}; CPU {family} OS {parts['version']} like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    )
 
 
-def _extract_ios_device_model(ua: str) -> str:
-    """Return an FBDV-compatible iOS device model token (e.g. iPhone17,1).
+def _generic_mobile_browser(ua: str) -> str:
+    if _is_mobile_ua(ua) == "ios":
+        parts = _ios_parts(ua)
+        family = parts["family"]
+        return (
+            f"Mozilla/5.0 ({family}; CPU {family} OS {parts['version']} like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
+            "Mobile/15E148 Safari/604.1"
+        )
+    major_match = re.search(r"\bChrome/(\d+)", ua or "", re.I)
+    major = major_match.group(1) if major_match else "149"
+    return (
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36"
+    )
 
-    Real Facebook iOS UAs include the device internal model id, not the
-    marketing name. We look at the UA's CPU/OS hints to pick a recent
-    plausible model. Defaults to a 2024 iPhone if nothing matches.
-    """
-    if not ua:
-        return "iPhone15,3"
-    ual = ua.lower()
-    # iPad signatures — broader pool.
-    if "ipad" in ual:
-        return random.choice(["iPad13,16", "iPad14,3", "iPad14,5", "iPad14,8"])
-    # iPhone — pick a model matching the OS major version when possible.
-    m = re.search(r"iphone os (\d+)[_\d]*", ual)
-    if m:
-        major = int(m.group(1))
-        if major >= 18:
-            return random.choice(["iPhone17,1", "iPhone17,2", "iPhone16,1", "iPhone16,2"])
-        if major == 17:
-            return random.choice(["iPhone15,2", "iPhone15,3", "iPhone16,1", "iPhone14,5"])
-        if major == 16:
-            return random.choice(["iPhone14,7", "iPhone14,8", "iPhone15,2", "iPhone13,2"])
-        if major == 15:
-            return random.choice(["iPhone13,2", "iPhone13,3", "iPhone14,2"])
-    return "iPhone15,3"
+
+def _generic_browser_fallback(ua: str) -> str:
+    """Preserve a valid generic browser exactly; rebuild only bad/app-marked UAs."""
+    original = ua or ""
+    verdict = validate_user_agent(original, expected_app="browser")
+    if (
+        verdict["valid"]
+        and not verdict["issues"]
+        and not verdict["identities"]
+        and verdict["profile_type"] == "browser"
+    ):
+        return original
+    return _generic_mobile_browser(original)
+
+
+def _identity_suffix(app: str, family: str, parts: Dict[str, str], locale: str) -> str:
+    release = APP_RELEASES_BY_PLATFORM[app][family][0]
+    version = release["version"]
+    posix = (locale or "en-US").replace("-", "_")
+    lang = (locale or "en-US").replace("_", "-")
+    if app == "instagram":
+        if family == "android":
+            dpi, resolution, vendor, soc, chipset = _ANDROID_HARDWARE.get(
+                parts["model"].lower(),
+                ("420dpi", "1080x2400", "google", "shiba", "tensor"),
+            )
+            sdk = {"15": "35", "14": "34", "13": "33", "12": "31", "11": "30"}.get(
+                parts["version"].split(".", 1)[0], "34"
+            )
+            return (
+                f"Instagram {version} Android ({sdk}/{parts['version']}; {dpi}; "
+                f"{resolution}; {vendor}; {parts['model']}; {soc}; {chipset}; "
+                f"{posix}; {release['version_code']}; IABMV/1)"
+            )
+        scale, resolution = _IOS_HARDWARE.get(
+            parts["model"].lower(),
+            ("2.00", "1668x2388") if parts["family"] == "iPad"
+            else ("3.00", "1179x2556"),
+        )
+        return (
+            f"Instagram {version} ({parts['model']}; iOS {parts['version']}; "
+            f"{posix}; {lang}; scale={scale}; {resolution})"
+        )
+    if app == "facebook":
+        if family == "android":
+            return (
+                f"[FB_IAB/FB4A;FBAV/{version};IABMV/1;"
+                f"FBBV/{release['build']};]"
+            )
+        device_family = parts["family"]
+        return (
+            f"[FBAN/FBIOS;FBAV/{version};FBDV/{parts['model']};"
+            f"FBMD/{device_family};FBSN/iOS;FBSV/{parts['version'].replace('_', '.')};"
+            f"FBSS/{2 if device_family == 'iPad' else 3};"
+            f"FBID/{'tablet' if device_family == 'iPad' else 'phone'};"
+            f"FBLC/{posix};IABMV/1]"
+        )
+    if app == "tiktok":
+        channel = "googleplay" if family == "android" else "App Store"
+        sdk = "1.0" if family == "android" else "2.0"
+        marker = (
+            f"TikTok/{version} musical_ly_{release.get('version_code', version)} "
+            f"JsSdk/{sdk} NetType/WIFI Channel/{channel} AppName/musical_ly "
+            f"app_version/{version}"
+        )
+        if locale:
+            marker += f" ByteLocale/{lang.split('-', 1)[0]} ByteFullLocale/{posix}"
+        if family == "android":
+            marker += f" com.zhiliaoapp.musically/{release['version_code']}"
+        else:
+            marker += " AppId/1233 WKWebView/1"
+        return marker
+    if app == "pinterest":
+        return f"[Pinterest/{'Android' if family == 'android' else 'iOS'}]"
+    if app == "snapchat":
+        return f"Snapchat/{version}"
+    if app == "whatsapp":
+        return f"WhatsApp/{version} A"
+    if app == "linkedin":
+        marker = f"[LinkedInApp]/{version}"
+        if family == "android":
+            marker += f" com.linkedin.android/{release['package_build']}"
+        return marker
+    if app == "twitter":
+        return (
+            f"TwitterAndroid/{version}-release.0"
+            if family == "android" else f"Twitter for iPhone/{version}"
+        )
+    if app == "reddit":
+        return (
+            f"Reddit/Version {version}/Build {release['build']}/Android "
+            f"{parts['version']}"
+        )
+    if app == "telegram":
+        return (
+            f"Telegram-Android/{version} (Android {parts['version']}; "
+            f"{parts['model']}; {lang})"
+        )
+    if app == "gsearch":
+        return f"GoogleApp/{version}" if family == "android" else f"GSA/{version}"
+    return ""
+
+
+def _strip_foreign_inapp_markers(ua: str, keep_platform: str = "") -> str:
+    """Strip every known/partial app identity by rebuilding only the browser base."""
+    del keep_platform
+    family = _is_mobile_ua(ua)
+    if family == "android":
+        return _android_webview_base(_android_parts(ua))
+    if family == "ios":
+        return _ios_webview_base(_ios_parts(ua))
+    return ua or ""
+
+
+def build_inapp_ua_suffix(platform: str, ua: str, locale: str = "") -> str:
+    app = _PLATFORM_TO_APP.get((platform or "").lower().strip())
+    family = _is_mobile_ua(ua)
+    if not app or family not in {"android", "ios"}:
+        return ""
+    if APP_SUPPORT_MATRIX[app][family] != "supported":
+        return ""
+    parts = _android_parts(ua) if family == "android" else _ios_parts(ua)
+    return _identity_suffix(app, family, parts, _explicit_app_locale(ua, locale))
+
+
+def coerce_ua_for_platform(ua: str, platform: str, locale: str = "") -> str:
+    """Apply exactly one contract-valid app identity, or a clean browser fallback."""
+    original = ua or ""
+    target = (platform or "").lower().strip()
+    if target in _FALLBACK_ONLY_PLATFORMS:
+        fallback = _generic_browser_fallback(original)
+        logger.warning(
+            "[ua-fallback-only] %s has no verified browser-UA contract; "
+            "using a clean generic browser identity without fabricated app markers",
+            target,
+        )
+        return fallback
+
+    app = _PLATFORM_TO_APP.get(target)
+    family = _is_mobile_ua(original)
+    if not app or family not in {"android", "ios"}:
+        return original
+
+    if APP_SUPPORT_MATRIX[app][family] != "supported":
+        fallback = _generic_browser_fallback(original)
+        verdict = validate_user_agent(fallback, expected_app=app)
+        if verdict["issues"]:
+            logger.warning(
+                "UA coercion fallback for %s %s could not satisfy contract: %s",
+                app, family, "; ".join(verdict["issues"]),
+            )
+        return fallback
+
+    expected = app
+    current = validate_user_agent(original, expected_app=expected)
+    if current["valid"] and not current["issues"]:
+        return original
+
+    parts = _android_parts(original) if family == "android" else _ios_parts(original)
+    base = _android_webview_base(parts) if family == "android" else _ios_webview_base(parts)
+    suffix = _identity_suffix(
+        app, family, parts, _explicit_app_locale(original, locale)
+    )
+    candidate = f"{base} {suffix}".strip()
+    verdict = validate_user_agent(candidate, expected_app=expected)
+    if verdict["valid"] and not verdict["issues"]:
+        return candidate
+
+    fallback = _generic_mobile_browser(original)
+    logger.warning(
+        "Invalid coerced %s %s UA; using generic mobile browser fallback: %s",
+        app, family, "; ".join(verdict["issues"]) or "unknown validation failure",
+    )
+    return fallback
+
+
+def _is_tiktok_android_ua_complete(ua: str) -> bool:
+    """Compatibility helper backed by strict validation, not marker presence."""
+    verdict = validate_user_agent(ua or "", expected_app="tiktok")
+    return (
+        verdict["platform"] == "Android"
+        and verdict["engine"] == "android_webview"
+        and verdict["valid"]
+    )
+
+
+def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
+    """Compatibility helper: true only for one fully valid target identity."""
+    app = _PLATFORM_TO_APP.get((platform or "").lower().strip())
+    if not app:
+        return False
+    verdict = validate_user_agent(ua or "", expected_app=app)
+    return verdict["valid"] and verdict["app"] == app
 
 
 def is_non_chrome_inapp_ua(ua: str) -> bool:
-    """True iff an in-app/native UA must not emit Chromium client hints.
-    emit Chromium's default Sec-CH-UA / navigator.userAgentData
-    (real device would send TikTok-Cronet / Facebook-Cronet / IG /
-    Snapchat markers instead of "Google Chrome").
-
-    Real advertiser trackers (Voluum / RedTrack / Anura / IPQS /
-    Everflow / FingerprintJS Pro) treat Sec-CH-UA + userAgentData as
-    "browser identity" — higher priority than the UA string. If we
-    emit `"Google Chrome"` in those two channels while the UA string
-    says TikTok/Cronet, the tracker either latches on Chrome
-    (~40% of clicks in the customer's 07-21 Everflow report) or
-    flags the visit as inconsistent (Firefox / WeChat / Whale
-    fallback labels).
-
-    Used by real_user_traffic.py to:
-      1. STRIP `sec-ch-ua*` headers via route interception.
-      2. SUPPRESS the `navigator.userAgentData` JS stealth override
-         (real WebViews don't expose it).
-      3. Skip the chrome-only branch inside `_build_client_hint_headers`.
-    """
-    if not ua:
-        return False
-    ul = ua.lower()
-    # TikTok native Cronet and iOS WKWebView are non-Chromium. Android
-    # offer-page WebView identities intentionally carry Chrome/Version/wv
-    # and should retain coherent Chromium client hints.
-    if "musical_ly" in ul or "bytedancewebview" in ul or "com.zhiliaoapp.musically" in ul:
-        return "chrome/" not in ul
-    # Facebook / Messenger native app UAs (iOS FBIOS variant is
-    # non-Chrome — a WKWebView shell around FB's own network stack).
-    if "fban/fbios" in ul or "fbav/" in ul and "chrome/" not in ul:
+    """Compatibility helper for native/non-Chromium app identities."""
+    profile = classify_user_agent(ua or "")
+    if not profile["runtime_compatible"]:
         return True
-    # Instagram iOS native. Android IG is Chrome WebView so it
-    # legitimately keeps Chrome/xxx tokens — do NOT flag as non-chrome.
-    if "instagram " in ul and "iphone" in ul:
-        return True
-    # Snapchat native app UA — non-Chrome.
-    if "snapchat/" in ul and "chrome/" not in ul:
-        return True
-    return False
+    return (
+        profile["app"] not in {"browser", "gchrome"}
+        and not client_hint_headers_for_ua(ua or "")
+    )
 
 
 def make_sec_ch_ua_strip_route_handler():
-    """Playwright route handler — strip branded Sec-CH-UA for in-app UAs.
-
-    Shared by RUT, profile launcher, and anti_detect_engine so TikTok /
-    FB-iOS WebViews never leak ``Google Chrome`` client hints on
-    sub-resource requests."""
+    """Enforce the exact shared client-hint set on every Playwright request."""
     async def _handler(route, request):
         try:
-            _req_ua = (
-                request.headers.get("user-agent")
-                or request.headers.get("User-Agent")
-                or ""
-            )
-            if not is_non_chrome_inapp_ua(_req_ua):
-                await route.continue_()
-                return
-            _hdrs = dict(request.headers or {})
-            _changed = False
-            for _k in list(_hdrs.keys()):
-                _kl = _k.lower()
-                if _kl.startswith("sec-ch-ua") and _kl not in (
-                    "sec-ch-ua-mobile",
-                    "sec-ch-ua-platform",
-                ):
-                    _hdrs.pop(_k, None)
-                    _changed = True
-            if _changed:
-                await route.continue_(headers=_hdrs)
-            else:
-                await route.continue_()
+            headers = dict(request.headers or {})
+            ua = headers.get("user-agent") or headers.get("User-Agent") or ""
+            headers = {
+                key: value for key, value in headers.items()
+                if not key.lower().startswith("sec-ch-ua")
+            }
+            casing = {
+                "sec-ch-ua": "Sec-CH-UA",
+                "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+                "sec-ch-ua-platform": "Sec-CH-UA-Platform",
+            }
+            headers.update({
+                casing[key]: value
+                for key, value in client_hint_headers_for_ua(ua).items()
+            })
+            await route.continue_(headers=headers)
         except Exception:
             try:
                 await route.continue_()
             except Exception:
                 pass
-
     return _handler
-
-
-
-def _is_tiktok_android_ua_complete(ua: str) -> bool:
-    """True for a complete TikTok Android offer-page WebView identity."""
-    if not ua:
-        return False
-    ual = ua.lower()
-    if "android" not in ual:
-        return False
-    if "fban/tiktokandroid" not in ual:
-        return False
-    for token in (
-        "; wv)", "applewebkit/537.36", "version/4.0",
-        "chrome/", "mobile safari/537.36",
-    ):
-        if token not in ual:
-            return False
-    markers = _INAPP_MARKER_LOOKUP.get("tiktok", ())
-    return any(m and m in ual for m in markers)
-
-
-def _ua_has_inapp_marker(ua: str, platform: str) -> bool:
-    """True iff `ua` already carries the in-app marker for `platform`.
-
-    Used for idempotency — coerce_ua_for_platform short-circuits when the
-    UA is already a proper in-app webview UA for the chosen platform.
-
-    2026-06-15 hardening (anti-"Unknown" version bug): for Facebook /
-    Messenger UAs we now require BOTH a family marker (FB_IAB / FBAN /
-    FB4A / FBIOS) AND a parseable `FBAV/<X.X.X[.X.X]>` version of at
-    least 5 chars (e.g. "200.0" or full "515.1.0.62.90"). Earlier we
-    returned True on family-marker presence alone — which let UAs that
-    had `FB_IAB/FB4A` but EMPTY or MISSING FBAV slip through the
-    coercion short-circuit unchanged. Affiliate-side UA parsers
-    (user-agents / ua-parser / Browscap) then detected "Facebook" as
-    the browser family but had no version to extract, producing the
-    "Facebook for Android (Unknown)" cluster on advertiser dashboards.
-    Re-running coercion on those UAs now properly appends a fresh
-    `[FB_IAB/FB4A;FBAV/<real_ver>;IABMV/1;]` suffix.
-
-    2026-07 v2.6.33: Android TikTok requires FBAN/TikTokAndroid —
-    musical_ly alone is incomplete and must be upgraded.
-    """
-    if not ua or not platform:
-        return False
-    ual = ua.lower()
-    p = platform.lower()
-    markers = _INAPP_MARKER_LOOKUP.get(p, ())
-    has_family_marker = any(m and m in ual for m in markers)
-    if not has_family_marker:
-        return False
-
-    # Facebook / Messenger special-case: require complete FBAV version.
-    if p in ("facebook", "messenger"):
-        # Real FBAV format: 3-5 dot-separated numeric segments
-        # (e.g. "200.0.0", "515.1.0.62.90"). Allow either short or full
-        # — anything is OK as long as at least one dotted version is
-        # present and the version body is ≥ 5 chars (so "FBAV/" or
-        # "FBAV/x" both fail and trigger re-coercion).
-        m = re.search(r"fbav/([\d.]+)", ual)
-        if not m or len(m.group(1)) < 5 or "." not in m.group(1):
-            return False
-        return True
-
-    if p == "tiktok" and _is_mobile_ua(ua) == "android":
-        return _is_tiktok_android_ua_complete(ua)
-
-    return True
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 2026-07 v2.2.3 — Strip FOREIGN in-app markers before appending fresh
-# ──────────────────────────────────────────────────────────────────────
-# Bug reported by customer: ran TikTok RUT job. Referrer report showed
-# tiktok.com correctly, but the "Browser" column on the advertiser
-# dashboard read "Facebook for Android (Unknown)" for some visits.
-# Root cause: when the operator's UA pool already contained a Facebook
-# in-app UA (either typed manually or generated by an AI helper), and
-# the chosen platform for the visit was TikTok, `coerce_ua_for_platform`
-# only stripped markers of the SAME platform (target). The Facebook
-# `[FB_IAB/FB4A;FBAV/...]` bracket stayed at the end, then the TikTok
-# `musical_ly_...BytedanceWebview/...` suffix was appended on top.
-# Result: a hybrid UA carrying BOTH platforms' markers.  Advertiser-side
-# UA parsers (user-agents / ua-parser / Browscap) scan left→right and
-# stop at the first family marker → labelled the click "Facebook for
-# Android" even though our Referer + urlparams said tiktok.
-#
-# Fix: strip in-app markers of EVERY OTHER platform before appending
-# the target platform's fresh markers. The regex library below matches
-# the exact shapes produced by `build_inapp_ua_suffix` (Facebook / IG /
-# TikTok / Snapchat / LinkedIn / Twitter). Pure function — safe to
-# call from any codepath. Never raises.
-# ──────────────────────────────────────────────────────────────────────
-_FOREIGN_INAPP_STRIP_PATTERNS: Dict[str, str] = {
-    # Facebook / Messenger use the same `[FB_IAB/FB4A;...]` (Android) or
-    # `[FBAN/FBIOS;...]` (iOS) trailing bracket. When target is fb or msgr
-    # we skip this bucket (they're aliases of each other for stripping).
-    # v2.6.27 TIGHTENING: we now match ONLY the Facebook-specific bracket
-    # shapes — `FB_IAB/FB4A` or `FBAN/FBIOS`. Other in-app browsers now
-    # also use the FB_IAB/FBAN bracket format (TikTokAndroid, IG Android,
-    # etc.) but with DIFFERENT FBAN values; matching those under the
-    # `fb_bracket` bucket accidentally stripped them when coercing to
-    # their own platform (e.g. our new `[FB_IAB/;FBAN/TikTokAndroid;…]`
-    # trailer was being wiped by the coerce-to-tiktok path).
-    "fb_bracket": r"\s*\[\s*(?:FB_IAB/FB4A|FBAN/FBIOS)[^\]]*\]\s*",
-    # Instagram — `Instagram <ver> (Android|iPhone; ...)` block. We keep
-    # the regex tolerant (any run of non-paren chars between the parens).
-    "instagram":  r"\s+Instagram\s+\S+\s+(?:Android\s+)?\([^)]*\)",
-    # TikTok — long `musical_ly_<code> ... BytedanceWebview/<hash>` run,
-    # optionally followed by the v2.6.27 `[FB_IAB/;FBAN/TikTokAndroid;…]`
-    # trailer that advertiser trackers use to label the click.
-    # `.*?` is bounded by the required `BytedanceWebview/` trailer so
-    # this regex can't chew up unrelated tokens accidentally.
-    # v2.6.26: also strip an optional preceding `TikTok/{ver}` marker.
-    # v2.6.27: also strip an optional trailing FB_IAB TikTokAndroid
-    # bracket + any preceding `com.zhiliaoapp.musically/…` token.
-    "tiktok":     r"\s+(?:TikTok/[\d.]+\s+)?musical_ly[_A-Za-z0-9]*\s+.*?BytedanceWebview/\S+(?:\s+ttwebview/\S+)?(?:\s+com\.zhiliaoapp\.musically/\S+)?(?:\s+\[FB_IAB/;FBAN/TikTokAndroid;[^\]]+\])?",
-    # Snapchat — trailing `Snapchat/<ver>` token.
-    "snapchat":   r"\s+Snapchat/[\d.]+",
-    # LinkedIn — trailing `LinkedInApp/<ver>` (iOS) or
-    # `com.linkedin.android/<ver>` (Android).
-    "linkedin":   r"\s+(?:LinkedInApp|com\.linkedin\.android)/\S+",
-    # Twitter / X — trailing `TwitterAndroid/<rev>` or `TwitterIOS/<rev>`.
-    "twitter":    r"\s+(?:TwitterAndroid|TwitterIOS)/\d+",
-    # 2026-07 v2.2.5 — search / video / discovery in-app markers.
-    "youtube":    r"\s+com\.google\.(?:ios|android)\.youtube/\S+(?:\s+\([^)]*\))?",
-    "google":     r"\s+GSA/\S+(?:\s+Mobile/\S+\s+Safari/\S+)?",
-    "reddit":     r"\s+Reddit/Version\s+\S+(?:/Build\s+\S+)?(?:/Android\s+\S+)?",
-    "pinterest":  r"\s+Pinterest/\S+",
-    # 2026-02 v2.6.18 — Third-party mobile browsers whose primary
-    # signature would out-rank an appended in-app suffix in the offer
-    # tracker's UA parser. Customer's Traxun report was labelling
-    # TikTok-preset visits as WeChat / Firefox / Whale / Chrome
-    # because the underlying UA carried these markers. Stripping them
-    # before coerce lets the fresh in-app suffix become the ONLY
-    # browser signature the offer's parser detects. None of these are
-    # in `_INAPP_CAPABLE_PLATFORMS`, so they are ALWAYS stripped —
-    # regardless of the target platform.
-    "wechat":            r"\s+MicroMessenger/\S+(?:\([^)]*\))?",
-    "firefox_mobile":    r"\s+FxiOS/\S+",
-    "firefox_focus":     r"\s+Focus/\S+",
-    "whale":             r"\s+(?:Whale|NaverW)/\S+",
-    "ucbrowser":         r"\s+(?:UCBrowser|UCWEB|UCTurbo)/\S+",
-    "samsung_internet":  r"\s+SamsungBrowser/\S+",
-    "opera_mobile":      r"\s+(?:OPR|Opera(?:Mini|Mobi)?)/\S+",
-    "edge_mobile":       r"\s+(?:EdgA|EdgiOS|EdgeIOS|Edge)/\S+",
-    "line_browser":      r"\s+Line/\S+",
-    "kakao":             r"\s+KAKAOTALK/\S+",
-    "qq":                r"\s+(?:MQQBrowser|QQBrowser|QQ)/\S+",
-    "yandex":            r"\s+(?:YaBrowser|YandexSearchBrowser|YandexSearch)/\S+",
-    "brave_mobile":      r"\s+Brave/\S+",
-    "duckduckgo":        r"\s+DuckDuckGo/\S+",
-    "puffin":            r"\s+Puffin/\S+",
-    "silk":              r"\s+Silk(?:-Accelerated=[^ ]+)?(?:/\S+)?",
-    "miui":              r"\s+MiuiBrowser/\S+",
-    "huawei":            r"\s+HuaweiBrowser/\S+",
-    "vivo":              r"\s+VivoBrowser/\S+",
-    "oppo":              r"\s+(?:HeyTapBrowser|OppoBrowser)/\S+",
-    "baidu":             r"\s+baiduboxapp/\S+",
-    "sogou":             r"\s+SogouMobileBrowser/\S+",
-    "coc_coc":           r"\s+coc_coc_browser/\S+",
-}
-
-
-def _rebuild_tiktok_android_ua_base(ua: str) -> str:
-    """Rebuild Android input as an offer-page WebView base.
-
-    External Cronet/native UAs remain valid checker inputs, but RUT navigates
-    pages in Chromium and therefore needs a browser/WebView identity.
-    """
-    if not ua:
-        return ua or ""
-    try:
-        m_ver = re.search(r"\bAndroid\s+([\d.]+)", ua, flags=re.IGNORECASE)
-        android_ver = m_ver.group(1) if m_ver else "14"
-        m_dev = re.search(
-            r"Android\s+[\d.]+\s*;\s*(?:[a-z]{2}_[A-Z]{2}\s*;\s*)?"
-            r"([^;()]+?)(?:\s*;\s*|\s+)Build/([^;)\s]+)",
-            ua,
-            flags=re.IGNORECASE,
-        )
-        device = (m_dev.group(1).strip() if m_dev else "SM-S928B")
-        build_id = (m_dev.group(2).strip() if m_dev else "UP1A.231005.007")
-        m_chrome = re.search(r"\bChrome/([\d.]+)", ua, flags=re.IGNORECASE)
-        chrome_ver = m_chrome.group(1) if m_chrome else "128.0.6613.88"
-        return (
-            f"Mozilla/5.0 (Linux; Android {android_ver}; {device} Build/{build_id}; wv) "
-            f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
-            f"Chrome/{chrome_ver} Mobile Safari/537.36"
-        )
-    except Exception:
-        return ua
-
-
-
-def _strip_foreign_inapp_markers(ua: str, keep_platform: str) -> str:
-    """Remove in-app markers of every OTHER in-app platform from `ua`,
-    so appending the target platform's fresh markers produces a UA
-    consistent with a SINGLE app (not a hybrid FB+TT+IG franken-UA that
-    advertiser UA parsers flag). Returns cleaned UA. Never raises.
-
-    `keep_platform` values that are in `_INAPP_CAPABLE_PLATFORMS`
-    (facebook / messenger / instagram / tiktok / snapchat / linkedin /
-    twitter) preserve their OWN markers untouched (those get stripped
-    later by the coerce-idempotency block or by the target-specific
-    strip inside `coerce_ua_for_platform`). Any other value (or empty)
-    strips ALL known in-app markers.
-    """
-    if not ua:
-        return ua or ""
-    try:
-        keep = (keep_platform or "").lower().strip()
-        # Facebook + Messenger share the same bracket shape.
-        keep_fb_family = keep in ("facebook", "messenger")
-        new = ua
-        for bucket, pat in _FOREIGN_INAPP_STRIP_PATTERNS.items():
-            # Skip the target platform's own bucket so we don't strip
-            # what we're about to (re-)add. `_ua_has_inapp_marker` may
-            # already have short-circuited the caller if the current
-            # marker was complete, so anything we see here that
-            # matches the target is stale/incomplete and will be
-            # rebuilt by the coerce append.
-            if bucket == "fb_bracket" and keep_fb_family:
-                continue
-            if bucket == keep:
-                continue
-            new = re.sub(pat, "", new, flags=re.IGNORECASE)
-        # Squeeze double spaces the stripping may leave behind so the
-        # final UA looks like a natural single-space-delimited capture.
-        new = re.sub(r"\s{2,}", " ", new).rstrip()
-        return new
-    except Exception:
-        return ua
-
-
-
-
-def build_inapp_ua_suffix(platform: str, ua: str) -> str:
-    """Build the realistic in-app webview suffix for `platform`, sized
-    appropriately for the OS family detected in `ua`.
-
-    Returns "" when:
-        * platform is not in _INAPP_CAPABLE_PLATFORMS, OR
-        * ua is desktop / not mobile (callers should not append anything
-          to desktop UAs — that would itself look forged).
-
-    Real-world structure references:
-        Facebook Android: [FB_IAB/FB4A;FBAV/515.1.0.62.90;IABMV/1;]
-        Facebook iOS:     [FBAN/FBIOS;FBAV/515.0.0.43.108;FBBV/683141668;
-                           FBDV/iPhone17,1;FBMD/iPhone;FBSN/iOS;FBSV/18.3;
-                           FBSS/3;FBID/phone;FBLC/en_US;FBOP/5;
-                           FBRV/684552024;IABMV/1]
-        TikTok Android:   musical_ly_2024105080 JsSdk/1.0 NetType/WIFI
-                          Channel/googleplay AppName/musical_ly
-                          app_version/34.5.1 ByteLocale/en Region/US
-                          BytedanceWebview/d8a21c6
-        Instagram And:    Instagram 354.0.0.45.81 Android (...; en_US;
-                          640573830)
-        Instagram iOS:    Instagram 354.0.0.45.81 (iPhone17,1; iOS 18_3
-                          like Mac OS X; en_US; en-US; scale=3.00;
-                          1170x2532; 640573830)
-        Snapchat:         Snapchat/12.95.0.41 (...; en_US)
-    """
-    p = (platform or "").lower().strip()
-    if p not in _INAPP_CAPABLE_PLATFORMS:
-        return ""
-    family = _is_mobile_ua(ua)
-    if not family:
-        return ""
-
-    if p in ("facebook", "messenger"):
-        if family == "android":
-            ver = random.choice(_FBAV_ANDROID_VERSIONS)
-            if p == "messenger":
-                # Messenger UAs use FBAN/MessengerForAndroid + Orca-Android
-                return f"[FB_IAB/MESSENGER;FBAV/{ver};IABMV/1;]"
-            return f"[FB_IAB/FB4A;FBAV/{ver};IABMV/1;]"
-        # iOS
-        ver = random.choice(_FBAV_IOS_VERSIONS)
-        fbbv = random.randint(*_FBBV_IOS_RANGE)
-        fbrv = random.randint(*_FBRV_IOS_RANGE)
-        fbdv = _extract_ios_device_model(ua)
-        # Pull iOS major.minor from UA → FBSV value.
-        m = re.search(r"iphone os ([\d_]+)", ua.lower())
-        fbsv = m.group(1).replace("_", ".") if m else "18.3"
-        # Locale — operator-set Accept-Language can override later, but
-        # the suffix string itself carries FBLC for cross-checking.
-        fblc = random.choice(["en_US", "en_GB", "en_CA", "es_US", "pt_BR", "de_DE", "fr_FR"])
-        app_name = "MESSENGER" if p == "messenger" else "FBIOS"
-        return (
-            f"[FBAN/{app_name};FBAV/{ver};FBBV/{fbbv};FBDV/{fbdv};"
-            f"FBMD/iPhone;FBSN/iOS;FBSV/{fbsv};FBSS/3;FBID/phone;"
-            f"FBLC/{fblc};FBOP/5;FBRV/{fbrv};IABMV/1]"
-        )
-
-    if p == "instagram":
-        ver = random.choice(_IG_APP_VERSIONS)
-        build_id = random.randint(*_IG_BUILD_RANGE)
-        locale = random.choice(["en_US", "en_GB", "en_CA", "es_US", "pt_BR"])
-        if family == "android":
-            # Find the Android version + device model from the UA so the
-            # Instagram suffix is internally coherent.
-            m_ver = re.search(r"android (\d+(?:\.\d+)?)", ua.lower())
-            android_ver = m_ver.group(1) if m_ver else "14"
-            m_dev = re.search(r";\s*([A-Z0-9][A-Za-z0-9 _\-\+]*?)\s*Build/", ua)
-            device = (m_dev.group(1).strip() if m_dev else "SM-S928B")
-            dpi = random.choice(["420dpi", "480dpi", "560dpi", "640dpi"])
-            res = random.choice(["1080x2340", "1170x2532", "1284x2778", "1080x2400"])
-            return (
-                f"Instagram {ver} Android (29/{android_ver}; {dpi}; {res}; "
-                f"samsung; {device}; sm; sm; {locale.replace('_','-').lower()}; {build_id})"
-            )
-        # iOS
-        m = re.search(r"iphone os ([\d_]+)", ua.lower())
-        ios_ver = m.group(1) if m else "18_3"
-        device = _extract_ios_device_model(ua)
-        return (
-            f"Instagram {ver} (iPhone; CPU iPhone OS {ios_ver} like Mac OS X; "
-            f"{locale}; scale=3.00; 1170x2532; {build_id})"
-        )
-
-    if p == "tiktok":
-        ver = random.choice(_TIKTOK_APP_VERSIONS)
-        wv_hash = random.choice(_BYTEDANCE_WV_HASHES)
-        region = random.choice(_TIKTOK_REGIONS)
-        locale = _TIKTOK_REGION_LOCALES[region]
-        # TikTok's `app_version` build counter — numeric YYYYRRRSS-style.
-        # Constructed deterministically from the version string so that
-        # version "34.5.1" → 2034050010 etc. (matches their real coder).
-        try:
-            mj, mn, pt = (ver.split(".") + ["0"])[:3]
-            ver_code = f"20{int(mj):02d}{int(mn):02d}0{int(pt):02d}0"
-        except Exception:
-            ver_code = "2034050010"
-        nettype = random.choice(["WIFI", "MOBILE", "4G", "5G"])
-        if family == "android":
-            channel = random.choice(["googleplay", "googleplay", "samsung", "huawei", "xiaomi"])
-            # v2.6.27: appended `[FB_IAB/;FBAN/TikTokAndroid;FBAV/{ver};…]`
-            # bracket (mirrors the `_ua_tiktok_android` fix in server.py) —
-            # advertiser trackers (Everflow / Voluum / RedTrack / Binom)
-            # detect Android TikTok via the FB_IAB bracket contents.
-            # v2.6.26's `TikTok/{ver}` marker alone is NOT in uap-core /
-            # user_agents / advertiser DBs and clicks were mis-labelled
-            # as `Browser=Android` in the customer's tracker.
-            return (
-                f"TikTok/{ver} musical_ly_{ver_code} JsSdk/1.0 NetType/{nettype} Channel/{channel} "
-                f"AppName/musical_ly app_version/{ver} ByteLocale/{locale} "
-                f"ByteFullLocale/{locale} Region/{region} AppVersion/{ver} "
-                f"BytedanceWebview/{wv_hash} com.zhiliaoapp.musically/{ver_code} "
-                f"[FB_IAB/;FBAN/TikTokAndroid;FBAV/{ver};IABMV/1;FBBV/{ver_code};FBOP/19;]"
-            )
-        # iOS
-        return (
-            f"musical_ly_{ver_code} JsSdk/1.0 NetType/{nettype} "
-            f"AppName/musical_ly app_version/{ver} ByteLocale/{locale} "
-            f"Region/{region} AppVersion/{ver} BytedanceWebview/{wv_hash} "
-            f"com.zhiliaoapp.musically/{ver_code}"
-        )
-
-    if p == "snapchat":
-        ver = random.choice(_SNAPCHAT_APP_VERSIONS)
-        if family == "android":
-            return f"Snapchat/{ver}"
-        return f"Snapchat/{ver}"
-
-    if p == "linkedin":
-        ver = random.choice(_LINKEDIN_APP_VERSIONS)
-        if family == "android":
-            return f"com.linkedin.android/{ver}"
-        return f"LinkedInApp/{ver}"
-
-    if p == "twitter":
-        # Twitter mobile webview UA marker.
-        rev = random.randint(10000000, 99000000)
-        if family == "android":
-            return f"TwitterAndroid/{rev}"
-        return f"TwitterIOS/{rev}"
-
-    # 2026-07 v2.2.5 — search / video / discovery in-app browsers.
-    # Real UA references (sampled from live traffic June-July 2026):
-    #   YouTube iOS:    …Mobile/15E148 com.google.ios.youtube/20.15.3
-    #                   (iPhone17,2; U; CPU iOS 26_4_1 like Mac OS X;
-    #                   en_US)
-    #   YouTube Andrd:  …com.google.android.youtube/20.15.36 (Linux;
-    #                   U; Android 14; en_US; SM-S928B Build/UP1A…)
-    #   GSA iOS:        …Mobile/15E148 GSA/424.0.578291269 Mobile/15E148
-    #                   Safari/604.1
-    #   GSA Android:    Mozilla/5.0 (Linux; Android 14; …) AppleWebKit/…
-    #                   Chrome/… Mobile Safari/537.36 GSA/424.0.578…
-    #   Reddit iOS:     …Mobile/15E148 Reddit/Version 2024.28.0/Build 15024872
-    #   Reddit Andrd:   …Mobile Safari/537.36 Reddit/Version 2024.28.0/Build
-    #                   1502487/Android 14
-    #   Pinterest:      …Mobile/15E148 Pinterest/11.34
-    if p == "youtube":
-        yt_ver = random.choice(_YOUTUBE_APP_VERSIONS)
-        if family == "android":
-            # Android YouTube app uses lowercase package id.
-            return f"com.google.android.youtube/{yt_ver}"
-        # iOS
-        return f"com.google.ios.youtube/{yt_ver}"
-
-    if p == "google":
-        gsa_ver = random.choice(_GSA_APP_VERSIONS)
-        # Both families use the same GSA/<ver> marker shape.
-        return f"GSA/{gsa_ver}"
-
-    if p == "reddit":
-        r_ver = random.choice(_REDDIT_APP_VERSIONS)
-        build = random.randint(15000000, 15999999)
-        if family == "android":
-            m_and = re.search(r"android (\d+(?:\.\d+)?)", ua.lower())
-            android_ver = m_and.group(1) if m_and else "14"
-            return f"Reddit/Version {r_ver}/Build {build}/Android {android_ver}"
-        return f"Reddit/Version {r_ver}/Build {build}"
-
-    if p == "pinterest":
-        p_ver = random.choice(_PINTEREST_APP_VERSIONS)
-        return f"Pinterest/{p_ver}"
-
-    return ""
-
-
-def coerce_ua_for_platform(ua: str, platform: str) -> str:
-    """Return a UA whose tail markers are consistent with `platform`.
-
-    Behaviour:
-      * desktop UA → returned unchanged (legit signature on desktop).
-      * mobile UA + non-inapp platform (google/bing/direct/email/youtube
-        watch-only/etc.) → returned unchanged.
-      * mobile UA + in-app platform AND UA already carries the matching
-        markers → returned unchanged (idempotent).
-      * mobile UA + in-app platform → suffix appended. For Android we
-        also ensure the UA has the `wv` token and a `Version/4.0` (the
-        WebKit version token Android WebView always emits) — both are
-        signals fraud detectors check for, and synthetic UAs sometimes
-        miss them.
-      * any error → original UA (never raises).
-
-    Pure function. No I/O.
-    """
-    try:
-        if not ua or not platform:
-            return ua or ""
-        p = platform.lower().strip()
-        if p not in _INAPP_CAPABLE_PLATFORMS:
-            return ua
-        family = _is_mobile_ua(ua)
-        if not family:
-            return ua
-
-        # ── 2026-02 v2.6.22 CRITICAL FIX — "mixed browser leak" ────────
-        # Idempotency short-circuit MUST run AFTER foreign-marker strip,
-        # else hybrid UAs pass through unchanged and advertiser
-        # trackers latch onto the LEAKED signature (FB / Chrome /
-        # Safari) instead of the target platform. Two documented
-        # customer leaks this fix closes:
-        #   BUG A: UA carries target marker (e.g. musical_ly) AND a
-        #          foreign in-app marker (e.g. FBAV). Old code returned
-        #          UA unchanged → advertiser parser stops at FBAV →
-        #          click labelled "Facebook for Android".
-        # TikTok Android page-navigation UAs are intentionally standard
-        # WebViews; Cronet is reserved for external native/API identities.
-        new_ua = _strip_foreign_inapp_markers(ua, p)
-
-        # Now idempotency check on the CLEANED UA. If clean UA still
-        # has the target's marker, we're done.
-        if _ua_has_inapp_marker(new_ua, p):
-            return new_ua
-
-        suffix = build_inapp_ua_suffix(p, new_ua)
-        if not suffix:
-            return new_ua
-
-        # 2026-07 v2.2.3 — Strip FOREIGN in-app markers first.
-        # Customer report: TikTok RUT job produced clicks where Referrer=
-        # tiktok.com but the advertiser dashboard labelled the browser
-        # as "Facebook for Android (Unknown)". Root cause: operator UA
-        # pool contained an FBAN/FBAV UA. Old coerce only stripped
-        # markers of THE SAME target platform, so the FB bracket
-        # survived and the TikTok suffix got appended on top → hybrid
-        # UA → advertiser parser stopped at the first (FB) marker.
-        # This new step removes markers of EVERY OTHER in-app platform
-        # so the fresh target marker is the only in-app signature left.
-        new_ua = _strip_foreign_inapp_markers(new_ua, p)
-
-        # ── 2026-06-15 (anti "Unknown" version): if the UA already carries
-        # an INCOMPLETE platform bracket (e.g. `[FB_IAB/FB4A;]` with
-        # missing/empty FBAV), strip it BEFORE we append the fresh one.
-        # Without this, the UA would end up with TWO brackets — the
-        # broken old + the fresh good — which is itself a fraud tell
-        # (no real client ships duplicate app-marker brackets). The new
-        # `_ua_has_inapp_marker` already returns False for these
-        # incomplete brackets so we land here.
-        if p in ("facebook", "messenger"):
-            # Match trailing `[FB_IAB/...]` or `[FBAN/...]` bracket and
-            # remove it. Real captures only ever have ONE such bracket
-            # at the very end of the UA, so a single removal is safe.
-            new_ua = re.sub(
-                r"\s*\[\s*(?:FB_IAB|FBAN)/[^\]]*\]\s*$",
-                "",
-                new_ua,
-                flags=re.IGNORECASE,
-            ).rstrip()
-        elif p == "instagram":
-            # Real IG iOS UA ends with `Instagram <ver> (...)` paren block.
-            # Strip incomplete trailing `Instagram` paren if FBAV-equiv
-            # version is missing — same principle as Facebook. We use a
-            # conservative regex that ONLY removes the trailing
-            # `Instagram ...` suffix when no version number follows.
-            if re.search(r"instagram\s*$", new_ua, flags=re.IGNORECASE):
-                new_ua = re.sub(
-                    r"\s+Instagram\s*$",
-                    "",
-                    new_ua,
-                    flags=re.IGNORECASE,
-                ).rstrip()
-        elif p == "tiktok":
-            # Strip incomplete trailing musical_ly / aweme / trill_
-            # markers that lack version info, so the fresh suffix
-            # doesn't double up.
-            new_ua = re.sub(
-                r"\s+(musical_ly|aweme|trill_)\S*\s*$",
-                "",
-                new_ua,
-                flags=re.IGNORECASE,
-            ).rstrip()
-
-        # Android WebView realism: real in-app UAs include "; wv)" and a
-        # "Version/4.0" token. If they're missing, synthesise the most
-        # common form before appending the suffix.
-        if family == "android":
-            # RUT performs offer-page navigation in Chromium. TikTok's
-            # external Cronet/API identity must therefore be converted to
-            # the same WebView page shape used by other Android app choices.
-            if p == "tiktok":
-                rebuilt = _rebuild_tiktok_android_ua_base(new_ua)
-                if rebuilt and rebuilt.startswith("Mozilla/5.0 "):
-                    new_ua = rebuilt
-            new_ua = _ensure_android_device_token(new_ua)
-            if "; wv)" not in new_ua and "wv)" not in new_ua:
-                new_ua = re.sub(
-                    r"\((Linux; Android[^)]*?)\)",
-                    lambda m: f"({m.group(1)}; wv)",
-                    new_ua,
-                    count=1,
-                )
-            if "Version/4.0" not in new_ua:
-                new_ua = re.sub(
-                    r"AppleWebKit/([\d.]+) \(KHTML, like Gecko\) Chrome/",
-                    r"AppleWebKit/\1 (KHTML, like Gecko) Version/4.0 Chrome/",
-                    new_ua,
-                    count=1,
-                )
-
-        # iOS realism: real in-app webview UAs DROP the
-        # `Version/<X.X>` and `Safari/<X.X.X>` tokens that plain Safari
-        # carries, then append the app-specific marker block. UA parsers
-        # scan left-to-right and stop at `Safari/...` — if we leave that
-        # token in place, the tracker classifies the click as Safari and
-        # ignores everything after, hiding the in-app signature.
-        # Apple's iOS 26 / Safari 26 UAs additionally FREEZE the OS
-        # version at 18_6 and remove device model tokens (privacy by
-        # design — see Safari 26 release notes). We preserve that
-        # freezing — we ONLY strip Version/X + Safari/X and ensure the
-        # `Mobile/<build>` token stays in place since real in-app
-        # captures keep it.
-        if family == "ios" and p in (
-            "facebook", "messenger", "tiktok", "instagram",
-            "snapchat", "linkedin", "twitter",
-            "youtube", "google", "reddit", "pinterest",
-        ):
-            # 1. Strip the trailing `Safari/<X.X.X>` token (real in-app
-            #    UAs don't carry it).
-            new_ua = re.sub(r"\s+Safari/[\d.]+\s*$", "", new_ua).rstrip()
-            # 2. Strip the `Version/<X.X>` token (modern iOS in-app
-            #    webviews omit it; FBAN/musical_ly/Instagram all replace
-            #    that slot with their own version block).
-            new_ua = re.sub(r"\s+Version/[\d.]+\b", "", new_ua)
-            # 3. Ensure a `Mobile/<build>` token exists — real captures
-            #    always have one. iOS Safari 26 emits `Mobile/15E148`
-            #    (frozen) so we use the same default if missing.
-            if "Mobile/" not in new_ua:
-                new_ua += " Mobile/15E148"
-
-        # Final append — ensure a single space separator.
-        sep = " " if not new_ua.endswith(" ") else ""
-        return f"{new_ua}{sep}{suffix}"
-    except Exception:
-        # NEVER raise — fraud-coerce must be a safe additive layer.
-        return ua
 
 
 # ══════════════════════════════════════════════════════════════════════

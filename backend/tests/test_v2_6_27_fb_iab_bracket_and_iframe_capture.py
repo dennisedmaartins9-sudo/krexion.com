@@ -1,119 +1,105 @@
 """
-v2.6.27 — TikTok Android FB_IAB bracket + Facebook FBAV normalisation
-======================================================================
+TikTok Android and Facebook marker regression coverage
+=======================================================
 
 Bug follow-up from customer's second CSV report (screenshots of Everflow
 click details in Session 4):
 
-  1. `Browser=Android (13.0)` on TikTok Android clicks — v2.6.26's
-     `TikTok/{app_ver}` slug alone was NOT in advertiser UA parsers'
-     rule DB (uap-core / user_agents lib still returned `family='Android'`
-     for those UAs). Fix: append `[FB_IAB/;FBAN/TikTokAndroid;FBAV/{ver};
-     IABMV/1;FBBV/{ml_build};FBOP/19;]` bracket — the FB_IAB format is
-     the UNIVERSAL in-app-browser marker every major tracker (Everflow,
-     Voluum, RedTrack, Binom) understands, and setting FBAN=TikTokAndroid
-     triggers their "TikTok for Android" detection branch.
+  1. TikTok Android page identities are standard Chromium WebViews with
+     verified TikTok release markers, never Facebook-shaped brackets.
 
-  2. `Facebook for iOS (Unknown)` + `Facebook for Android (Unknown)` —
-     the browser was correctly detected as Facebook but the version
-     column always said "Unknown". Root cause: our upstream
-     `_APP_VERSIONS['facebook']` pool mixes 2-part (`557.0`) and 5-part
-     (`550.0.0.45.102`) shapes; many parser DBs expect exactly `X.Y.Z`.
-     Fix: new `_fbav_3part()` helper normalises the app_version to 3
-     dot-separated groups before it lands in `FBAV/…`, and both
-     `_ua_facebook_android` and `_ua_facebook_ios` now use it. Also
-     added `FBAN/FB4A` slug to the Android bracket alongside the
-     existing `FB_IAB/FB4A` (real modern 2024+ FB Android captures
-     carry both).
+  2. Facebook uses the exact audited platform release and matching build.
 
-Additional coerce-machinery updates:
-  - `_FOREIGN_INAPP_STRIP_PATTERNS['fb_bracket']` TIGHTENED to match
-    ONLY the Facebook-specific bracket shapes (`FB_IAB/FB4A` or
-    `FBAN/FBIOS`) so the new `[FB_IAB/;FBAN/TikTokAndroid;…]` trailer
-    isn't accidentally wiped when coercing to tiktok.
-  - `_FOREIGN_INAPP_STRIP_PATTERNS['tiktok']` EXTENDED so the FB_IAB
-    TikTokAndroid bracket is stripped when coercing away from tiktok.
+The visual-recorder iframe regression coverage below is intentionally retained.
 """
+import ast
+import random
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import server  # noqa: E402
 import referrer_pro  # noqa: E402
+from ua_profile_contract import APP_RELEASES_BY_PLATFORM, validate_user_agent  # noqa: E402
 
 
-# ─── 1. TikTok Android UA carries the FB_IAB TikTokAndroid bracket ────
-def test_ua_tiktok_android_carries_fb_iab_tiktokandroid_bracket():
+def _server_templates():
+    server_file = Path(__file__).resolve().parents[1] / "server.py"
+    tree = ast.parse(server_file.read_text(encoding="utf-8"))
+    wanted = {
+        "_ua_android_webview", "_ua_tiktok_android",
+        "_ua_facebook_android", "_ua_facebook_ios",
+    }
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    ns = {
+        "random": random,
+        "Optional": Optional,
+        "_APP_RELEASES_RUNTIME": APP_RELEASES_BY_PLATFORM,
+        "_CHROME_VERSIONS": ["149.0.7827.114"],
+        "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
+        "_pick_region": lambda _code: {
+            "code": "US", "byte_locale": "en-US",
+            "posix_locale": "en_US", "lang_tag": "en-US",
+        },
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(server_file), "exec"), ns)
+    return SimpleNamespace(**ns)
+
+
+server = _server_templates()
+
+
+# ─── 1. TikTok Android uses a browser-page WebView without FB bracket ─
+def test_ua_tiktok_android_has_no_facebook_shaped_bracket():
     d = {"and_ver": "14", "model": "SM-S928B",
          "build": "UP1A.231005.007", "sdk": "34"}
     for _ in range(30):
-        ua = server._ua_tiktok_android(d, "44.7.0")
-        assert re.search(r"\[FB_IAB/;FBAN/TikTokAndroid;FBAV/44\.7\.0;IABMV/1;FBBV/\d+;FBOP/19;\]", ua), (
-            f"missing FB_IAB TikTokAndroid bracket: {ua!r}"
-        )
-        # v2.6.26 markers still preserved
-        assert re.search(r"\bTikTok/44\.7\.0\b", ua)
+        ua = server._ua_tiktok_android(d, "45.8.2")
+        assert "FBAN/TikTokAndroid" not in ua
+        assert "[FB_IAB/" not in ua
+        assert re.search(r"\bTikTok/45\.8\.2\b", ua)
         assert re.search(r"\bmusical_ly_\d+\b", ua)
         assert "com.zhiliaoapp.musically/" in ua
-        # No Chrome/Safari leak from v2.6.22 guarantee still holds
-        assert "Chrome/" not in ua
-        assert "Mobile Safari/" not in ua
+        assert "; wv)" in ua and "Chrome/" in ua and "Mobile Safari/" in ua
 
 
-def test_build_inapp_ua_suffix_tiktok_android_carries_fb_iab_bracket():
+def test_build_inapp_ua_suffix_tiktok_android_has_no_fb_bracket():
     base = "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv)"
     for _ in range(20):
         suf = referrer_pro.build_inapp_ua_suffix("tiktok", base)
-        assert re.search(r"\[FB_IAB/;FBAN/TikTokAndroid;FBAV/\d+\.\d+\.\d+;IABMV/1;FBBV/\d+;FBOP/19;\]", suf), (
-            f"suffix missing FB_IAB TikTokAndroid bracket: {suf!r}"
-        )
+        assert "FBAN/TikTokAndroid" not in suf
+        assert "[FB_IAB/" not in suf
         assert suf.startswith("TikTok/")
 
 
-# ─── 2. Facebook FBAV is normalised to 3-part `X.Y.Z` ────────────────
-def test_fbav_3part_helper():
-    assert server._fbav_3part("557.0") == "557.0.0"
-    assert server._fbav_3part("550.0.0.45.102") == "550.0.0"
-    assert server._fbav_3part("461.0.0") == "461.0.0"
-    assert server._fbav_3part("") == "0.0.0"
-    assert server._fbav_3part("1") == "1.0.0"
-    assert server._fbav_3part("1.2") == "1.2.0"
-
-
-def test_ua_facebook_android_fbav_is_3part_and_fban_present():
+# ─── 2. Facebook FBAV uses the audited full release ───────────────────
+def test_ua_facebook_android_uses_release_and_matching_build():
     d = {"and_ver": "14", "model": "SM-S928B",
          "build": "UP1A.231005.007", "sdk": "34"}
-    # Test with 5-part input version → should render as 3-part in UA
-    ua = server._ua_facebook_android(d, "550.0.0.45.102", "128.0.6613.127")
-    assert "FBAV/550.0.0;" in ua, f"FBAV must be 3-part: {ua!r}"
-    assert "FBAN/FB4A;" in ua, f"FBAN/FB4A slug missing: {ua!r}"
-    assert "FB_IAB/FB4A;" in ua, f"FB_IAB/FB4A slug missing (real-capture parity): {ua!r}"
-
-    # Test with 2-part input version → should also render as 3-part
-    ua2 = server._ua_facebook_android(d, "557.0", "128.0.6613.127")
-    assert "FBAV/557.0.0;" in ua2, f"FBAV must be 3-part: {ua2!r}"
+    ua = server._ua_facebook_android(d, "556.0.0.59.68", "149.0.7827.114")
+    assert "FBAV/556.0.0.59.68;" in ua
+    assert "FBBV/681204512;" in ua
+    assert "FBAN/FB4A;" not in ua
+    assert validate_user_agent(ua, expected_app="facebook")["issues"] == []
 
 
-def test_ua_facebook_ios_fbav_is_3part():
+def test_ua_facebook_ios_uses_audited_release():
     d = {"ios": "18_3", "brand": "iPhone", "model": "iPhone15,3",
          "build": "22D63", "sdk": "18", "scale": "3.0"}
-    ua = server._ua_facebook_ios(d, "461.0.0.51.107")
-    assert "FBAV/461.0.0;" in ua, f"FBAV must be 3-part: {ua!r}"
-    assert "FBAN/FBIOS;" in ua  # existing marker preserved
-    # 2-part input → 3-part output
-    ua2 = server._ua_facebook_ios(d, "551.0")
-    assert "FBAV/551.0.0;" in ua2
+    ua = server._ua_facebook_ios(d, "557.0")
+    assert "FBAV/557.0;" in ua
+    assert "FBAN/FBIOS;" in ua
+    assert validate_user_agent(ua, expected_app="facebook")["issues"] == []
 
 
-# ─── 3. Strip regex tightening — non-FB brackets stay when target=tiktok
-def test_coerce_to_tiktok_preserves_tiktokandroid_bracket():
-    """The TIGHTENED `fb_bracket` regex must NOT strip our own
-    TikTokAndroid FB_IAB bracket when coercing to tiktok — that was
-    the bug in v2.6.27 pre-tightening: uap-core saw TikTok bracket as
-    Facebook (fb_bracket bucket matched it) → coerce wiped it → parser
-    fell back to `Browser=Android`."""
+# ─── 3. Coercion removes all fabricated/foreign bracket markers ──────
+def test_coerce_to_tiktok_removes_tiktokandroid_bracket():
     ua = (
         "Mozilla/5.0 (Linux; U; Android 14; en_US; SM-S928B; "
         "Build/UP1A.231005.007; Cronet/58.0.2991.0) "
@@ -124,10 +110,9 @@ def test_coerce_to_tiktok_preserves_tiktokandroid_bracket():
         "[FB_IAB/;FBAN/TikTokAndroid;FBAV/44.7.0;IABMV/1;FBBV/4470000000;FBOP/19;]"
     )
     back = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
-    assert "FBAN/TikTokAndroid" in back, (
-        f"TikTokAndroid bracket was wiped by coerce: {back!r}"
-    )
-    assert "TikTok/44.7.0" in back
+    assert "FBAN/TikTokAndroid" not in back
+    assert "[FB_IAB/" not in back
+    assert "TikTok/45.8.2" in back
     assert "musical_ly_" in back
 
 
@@ -158,9 +143,7 @@ def test_coerce_away_from_tiktok_strips_the_new_bracket():
 
 
 def test_coerce_fb_to_fb_preserves_fb_bracket():
-    """Existing behaviour must not regress: coercing an FB Android UA
-    to `facebook` platform must PRESERVE the FB_IAB/FB4A bracket
-    (that's how FB IAB clicks self-identify)."""
+    """A stale FB identity is rebuilt to the one audited bracket."""
     ua = (
         "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/128.0.6613.127 "
@@ -169,15 +152,13 @@ def test_coerce_fb_to_fb_preserves_fb_bracket():
     )
     out = referrer_pro.coerce_ua_for_platform(ua, "facebook")
     assert "[FB_IAB/FB4A;" in out
-    assert "FBAN/FB4A;" in out
-    assert "FBAV/550.0.0;" in out
+    assert "FBAN/FB4A;" not in out
+    assert "FBAV/556.0.0.59.68;" in out
+    assert "FBBV/681204512;" in out
 
 
 def test_coerce_fb_to_tiktok_strips_fb_bracket_and_adds_tt_markers():
-    """When operator's UA pool has a FB-signed UA but the target
-    platform is TikTok, coerce must STRIP the FB bracket AND ADD both
-    the v2.6.26 TikTok/{ver} slug AND the v2.6.27 FB_IAB TikTokAndroid
-    trailer."""
+    """A Facebook UA is rebuilt as the strict canonical TikTok WebView."""
     ua = (
         "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/128.0.6613.127 "
@@ -186,10 +167,11 @@ def test_coerce_fb_to_tiktok_strips_fb_bracket_and_adds_tt_markers():
     )
     out = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
     assert "[FB_IAB/FB4A;" not in out, f"FB bracket leaked: {out!r}"
-    assert "FBAN/FB4A" not in out or "FBAN/TikTokAndroid" in out, out
-    # New TT markers
-    assert "musical_ly_" in out
-    assert "FBAN/TikTokAndroid" in out
+    assert "FBAN/FB4A" not in out
+    assert "musical_ly_2024508020" in out
+    assert "FBAN/TikTokAndroid" not in out
+    assert "[FB_IAB/" not in out
+    assert "TikTok/45.8.2" in out
 
 
 # ─── 4. Visual Recorder — iframe_path capture surface exists ─────────

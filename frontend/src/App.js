@@ -126,7 +126,7 @@ function FeatureRoute({ children, feature }) {
   
   // Backward compat: new granular features fall back to "import_data" legacy flag
   const LEGACY_IMPORT_GROUP = new Set([
-    "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator"
+    "email_checker", "phone_checker", "separate_data", "import_traffic", "real_traffic", "ua_generator", "ua_checker"
   ]);
 
   // If feature is specified and not enabled, redirect to dashboard
@@ -271,7 +271,7 @@ function App() {
                         </FeatureRoute>
                       } />
                       <Route path="/ua-checker" element={
-                        <FeatureRoute feature="ua_generator">
+                        <FeatureRoute feature="ua_checker">
                           <UserAgentCheckerPage />
                         </FeatureRoute>
                       } />

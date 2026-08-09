@@ -290,6 +290,8 @@ export default function AdminDashboard() {
       conversions: false,
       proxies: false,
       import_data: false,
+      ua_generator: false,
+      ua_checker: false,
       max_links: 10,
       max_clicks: 10000
     });
@@ -2878,6 +2880,7 @@ MASTER_ADMIN_PASSWORD=YourVeryLongSecretPassword`}
                   { key: "import_traffic", label: "Import Traffic (Quick / Manual / Bulk)" },
                   { key: "real_traffic", label: "Real Traffic (residential proxies)" },
                   { key: "ua_generator", label: "User Agent Generator" },
+                  { key: "ua_checker", label: "User Agent Checker" },
                   { key: "email_checker", label: "Email Profile Checker" },
                   { key: "phone_checker", label: "Phone Checker (free libphonenumber)" },
                   { key: "separate_data", label: "Separate Data (row filter)" },

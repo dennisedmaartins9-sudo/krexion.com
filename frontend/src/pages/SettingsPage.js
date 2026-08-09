@@ -39,6 +39,7 @@ const ALL_SUB_USER_PERMISSIONS = [
   { key: "import_traffic",    label: "Import Traffic",     parentFeatKey: "import_traffic" },
   { key: "real_traffic",      label: "Real Traffic",       parentFeatKey: "real_traffic" },
   { key: "ua_generator",      label: "UA Generator",       parentFeatKey: "ua_generator" },
+  { key: "ua_checker",        label: "UA Checker",         parentFeatKey: "ua_checker" },
   { key: "email_checker",     label: "Email Checker",      parentFeatKey: "email_checker" },
   { key: "separate_data",     label: "Separate Data",      parentFeatKey: "separate_data" },
   { key: "form_filler",       label: "Form Filler",        parentFeatKey: "form_filler" },

@@ -1,108 +1,141 @@
-"""Iteration 20 — extra verification for v2.6.27 fixes.
-
-Focused on the exact acceptance criteria from the review request:
- - TikTok Android UA contains FB_IAB TikTokAndroid bracket in canonical shape
- - _fbav_3part normaliser correctness
- - Facebook Android/iOS UA FBAV 3-part + FBAN slug presence
- - coerce_ua_for_platform idempotency + cross-platform strip
- - _build_fallbacks iframe_path forwarding + sanitisation
-"""
+"""Iteration 20 regressions aligned with the strict shared UA contract."""
+import ast
+import random
 import re
 import sys
 import pathlib
+from types import SimpleNamespace
+from typing import Optional
 
 # Ensure backend on path
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-import server
 import referrer_pro
 import visual_recorder
+from ua_profile_contract import APP_RELEASES_BY_PLATFORM
 
 
-TIKTOK_ANDROID_BRACKET_RE = re.compile(
-    r"\[FB_IAB/;FBAN/TikTokAndroid;FBAV/\d+\.\d+\.\d+;IABMV/1;FBBV/\d+;FBOP/19;\]"
-)
+SERVER_FILE = pathlib.Path(__file__).resolve().parents[1] / "server.py"
+REGION = {
+    "code": "US",
+    "byte_locale": "en",
+    "posix_locale": "en_US",
+    "lang_tag": "en-US",
+}
+
+
+def _templates():
+    """AST-load generator helpers without importing server dependencies."""
+    names = {
+        "_ua_android_webview",
+        "_ua_ios_wkwebview",
+        "_ua_tiktok_android",
+        "_ua_facebook_android",
+        "_ua_facebook_ios",
+    }
+    tree = ast.parse(SERVER_FILE.read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in names
+    ]
+    runtime_releases = {
+        app: {
+            platform: [dict(record) for record in records]
+            for platform, records in platforms.items()
+        }
+        for app, platforms in APP_RELEASES_BY_PLATFORM.items()
+    }
+    namespace = {
+        "random": random,
+        "Optional": Optional,
+        "APP_RELEASES_BY_PLATFORM": APP_RELEASES_BY_PLATFORM,
+        "_APP_RELEASES_RUNTIME": runtime_releases,
+        "_CHROME_VERSIONS": ["149.0.7827.114"],
+        "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
+        "_pick_region": lambda _code: REGION,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER_FILE), "exec"), namespace)
+    return SimpleNamespace(**namespace)
 
 
 DEV = {"and_ver": "14", "model": "SM-S928B", "build": "UP1A.231005.007", "sdk": "34"}
+TEMPLATES = _templates()
 
 
-class TestTikTokAndroidBracket:
-    def test_ua_tiktok_android_contains_bracket_30_iterations(self):
-        vers = ["44.7.0", "43.5.0", "42.7.0"]
-        for v in vers:
-            for _ in range(10):
-                ua = server._ua_tiktok_android(DEV, v)
-                assert TIKTOK_ANDROID_BRACKET_RE.search(ua), f"missing bracket in: {ua}"
-                # v2.6.26 markers still present
-                assert f"TikTok/{v}" in ua, f"missing TikTok/{{ver}} slug: {ua}"
-                assert re.search(r"musical_ly_\d+", ua), f"missing musical_ly marker: {ua}"
-                assert "com.zhiliaoapp.musically/" in ua, f"missing musically pkg: {ua}"
+class TestTikTokAndroidWebView:
+    def test_ua_tiktok_android_canonical_30_iterations(self):
+        for _ in range(30):
+            ua = TEMPLATES._ua_tiktok_android(DEV, "45.8.2")
+            assert "; wv)" in ua and "Version/4.0" in ua
+            assert "Chrome/151.0.7922.83" in ua
+            assert "TikTok/45.8.2" in ua
+            assert "musical_ly_2024508020" in ua
+            assert "app_version/45.8.2" in ua
+            assert "com.zhiliaoapp.musically/2024508020" in ua
+            assert "Cronet/" not in ua
+            assert "FBAN/TikTokAndroid" not in ua
+            assert "BytedanceWebview/" not in ua
+            assert "ttwebview/" not in ua
 
     def test_build_inapp_ua_suffix_tiktok_20_iters(self):
         android_base = (
-            "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+            "Chrome/149.0.7827.114 Mobile Safari/537.36"
         )
         for _ in range(25):
             out = referrer_pro.build_inapp_ua_suffix("tiktok", android_base)
-            assert out.startswith("TikTok/"), f"does not start with TikTok/: {out!r}"
-            assert TIKTOK_ANDROID_BRACKET_RE.search(out), f"missing bracket: {out!r}"
-
-
-class TestFbav3Part:
-    def test_cases(self):
-        f = server._fbav_3part
-        assert f("557.0") == "557.0.0"
-        assert f("550.0.0.45.102") == "550.0.0"
-        assert f("461.0.0") == "461.0.0"
-        assert f("") == "0.0.0"
-        assert f("1") == "1.0.0"
-        assert f("1.2") == "1.2.0"
+            assert out.startswith("TikTok/45.8.2 ")
+            assert "musical_ly_2024508020" in out
+            assert "app_version/45.8.2" in out
+            assert "com.zhiliaoapp.musically/2024508020" in out
+            assert not any(token in out for token in (
+                "FBAN/TikTokAndroid", "BytedanceWebview/", "ttwebview/",
+            ))
 
 
 class TestFacebookUAs:
-    def test_fb_android_2part_input(self):
-        ua = server._ua_facebook_android(DEV, "557.0", "128.0.6613.127")
-        assert "FBAV/557.0.0;" in ua
-        assert "FB_IAB/FB4A;" in ua
-        assert "FBAN/FB4A;" in ua
-        assert re.search(r"FBBV/\d+", ua)
+    def test_fb_android_preserves_full_verified_release(self):
+        ua = TEMPLATES._ua_facebook_android(
+            DEV, "556.0.0.59.68", "149.0.7827.114"
+        )
+        assert ua.count("[FB_IAB/FB4A;") == 1
+        assert "FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;" in ua
+        assert "FBAN/FB4A;" not in ua
+        assert "FBAV/556.0.0;" not in ua
 
-    def test_fb_android_5part_input(self):
-        ua = server._ua_facebook_android(DEV, "550.0.0.45.102", "128.0.6613.127")
-        assert "FBAV/550.0.0;" in ua
-        assert "FB_IAB/FB4A;" in ua
-        assert "FBAN/FB4A;" in ua
-
-    def test_fb_ios_normalisation(self):
+    def test_fb_ios_keeps_audited_release(self):
         ios_dev = {"brand": "iPhone", "ios": "17_5", "model": "iPhone15,3", "scale": "3"}
-        ua = server._ua_facebook_ios(ios_dev, "461.0.0.30.100")
-        assert "FBAV/461.0.0;" in ua
+        ua = TEMPLATES._ua_facebook_ios(ios_dev, "557.0")
+        assert "FBAV/557.0;" in ua
         assert "FBAN/FBIOS;" in ua
         assert re.search(r"FBSN/iOS;FBSV/\d", ua)
 
 
 class TestCoerceIdempotency:
     def test_coerce_tiktok_preserves_own_signature(self):
-        ua = server._ua_tiktok_android(DEV, "44.7.0")
+        ua = TEMPLATES._ua_tiktok_android(DEV, "45.8.2")
         out = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
-        assert "FBAN/TikTokAndroid" in out
-        assert "TikTok/" in out
-        assert re.search(r"musical_ly_\d+", out)
+        assert out == ua
+        assert "musical_ly_2024508020" in out
+        assert "FBAN/TikTokAndroid" not in out
 
     def test_coerce_fb_preserves_fb_signature(self):
-        ua = server._ua_facebook_android(DEV, "557.0", "128.0.6613.127")
+        ua = TEMPLATES._ua_facebook_android(
+            DEV, "556.0.0.59.68", "149.0.7827.114"
+        )
         out = referrer_pro.coerce_ua_for_platform(ua, "facebook")
+        assert out == ua
         assert "FB_IAB/FB4A" in out
-        assert "FBAN/FB4A" in out
-        assert re.search(r"FBAV/\d+\.\d+\.\d+", out)
+        assert "FBAN/FB4A" not in out
+        assert "FBAV/556.0.0.59.68" in out
 
 
 class TestCoerceCrossPlatform:
     def test_strip_tiktok_when_coercing_away(self):
-        ua = server._ua_tiktok_android(DEV, "44.7.0")
-        for target in ["facebook", "instagram", "snapchat", "twitter", "google", "youtube"]:
+        ua = TEMPLATES._ua_tiktok_android(DEV, "45.8.2")
+        for target in ["facebook", "instagram", "snapchat", "twitter", "linkedin", "pinterest"]:
             out = referrer_pro.coerce_ua_for_platform(ua, target)
             assert "FBAN/TikTokAndroid" not in out, f"[{target}] TikTokAndroid bracket leaked: {out}"
             assert "TikTok/" not in out, f"[{target}] TikTok/ leaked: {out}"
@@ -111,13 +144,15 @@ class TestCoerceCrossPlatform:
             assert "com.zhiliaoapp.musically" not in out
 
     def test_fb_to_tiktok_strips_fb_slugs(self):
-        ua = server._ua_facebook_android(DEV, "557.0", "128.0.6613.127")
+        ua = TEMPLATES._ua_facebook_android(
+            DEV, "556.0.0.59.68", "149.0.7827.114"
+        )
         out = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
         assert "FB_IAB/FB4A" not in out, f"FB4A leaked: {out}"
         assert "FBAN/FB4A" not in out, f"FBAN/FB4A leaked: {out}"
-        assert "TikTok/" in out
-        assert re.search(r"musical_ly_\d+", out)
-        assert "FBAN/TikTokAndroid" in out
+        assert "TikTok/45.8.2" in out
+        assert "musical_ly_2024508020" in out
+        assert "FBAN/TikTokAndroid" not in out
 
 
 class TestBuildFallbacksIframePath:
@@ -151,8 +186,7 @@ class TestBuildFallbacksIframePath:
 
 
 class TestUserAgentsLibParse:
-    """Sanity: `user_agents` sees FBAN=TikTokAndroid bracket; family may say Facebook
-    (generic FB_IAB rule) — this is EXPECTED per Everflow more-specific FBAN match."""
+    """The canonical WebView UA remains parseable by user_agents."""
 
     def test_parse_no_exception(self):
         try:
@@ -160,7 +194,6 @@ class TestUserAgentsLibParse:
         except Exception:
             import pytest
             pytest.skip("user_agents not installed")
-        ua = server._ua_tiktok_android(DEV, "44.7.0")
+        ua = TEMPLATES._ua_tiktok_android(DEV, "45.8.2")
         p = parse(ua)
-        # Do NOT assert family == TikTok — see docstring; assert it parses cleanly + is mobile
         assert p.is_mobile or p.is_tablet
