@@ -147,7 +147,7 @@ def test_coerce_ua_for_platform_tiktok_preserves_TikTok_slash_ver():
         "com.zhiliaoapp.musically/2034090050"
     )
     out = referrer_pro.coerce_ua_for_platform(ua_in, "tiktok")
-    assert "TikTok/45.8.2" in out
+    assert "TikTok/46.4.1" in out
     assert "musical_ly_" in out
     assert "Cronet/" not in out
 

@@ -62,9 +62,12 @@ def test_platform_release_contract_and_legacy_pools_are_exported():
         {"version": "437.0.0.33.78", "version_code": "1011909233"}
     ]
     assert APP_RELEASES_BY_PLATFORM["tiktok"]["android"][0] == {
-        "version": "45.8.2",
-        "version_code": "2024508020",
+        "version": "46.4.1",
+        "version_code": "2024604010",
     }
+    assert {"version": "45.8.2", "version_code": "2024508020"} in (
+        APP_RELEASES_BY_PLATFORM["tiktok"]["android"]
+    )
     assert APP_RELEASES_BY_PLATFORM["linkedin"]["android"][0]["package_build"] == "212600"
     assert APP_RELEASES_BY_PLATFORM["reddit"]["android"][0]["build"] == "2618090"
     assert APP_RELEASES_BY_PLATFORM["telegram"]["android"][0]["version"] == "12.9.2"
@@ -201,6 +204,7 @@ def test_unknown_external_oem_build_warns_instead_of_false_failure():
 
 def test_android_16_capture_tuples_validate():
     for model, build in (
+        ("Pixel 8", "CP1A.260505.005"),
         ("Pixel 9", "CP1A.260505.005"),
         ("2510ERA8BG", "BP2A.250605.031.A3"),
     ):

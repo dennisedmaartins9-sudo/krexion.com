@@ -14068,7 +14068,7 @@ def _ua_snapchat_ios(d: dict, app_ver: str) -> str:
     )
 
 def _ua_tiktok_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
-    """TikTok iOS WKWebView marker without unverified internal revisions."""
+    """TikTok iOS WKWebView marker aligned with RUT coerce identity."""
     r = region or _pick_region(None)
     byte_locale = r["posix_locale"].split("_", 1)[0]
     full_locale = r["posix_locale"]
@@ -14076,7 +14076,8 @@ def _ua_tiktok_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
     net_type = random.choices(["WIFI", "4G", "5G"], weights=[70, 25, 5], k=1)[0]
     return (
         f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 musical_ly_{app_ver} app_version/{app_ver} JsSdk/2.0 "
+        f"(KHTML, like Gecko) Mobile/15E148 "
+        f"TikTok/{app_ver} musical_ly_{app_ver} app_version/{app_ver} JsSdk/2.0 "
         f"NetType/{net_type} Channel/App Store "
         f"ByteLocale/{byte_locale} ByteFullLocale/{full_locale} Region/{region_code} "
         "AppId/1233 WKWebView/1"
@@ -15047,6 +15048,46 @@ async def generate_user_agents(payload: UAGenerateRequest, user: dict = Depends(
             expected_app=expected_app,
             require_verified_device=(kind == "android" and "Build/" in ua),
         )
+        # Manual RUT-ready gate: supported in-app identities must validate the
+        # same way coerce/ensure does in Real User Traffic. If a generated UA
+        # fails, rebuild once through the shared identity path so customers can
+        # paste generator output into a job without Chrome/generic leaks.
+        if (
+            not is_generic_fallback
+            and expected_app
+            and kind in {"android", "ios"}
+            and (not profile.get("valid") or profile.get("issues"))
+        ):
+            try:
+                from referrer_pro import ensure_inapp_platform_ua as _ensure_gen_ua
+                _platform_key = {
+                    "gsearch": "google",
+                }.get(current_app, current_app)
+                if _platform_key not in {"chrome", "gchrome"}:
+                    _locale = (
+                        region_for_ua.get("lang_tag")
+                        or region_for_ua.get("posix_locale")
+                        or "en-US"
+                    )
+                    repaired = _ensure_gen_ua(
+                        ua,
+                        _platform_key,
+                        str(_locale),
+                        attempts=3,
+                    )
+                    if repaired and repaired != ua:
+                        ua = repaired
+                        result_warnings.append(
+                            "Generated UA was rebuilt through the shared in-app "
+                            "identity path so it is RUT-ready for manual paste."
+                        )
+                        profile = validate_user_agent(
+                            ua,
+                            expected_app=expected_app,
+                            require_verified_device=(kind == "android" and "Build/" in ua),
+                        )
+            except Exception:
+                pass
         if is_generic_fallback:
             profile = {
                 **profile,

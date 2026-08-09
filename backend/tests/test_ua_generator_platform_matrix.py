@@ -173,9 +173,9 @@ def test_exact_android_mapped_fields_and_no_fabricated_builds():
     assert samples["facebook"].count("[FB_IAB/FB4A;") == 1
     assert "FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;" in samples["facebook"]
     assert "FBAN/" not in samples["facebook"] and "FBOP/" not in samples["facebook"]
-    assert "musical_ly_2024508020" in samples["tiktok"]
-    assert "app_version/45.8.2" in samples["tiktok"]
-    assert "com.zhiliaoapp.musically/2024508020" in samples["tiktok"]
+    assert "musical_ly_2024604010" in samples["tiktok"]
+    assert "app_version/46.4.1" in samples["tiktok"]
+    assert "com.zhiliaoapp.musically/2024604010" in samples["tiktok"]
     assert "[LinkedInApp]/2.286.33 com.linkedin.android/212600" in samples["linkedin"]
     assert "Reddit/Version 2026.18.0/Build 2618090/" in samples["reddit"]
 
@@ -264,6 +264,7 @@ def test_android_16_capture_profiles_and_webview_source_are_separate():
         for row in ANDROID_DEVICE_SNAPSHOTS
     }
     assert ("2510ERA8BG", "16", "BP2A.250605.031.A3") in snapshots
+    assert ("Pixel 8", "16", "CP1A.260505.005") in snapshots
     assert ("Pixel 9", "16", "CP1A.260505.005") in snapshots
 
     t = _templates()

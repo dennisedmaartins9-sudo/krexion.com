@@ -7282,7 +7282,14 @@ async def _resolve_tracker_via_localhost(
     # the request is built.
     _ua_clean = (user_agent or "").strip()
     if (not _ua_clean) or len(_ua_clean) < 50 or _ua_clean in (".", "-", "_"):
-        user_agent = _realistic_fallback_ua()
+        # Prefer a mobile WebView shell over desktop Chrome — junk UAs on
+        # in-app jobs previously leaked as "Browser: Chrome" on offers.
+        try:
+            user_agent = _mobile_ua_for_inapp()
+        except Exception:
+            user_agent = _realistic_fallback_ua()
+        if not (user_agent or "").strip():
+            user_agent = _realistic_fallback_ua()
 
     safe_ua = user_agent or _realistic_fallback_ua()
     headers = {
@@ -9849,7 +9856,13 @@ async def run_real_user_traffic_job(
                 # never set the flag get the safer/realer default too.
                 if _referer_cfg.get("match_ua_to_platform", True) and _kx_platform:
                     try:
-                        from referrer_pro import coerce_ua_for_platform as _coerce_ua
+                        from referrer_pro import (
+                            coerce_ua_for_platform as _coerce_ua,
+                            ensure_inapp_platform_ua as _ensure_inapp_ua,
+                            _ua_has_inapp_marker as _has_inapp_marker,
+                            APP_SUPPORT_MATRIX as _APP_SUPPORT,
+                            _PLATFORM_TO_APP as _P2A,
+                        )
                         # ── 2026-07 v2.6.4 — Perfect Ad Simulation guard ──
                         # When the user picked an in-app-only platform
                         # (TikTok / Instagram / Snapchat / Facebook /
@@ -9868,7 +9881,9 @@ async def run_real_user_traffic_job(
                         _MOBILE_ONLY_PLATFORMS = {
                             "tiktok", "instagram", "snapchat",
                             "facebook", "pinterest",
-                            "linkedin", "twitter",
+                            "linkedin", "twitter", "reddit",
+                            "whatsapp", "telegram", "google",
+                            "gsearch", "youtube",
                         }
                         if _kx_platform in _MOBILE_ONLY_PLATFORMS:
                             try:
@@ -9883,9 +9898,31 @@ async def run_real_user_traffic_job(
                                         )
                             except Exception:
                                 pass
-                        _coerced_ua = _coerce_ua(
-                            ua, _kx_platform, str(geo.get("locale") or "")
+                        _locale_for_ua = str(geo.get("locale") or "")
+                        _app_key = _P2A.get((_kx_platform or "").lower())
+                        _family = ""
+                        try:
+                            from referrer_pro import _is_mobile_ua as _is_mob2
+                            _family = _is_mob2(ua) or ""
+                        except Exception:
+                            _family = ""
+                        _needs_strict_identity = bool(
+                            _app_key
+                            and _family in {"android", "ios"}
+                            and _APP_SUPPORT.get(_app_key, {}).get(_family) == "supported"
                         )
+                        if _needs_strict_identity:
+                            _coerced_ua = _ensure_inapp_ua(
+                                ua,
+                                _kx_platform,
+                                _locale_for_ua,
+                                mobile_ua_factory=_mobile_ua_for_inapp,
+                                attempts=4,
+                            )
+                        else:
+                            _coerced_ua = _coerce_ua(
+                                ua, _kx_platform, _locale_for_ua
+                            )
                         if _kx_platform == "messenger":
                             try:
                                 push_live_step(
@@ -9895,9 +9932,29 @@ async def run_real_user_traffic_job(
                                 )
                             except Exception:
                                 pass
-                        if _coerced_ua and _coerced_ua != ua:
-                            ua = _coerced_ua
-                        elif _coerced_ua:
+                        if _needs_strict_identity and (
+                            not _coerced_ua
+                            or not _has_inapp_marker(_coerced_ua, _kx_platform)
+                        ):
+                            entry["status"] = "skipped_ua"
+                            entry["error"] = (
+                                f"Could not build a valid {_kx_platform} in-app UA; "
+                                "visit skipped to avoid Chrome/generic browser leak"
+                            )
+                            try:
+                                async with report_lock:
+                                    RUT_JOBS[job_id]["skipped_ua"] = (
+                                        int(RUT_JOBS[job_id].get("skipped_ua") or 0) + 1
+                                    )
+                            except Exception:
+                                pass
+                            push_live_step(
+                                job_id, i + 1, "ua", "skipped",
+                                entry["error"],
+                            )
+                            await _record(job_id, entry, report, report_lock, db)
+                            return
+                        if _coerced_ua:
                             ua = _coerced_ua
                         else:
                             try:
@@ -9914,6 +9971,34 @@ async def run_real_user_traffic_job(
                                 f"UA coerce for {_kx_platform} failed "
                                 f"({type(_coerce_err).__name__}) — using base UA",
                             )
+                        except Exception:
+                            pass
+                        # Supported in-app platforms must not continue with an
+                        # uncoerced base UA (Chrome leak). Skip the visit.
+                        try:
+                            from referrer_pro import (
+                                APP_SUPPORT_MATRIX as _APP_SUPPORT2,
+                                _PLATFORM_TO_APP as _P2A2,
+                                _is_mobile_ua as _is_mob3,
+                            )
+                            _app2 = _P2A2.get((_kx_platform or "").lower())
+                            _fam2 = _is_mob3(ua) or ""
+                            if (
+                                _app2
+                                and _fam2 in {"android", "ios"}
+                                and _APP_SUPPORT2.get(_app2, {}).get(_fam2) == "supported"
+                            ):
+                                entry["status"] = "skipped_ua"
+                                entry["error"] = (
+                                    f"UA coerce exception for {_kx_platform}; "
+                                    "visit skipped to avoid identity leak"
+                                )
+                                push_live_step(
+                                    job_id, i + 1, "ua", "skipped",
+                                    entry["error"],
+                                )
+                                await _record(job_id, entry, report, report_lock, db)
+                                return
                         except Exception:
                             pass
                 # v2.6.33 — Rebuild fingerprint + entry metadata after UA changes.
@@ -10093,7 +10178,27 @@ async def run_real_user_traffic_job(
                 try:
                     _ua_stripped = (ua or "").strip()
                     if (not _ua_stripped) or len(_ua_stripped) < 50 or _ua_stripped in (".", "-", "_"):
-                        _safe_ua = _realistic_fallback_ua()
+                        _safe_ua = ""
+                        _plat_for_safe = str(
+                            _kx_platform
+                            or _referer_cfg.get("preset_platform")
+                            or ""
+                        ).strip().lower()
+                        if _plat_for_safe:
+                            try:
+                                from referrer_pro import ensure_inapp_platform_ua as _ensure_safe
+                                _safe_ua = _ensure_safe(
+                                    _mobile_ua_for_inapp(),
+                                    _plat_for_safe,
+                                    str(geo.get("locale") or ""),
+                                    mobile_ua_factory=_mobile_ua_for_inapp,
+                                    attempts=3,
+                                )
+                            except Exception:
+                                _safe_ua = ""
+                        if not _safe_ua:
+                            # Last resort for non-in-app / fallback-only platforms.
+                            _safe_ua = _mobile_ua_for_inapp() or _realistic_fallback_ua()
                         try:
                             logger.warning(
                                 f"[ua-leak-defence] visit {i + 1}: suspicious UA "
@@ -10103,6 +10208,7 @@ async def run_real_user_traffic_job(
                         except Exception:
                             pass
                         ua = _safe_ua
+                        entry["ua"] = ua
                 except Exception:
                     pass
                 try:

@@ -112,7 +112,7 @@ def test_coerce_to_tiktok_removes_tiktokandroid_bracket():
     back = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
     assert "FBAN/TikTokAndroid" not in back
     assert "[FB_IAB/" not in back
-    assert "TikTok/45.8.2" in back
+    assert "TikTok/46.4.1" in back
     assert "musical_ly_" in back
 
 
@@ -168,10 +168,10 @@ def test_coerce_fb_to_tiktok_strips_fb_bracket_and_adds_tt_markers():
     out = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
     assert "[FB_IAB/FB4A;" not in out, f"FB bracket leaked: {out!r}"
     assert "FBAN/FB4A" not in out
-    assert "musical_ly_2024508020" in out
+    assert "musical_ly_2024604010" in out
     assert "FBAN/TikTokAndroid" not in out
     assert "[FB_IAB/" not in out
-    assert "TikTok/45.8.2" in out
+    assert "TikTok/46.4.1" in out
 
 
 # ─── 4. Visual Recorder — iframe_path capture surface exists ─────────

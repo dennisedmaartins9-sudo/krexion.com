@@ -200,20 +200,8 @@ export default function UserAgentGeneratorPage() {
       ? ["android", "ios"]
       : [platform];
   const isMixMode = activeApps.length > 1 || activePlatforms.length > 1;
-  const desktopAllowed = activeApps.every((key) => key === "chrome" || key === "gchrome");
   const scalarOverridesLocked =
     isMixMode || appMode === "many" || platformMode === "many";
-
-  useEffect(() => {
-    if (!desktopAllowed && platform === "desktop") {
-      setPlatform("android");
-      toast.info("Desktop was changed to Android because the selected app has no desktop identity.");
-    }
-    if (!desktopAllowed && platformsPool.includes("desktop")) {
-      setPlatformsPool((values) => values.filter((value) => value !== "desktop"));
-      toast.info("Desktop was removed because named app identities are mobile-only.");
-    }
-  }, [desktopAllowed, platform, platformsPool]);
 
   useEffect(() => {
     if (!scalarOverridesLocked) return;
@@ -292,7 +280,7 @@ export default function UserAgentGeneratorPage() {
     const [selectedPlatform] = activePlatforms;
     if (selectedApp === "chrome") return "generic";
     if (selectedApp === "gchrome" && selectedPlatform === "android") return "fallback";
-    if (selectedPlatform === "desktop") return selectedApp === "gchrome" ? "fallback" : "generic";
+    if (selectedPlatform === "desktop") return "fallback";
     return options?.app_support_matrix?.[selectedApp]?.[selectedPlatform] || "unknown";
   })();
   const appVersionOverrideDisabled =
@@ -443,8 +431,9 @@ export default function UserAgentGeneratorPage() {
       <div>
         <h1 className="text-2xl font-bold text-white">User Agent Generator</h1>
         <p className="text-zinc-400">
-          Generate coherent, verified-sample-based app and browser profiles.
-          Public captures guide the contract but are not authenticity guarantees.
+          Generate coherent, verified-sample-based in-app and browser profiles for
+          Real User Traffic jobs (manual paste or generator pool). Public captures
+          guide the contract but are not authenticity guarantees.
         </p>
       </div>
 
@@ -455,8 +444,8 @@ export default function UserAgentGeneratorPage() {
             Choose app, device and version
           </CardTitle>
           <CardDescription>
-            Mobile profiles preserve compatible device, firmware, screen and release
-            records. Desktop is available only as a generic browser profile.
+            Supported mobile apps emit RUT-ready in-app identities (same contract as
+            live jobs). Desktop remains a generic browser profile only.
           </CardDescription>
           {/* Auto-update status row */}
           {options?.versions_meta && (
@@ -571,18 +560,12 @@ export default function UserAgentGeneratorPage() {
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">
               {APPS.map((a) => {
                 const Icon = a.icon;
-                const appDisabled =
-                  platformMode === "one" &&
-                  platform === "desktop" &&
-                  a.key !== "chrome" &&
-                  a.key !== "gchrome";
                 const active = appMode === "many"
                   ? appsPool.includes(a.key)
                   : app === a.key;
                 return (
                   <button
                     key={a.key}
-                    disabled={appDisabled}
                     onClick={() => {
                       if (appMode === "many") {
                         setAppsPool((prev) =>
@@ -669,14 +652,12 @@ export default function UserAgentGeneratorPage() {
             <div className="flex gap-2 flex-wrap">
               {PLATFORMS.filter((p) => platformMode === "one" || p.key !== "any").map((p) => {
                 const Icon = p.icon;
-                const platformDisabled = p.key === "desktop" && !desktopAllowed;
                 const active = platformMode === "many"
                   ? platformsPool.includes(p.key)
                   : platform === p.key;
                 return (
                   <button
                     key={p.key}
-                    disabled={platformDisabled}
                     onClick={() => {
                       if (platformMode === "many") {
                         setPlatformsPool((prev) =>
@@ -705,7 +686,7 @@ export default function UserAgentGeneratorPage() {
               <div className="mt-2 flex items-center gap-2 text-[11px] text-zinc-400">
                 <button
                   type="button"
-                  onClick={() => setPlatformsPool(desktopAllowed ? ["android", "ios", "desktop"] : ["android", "ios"])}
+                  onClick={() => setPlatformsPool(["android", "ios", "desktop"])}
                   className="px-2 py-0.5 rounded bg-zinc-800 border border-zinc-700 hover:bg-zinc-700"
                   data-testid="platforms-select-all"
                 >
@@ -722,7 +703,8 @@ export default function UserAgentGeneratorPage() {
               </div>
             )}
             <p className="text-zinc-500 text-xs mt-2">
-              Android + iOS means the mobile union only. Desktop is never included unless selected explicitly.
+              Android + iOS means the mobile union only. Desktop is included only when selected;
+              mobile-only apps then produce an explicitly labeled generic desktop-browser fallback.
             </p>
           </div>
 

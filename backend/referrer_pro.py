@@ -2016,8 +2016,17 @@ def _identity_suffix(app: str, family: str, parts: Dict[str, str], locale: str) 
             f"JsSdk/{sdk} NetType/WIFI Channel/{channel} AppName/musical_ly "
             f"app_version/{version}"
         )
-        if locale:
-            marker += f" ByteLocale/{lang.split('-', 1)[0]} ByteFullLocale/{posix}"
+        # Always emit coherent locale + Region together so ByteFullLocale
+        # cannot exist without a matching Region token (validator + offer
+        # parsers both expect this pairing on Android/iOS WebView UAs).
+        region = posix.split("_")[-1].upper() if "_" in posix else "US"
+        lang_token = lang.split("-", 1)[0].lower() or "en"
+        if len(region) != 2:
+            region = "US"
+        marker += (
+            f" ByteLocale/{lang_token} ByteFullLocale/{lang_token}_{region} "
+            f"Region/{region}"
+        )
         if family == "android":
             marker += f" com.zhiliaoapp.musically/{release['version_code']}"
         else:
@@ -2076,8 +2085,44 @@ def build_inapp_ua_suffix(platform: str, ua: str, locale: str = "") -> str:
     return _identity_suffix(app, family, parts, _explicit_app_locale(ua, locale))
 
 
+def _verified_android_parts() -> Dict[str, str]:
+    """Pick a capture-backed Android firmware tuple for safe rebuilds."""
+    snapshot = random.choice(ANDROID_DEVICE_SNAPSHOTS)
+    return {
+        "version": snapshot["and_ver"],
+        "model": snapshot["model"],
+        "build": snapshot["build"],
+        "chrome": "151.0.7922.71",
+    }
+
+
+def _verified_ios_parts() -> Dict[str, str]:
+    return {
+        "family": "iPhone",
+        "version": "18_6",
+        "model": "iPhone15,2",
+    }
+
+
+def _build_supported_identity_ua(
+    app: str,
+    family: str,
+    parts: Dict[str, str],
+    locale: str,
+) -> str:
+    base = _android_webview_base(parts) if family == "android" else _ios_webview_base(parts)
+    suffix = _identity_suffix(app, family, parts, locale)
+    return f"{base} {suffix}".strip()
+
+
 def coerce_ua_for_platform(ua: str, platform: str, locale: str = "") -> str:
-    """Apply exactly one contract-valid app identity, or a clean browser fallback."""
+    """Apply exactly one contract-valid app identity, or a clean browser fallback.
+
+    Supported in-app platforms NEVER fall through to a generic Chrome UA.
+    If the original device shell cannot host a valid identity, we rebuild
+    from a verified mobile firmware snapshot. Returning "" signals hard
+    failure so callers can skip the visit instead of leaking Chrome.
+    """
     original = ua or ""
     target = (platform or "").lower().strip()
     if target in _FALLBACK_ONLY_PLATFORMS:
@@ -2105,26 +2150,93 @@ def coerce_ua_for_platform(ua: str, platform: str, locale: str = "") -> str:
         return fallback
 
     expected = app
+    locale_token = _explicit_app_locale(original, locale) or "en-US"
     current = validate_user_agent(original, expected_app=expected)
     if current["valid"] and not current["issues"]:
         return original
 
+    attempts = []
     parts = _android_parts(original) if family == "android" else _ios_parts(original)
-    base = _android_webview_base(parts) if family == "android" else _ios_webview_base(parts)
-    suffix = _identity_suffix(
-        app, family, parts, _explicit_app_locale(original, locale)
+    attempts.append(parts)
+    # Second chance: ignore unverified OEM shells and use a capture-backed
+    # firmware identity that the contract accepts for all platforms.
+    attempts.append(
+        _verified_android_parts() if family == "android" else _verified_ios_parts()
     )
-    candidate = f"{base} {suffix}".strip()
-    verdict = validate_user_agent(candidate, expected_app=expected)
-    if verdict["valid"] and not verdict["issues"]:
-        return candidate
 
-    fallback = _generic_mobile_browser(original)
+    last_issues = []
+    for attempt_parts in attempts:
+        candidate = _build_supported_identity_ua(
+            app, family, attempt_parts, locale_token
+        )
+        verdict = validate_user_agent(candidate, expected_app=expected)
+        if verdict["valid"] and not verdict["issues"]:
+            return candidate
+        last_issues = list(verdict["issues"] or [])
+
     logger.warning(
-        "Invalid coerced %s %s UA; using generic mobile browser fallback: %s",
-        app, family, "; ".join(verdict["issues"]) or "unknown validation failure",
+        "Invalid coerced %s %s UA after verified rebuild; refusing generic Chrome "
+        "fallback: %s",
+        app, family, "; ".join(last_issues) or "unknown validation failure",
     )
-    return fallback
+    return ""
+
+
+def ensure_inapp_platform_ua(
+    ua: str,
+    platform: str,
+    locale: str = "",
+    mobile_ua_factory=None,
+    attempts: int = 3,
+) -> str:
+    """Guarantee a platform-correct mobile UA for supported in-app targets.
+
+    Retries with fresh mobile bases when coercion fails. Returns "" only when
+    every attempt fails — callers should skip that visit.
+    """
+    target = (platform or "").lower().strip()
+    app = _PLATFORM_TO_APP.get(target)
+    if target in _FALLBACK_ONLY_PLATFORMS:
+        return coerce_ua_for_platform(ua, target, locale)
+    if not app:
+        return ua or ""
+
+    family = _is_mobile_ua(ua or "")
+    support = (
+        APP_SUPPORT_MATRIX.get(app, {}).get(family)
+        if family in {"android", "ios"}
+        else None
+    )
+    if support == "fallback":
+        return coerce_ua_for_platform(ua or "", target, locale)
+
+    if support != "supported" and family in {"android", "ios"}:
+        # Unknown/unsupported combo — keep existing coerce behavior.
+        return coerce_ua_for_platform(ua or "", target, locale)
+
+    current = ua or ""
+    for _ in range(max(1, int(attempts or 1))):
+        if not _is_mobile_ua(current):
+            if callable(mobile_ua_factory):
+                current = mobile_ua_factory() or current
+            else:
+                # Prefer Android for retries (matches real in-app traffic mix).
+                snap = _verified_android_parts()
+                current = _android_webview_base(snap)
+        coerced = coerce_ua_for_platform(current, target, locale)
+        if not coerced:
+            if callable(mobile_ua_factory):
+                current = mobile_ua_factory() or current
+            else:
+                snap = _verified_android_parts()
+                current = _android_webview_base(snap)
+            continue
+        if APP_SUPPORT_MATRIX.get(app, {}).get(_is_mobile_ua(coerced)) != "supported":
+            return coerced
+        if _ua_has_inapp_marker(coerced, target):
+            return coerced
+        current = coerced
+    return ""
 
 
 def _is_tiktok_android_ua_complete(ua: str) -> bool:

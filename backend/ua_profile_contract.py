@@ -25,7 +25,11 @@ APP_RELEASES_BY_PLATFORM = {
         "ios": [{"version": value} for value in ("557.0", "555.0", "553.0")],
     },
     "tiktok": {
-        "android": [{"version": "45.8.2", "version_code": "2024508020"}],
+        "android": [
+            {"version": "46.4.1", "version_code": "2024604010"},
+            {"version": "46.3.3", "version_code": "2024603030"},
+            {"version": "45.8.2", "version_code": "2024508020"},
+        ],
         "ios": [{"version": value} for value in ("44.7.0", "44.3.0", "43.9.0")],
     },
     "pinterest": {
@@ -96,6 +100,9 @@ ANDROID_DEVICE_SNAPSHOTS = (
      "soc": "panther", "res": "1080x2400", "dpi": "420dpi"},
     {"brand": "Google", "model": "Pixel 8", "and_ver": "14", "sdk": "34",
      "build": "AP1A.240505.005", "vendor": "google", "chipset": "tensor",
+     "soc": "shiba", "res": "1080x2400", "dpi": "420dpi"},
+    {"brand": "Google", "model": "Pixel 8", "and_ver": "16", "sdk": "36",
+     "build": "CP1A.260505.005", "vendor": "google", "chipset": "tensor",
      "soc": "shiba", "res": "1080x2400", "dpi": "420dpi"},
     {"brand": "Google", "model": "Pixel 9", "and_ver": "15", "sdk": "35",
      "build": "AP3A.240905.015", "vendor": "google", "chipset": "tensor",

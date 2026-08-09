@@ -120,7 +120,7 @@ BASE_IOS_UA = (
 PLATFORM_UA_MARKERS = {
     "facebook":  {"android": ["FB_IAB/FB4A", "FBAV/"], "ios": ["FBAN/FBIOS", "FBAV/"]},
     "instagram": {"android": ["Instagram "], "ios": ["Instagram "]},
-    "tiktok":    {"android": ["musical_ly_2024508020", "app_version/45.8.2"], "ios": ["musical_ly_", "app_version/"]},
+    "tiktok":    {"android": ["musical_ly_2024604010", "app_version/46.4.1"], "ios": ["musical_ly_", "app_version/"]},
     "snapchat":  {"android": ["Snapchat/"], "ios": ["Snapchat/"]},
     "linkedin":  {"android": ["[LinkedInApp]/", "com.linkedin.android/"], "ios": ["[LinkedInApp]/"]},
     "twitter":   {"android": ["TwitterAndroid/"], "ios": ["Twitter for iPhone/"]},
@@ -288,9 +288,9 @@ def test_tiktok_android_keeps_webview_shell_after_coerce():
     assert "Chrome/" in ua_out
     assert "Mobile Safari/537.36" in ua_out
     assert "Cronet/" not in ua_out
-    assert "musical_ly_2024508020" in ua_out
-    assert "app_version/45.8.2" in ua_out
-    assert "com.zhiliaoapp.musically/2024508020" in ua_out
+    assert "musical_ly_2024604010" in ua_out
+    assert "app_version/46.4.1" in ua_out
+    assert "com.zhiliaoapp.musically/2024604010" in ua_out
     assert "FBAN/TikTokAndroid" not in ua_out
     assert "BytedanceWebview/" not in ua_out
     assert "ttwebview/" not in ua_out

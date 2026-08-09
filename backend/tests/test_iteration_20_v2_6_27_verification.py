@@ -86,10 +86,10 @@ class TestTikTokAndroidWebView:
         )
         for _ in range(25):
             out = referrer_pro.build_inapp_ua_suffix("tiktok", android_base)
-            assert out.startswith("TikTok/45.8.2 ")
-            assert "musical_ly_2024508020" in out
-            assert "app_version/45.8.2" in out
-            assert "com.zhiliaoapp.musically/2024508020" in out
+            assert out.startswith("TikTok/46.4.1 ")
+            assert "musical_ly_2024604010" in out
+            assert "app_version/46.4.1" in out
+            assert "com.zhiliaoapp.musically/2024604010" in out
             assert not any(token in out for token in (
                 "FBAN/TikTokAndroid", "BytedanceWebview/", "ttwebview/",
             ))
@@ -150,8 +150,8 @@ class TestCoerceCrossPlatform:
         out = referrer_pro.coerce_ua_for_platform(ua, "tiktok")
         assert "FB_IAB/FB4A" not in out, f"FB4A leaked: {out}"
         assert "FBAN/FB4A" not in out, f"FBAN/FB4A leaked: {out}"
-        assert "TikTok/45.8.2" in out
-        assert "musical_ly_2024508020" in out
+        assert "TikTok/46.4.1" in out
+        assert "musical_ly_2024604010" in out
         assert "FBAN/TikTokAndroid" not in out
 
 

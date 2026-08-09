@@ -90,7 +90,7 @@ def test_facebook_shaped_tiktok_bracket_is_removed():
     out = _rp().coerce_ua_for_platform(ua, "tiktok")
     assert "FBAN/TikTokAndroid" not in out
     assert "[FB_IAB/" not in out
-    assert "TikTok/45.8.2" in out
+    assert "TikTok/46.4.1" in out
 
 
 def test_ios_musical_ly_still_idempotent_for_tiktok():

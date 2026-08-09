@@ -139,8 +139,8 @@ def test_coercion_uses_release_contract_and_one_identity_only():
     verdict = validate_user_agent(output, expected_app="tiktok")
     assert verdict["valid"], verdict
     assert detect_app(output)["identities"] == ["tiktok"]
-    assert output.count("TikTok/45.8.2") == 1
-    assert output.count("musical_ly_2024508020") == 1
+    assert output.count("TikTok/46.4.1") == 1
+    assert output.count("musical_ly_2024604010") == 1
     assert "FBAN/TikTokAndroid" not in output
     assert "BytedanceWebview" not in output
     assert "ttwebview" not in output
@@ -325,3 +325,56 @@ def test_context_accept_language_is_shared_by_every_outbound_request_path():
     assert '_ctx_headers = {"Accept-Language": _context_accept_language}' in source
     assert "_ctx_headers[\"Accept-Language\"] = _context_accept_language" in source
     assert "accept_language=geo.get(\"accept_language\")" not in source
+
+
+def test_supported_inapp_coerce_never_returns_generic_chrome():
+    samsung = (
+        "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+        "Chrome/145.0.7632.99 Mobile Safari/537.36"
+    )
+    for platform in ("tiktok", "facebook", "instagram", "snapchat", "linkedin", "twitter"):
+        out = rp.coerce_ua_for_platform(samsung, platform, "en-US")
+        assert out, platform
+        assert "Android 10; K" not in out, (platform, out)
+        app = detect_app(out)["app"]
+        expected = {
+            "tiktok": "tiktok",
+            "facebook": "facebook",
+            "instagram": "instagram",
+            "snapchat": "snapchat",
+            "linkedin": "linkedin",
+            "twitter": "twitter",
+        }[platform]
+        assert app == expected, (platform, out)
+        assert validate_user_agent(out, expected_app=app)["valid"], (platform, out)
+
+
+def test_ensure_inapp_platform_ua_rebuilds_until_identity_is_valid():
+    junk = "."
+    out = rp.ensure_inapp_platform_ua(
+        junk,
+        "tiktok",
+        "en-US",
+        mobile_ua_factory=lambda: (
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+            "Chrome/145.0.7632.99 Mobile Safari/537.36"
+        ),
+        attempts=3,
+    )
+    assert out
+    assert detect_app(out)["app"] == "tiktok"
+    assert "musical_ly_" in out
+    assert "Region/" in out
+    assert "Android 10; K" not in out
+    assert validate_user_agent(out, expected_app="tiktok")["valid"]
+
+
+def test_rut_visit_path_skips_instead_of_chrome_leak_on_coerce_failure():
+    source = (BACKEND / "real_user_traffic.py").read_text(encoding="utf-8")
+    assert "ensure_inapp_platform_ua" in source
+    assert 'visit skipped to avoid Chrome/generic browser leak' in source
+    assert "skipped_ua" in source
+    assert "_mobile_ua_for_inapp()" in source
+    assert "_realistic_fallback_ua()" in source
