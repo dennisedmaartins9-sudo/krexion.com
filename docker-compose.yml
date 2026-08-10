@@ -25,10 +25,14 @@ services:
     networks:
       - krexion-net
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+      # Explicit exit codes — bare `.ok` print can leave flaky statuses.
+      # start_period gives mongod time after recreate / journal recovery
+      # before failures count (fixes VPS deploy "mongo unhealthy").
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.runCommand({ping:1}).ok ? 0 : 2)"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 60s
     # Container-level memory ceiling — paired with the WT cache cap above
     # this is a TWO-LAYER guarantee that Mongo can never grow past 4 GB.
     deploy:

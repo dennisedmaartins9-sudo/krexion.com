@@ -90,6 +90,13 @@ jobs:
             docker builder prune -af --keep-storage 5GB 2>&1 | tail -3 || true
             docker system prune -f 2>&1 | tail -2 || true
           fi
+          # Extra pass when critically low — mongo journal + image layers
+          # need headroom or healthchecks flip to unhealthy during up.
+          if [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt 6 ]; then
+            echo ">> Disk under 6GB free — pruning unused images/volumes carefully"
+            docker image prune -af 2>&1 | tail -3 || true
+            docker builder prune -af --keep-storage 2GB 2>&1 | tail -3 || true
+          fi
           echo ">> Disk AFTER cleanup"
           df -h / /var/lib/docker 2>/dev/null | head -5
 
@@ -121,12 +128,74 @@ jobs:
           COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
         run: |
           cd /opt/krexion
-          if ! docker compose -f "$COMPOSE_FILE" up -d backend frontend; then
-            echo "::group::Backend startup diagnostics"
-            docker compose -f "$COMPOSE_FILE" ps backend || true
-            docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 backend || true
+          set -e
+
+          mongo_status() {
+            docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' krexion-mongo 2>/dev/null || echo missing
+          }
+
+          mongo_ping_ok() {
+            docker exec krexion-mongo mongosh --quiet --eval 'quit(db.runCommand({ping:1}).ok ? 0 : 2)' >/dev/null 2>&1
+          }
+
+          echo ">> Bringing mongo up first (backend depends on healthy mongo)..."
+          docker compose -f "$COMPOSE_FILE" up -d mongo
+
+          healthy=0
+          for i in $(seq 1 45); do
+            st=$(mongo_status)
+            echo "  mongo status=$st (attempt $i/45)"
+            if [ "$st" = "healthy" ]; then
+              healthy=1
+              break
+            fi
+            # Heal stuck/unhealthy/exited mongo without wiping the data volume
+            if [ "$st" = "unhealthy" ] || [ "$st" = "exited" ] || [ "$st" = "dead" ] || [ "$st" = "missing" ]; then
+              if [ $((i % 6)) -eq 0 ]; then
+                echo ">> Healing mongo (restart / recreate, volume preserved)..."
+                docker compose -f "$COMPOSE_FILE" restart mongo || true
+                sleep 8
+                st2=$(mongo_status)
+                if [ "$st2" = "unhealthy" ] || [ "$st2" = "exited" ] || [ "$st2" = "dead" ] || [ "$st2" = "missing" ]; then
+                  docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-deps mongo || true
+                fi
+              fi
+            fi
+            # Live ping can succeed even while health label is still catching up
+            if mongo_ping_ok; then
+              echo "  mongosh ping OK"
+              if [ "$st" = "healthy" ] || [ "$i" -ge 12 ]; then
+                healthy=1
+                break
+              fi
+            fi
+            sleep 3
+          done
+
+          if [ "$healthy" != "1" ]; then
+            echo "::group::Mongo diagnostics (deploy blocked)"
+            docker compose -f "$COMPOSE_FILE" ps mongo || true
+            docker logs --no-color --tail=150 krexion-mongo || true
+            df -h / /var/lib/docker 2>/dev/null | head -5 || true
+            free -h || true
             echo "::endgroup::"
             exit 1
+          fi
+
+          echo ">> Mongo healthy — starting backend + frontend..."
+          if ! docker compose -f "$COMPOSE_FILE" up -d backend frontend; then
+            echo "::group::Backend startup diagnostics"
+            docker compose -f "$COMPOSE_FILE" ps || true
+            docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 backend || true
+            docker logs --no-color --tail=120 krexion-mongo || true
+            echo "::endgroup::"
+            # Last resort: if mongo ping works, start deps without waiting on label
+            if mongo_ping_ok; then
+              echo ">> Retrying backend/frontend with --no-deps (mongo ping OK)..."
+              docker compose -f "$COMPOSE_FILE" up -d --no-deps backend frontend
+            else
+              exit 1
+            fi
           fi
           echo ">> Containers started"
 
