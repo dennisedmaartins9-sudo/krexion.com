@@ -7400,7 +7400,7 @@ async def form_filler_create_job(
     proxy_chain_use_tor: bool = Form(True),
     browser_variant: str = Form("auto"),
     behavioral_bio_enabled: bool = Form(True),
-    ip_warmup_enabled: bool = Form(True),
+    ip_warmup_enabled: bool = Form(False),  # opt-in; ~10–15s/visit
     user: dict = Depends(get_current_user),
     _cloud_gate: bool = Depends(require_local_mode),
 ):
@@ -8864,7 +8864,7 @@ async def _rut_prepare_and_run(
             browser_variant=str(params.get("browser_variant") or "auto").strip().lower(),
             # 2026-02 v2.1.31 — Step 4 wiring
             behavioral_bio_enabled=bool(params.get("behavioral_bio_enabled", True)),
-            ip_warmup_enabled=bool(params.get("ip_warmup_enabled", True)),
+            ip_warmup_enabled=bool(params.get("ip_warmup_enabled", False)),
             ad_chain_simulation_enabled=False,
             ip_quality_check_enabled=bool(params.get("ip_quality_check_enabled", True)),
             # 2026-06 — Referrer override wiring
@@ -9244,7 +9244,7 @@ async def rut_create_job(
     browser_variant: str = Form("auto"),
     # ── 2026-02 v2.1.31 — Step 4: Phase-4 Anti-Detect ────────────────
     behavioral_bio_enabled: bool = Form(True),
-    ip_warmup_enabled: bool = Form(True),
+    ip_warmup_enabled: bool = Form(False),  # opt-in; ~10–15s/visit
     # v2.6.35 — Pixel prefire + intermediate redirect hops before offer.
     ad_chain_simulation_enabled: bool = Form(False),
     # v2.6.35 — Block datacenter / high fraud-score exit IPs pre-visit.

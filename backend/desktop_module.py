@@ -311,22 +311,59 @@ async def _db_health() -> dict:
         return {"connected": False, "collections": 0, "last_error": str(exc)[:200]}
 
 
+def _sync_status_candidates() -> list[Path]:
+    """Paths where sync_client may have written the heartbeat ack.
+
+    Order: explicit env → ProgramData (native Windows writer default) →
+    legacy /tmp path (old dashboard reader default). Must stay aligned
+    with sync_client.default_sync_status_path().
+    """
+    paths: list[Path] = []
+    env = (os.environ.get("KREXION_SYNC_STATUS_FILE") or "").strip()
+    if env:
+        paths.append(Path(env))
+    paths.append(
+        Path(os.environ.get("PROGRAMDATA", "C:/ProgramData"))
+        / "Krexion"
+        / "sync-status.json"
+    )
+    paths.append(Path("/tmp/krexion-sync-status.json"))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in paths:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 async def _cloud_link_status() -> dict:
     """Reads the last heartbeat ack time from the sync_client side. On
     local installs `sync_client.py` updates a tiny status file each
     successful heartbeat — we read that here instead of doing an HTTP
-    round-trip every 2 s."""
-    status_file = Path(os.environ.get("KREXION_SYNC_STATUS_FILE", "/tmp/krexion-sync-status.json"))
-    try:
-        if status_file.exists():
+    round-trip every 2 s.
+
+    v2.6.75: also check ProgramData (writer default). Pre-fix the
+    dashboard only looked at /tmp/... so Windows native always showed
+    yellow 'no recent heartbeat' even when heartbeats succeeded.
+    """
+    best: Optional[dict] = None
+    for status_file in _sync_status_candidates():
+        try:
+            if not status_file.exists():
+                continue
             d = json.loads(status_file.read_text(encoding="utf-8-sig"))
             last = d.get("last_heartbeat_at")
-            if last:
-                age_sec = int(time.time() - float(last))
-                return {"connected": age_sec < 120, "last_sync_age": age_sec}
-    except Exception:  # noqa: BLE001
-        pass
-    return {"connected": False, "last_sync_age": None}
+            if not last:
+                continue
+            age_sec = int(time.time() - float(last))
+            cand = {"connected": age_sec < 120, "last_sync_age": age_sec}
+            if best is None or age_sec < int(best.get("last_sync_age") or 10**9):
+                best = cand
+        except Exception:  # noqa: BLE001
+            continue
+    return best or {"connected": False, "last_sync_age": None}
 
 
 def _feature_to_label(feature: str) -> str:

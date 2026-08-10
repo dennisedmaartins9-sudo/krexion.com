@@ -7588,8 +7588,8 @@ async def run_real_user_traffic_job(
     # making the IP look "warmed" instead of cold. Adds ~10-15s per
     # visit. Combined with TLS prewarm gives the strongest cold-IP
     # bypass possible without a real human session.
-    # v2.6.35: default ON.
-    ip_warmup_enabled: bool = True,
+    # Default OFF (opt-in) — least often needed; customer enables in RUT UI.
+    ip_warmup_enabled: bool = False,
     # `ad_chain_simulation_enabled` — when True, fire platform pixel
     # preflight pings + 1 intermediate redirect hop before the offer
     # navigation so the session looks like a real ad-click journey.

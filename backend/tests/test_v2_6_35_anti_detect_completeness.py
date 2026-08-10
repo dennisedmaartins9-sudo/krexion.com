@@ -42,7 +42,7 @@ def test_fire_pixel_prefire_and_navigate_helpers_exist():
 def test_rut_ad_chain_default_is_disabled():
     src = RUT_FILE.read_text(encoding="utf-8")
     assert re.search(r"tls_prewarm:\s*bool\s*=\s*True", src)
-    assert re.search(r"ip_warmup_enabled:\s*bool\s*=\s*True", src)
+    assert re.search(r"ip_warmup_enabled:\s*bool\s*=\s*False", src)
     assert re.search(r"behavioral_bio_enabled:\s*bool\s*=\s*True", src)
     assert re.search(r"ad_chain_simulation_enabled:\s*bool\s*=\s*False", src)
 
@@ -78,7 +78,7 @@ def test_ad_chain_helpers_remain_compatible_but_execution_is_disabled():
 def test_server_ad_chain_form_default_is_disabled():
     src = SERVER_FILE.read_text(encoding="utf-8")
     assert "tls_prewarm: bool = Form(True)" in src
-    assert "ip_warmup_enabled: bool = Form(True)" in src
+    assert "ip_warmup_enabled: bool = Form(False)" in src
     assert "behavioral_bio_enabled: bool = Form(True)" in src
     assert "ad_chain_simulation_enabled: bool = Form(False)" in src
     assert "ip_quality_check_enabled: bool = Form(True)" in src

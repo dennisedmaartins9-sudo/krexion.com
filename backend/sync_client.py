@@ -32,6 +32,23 @@ logger = logging.getLogger(__name__)
 CLOUD_URL = (os.environ.get("KREXION_CLOUD_URL") or "https://krexion.com").rstrip("/")
 
 
+def default_sync_status_path() -> Path:
+    """Canonical path for the local→cloud heartbeat ack file.
+
+    Must stay aligned with desktop_module._cloud_link_status() — if the
+    writer and dashboard reader disagree, the Local PC Dashboard always
+    shows yellow 'no recent heartbeat' even when heartbeats succeed.
+    """
+    env = (os.environ.get("KREXION_SYNC_STATUS_FILE") or "").strip()
+    if env:
+        return Path(env)
+    return (
+        Path(os.environ.get("PROGRAMDATA", "C:/ProgramData"))
+        / "Krexion"
+        / "sync-status.json"
+    )
+
+
 def _resolve_license_key() -> str:
     """v1.0.14: read LICENSE_KEY from env (highest priority), or from
     LICENSE_KEY_FILE (used by the installer's NSSM service env which
@@ -234,11 +251,7 @@ async def _heartbeat() -> None:
                 # always showed yellow 'no recent heartbeat' even when
                 # the daemon was happily heart-beating.
                 try:
-                    status_path = Path(
-                        os.environ.get("KREXION_SYNC_STATUS_FILE")
-                        or (Path(os.environ.get("PROGRAMDATA", "C:/ProgramData"))
-                            / "Krexion" / "sync-status.json")
-                    )
+                    status_path = default_sync_status_path()
                     status_path.parent.mkdir(parents=True, exist_ok=True)
                     status_path.write_text(
                         json.dumps({

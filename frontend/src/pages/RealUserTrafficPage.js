@@ -644,7 +644,8 @@ export default function RealUserTrafficPage() {
 
   // ── 2026-02 v2.1.31 — Step 4: Phase-4 Anti-Detect ──
   const [behavioralBioEnabled, setBehavioralBioEnabled] = useState(true);
-  const [ipWarmupEnabled, setIpWarmupEnabled] = useState(true);
+  // Default OFF — adds ~10–15s/visit; opt-in when cold IP / CF needs it.
+  const [ipWarmupEnabled, setIpWarmupEnabled] = useState(false);
 
   // ── 2026-06-11: UNIFIED Anti-Detect master toggle ──
   // Single user-facing switch. When ON, all underlying flags above
@@ -3656,17 +3657,18 @@ export default function RealUserTrafficPage() {
                       if (!pacingPerHour) setPacingPerHour(30);
                       setTlsPrewarm(true);
                       setBehavioralBioEnabled(true);
-                      setIpWarmupEnabled(true);
+                      // IP warm-up stays independent (default OFF) — slow
+                      // (~10–15s/visit) and least often needed; customer
+                      // opts in via its own toggle when cold IP / CF needs it.
                       // Keep Browser Engine toggle (Full Chromium / Light)
                       // — do not force "rotate" over the user's choice.
                       // Multi-hop proxy chain stays opt-in (heavy resource
                       // — Tor adds ~3-5s per visit). Auto-enable only when
                       // proxies list exists and customer wants paranoia.
                     } else {
-                      // Reset heavy opt-ins only — production anti-detect
-                      // baselines (TLS prewarm, IP warm-up, behavioral bio)
-                      // stay ON per v2.6.35 defaults. Browser Engine toggle
-                      // stays as the operator left it.
+                      // Reset heavy opt-ins only — TLS prewarm + behavioral
+                      // bio stay at their current values. IP warm-up stays
+                      // opt-in. Browser Engine toggle stays as left.
                       setProxyChainEnabled(false);
                     }
                   }}
@@ -4867,7 +4869,7 @@ export default function RealUserTrafficPage() {
           <div className="mt-6 p-4 rounded-lg border border-emerald-500/30 bg-emerald-950/10">
             <div className="flex items-center gap-2 mb-3">
               <span className="text-emerald-300 text-sm font-semibold">🧬 Anti-Detect (Phase 4)</span>
-              <span className="text-[10px] text-zinc-500 px-2 py-0.5 rounded-full bg-zinc-900 border border-zinc-800">WebAuthn · ClientRects · HTTP/3 · IPv6 · Behavioral · IP Warm-up · Identity Persistence</span>
+              <span className="text-[10px] text-zinc-500 px-2 py-0.5 rounded-full bg-zinc-900 border border-zinc-800">WebAuthn · ClientRects · HTTP/3 · IPv6 · Behavioral · Identity Persistence · IP Warm-up opt-in</span>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -4913,9 +4915,9 @@ export default function RealUserTrafficPage() {
                       className="mt-0.5 w-4 h-4 rounded accent-emerald-500"
                     />
                     <div>
-                      <div className="text-sm text-zinc-200">IP Warm-up (visit Google / Wikipedia first)</div>
+                      <div className="text-sm text-zinc-200">IP Warm-up <span className="text-[10px] text-zinc-500 font-normal">(optional · default OFF)</span></div>
                       <p className="text-[11px] text-zinc-500">
-                        Visits 2 benign sites via the same proxy before target. Seeds CF / Akamai cookies, IP looks "active" not cold. +~10s/visit.
+                        Pehle same proxy se Google / Wikipedia jaisi 2 sites open karta hai, phir offer. Cold IP / CF pe help; har visit ~10–15s slow. Sirf zarurat ho to ON karein.
                       </p>
                     </div>
                   </label>
