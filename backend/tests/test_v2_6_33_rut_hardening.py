@@ -90,6 +90,7 @@ def test_tls_resolve_redirect_location_exported():
     import inspect
 
     assert inspect.iscoroutinefunction(resolve_redirect_location)
+    assert "proxy" in inspect.signature(resolve_redirect_location).parameters
 
 
 def test_detect_is_paid_for_legacy_extras():

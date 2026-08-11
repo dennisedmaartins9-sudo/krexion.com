@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,7 @@ LOCAL_API_BASE = (os.environ.get("LOCAL_API_BASE") or "http://localhost:8001").r
 _running = False
 _HB_FAILS = 0
 _HB_OKS = 0
+_HB_THREAD: threading.Thread | None = None
 
 
 def _current_license_key() -> str:
@@ -175,7 +177,8 @@ def _write_sync_status_file() -> None:
 def _heartbeat_post_sync() -> tuple[int, str, Any]:
     """Blocking POST so RUT/Playwright cannot starve cloud keepalive.
 
-    Runs in a worker thread via asyncio.to_thread.
+    Called from the dedicated OS heartbeat thread (v2.6.77). Network
+    I/O releases the GIL so this still runs while Chromium is busy.
     """
     key = _current_license_key()
     if not key:
@@ -200,121 +203,80 @@ def _heartbeat_post_sync() -> tuple[int, str, Any]:
         return int(r.status_code), (r.text or "")[:200], data
 
 
-async def _heartbeat() -> None:
-    """v2.6.76: retries + thread offload + independent loop.
-
-    v1.0.16 logged failures; this revision also survives VPS blips and
-    a busy local event loop (100 concurrent customer PCs + RUT).
+def _heartbeat_thread_main() -> None:
+    """OS-thread keepalive. v2.6.76 used asyncio.create_task + to_thread;
+    Playwright on the main loop still delayed scheduling so 2.6.76 PCs
+    showed yellow 'no recent heartbeat' and Failed to fetch links during
+    RUT. This thread never waits on the event loop.
     """
     global _HB_FAILS, _HB_OKS
-    key = _current_license_key()
-    if not key:
-        if _HB_FAILS < 3:
-            logger.info(
-                "[sync] heartbeat skipped: no license key found in env "
-                "LICENSE_KEY/LICENSE_KEY_FILE/PROGRAMDATA. Wizard may "
-                "not have written license-key.txt yet - will retry."
-            )
-        _HB_FAILS += 1
-        return
-
-    last_err = ""
-    for attempt in range(max(1, HEARTBEAT_RETRIES)):
+    while _running:
+        started = time.time()
         try:
-            status, text, hb_resp = await asyncio.to_thread(_heartbeat_post_sync)
-            if status == 0:
-                _HB_FAILS += 1
-                return
-            if status >= 400:
-                last_err = f"HTTP {status}: {text}"
-                if attempt + 1 < HEARTBEAT_RETRIES:
-                    await asyncio.sleep(1.2 * (attempt + 1))
-                    continue
+            key = _current_license_key()
+            if not key:
                 if _HB_FAILS < 3:
                     logger.info(
-                        f"[sync] heartbeat returned {last_err}. License key tail "
-                        f"...{key[-6:]}, cloud={CLOUD_URL}"
+                        "[sync] heartbeat skipped: no license key found in env "
+                        "LICENSE_KEY/LICENSE_KEY_FILE/PROGRAMDATA. Wizard may "
+                        "not have written license-key.txt yet - will retry."
                     )
                 _HB_FAILS += 1
-                return
-
-            if _HB_OKS == 0:
-                logger.info(
-                    f"[sync] heartbeat OK to {CLOUD_URL} - PC is now online "
-                    f"in the cloud, heavy jobs will route here."
-                )
-            _HB_OKS += 1
-            _HB_FAILS = 0
-            _write_sync_status_file()
-            try:
-                cloud_user = (hb_resp or {}).get("user") or {}
-                cloud_lic = (hb_resp or {}).get("license") or {}
-                if cloud_user.get("email") and cloud_user.get("id"):
+            else:
+                last_err = ""
+                ok = False
+                for attempt in range(max(1, HEARTBEAT_RETRIES)):
                     try:
-                        from server import db as _local_db  # type: ignore
-                        await _local_db.users.update_one(
-                            {"email": cloud_user["email"]},
-                            {"$set": {
-                                "id": cloud_user["id"],
-                                "email": cloud_user["email"],
-                                "status": "active",
-                                "bridge_synced": True,
-                            }, "$setOnInsert": {
-                                "name": cloud_user["email"].split("@")[0],
-                                "is_admin": False,
-                                "features": {f: True for f in (
-                                    "real_user_traffic", "form_filler",
-                                    "visual_recorder", "proxies", "links",
-                                    "clicks", "import_traffic",
-                                    "email_checker", "separate_data",
-                                    "ua_generator", "ua_checker",
-                                    "real_traffic", "import_data",
-                                    "adspower", "uploaded_things",
-                                    "profile_builder", "traffic_sources",
-                                )},
-                                "created_at": _now_iso_local(),
-                            }},
-                            upsert=True,
-                        )
-                        if cloud_lic.get("license_key"):
-                            await _local_db.licenses.update_one(
-                                {"license_key": cloud_lic["license_key"]},
-                                {"$set": {
-                                    "license_key": cloud_lic["license_key"],
-                                    "user_id": cloud_user["id"],
-                                    "email": cloud_user["email"],
-                                    "status": cloud_lic.get("status", "active"),
-                                }},
-                                upsert=True,
+                        status, text, _hb_resp = _heartbeat_post_sync()
+                        if status == 0:
+                            last_err = text or "no-license"
+                            break
+                        if status >= 400:
+                            last_err = f"HTTP {status}: {text}"
+                            if attempt + 1 < HEARTBEAT_RETRIES:
+                                time.sleep(1.2 * (attempt + 1))
+                                continue
+                            break
+                        if _HB_OKS == 0:
+                            logger.info(
+                                f"[sync] heartbeat OK to {CLOUD_URL} - PC is now online "
+                                f"in the cloud, heavy jobs will route here."
                             )
-                    except Exception as _mirror_err:  # noqa: BLE001
-                        logger.debug(f"[sync] local mirror skipped: {_mirror_err}")
-            except Exception:  # noqa: BLE001
-                pass
-            return
+                        _write_sync_status_file()
+                        _HB_OKS += 1
+                        _HB_FAILS = 0
+                        ok = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_err = f"{type(e).__name__}: {e}"
+                        if attempt + 1 < HEARTBEAT_RETRIES:
+                            time.sleep(1.2 * (attempt + 1))
+                            continue
+                        break
+                if not ok:
+                    if _HB_FAILS < 3:
+                        logger.info(
+                            f"[sync] heartbeat failed: {last_err}. "
+                            f"Will retry every {HEARTBEAT_INTERVAL}s."
+                        )
+                    _HB_FAILS += 1
         except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
-            if attempt + 1 < HEARTBEAT_RETRIES:
-                await asyncio.sleep(1.2 * (attempt + 1))
-                continue
-            if _HB_FAILS < 3:
-                logger.info(
-                    f"[sync] heartbeat exception: {last_err}. "
-                    f"Will retry every {HEARTBEAT_INTERVAL}s."
-                )
+            logger.debug(f"[sync] heartbeat thread error: {e}")
             _HB_FAILS += 1
-            return
+        wait = max(8.0, float(HEARTBEAT_INTERVAL) - (time.time() - started))
+        time.sleep(wait)
 
 
-async def _heartbeat_loop() -> None:
-    """Keepalive only — never waits on link push / job execution."""
-    global _running
-    while _running:
-        try:
-            await _heartbeat()
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"[sync] heartbeat loop error: {e}")
-        await asyncio.sleep(max(8, HEARTBEAT_INTERVAL))
+def _start_heartbeat_thread() -> None:
+    global _HB_THREAD
+    if _HB_THREAD is not None and _HB_THREAD.is_alive():
+        return
+    _HB_THREAD = threading.Thread(
+        target=_heartbeat_thread_main,
+        name="krexion-cloud-heartbeat",
+        daemon=True,
+    )
+    _HB_THREAD.start()
 
 
 async def _push_links(user_db: Any) -> int:
@@ -997,7 +959,7 @@ def start_if_local(main_db, get_db_for_user) -> bool:
             logger.debug(f"[sync] legacy task cleanup skipped: {_cleanup_err}")
     try:
         _running = True
-        asyncio.create_task(_heartbeat_loop())
+        _start_heartbeat_thread()
         asyncio.create_task(_sync_loop(main_db, get_db_for_user))
         asyncio.create_task(_bridge_loop())
         logger.info(

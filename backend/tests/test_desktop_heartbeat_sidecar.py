@@ -50,6 +50,8 @@ def test_heartbeat_snapshot_shape():
     assert snap["ok"] is True
     assert snap["alive"] is True
     assert "heavy" in snap
+    assert "cloud" in snap
+    assert "connected" in snap["cloud"]
     assert "backend_version" in snap
 
 

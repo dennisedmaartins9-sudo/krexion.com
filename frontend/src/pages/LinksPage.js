@@ -437,9 +437,20 @@ export default function LinksPage() {
   const fetchLinks = async () => {
     try {
       const token = localStorage.getItem("token");
-      const response = await axios.get(`${API}/links`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const headers = { Authorization: `Bearer ${token}` };
+      let response;
+      try {
+        response = await axios.get(`${API}/links`, { headers, timeout: 15000 });
+      } catch (firstErr) {
+        // Native RUT can starve 127.0.0.1:8001; links live on krexion.com.
+        const cloudApi = "https://krexion.com/api";
+        if (API.startsWith("http://127.0.0.1") || API.startsWith("http://localhost")) {
+          response = await axios.get(`${cloudApi}/links`, { headers, timeout: 15000 });
+        } else {
+          await new Promise((r) => setTimeout(r, 800));
+          response = await axios.get(`${API}/links`, { headers, timeout: 15000 });
+        }
+      }
       setLinks(response.data);
       // v2.2.0 — auto-fetch believability score for each link (async, non-blocking)
       (response.data || []).forEach((lnk) => {

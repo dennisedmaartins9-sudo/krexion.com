@@ -81,12 +81,14 @@ def test_cloud_link_stale_is_disconnected(monkeypatch, tmp_path):
 
 def test_heartbeat_loop_is_independent_of_sync_loop():
     src = (BACKEND_DIR / "sync_client.py").read_text(encoding="utf-8")
-    assert "async def _heartbeat_loop(" in src
-    assert "asyncio.create_task(_heartbeat_loop())" in src
-    assert "await asyncio.to_thread(_heartbeat_post_sync)" in src
+    assert "def _heartbeat_thread_main(" in src
+    assert "def _start_heartbeat_thread(" in src
+    assert "_start_heartbeat_thread()" in src
+    assert "name=\"krexion-cloud-heartbeat\"" in src or 'name="krexion-cloud-heartbeat"' in src
     # link-sync loop must not block keepalive
     sync_fn = src.split("async def _sync_loop", 1)[1].split("def start_if_local", 1)[0]
     assert "await _heartbeat()" not in sync_fn
+    assert "asyncio.create_task(_heartbeat_loop())" not in src
 
 
 def test_cloud_online_window_is_wide():

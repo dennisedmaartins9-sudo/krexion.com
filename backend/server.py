@@ -9302,11 +9302,10 @@ async def rut_create_job(
     # ── 2026-01 — Pass-Referer-To-Offer (direct offer navigation) ────
     # OFF (default) → legacy: bot navigates tracker → 302 → offer.
     #                  Offer sees Krexion origin per browser policy.
-    # ON  → bot resolves tracker SERVER-SIDE (click is still recorded
-    #       w/ proxy exit-IP via X-Forwarded-For), then Chromium
-    #       navigates DIRECTLY to the resolved offer URL with the
-    #       chosen Referer. Offer sees the EXACT chosen Referer
-    #       (TikTok / custom URL / platform pool / etc.).
+    # ON  → bot resolves tracker through the visit residential proxy
+    #       (unique exit IP), then Chromium navigates DIRECTLY to the
+    #       offer with the chosen Referer. Offer sees the EXACT
+    #       chosen Referer (TikTok / custom URL / platform pool / etc.).
     referer_pass_to_offer: bool = Form(False),
     # ── 2026-06-14: UA ↔ Referer coercion (anti-fraud) ──────────────
     # Default True — when the chosen referer is an in-app platform
@@ -15765,7 +15764,7 @@ async def get_links(user: dict = Depends(get_current_user_with_fresh_data)):
     if user.get("is_sub_user"):
         query["created_by"] = user.get("sub_user_id")
     
-    links = await db.links.find(query, {"_id": 0}).to_list(100000)
+    links = await db.links.find(query, {"_id": 0}).max_time_ms(8000).to_list(5000)
     return [LinkResponse(**link) for link in links]
 
 @api_router.get("/links/{link_id}", response_model=LinkResponse)

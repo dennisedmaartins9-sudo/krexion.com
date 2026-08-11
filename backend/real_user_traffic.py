@@ -7208,6 +7208,60 @@ def _append_rut_defer_click_qs(url: str, visit_token: str = "") -> str:
         return url
 
 
+def _safe_tracker_redirect_location(loc: str) -> Optional[str]:
+    """Reject loopback Locations so the browser never opens 127.0.0.1."""
+    loc_stripped = (loc or "").strip()
+    if not loc_stripped:
+        return None
+    loc_low = loc_stripped.lower()
+    if (
+        "127.0.0.1" in loc_low
+        or "://localhost" in loc_low
+        or loc_low.startswith("localhost")
+    ):
+        return None
+    return loc_stripped
+
+
+def _pass_to_offer_resolve_headers(
+    user_agent: str,
+    *,
+    referer: str = "",
+    accept_language: str = "",
+    sec_ch_ua_headers: Optional[Dict[str, str]] = None,
+    spoof_xff_ip: str = "",
+) -> Dict[str, str]:
+    """Browser-like headers for tracker resolve.
+
+    Proxy path: leave spoof_xff_ip empty so affiliate uniqueness uses the
+    real residential TCP IP. Direct/localhost fallback (own Krexion tracker
+    only) may set XFF to the probed exit IP.
+    """
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": accept_language or "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if spoof_xff_ip:
+        headers["X-Forwarded-For"] = spoof_xff_ip
+        headers["X-Real-IP"] = spoof_xff_ip
+        headers["True-Client-IP"] = spoof_xff_ip
+        headers["X-Client-IP"] = spoof_xff_ip
+    if sec_ch_ua_headers:
+        for k, v in sec_ch_ua_headers.items():
+            if k and v and k not in headers:
+                headers[k] = v
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
 def _click_id_from_resolved_url(url: str) -> str:
     """Safely extract a tracker click identity from a resolved destination."""
     try:
@@ -7236,39 +7290,33 @@ async def _resolve_tracker_via_localhost(
     accept_language: str = "",
     sec_ch_ua_headers: Optional[Dict[str, str]] = None,
     visit_token: str = "",
+    proxy: Optional[Dict[str, Any]] = None,
+    allow_direct_xff: bool = False,
 ) -> Optional[str]:
-    """Resolve the tracker server-side WITHOUT going through the
-    residential proxy, while still recording the click as the
-    proxy's exit IP via the X-Forwarded-For header.
+    """Resolve tracker → offer URL in one GET (no browser hop).
 
-    Architecture-aware: this fits two deployment styles —
-      1. **Distributed**: the RUT browser runs on a customer PC but
-         the tracker (`api.krexion.com/api/t/...`) lives on a remote
-         VPS. The PC's backend (where RUT is running) can reach the
-         VPS over its regular internet connection — no proxy needed.
-      2. **All-local**: the RUT browser AND the tracker run on the
-         same machine (e.g. a self-contained krexion install) and
-         127.0.0.1 reaches the tracker too.
+    Default (pass-to-offer): GET the tracker **through the same residential
+    proxy** the visit will use. Affiliate Clicks/Hosts then see the unique
+    exit IP, not the customer PC. Chromium still opens the offer with the
+    chosen TikTok/custom Referer.
 
-    Strategy: try the ORIGINAL target URL first (direct internet
-    call from the RUT host, no proxy, with X-Forwarded-For injected).
-    If that fails for any reason (DNS, host firewall, 404 because the
-    link only exists on the local backend, etc.) we fall back to
-    127.0.0.1:${LOCAL_BACKEND_PORT|PORT|8001}. Whichever returns a
-    3xx redirect wins.
+    Direct / 127.0.0.1 + X-Forwarded-For is ONLY for:
+      • allow_direct_xff=True (proxy cannot reach our own Krexion tracker)
+      • proxy failed AND the target host is a Krexion bypass host
 
-    2026-06-14: extended to forward Referer + Accept-Language + Sec-CH-UA-*
-    so the tracker-side click log captures the FULL realistic envelope —
-    earlier we only sent X-Forwarded-For + UA which caused the offer's
-    dashboard to show "Browser: ., User Agent: ." for ~30% of clicks
-    when intermediate redirects stripped headers.
+    External affiliate trackers never fall back to PC-IP + XFF.
 
     Returns the Location URL from the 3xx response, or None on
     failure. Never raises.
     """
-    if not (target_url and exit_ip):
+    if not target_url:
         return None
-    target_url = _append_rut_defer_click_qs(target_url, visit_token)
+    own_tracker = _url_host_matches_bypass(target_url)
+    if own_tracker and (visit_token or "").strip():
+        try:
+            target_url = _append_rut_defer_click_qs(target_url, visit_token)
+        except Exception:
+            pass
 
     # ── 2026-06-15 (UA-leak defence): refuse to fire the server-side
     # tracker resolve with a suspicious / empty / dot-only UA. Earlier
@@ -7292,54 +7340,76 @@ async def _resolve_tracker_via_localhost(
             user_agent = _realistic_fallback_ua()
 
     safe_ua = user_agent or _realistic_fallback_ua()
-    headers = {
-        # Standard reverse-proxy headers — most FastAPI / Caddy /
-        # Nginx setups read one of these to determine the real
-        # client IP. We set all the common ones so whichever the
-        # backend trusts will pick up the residential exit IP.
-        "X-Forwarded-For": exit_ip,
-        "X-Real-IP": exit_ip,
-        "True-Client-IP": exit_ip,
-        "X-Client-IP": exit_ip,
-        # NOTE: We intentionally do NOT set CF-Connecting-IP here.
-        # If the request actually transits Cloudflare, CF replaces
-        # that header with the request's real source IP (so our
-        # value would be ignored anyway). For non-CF setups, the
-        # other four headers above cover the common cases.
-        "User-Agent": safe_ua,
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": accept_language or "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "max-age=0",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    # 2026-06-14: Forward Sec-CH-UA-* headers when the caller supplied
-    # them so the tracker's click log + any downstream postback carries
-    # the SAME hints as the browser navigation that follows.
-    if sec_ch_ua_headers:
-        for k, v in sec_ch_ua_headers.items():
-            if k and v and k not in headers:
-                headers[k] = v
-    if referer:
-        headers["Referer"] = referer
+    header_kw = dict(
+        referer=referer or "",
+        accept_language=accept_language or "",
+        sec_ch_ua_headers=sec_ch_ua_headers,
+    )
 
+    async def _try_one(
+        url: str,
+        req_headers: Dict[str, str],
+        via_proxy: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        # v2.6.33 — TLS-impersonated S2S resolve first (matches browser JA3).
+        if _TLS_AD_OK and _tls_ad is not None:
+            try:
+                _loc_tls = await _tls_ad.resolve_redirect_location(
+                    url,
+                    headers=req_headers,
+                    ua=safe_ua,
+                    timeout=timeout,
+                    proxy=via_proxy,
+                )
+                safe_tls = _safe_tracker_redirect_location(_loc_tls or "")
+                if safe_tls:
+                    return safe_tls
+            except Exception:
+                pass
+        client_kw: Dict[str, Any] = {
+            "follow_redirects": False,
+            "timeout": timeout,
+            "trust_env": False,
+        }
+        proxy_url = _proxy_url_for_http(via_proxy) if via_proxy else ""
+        if proxy_url:
+            client_kw["proxy"] = proxy_url
+        async with httpx.AsyncClient(**client_kw) as c:
+            r = await c.get(url, headers=req_headers)
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location") or r.headers.get("location")
+            return _safe_tracker_redirect_location(loc or "")
+        return None
+
+    # 1) Unique-IP path: tracker hit exits through the visit proxy.
+    if proxy and _proxy_url_for_http(proxy):
+        try:
+            proxy_headers = _pass_to_offer_resolve_headers(safe_ua, **header_kw)
+            loc = await _try_one(target_url, proxy_headers, via_proxy=proxy)
+            if loc:
+                return loc
+        except Exception:
+            pass
+        if not own_tracker and not allow_direct_xff:
+            return None
+
+    # 2) Own-tracker / explicit bypass only: direct or 127.0.0.1 + XFF.
+    if not allow_direct_xff and not own_tracker:
+        return None
+    if not (exit_ip or "").strip():
+        return None
+
+    headers = _pass_to_offer_resolve_headers(
+        safe_ua, spoof_xff_ip=exit_ip, **header_kw
+    )
     candidates: List[str] = []
     try:
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(target_url)
 
-        # Candidate #1 — call the ORIGINAL target URL directly (no
-        # proxy). This is the right path for the typical owner setup
-        # where the tracker is on a remote VPS but RUT runs on a PC.
         if parsed.scheme and parsed.netloc:
             candidates.append(target_url)
 
-        # Candidate #2 — fall back to 127.0.0.1 on the configured
-        # backend port. Right path for self-contained installs where
-        # the tracker lives in the same box.
         local_port = (
             os.environ.get("LOCAL_BACKEND_PORT")
             or os.environ.get("PORT")
@@ -7357,72 +7427,23 @@ async def _resolve_tracker_via_localhost(
     except Exception:
         return None
 
-    # Try each candidate; the first one to return a 3xx wins.
     for url in candidates:
         try:
-            # The Host header for the 127.0.0.1 call should still be
-            # the public hostname so the tracker's link lookup picks
-            # up the right tenant (matters for multi-tenant setups).
             req_headers = dict(headers)
             if url.startswith("http://127.0.0.1"):
                 try:
-                    public_host = urlparse(target_url).hostname or ""
+                    from urllib.parse import urlparse as _up
+                    public_host = _up(target_url).hostname or ""
                     if public_host:
                         req_headers["Host"] = public_host
                         req_headers["X-Forwarded-Host"] = public_host
                         req_headers["X-Forwarded-Proto"] = "https"
                 except Exception:
                     pass
-
-            # v2.6.33 — TLS-impersonated S2S resolve first (matches browser JA3).
-            if _TLS_AD_OK and _tls_ad is not None:
-                try:
-                    _loc_tls = await _tls_ad.resolve_redirect_location(
-                        url,
-                        headers=req_headers,
-                        ua=safe_ua,
-                        timeout=timeout,
-                    )
-                    if _loc_tls:
-                        _loc_low = _loc_tls.lower()
-                        if (
-                            "127.0.0.1" not in _loc_low
-                            and "://localhost" not in _loc_low
-                            and not _loc_low.startswith("localhost")
-                        ):
-                            return _loc_tls
-                except Exception:
-                    pass
-
-            async with httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=timeout,
-                trust_env=False,
-                # Verify SSL for public URLs; for 127.0.0.1 we use
-                # http:// so verify doesn't matter.
-            ) as c:
-                r = await c.get(url, headers=req_headers)
-            if r.status_code in (301, 302, 303, 307, 308):
-                loc = r.headers.get("Location") or r.headers.get("location")
-                if loc:
-                    loc_stripped = loc.strip()
-                    # SAFETY: never propagate a customer-visible
-                    # 127.0.0.1 / localhost URL back to the browser
-                    # — the browser address bar must show only the
-                    # real offer URL for a professional appearance.
-                    # Reject any Location that resolves to a private
-                    # / loopback host; the next candidate (or the
-                    # original failure path) will be tried instead.
-                    _loc_low = loc_stripped.lower()
-                    if (
-                        "127.0.0.1" in _loc_low
-                        or "://localhost" in _loc_low
-                        or _loc_low.startswith("localhost")
-                    ):
-                        continue
-                    return loc_stripped
+            loc = await _try_one(url, req_headers, via_proxy=None)
+            if loc:
+                return loc
         except Exception:
-            # Move on to the next candidate.
             continue
     return None
 
@@ -7632,13 +7653,11 @@ async def run_real_user_traffic_job(
     referer_traffic_type: str = "auto",
     referer_campaign_type: str = "auto",
     # ── 2026-01: PASS-REFERER-TO-OFFER ───────────────────────────────
-    # When True, the bot RESOLVES the Krexion tracker server-side
-    # (records the click with the proxy's exit IP via X-Forwarded-For)
-    # then navigates Chromium DIRECTLY to the resolved offer URL with
-    # the chosen Referer. Result: the offer sees the EXACT chosen
-    # Referer (TikTok / custom URL / platform pool / search engine /
-    # etc.) instead of the Krexion origin that a 302 hop would
-    # otherwise expose. Default OFF — fully backwards-compatible.
+    # When True, the bot RESOLVES the tracker through the visit's
+    # residential proxy (unique TCP exit IP for affiliate Hosts),
+    # then navigates Chromium DIRECTLY to the offer with the chosen
+    # Referer. Offer sees TikTok/custom Referer instead of Krexion
+    # origin. Default OFF — fully backwards-compatible.
     referer_pass_to_offer: bool = False,
     # ── 2026-06-14: UA ↔ Referer consistency coercion ──────────────
     # When True (default for new jobs), the engine coerces the per-visit
@@ -10153,18 +10172,15 @@ async def run_real_user_traffic_job(
                     # the unmodified target URL.
                     pass
                 # ── 2026-01: PASS-REFERER-TO-OFFER bypass ────────────────
-                # Toggle ON  → resolve the tracker server-side (records
-                # click w/ exit_ip via X-Forwarded-For), then point the
-                # browser DIRECTLY at the resolved offer URL with the
-                # SAME chosen Referer. Result: offer sees the exact
-                # TikTok/custom/platform-pool Referer the operator
-                # configured — not the Krexion origin a 302 would leak.
+                # Toggle ON  → resolve the tracker through THIS visit's
+                # residential proxy (unique exit IP = 1 click / 1 host),
+                # then point the browser DIRECTLY at the offer with the
+                # SAME chosen Referer. Offer sees TikTok/custom Referer
+                # — not the Krexion origin a 302 would leak.
                 # Toggle OFF → legacy path (browser navigates tracker → 302
                 # → offer; offer sees Krexion origin per browser policy).
-                # SAFETY: requires both a non-empty chosen Referer AND a
-                # successful 3xx from the server-side tracker resolve.
-                # If either fails we silently fall back to the legacy
-                # path so the visit still completes.
+                # SAFETY: if proxy resolve fails we silently fall back to
+                # the legacy browser→tracker path (still unique proxy IP).
                 _ptro_swapped = False
                 # ── 2026-06-15 (UA-leak defence): hard sanity guard on
                 # `ua`. Any UA shorter than 50 chars, or a literal "."
@@ -10251,6 +10267,7 @@ async def run_real_user_traffic_job(
                                 if k.lower().startswith("sec-ch-")
                             },
                             visit_token=_visit_claim_token,
+                            proxy=_effective_proxy or proxy,
                         )
                         if _resolved_offer_direct:
                             _visit_target_url = _resolved_offer_direct
@@ -10303,7 +10320,7 @@ async def run_real_user_traffic_job(
                                 push_live_step(
                                     job_id, i + 1, "referer",
                                     "info",
-                                    f"Pass-Referer-To-Offer: browser → offer directly with Referer={_ua_referer[:80]}",
+                                    f"Pass-Referer-To-Offer: tracker via unique proxy IP, browser → offer with Referer={_ua_referer[:80]}",
                                 )
                             except Exception:
                                 pass
@@ -10675,6 +10692,7 @@ async def run_real_user_traffic_job(
                                     if k.lower().startswith("sec-ch-")
                                 },
                                 visit_token=_visit_claim_token,
+                                proxy=_effective_proxy or proxy,
                             )
                             if _resolved_offer_prewarm:
                                 _prewarm_url = _resolved_offer_prewarm
@@ -11138,6 +11156,7 @@ async def run_real_user_traffic_job(
                                 _bypass_offer_url = await _resolve_tracker_via_localhost(
                                     target_url, _exit_ip_for_bypass, ua,
                                     visit_token=_visit_claim_token,
+                                    allow_direct_xff=True,
                                 )
                                 if _bypass_offer_url:
                                     push_live_step(

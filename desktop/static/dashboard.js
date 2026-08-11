@@ -146,6 +146,10 @@ async function pollLocal() {
         busy
           ? `heavy job running${d.heavy && d.heavy.label ? " · " + d.heavy.label : ""} — visits continue normally`
           : "main API briefly busy — heartbeat OK");
+      setDot("cloud-dot", d.cloud?.connected ? "ok" : "warn");
+      setText("cloud-detail", d.cloud?.connected
+        ? `linked · ${d.cloud.last_sync_age || 0}s ago`
+        : "no recent heartbeat");
       setText("version-pill", "v" + (d.backend_version || "—"));
       if (d.backend_version) {
         _localVersion = String(d.backend_version).replace(/^v/i, "");

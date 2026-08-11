@@ -143,6 +143,7 @@ def _heartbeat_snapshot() -> dict:
         "backend_version": _read_version(),
         "uptime_s": int(time.time() - _PROCESS_STARTED_AT),
         "heavy": busy,
+        "cloud": _read_cloud_link_status(),
         "sidecar": True,
         "sidecar_port": _SIDECAR_PORT,
         "main_port": 8001,
@@ -175,6 +176,7 @@ class _HeartbeatHandler(BaseHTTPRequestHandler):
             if cached is not None:
                 cached = dict(cached)
                 cached["heavy"] = heavy_job_status()
+                cached["cloud"] = _read_cloud_link_status()
                 cached["sidecar"] = True
                 self._send_json(200, cached)
                 return
@@ -343,18 +345,11 @@ def _sync_status_candidates() -> list[Path]:
     return out
 
 
-async def _cloud_link_status() -> dict:
-    """Reads the last heartbeat ack time from the sync_client side. On
-    local installs `sync_client.py` updates a tiny status file each
-    successful heartbeat — we read that here instead of doing an HTTP
-    round-trip every 2 s.
+def _read_cloud_link_status() -> dict:
+    """Sync read of heartbeat ack file. Safe from the :8002 sidecar thread.
 
-    v2.6.75: also check ProgramData (writer default). Pre-fix the
-    dashboard only looked at /tmp/... so Windows native always showed
-    yellow 'no recent heartbeat' even when heartbeats succeeded.
-
-    v2.6.76: 5-minute freshness window + last-good cache so a busy RUT
-    event loop / VPS blip does not flash yellow on every PC.
+    v2.6.77: sidecar overlays this on every /stats so RUT starving :8001
+    cannot freeze the krexion.com link pill on a stale yellow value.
     """
     global _LAST_GOOD_CLOUD_LINK, _LAST_GOOD_CLOUD_TS
     best: Optional[dict] = None
@@ -382,6 +377,22 @@ async def _cloud_link_status() -> dict:
         age = int(time.time() - _LAST_GOOD_CLOUD_TS)
         return {"connected": True, "last_sync_age": age}
     return {"connected": False, "last_sync_age": None}
+
+
+async def _cloud_link_status() -> dict:
+    """Reads the last heartbeat ack time from the sync_client side. On
+    local installs `sync_client.py` updates a tiny status file each
+    successful heartbeat — we read that here instead of doing an HTTP
+    round-trip every 2 s.
+
+    v2.6.75: also check ProgramData (writer default). Pre-fix the
+    dashboard only looked at /tmp/... so Windows native always showed
+    yellow 'no recent heartbeat' even when heartbeats succeeded.
+
+    v2.6.76: 5-minute freshness window + last-good cache so a busy RUT
+    event loop / VPS blip does not flash yellow on every PC.
+    """
+    return _read_cloud_link_status()
 
 
 def _feature_to_label(feature: str) -> str:

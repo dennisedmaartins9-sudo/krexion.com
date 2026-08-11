@@ -515,10 +515,13 @@ async def resolve_redirect_location(
     headers: Optional[Dict[str, str]] = None,
     ua: str = "",
     timeout: float = 15.0,
+    proxy: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """GET ``url`` without following redirects; return ``Location`` on 3xx.
 
     Used by RUT server-side tracker resolve so S2S TLS matches the browser UA.
+    When ``proxy`` is set the GET exits through that residential proxy so
+    affiliate Hosts match the unique exit IP (not the customer PC).
     Returns None on any error — caller falls back to httpx.
     """
     if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
@@ -540,9 +543,16 @@ async def resolve_redirect_location(
         req_headers.setdefault("Sec-Fetch-Site", "cross-site")
         req_headers.setdefault("Sec-Fetch-User", "?1")
 
+    proxy_uri = _build_proxy_uri(proxy) if proxy else None
     try:
         async with _AsyncSession(**_async_session_kwargs(ua or req_headers.get("User-Agent", ""), timeout=timeout)) as session:
-            r = await session.get(url, headers=req_headers, allow_redirects=False)
+            kwargs: Dict[str, Any] = {
+                "headers": req_headers,
+                "allow_redirects": False,
+            }
+            if proxy_uri:
+                kwargs["proxy"] = proxy_uri
+            r = await session.get(url, **kwargs)
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = (r.headers.get("Location") or r.headers.get("location") or "").strip()
                 return loc or None

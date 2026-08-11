@@ -4320,7 +4320,7 @@ export default function RealUserTrafficPage() {
                     Without this, the bot navigates <span className="text-zinc-400">tracker → 302 → offer</span> and the browser's referrer policy STRIPS your chosen Referer down to the Krexion origin — so the offer sees <span className="text-amber-400">https://krexion.com</span> (or empty) instead of TikTok / your custom URL.
                   </span>
                   <span className="text-emerald-200 text-[12px] leading-relaxed">
-                    Turn ON → Krexion resolves the tracker <span className="text-emerald-300">server-side</span> (click is still recorded with the proxy exit IP via <code className="text-emerald-200">X-Forwarded-For</code>) and Chromium navigates <span className="text-emerald-300">directly to the offer URL</span> with the EXACT Referer you picked (TikTok / custom URL / platform pool / Google search / Facebook wrapper / etc.).
+                    Turn ON → Krexion resolves the tracker <span className="text-emerald-300">through your unique residential proxy</span> (same exit IP the visit uses — so affiliate Clicks and Hosts stay 1:1) and Chromium navigates <span className="text-emerald-300">directly to the offer URL</span> with the EXACT Referer you picked (TikTok / custom URL / platform pool / Google search / Facebook wrapper / etc.).
                   </span>
                   <span className="text-zinc-400 text-[11px] leading-relaxed italic">
                     Safe fallback: if the server-side resolve fails for any reason, the visit silently falls back to the legacy tracker path so it still completes.
