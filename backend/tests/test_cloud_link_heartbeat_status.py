@@ -34,6 +34,8 @@ def test_default_sync_status_path_is_programdata(monkeypatch, tmp_path):
 def test_cloud_link_reads_programdata_status(monkeypatch, tmp_path):
     monkeypatch.delenv("KREXION_SYNC_STATUS_FILE", raising=False)
     monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+    desktop_module._LAST_GOOD_CLOUD_LINK = None
+    desktop_module._LAST_GOOD_CLOUD_TS = 0.0
     status = tmp_path / "Krexion" / "sync-status.json"
     status.parent.mkdir(parents=True, exist_ok=True)
     status.write_text(
@@ -43,12 +45,29 @@ def test_cloud_link_reads_programdata_status(monkeypatch, tmp_path):
     result = asyncio.run(desktop_module._cloud_link_status())
     assert result["connected"] is True
     assert result["last_sync_age"] is not None
-    assert result["last_sync_age"] < 120
+    assert result["last_sync_age"] < desktop_module.CLOUD_LINK_FRESH_SEC
+
+
+def test_cloud_link_still_fresh_after_3_minutes(monkeypatch, tmp_path):
+    monkeypatch.delenv("KREXION_SYNC_STATUS_FILE", raising=False)
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+    desktop_module._LAST_GOOD_CLOUD_LINK = None
+    desktop_module._LAST_GOOD_CLOUD_TS = 0.0
+    status = tmp_path / "Krexion" / "sync-status.json"
+    status.parent.mkdir(parents=True, exist_ok=True)
+    status.write_text(
+        json.dumps({"last_heartbeat_at": time.time() - 180}),
+        encoding="utf-8",
+    )
+    result = asyncio.run(desktop_module._cloud_link_status())
+    assert result["connected"] is True
 
 
 def test_cloud_link_stale_is_disconnected(monkeypatch, tmp_path):
     monkeypatch.delenv("KREXION_SYNC_STATUS_FILE", raising=False)
     monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+    desktop_module._LAST_GOOD_CLOUD_LINK = None
+    desktop_module._LAST_GOOD_CLOUD_TS = 0.0
     status = tmp_path / "Krexion" / "sync-status.json"
     status.parent.mkdir(parents=True, exist_ok=True)
     status.write_text(
@@ -57,4 +76,19 @@ def test_cloud_link_stale_is_disconnected(monkeypatch, tmp_path):
     )
     result = asyncio.run(desktop_module._cloud_link_status())
     assert result["connected"] is False
-    assert result["last_sync_age"] >= 120
+    assert result["last_sync_age"] >= desktop_module.CLOUD_LINK_FRESH_SEC
+
+
+def test_heartbeat_loop_is_independent_of_sync_loop():
+    src = (BACKEND_DIR / "sync_client.py").read_text(encoding="utf-8")
+    assert "async def _heartbeat_loop(" in src
+    assert "asyncio.create_task(_heartbeat_loop())" in src
+    assert "await asyncio.to_thread(_heartbeat_post_sync)" in src
+    # link-sync loop must not block keepalive
+    sync_fn = src.split("async def _sync_loop", 1)[1].split("def start_if_local", 1)[0]
+    assert "await _heartbeat()" not in sync_fn
+
+
+def test_cloud_online_window_is_wide():
+    import bridge_module
+    assert bridge_module.ONLINE_WINDOW_SEC >= 240

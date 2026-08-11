@@ -14,18 +14,21 @@ either finishes the slow geo/VPN path and writes a full click row.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 COLLECTION = "cross_user_ip_groups"
 CLAIMS_COLLECTION = "vps_ip_claims"
 TEAM_OFFER_CLAIMS_COLLECTION = "team_offer_ip_claims"
-PENDING_CLAIM_SECONDS = 240
+# Pending claim TTL — was 240s which locked an IP for the WHOLE team
+# when one visit hung. 90s is enough for geo/VPN + first navigation.
+PENDING_CLAIM_SECONDS = 90
 
 _PLACEHOLDER_IPS = frozenset(
     {"", "unknown", "Unknown", "no-ipv4-detected", "no-ip-detected"}
@@ -33,6 +36,8 @@ _PLACEHOLDER_IPS = frozenset(
 
 _GROUP_CACHE: Dict[str, Any] = {"at": 0.0, "user_to_peers": {}}
 _GROUP_CACHE_TTL = 60.0
+_SCOPE_CACHE: Dict[str, Any] = {}
+_SCOPE_CACHE_TTL = 30.0
 
 
 def canonicalize_ip(raw: Any) -> Optional[str]:
@@ -104,19 +109,30 @@ async def resolve_isolation_scope(db, user_id: str) -> Dict[str, Any]:
 
     One user should belong to at most one enabled group. Admin writes enforce a
     conflict check; if legacy corruption exists, claims fail closed.
+
+    Cached ~30s so 10–100 teammates hitting the tracker do not each
+    re-query groups+users on every click / RUT visit.
     """
     uid = (user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
+    now = time.time()
+    hit = _SCOPE_CACHE.get(uid)
+    if hit and (now - float(hit.get("at") or 0)) < _SCOPE_CACHE_TTL:
+        return dict(hit["scope"])
+    def _store(scope: Dict[str, Any]) -> Dict[str, Any]:
+        _SCOPE_CACHE[uid] = {"at": now, "scope": scope}
+        return dict(scope)
+
     if not await _user_vps_ip_db_enabled(db, uid):
-        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
+        return _store({"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False})
     groups = await db[COLLECTION].find(
         {"enabled": True, "user_ids": uid}, {"id": 1, "user_ids": 1, "_id": 0}
     ).to_list(2)
     if len(groups) > 1:
         raise RuntimeError("user belongs to multiple enabled isolation groups")
     if not groups:
-        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
+        return _store({"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False})
     group = groups[0]
     gid = str(group.get("id") or "").strip()
     if not gid:
@@ -129,13 +145,13 @@ async def resolve_isolation_scope(db, user_id: str) -> Dict[str, Any]:
         if doc.get("id"):
             eligible.add(str(doc["id"]))
     if uid not in eligible or len(eligible) < 2:
-        return {"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False}
-    return {
+        return _store({"scope_key": f"user:{uid}", "group_id": None, "member_ids": [uid], "shared": False})
+    return _store({
         "scope_key": f"group:{gid}",
         "group_id": gid,
         "member_ids": sorted(eligible),
         "shared": True,
-    }
+    })
 
 
 def team_offer_claim_required(scope: Dict[str, Any], duplicate_opt_in: bool) -> bool:
@@ -161,12 +177,101 @@ async def ensure_team_offer_claim_indexes(db) -> None:
     # IndexOptionsConflict and prevents the backend from starting.
     await db[COLLECTION].create_index("id", unique=True)
     await db[COLLECTION].create_index([("enabled", 1), ("user_ids", 1)], name="enabled_group_members")
+    try:
+        await db.rut_burnt_offer_ips.create_index(
+            [("offer_scope_key", 1), ("user_id", 1), ("ip", 1)],
+            name="burnt_offer_user_ip",
+        )
+    except Exception:
+        pass
+
+
+async def _team_ip_already_used(
+    db,
+    scope: Dict[str, Any],
+    offer_key: str,
+    canonical_ip: str,
+    get_user_db: Optional[Callable[[str], Any]] = None,
+) -> bool:
+    """Strict history check for THIS ip+offer across the whole team.
+
+    Does not load every teammate IP. Looks up one IP in burnt + each
+    member clicks DB (parallel, capped). Timeout on a shared team fails
+    closed so a slow Mongo never accidentally allows a duplicate.
+    """
+    members = [str(m).strip() for m in (scope.get("member_ids") or []) if str(m).strip()]
+    if not members or not canonical_ip or not offer_key:
+        return False
+    burnt = getattr(db, "rut_burnt_offer_ips", None)
+    if burnt is None:
+        try:
+            burnt = db["rut_burnt_offer_ips"]
+        except Exception:
+            burnt = None
+    if burnt is not None:
+        try:
+            hit = await burnt.find_one(
+                {
+                    "offer_scope_key": offer_key,
+                    "ip": canonical_ip,
+                    "user_id": {"$in": members},
+                },
+                {"_id": 1},
+            )
+            if hit:
+                return True
+        except Exception:
+            if scope.get("shared"):
+                return True
+    if get_user_db is None:
+        return False
+
+    async def _member_has_click(uid: str) -> bool:
+        try:
+            udb = get_user_db(uid)
+            doc = await udb.clicks.find_one(
+                {
+                    "$and": [
+                        {"$or": [
+                            {"ip_address": canonical_ip},
+                            {"ipv4": canonical_ip},
+                            {"detected_ip": canonical_ip},
+                        ]},
+                        {"offer_scope_key": offer_key},
+                    ]
+                },
+                {"_id": 1},
+            )
+            return bool(doc)
+        except Exception:
+            return False
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *[_member_has_click(uid) for uid in members[:100]],
+                return_exceptions=True,
+            ),
+            timeout=2.5,
+        )
+    except asyncio.TimeoutError:
+        return bool(scope.get("shared"))
+    return any(item is True for item in results)
 
 
 async def acquire_team_offer_ip_claim(
-    db, user_id: str, offer_url: str, ip: str, visit_token: str
+    db,
+    user_id: str,
+    offer_url: str,
+    ip: str,
+    visit_token: str,
+    get_user_db: Optional[Callable[[str], Any]] = None,
 ) -> Dict[str, Any]:
-    """Atomically reserve exact (stable scope, offer, canonical IP)."""
+    """Atomically reserve exact (stable scope, offer, canonical IP).
+
+    Unique index = 100 teammates cannot share one IP on one offer.
+    History lookup closes the gap for clicks recorded before claims.
+    """
     token = (visit_token or "").strip()
     canonical_ip = canonicalize_ip(ip)
     normalized_url, offer_key = canonical_offer_identity(offer_url)
@@ -175,6 +280,13 @@ async def acquire_team_offer_ip_claim(
     if not canonical_ip:
         raise ValueError("valid canonical IP is required")
     scope = await resolve_isolation_scope(db, user_id)
+    conflict = {
+        "status": "conflict", "acquired": False,
+        "scope_key": scope["scope_key"], "offer_key": offer_key,
+        "offer_url_normalized": normalized_url, "ip": canonical_ip,
+    }
+    if await _team_ip_already_used(db, scope, offer_key, canonical_ip, get_user_db):
+        return conflict
     now = datetime.now(timezone.utc)
     doc = {
         "id": str(uuid.uuid4()),
@@ -286,9 +398,43 @@ async def list_team_offer_claimed_ips(db, user_id: str, offer_url: str) -> Set[s
     return out
 
 
+async def list_team_shared_used_ips(db, user_id: str, offer_url: str) -> Set[str]:
+    """Team used-IPs in 1–2 queries (claims + burnt), never N full peer scans.
+
+    Calling ``_load_ips_for_user`` per teammate was O(N) distinct/aggregate
+    over every tenant clicks DB — 10–100 VPS-ON users in one group stalled
+    the whole VPS (and a global dup-IP lock then stalled unrelated customers).
+    """
+    out = await list_team_offer_claimed_ips(db, user_id, offer_url)
+    try:
+        scope = await resolve_isolation_scope(db, user_id)
+        if not offer_url or not scope.get("member_ids"):
+            return out
+        _, offer_key = canonical_offer_identity(offer_url)
+        members = list(scope.get("member_ids") or [])
+        burnt = getattr(db, "rut_burnt_offer_ips", None)
+        if burnt is None:
+            try:
+                burnt = db["rut_burnt_offer_ips"]
+            except Exception:
+                burnt = None
+        if burnt is not None and members:
+            async for doc in burnt.find(
+                {"offer_scope_key": offer_key, "user_id": {"$in": members}},
+                {"ip": 1, "_id": 0},
+            ):
+                canonical = canonicalize_ip(doc.get("ip"))
+                if canonical:
+                    out.add(canonical)
+    except ValueError:
+        pass
+    return out
+
+
 def invalidate_group_cache() -> None:
     _GROUP_CACHE["user_to_peers"] = {}
     _GROUP_CACHE["at"] = 0.0
+    _SCOPE_CACHE.clear()
 
 
 async def _load_user_to_peers(db) -> Dict[str, Set[str]]:

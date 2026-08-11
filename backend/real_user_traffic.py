@@ -9734,9 +9734,14 @@ async def run_real_user_traffic_job(
                 if _claim_ip and team_offer_claim_required(
                     _claim_scope, bool(skip_duplicate_ip)
                 ):
+                    try:
+                        from server import get_user_db as _rut_get_user_db
+                    except Exception:
+                        _rut_get_user_db = None
                     _claim_result = await acquire_team_offer_ip_claim(
                         db, engine_user_id, _claim_offer_url,
                         _claim_ip, _visit_claim_token,
+                        get_user_db=_rut_get_user_db,
                     )
                     if not _claim_result.get("acquired"):
                         entry["status"] = "skipped_duplicate_ip"

@@ -13,10 +13,19 @@ from cross_user_ip_isolation import (
     canonical_offer_identity,
     canonicalize_ip,
     complete_team_offer_ip_claim,
+    invalidate_group_cache,
+    list_team_shared_used_ips,
     release_team_offer_ip_claim,
     resolve_isolation_scope,
     team_offer_claim_required,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_isolation_caches():
+    invalidate_group_cache()
+    yield
+    invalidate_group_cache()
 
 
 def _async_test(func):
@@ -121,12 +130,15 @@ class _DB:
             {"id": "office02", "vps_ip_db_enabled": True},
         ])
         self.claims = _Collection(unique_claim=True)
+        self.rut_burnt_offer_ips = _Collection()
 
     def __getitem__(self, name):
         if name == "cross_user_ip_groups":
             return self.groups
         if name == "team_offer_ip_claims":
             return self.claims
+        if name == "rut_burnt_offer_ips":
+            return self.rut_burnt_offer_ips
         raise KeyError(name)
 
 
@@ -224,11 +236,68 @@ async def test_different_offer_allowed_release_complete_and_idempotency():
 @_async_test
 async def test_membership_change_keeps_stable_group_scope_id():
     db = _DB()
+    invalidate_group_cache()
     before = await resolve_isolation_scope(db, "office01")
     db.groups.docs[0]["user_ids"].append("office03")
     db.users.docs.append({"id": "office03", "vps_ip_db_enabled": True})
+    invalidate_group_cache()
     after = await resolve_isolation_scope(db, "office01")
     assert before["scope_key"] == after["scope_key"] == "group:stable-group-id"
+    assert "office03" in after["member_ids"]
+
+
+@_async_test
+async def test_list_team_shared_used_ips_merges_claims_and_burnt():
+    invalidate_group_cache()
+    db = _DB()
+    await acquire_team_offer_ip_claim(
+        db, "office01", "https://offer.example/x", "203.0.113.10", "v1"
+    )
+    db.rut_burnt_offer_ips.docs.append({
+        "ip": "203.0.113.11",
+        "user_id": "office02",
+        "offer_scope_key": canonical_offer_identity("https://offer.example/x")[1],
+    })
+    used = await list_team_shared_used_ips(db, "office01", "https://offer.example/x")
+    assert "203.0.113.10" in used
+    assert "203.0.113.11" in used
+
+
+@_async_test
+async def test_historical_teammate_click_blocks_even_without_claim_row():
+    """Isolation purpose: one used IP is dead for the whole team."""
+    invalidate_group_cache()
+    db = _DB()
+    offer = "https://offer.example/hist"
+    offer_key = canonical_offer_identity(offer)[1]
+    class _Clicks:
+        async def find_one(self, query, projection=None):
+            blob = str(query)
+            if "198.51.100.77" in blob and offer_key in blob:
+                return {"ip_address": "198.51.100.77", "offer_scope_key": offer_key}
+            return None
+
+    class _UserDB:
+        def __init__(self, clicks):
+            self.clicks = clicks
+
+    def get_user_db(uid):
+        if uid == "office01":
+            return _UserDB(_Clicks())
+        return _UserDB(_Collection())
+
+    blocked = await acquire_team_offer_ip_claim(
+        db, "office02", offer, "198.51.100.77", "later-visit",
+        get_user_db=get_user_db,
+    )
+    assert blocked["status"] == "conflict"
+    assert blocked["acquired"] is False
+
+    allowed = await acquire_team_offer_ip_claim(
+        db, "office02", offer, "198.51.100.78", "fresh-visit",
+        get_user_db=get_user_db,
+    )
+    assert allowed["acquired"] is True
 
 
 @_async_test

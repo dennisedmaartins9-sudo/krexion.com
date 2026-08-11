@@ -89,10 +89,18 @@ def _resolve_license_key() -> str:
 LICENSE_KEY = _resolve_license_key()
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL_SEC", "30") or 30)
 KREXION_MODE = (os.environ.get("KREXION_MODE") or "local").lower().strip()
+# Dedicated heartbeat — independent of link-sync and RUT so 100 busy
+# PCs still stay "online" on krexion.com. 8s used to fail under VPS
+# load and the dashboard showed yellow 'no recent heartbeat'.
+HEARTBEAT_INTERVAL = int(os.environ.get("SYNC_HEARTBEAT_SEC", "20") or 20)
+HEARTBEAT_TIMEOUT = float(os.environ.get("SYNC_HEARTBEAT_TIMEOUT_SEC", "20") or 20)
+HEARTBEAT_RETRIES = int(os.environ.get("SYNC_HEARTBEAT_RETRIES", "3") or 3)
 # Bridge-job pulling cycles faster than the main sync loop so heavy
 # features feel responsive (user clicks proxy-check on krexion.com cloud
-# UI → max ~5s before local PC picks it up).
+# UI → max ~5s before local PC picks it up). Idle PCs back off so 100
+# users don't hammer /jobs/pull every 5s for empty queues.
 JOB_PULL_INTERVAL = int(os.environ.get("BRIDGE_JOB_PULL_SEC", "5") or 5)
+JOB_PULL_IDLE_SEC = int(os.environ.get("BRIDGE_JOB_PULL_IDLE_SEC", "12") or 12)
 LOCAL_API_BASE = (os.environ.get("LOCAL_API_BASE") or "http://localhost:8001").rstrip("/")
 
 _running = False
@@ -148,11 +156,56 @@ def _hardware_info() -> dict:
     return info
 
 
+def _write_sync_status_file() -> None:
+    try:
+        status_path = default_sync_status_path()
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps({
+                "last_heartbeat_at": time.time(),
+                "cloud_url": CLOUD_URL,
+                "version": "2.1.4",
+            }),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _heartbeat_post_sync() -> tuple[int, str, Any]:
+    """Blocking POST so RUT/Playwright cannot starve cloud keepalive.
+
+    Runs in a worker thread via asyncio.to_thread.
+    """
+    key = _current_license_key()
+    if not key:
+        return 0, "no-license", None
+    body = {
+        "hostname": socket.gethostname(),
+        "version": "2.1.4",
+        "platform": "native-windows" if sys.platform.startswith("win") else "docker",
+    }
+    body.update(_hardware_info())
+    with httpx.Client(timeout=HEARTBEAT_TIMEOUT) as client:
+        r = client.post(
+            f"{CLOUD_URL}/api/sync/heartbeat",
+            json=body,
+            headers=_headers(),
+        )
+        data = None
+        try:
+            data = r.json() if r.content else {}
+        except Exception:  # noqa: BLE001
+            data = None
+        return int(r.status_code), (r.text or "")[:200], data
+
+
 async def _heartbeat() -> None:
-    """v1.0.16 fix: previously logged failures at DEBUG which never made
-    it to dashboard.log. Customers got stuck with 'no recent heartbeat'
-    forever with no visible reason. Now logs the first 3 failures at
-    INFO + a one-line root cause hint, then quiets down."""
+    """v2.6.76: retries + thread offload + independent loop.
+
+    v1.0.16 logged failures; this revision also survives VPS blips and
+    a busy local event loop (100 concurrent customer PCs + RUT).
+    """
     global _HB_FAILS, _HB_OKS
     key = _current_license_key()
     if not key:
@@ -164,112 +217,104 @@ async def _heartbeat() -> None:
             )
         _HB_FAILS += 1
         return
-    try:
-        body = {
-            "hostname": socket.gethostname(),
-            "version": "2.1.4",
-            "platform": "native-windows" if sys.platform.startswith("win") else "docker",
-        }
-        body.update(_hardware_info())
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.post(
-                f"{CLOUD_URL}/api/sync/heartbeat",
-                json=body,
-                headers=_headers(),
-            )
-            if r.status_code >= 400:
+
+    last_err = ""
+    for attempt in range(max(1, HEARTBEAT_RETRIES)):
+        try:
+            status, text, hb_resp = await asyncio.to_thread(_heartbeat_post_sync)
+            if status == 0:
+                _HB_FAILS += 1
+                return
+            if status >= 400:
+                last_err = f"HTTP {status}: {text}"
+                if attempt + 1 < HEARTBEAT_RETRIES:
+                    await asyncio.sleep(1.2 * (attempt + 1))
+                    continue
                 if _HB_FAILS < 3:
                     logger.info(
-                        f"[sync] heartbeat returned HTTP {r.status_code}: "
-                        f"{r.text[:200]}. License key tail "
+                        f"[sync] heartbeat returned {last_err}. License key tail "
                         f"...{key[-6:]}, cloud={CLOUD_URL}"
                     )
                 _HB_FAILS += 1
-            else:
-                if _HB_OKS == 0:
-                    logger.info(
-                        f"[sync] heartbeat OK to {CLOUD_URL} - PC is now online "
-                        f"in the cloud, heavy jobs will route here."
-                    )
-                _HB_OKS += 1
-                _HB_FAILS = 0  # reset failure counter on success
-                # v2.1: cloud now returns {user:{id,email}, license:{...}}.
-                # Mirror these into the LOCAL DB so bridge replay can mint
-                # a local-side JWT that the LOCAL backend's
-                # get_current_user can verify (cloud JWT has wrong
-                # SECRET_KEY → "Invalid token" before this fix).
-                try:
-                    hb_resp = r.json() if r.content else {}
-                    cloud_user = (hb_resp or {}).get("user") or {}
-                    cloud_lic = (hb_resp or {}).get("license") or {}
-                    if cloud_user.get("email") and cloud_user.get("id"):
-                        try:
-                            from server import db as _local_db  # type: ignore
-                            await _local_db.users.update_one(
-                                {"email": cloud_user["email"]},
+                return
+
+            if _HB_OKS == 0:
+                logger.info(
+                    f"[sync] heartbeat OK to {CLOUD_URL} - PC is now online "
+                    f"in the cloud, heavy jobs will route here."
+                )
+            _HB_OKS += 1
+            _HB_FAILS = 0
+            _write_sync_status_file()
+            try:
+                cloud_user = (hb_resp or {}).get("user") or {}
+                cloud_lic = (hb_resp or {}).get("license") or {}
+                if cloud_user.get("email") and cloud_user.get("id"):
+                    try:
+                        from server import db as _local_db  # type: ignore
+                        await _local_db.users.update_one(
+                            {"email": cloud_user["email"]},
+                            {"$set": {
+                                "id": cloud_user["id"],
+                                "email": cloud_user["email"],
+                                "status": "active",
+                                "bridge_synced": True,
+                            }, "$setOnInsert": {
+                                "name": cloud_user["email"].split("@")[0],
+                                "is_admin": False,
+                                "features": {f: True for f in (
+                                    "real_user_traffic", "form_filler",
+                                    "visual_recorder", "proxies", "links",
+                                    "clicks", "import_traffic",
+                                    "email_checker", "separate_data",
+                                    "ua_generator", "ua_checker",
+                                    "real_traffic", "import_data",
+                                    "adspower", "uploaded_things",
+                                    "profile_builder", "traffic_sources",
+                                )},
+                                "created_at": _now_iso_local(),
+                            }},
+                            upsert=True,
+                        )
+                        if cloud_lic.get("license_key"):
+                            await _local_db.licenses.update_one(
+                                {"license_key": cloud_lic["license_key"]},
                                 {"$set": {
-                                    "id": cloud_user["id"],
+                                    "license_key": cloud_lic["license_key"],
+                                    "user_id": cloud_user["id"],
                                     "email": cloud_user["email"],
-                                    "status": "active",
-                                    "bridge_synced": True,
-                                }, "$setOnInsert": {
-                                    "name": cloud_user["email"].split("@")[0],
-                                    "is_admin": False,
-                                    "features": {f: True for f in (
-                                        "real_user_traffic", "form_filler",
-                                        "visual_recorder", "proxies", "links",
-                                        "clicks", "import_traffic",
-                                        "email_checker", "separate_data",
-                                        "ua_generator", "ua_checker",
-                                        "real_traffic", "import_data",
-                                        "adspower", "uploaded_things",
-                                        "profile_builder", "traffic_sources",
-                                    )},
-                                    "created_at": _now_iso_local(),
+                                    "status": cloud_lic.get("status", "active"),
                                 }},
                                 upsert=True,
                             )
-                            if cloud_lic.get("license_key"):
-                                await _local_db.licenses.update_one(
-                                    {"license_key": cloud_lic["license_key"]},
-                                    {"$set": {
-                                        "license_key": cloud_lic["license_key"],
-                                        "user_id": cloud_user["id"],
-                                        "email": cloud_user["email"],
-                                        "status": cloud_lic.get("status", "active"),
-                                    }},
-                                    upsert=True,
-                                )
-                        except Exception as _mirror_err:  # noqa: BLE001
-                            logger.debug(f"[sync] local mirror skipped: {_mirror_err}")
-                except Exception:  # noqa: BLE001
-                    pass
-                # v1.0.17: write the sync-status file the desktop dashboard
-                # polls for the krexion.com link pill. desktop_module's
-                # _cloud_link_status() reads last_heartbeat_at from this
-                # file - pre-1.0.17 we never wrote it so the dashboard
-                # always showed yellow 'no recent heartbeat' even when
-                # the daemon was happily heart-beating.
-                try:
-                    status_path = default_sync_status_path()
-                    status_path.parent.mkdir(parents=True, exist_ok=True)
-                    status_path.write_text(
-                        json.dumps({
-                            "last_heartbeat_at": time.time(),
-                            "cloud_url": CLOUD_URL,
-                            "version": "2.1.4",
-                        }),
-                        encoding="utf-8",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-    except Exception as e:  # noqa: BLE001
-        if _HB_FAILS < 3:
-            logger.info(
-                f"[sync] heartbeat exception: {type(e).__name__}: {e}. "
-                f"Will retry every 30 s."
-            )
-        _HB_FAILS += 1
+                    except Exception as _mirror_err:  # noqa: BLE001
+                        logger.debug(f"[sync] local mirror skipped: {_mirror_err}")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+            if attempt + 1 < HEARTBEAT_RETRIES:
+                await asyncio.sleep(1.2 * (attempt + 1))
+                continue
+            if _HB_FAILS < 3:
+                logger.info(
+                    f"[sync] heartbeat exception: {last_err}. "
+                    f"Will retry every {HEARTBEAT_INTERVAL}s."
+                )
+            _HB_FAILS += 1
+            return
+
+
+async def _heartbeat_loop() -> None:
+    """Keepalive only — never waits on link push / job execution."""
+    global _running
+    while _running:
+        try:
+            await _heartbeat()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[sync] heartbeat loop error: {e}")
+        await asyncio.sleep(max(8, HEARTBEAT_INTERVAL))
 
 
 async def _push_links(user_db: Any) -> int:
@@ -834,23 +879,30 @@ async def _pull_and_run_jobs() -> int:
 
 
 async def _bridge_loop() -> None:
-    """Faster cycle dedicated to bridge job pulling for responsive UX."""
+    """Faster cycle dedicated to bridge job pulling for responsive UX.
+
+    Idle PCs poll slower so ~100 online installs don't stampede the
+    cloud every 5s for empty queues. After a claimed job, resume the
+    snappy interval.
+    """
     global _running
     while _running:
+        n = 0
         try:
-            if LICENSE_KEY:
-                await _pull_and_run_jobs()
+            if LICENSE_KEY or _current_license_key():
+                n = await _pull_and_run_jobs()
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[bridge] loop error: {e}")
-        await asyncio.sleep(JOB_PULL_INTERVAL)
+        wait = JOB_PULL_INTERVAL if n else max(JOB_PULL_INTERVAL, JOB_PULL_IDLE_SEC)
+        await asyncio.sleep(wait)
 
 
 async def _sync_loop(main_db, get_db_for_user) -> None:
-    global _running, LICENSE_KEY
-    _running = True
+    global LICENSE_KEY
     logger.info(
         f"[sync] daemon started - cloud={CLOUD_URL}, interval={SYNC_INTERVAL}s, "
-        f"bridge_pull={JOB_PULL_INTERVAL}s"
+        f"heartbeat={HEARTBEAT_INTERVAL}s, bridge_pull={JOB_PULL_INTERVAL}s/"
+        f"idle={JOB_PULL_IDLE_SEC}s"
     )
 
     while _running:
@@ -871,8 +923,6 @@ async def _sync_loop(main_db, get_db_for_user) -> None:
             if not LICENSE_KEY:
                 await asyncio.sleep(SYNC_INTERVAL)
                 continue
-
-            await _heartbeat()
 
             lic = await main_db.licenses.find_one(
                 {"license_key": LICENSE_KEY}, {"_id": 0}
@@ -912,6 +962,7 @@ def start_if_local(main_db, get_db_for_user) -> bool:
     to talk to the cloud. Only KREXION_MODE='cloud' (the VPS deploy)
     skips this path.
     """
+    global _running
     if KREXION_MODE == "cloud":
         logger.info("[sync] disabled - KREXION_MODE=cloud (this IS the cloud edge)")
         return False
@@ -945,6 +996,8 @@ def start_if_local(main_db, get_db_for_user) -> bool:
         except Exception as _cleanup_err:  # noqa: BLE001
             logger.debug(f"[sync] legacy task cleanup skipped: {_cleanup_err}")
     try:
+        _running = True
+        asyncio.create_task(_heartbeat_loop())
         asyncio.create_task(_sync_loop(main_db, get_db_for_user))
         asyncio.create_task(_bridge_loop())
         logger.info(

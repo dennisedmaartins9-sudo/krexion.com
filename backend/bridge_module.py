@@ -44,7 +44,8 @@ _get_current_user: Any = None
 _validate_license: Any = None
 
 # Online threshold - heartbeat must be within this many seconds.
-ONLINE_WINDOW_SEC = int(os.environ.get("BRIDGE_ONLINE_WINDOW_SEC", "90") or 90)
+# 5 min — brief VPS/Mongo blips must not mark 100 busy PCs offline.
+ONLINE_WINDOW_SEC = int(os.environ.get("BRIDGE_ONLINE_WINDOW_SEC", "300") or 300)
 
 # How long a job can stay pending before we give up and tell the user.
 JOB_TIMEOUT_SEC = int(os.environ.get("BRIDGE_JOB_TIMEOUT_SEC", "1800") or 1800)

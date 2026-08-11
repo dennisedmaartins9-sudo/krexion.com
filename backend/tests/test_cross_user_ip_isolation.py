@@ -20,9 +20,12 @@ def test_isolation_module_exists():
 def test_dup_ip_loader_uses_vps_ledger_peers():
     text = (ROOT / "backend" / "server.py").read_text(encoding="utf-8")
     assert "_load_ips_for_user" in text
-    assert "get_vps_ledger_peer_user_ids" in text
+    assert "list_team_shared_used_ips" in text
     assert "VPS IP ledger" in text
     assert "vps_ip_db_enabled" in text
+    iso = (ROOT / "backend" / "cross_user_ip_isolation.py").read_text(encoding="utf-8")
+    assert "async def list_team_shared_used_ips" in iso
+    assert "PENDING_CLAIM_SECONDS = 90" in iso
 
 
 def test_persist_burnt_ip_tags_vps_ledger_members():
@@ -42,6 +45,8 @@ def test_tracker_dup_checks_vps_ledger_peers():
     assert "vps_ledger_peer" in text
     assert "vps_ledger_burnt" in text
     assert "get_vps_ledger_peer_user_ids" in text
+    assert "_dup_ip_lock_for" in text
+    assert "peer click scan timed out" in text
 
 
 def test_same_second_ip_claim_helpers():

@@ -521,17 +521,18 @@ async def get_all_click_ips_from_entire_database(
         # ── Per-user (CORRECT for any RUT/proxy duplicate check) ──
         all_click_ips.update(await _load_ips_for_user(user_id, offer_url))
 
-        # Cross-user IP isolation — merge VPS-ON teammates only
-        # (Admin › Users › DB VPS + same IP Isolation group).
+        # Cross-user IP isolation — merge VPS-ON teammates via claims +
+        # burnt ledgers (1–2 queries). Do NOT N-scan every peer's clicks
+        # DB: that stalled 10–100 user teams and, via the global dup-IP
+        # lock, unrelated customers too.
         try:
-            from cross_user_ip_isolation import get_vps_ledger_peer_user_ids as _iso_peers
-            _peer_ids = await _iso_peers(db, user_id)
-            for _peer_id in _peer_ids:
-                all_click_ips.update(await _load_ips_for_user(_peer_id, offer_url))
-            if _peer_ids:
+            from cross_user_ip_isolation import list_team_shared_used_ips as _team_used
+            _team_ips = await _team_used(db, user_id, offer_url or "")
+            if _team_ips:
+                all_click_ips.update(_team_ips)
                 logger.info(
-                    f"VPS IP ledger: merged {len(_peer_ids)} DB-VPS peer(s) "
-                    f"for user {user_id[:8]}… → {len(all_click_ips)} total IPs"
+                    f"VPS IP ledger: merged {len(_team_ips)} team claim/burnt "
+                    f"IP(s) for user {user_id[:8]}… → {len(all_click_ips)} total IPs"
                 )
         except Exception as _iso_err:
             logger.warning(f"VPS IP ledger peer load failed: {_iso_err}")
@@ -7119,6 +7120,11 @@ async def update_user(user_id: str, update: UserUpdate, admin: dict = Depends(ge
         update_data["allow_cloud_heavy"] = bool(update.allow_cloud_heavy)
     if update.vps_ip_db_enabled is not None:
         update_data["vps_ip_db_enabled"] = bool(update.vps_ip_db_enabled)
+        try:
+            from cross_user_ip_isolation import invalidate_group_cache as _inv_iso
+            _inv_iso()
+        except Exception:
+            pass
     
     # Admin can update email
     if update.email and update.email != user["email"]:
@@ -7742,7 +7748,19 @@ def _rut_build_target_url(request: Request, link: dict, explicit_target: Optiona
 # in parallel — pushing Mongo into a thundering-herd. The lock ensures
 # only ONE rebuild runs at a time; the others reuse the freshly-warmed
 # cache.
-_DUP_IP_CACHE_LOCK = asyncio.Lock()
+_DUP_IP_CACHE_LOCK = asyncio.Lock()  # legacy; rebuilds use per-key locks below
+_DUP_IP_KEY_LOCKS: Dict[str, asyncio.Lock] = {}
+_DUP_IP_KEY_LOCKS_GUARD = asyncio.Lock()
+
+
+async def _dup_ip_lock_for(cache_key: str) -> asyncio.Lock:
+    """One rebuild at a time *per user/offer* — never block the whole VPS."""
+    async with _DUP_IP_KEY_LOCKS_GUARD:
+        lock = _DUP_IP_KEY_LOCKS.get(cache_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _DUP_IP_KEY_LOCKS[cache_key] = lock
+        return lock
 
 
 async def _get_dup_ip_set_safe(
@@ -7767,7 +7785,9 @@ async def _get_dup_ip_set_safe(
     burnt on offer A doesn't block offers B/C/D.
     """
     try:
-        async with _DUP_IP_CACHE_LOCK:
+        _ck = f"{user_id or '__all__'}::{offer_url or '__any__'}"
+        _lock = await _dup_ip_lock_for(_ck)
+        async with _lock:
             return await get_all_click_ips_from_entire_database(
                 force_refresh=force_refresh,
                 user_id=user_id,
@@ -19086,9 +19106,16 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         # their link_id belongs to a configured link canonicalizing to this
         # exact offer, preventing unrelated-offer history from false-blocking.
         try:
+            _link_owner_ids = [str(main_user_id)]
+            try:
+                from cross_user_ip_isolation import get_vps_ledger_peer_user_ids as _vps_peers_for_links
+                _link_owner_ids.extend(await _vps_peers_for_links(db, main_user_id))
+            except Exception:
+                pass
             _configured_links = await db.links.find(
-                {}, {"id": 1, "user_id": 1, "offer_url": 1, "_id": 0}
-            ).to_list(100000)
+                {"user_id": {"$in": list(dict.fromkeys(_link_owner_ids))}},
+                {"id": 1, "user_id": 1, "offer_url": 1, "_id": 0},
+            ).to_list(20000)
             _same_offer_link_ids_by_user = {}
             for _owner_link in _configured_links:
                 try:
@@ -19183,10 +19210,59 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         # per-tenant clicks (+ shared burnt ledger).
         if not existing_click:
             try:
-                from cross_user_ip_isolation import get_vps_ledger_peer_user_ids as _vps_peers
+                from cross_user_ip_isolation import (
+                    get_vps_ledger_peer_user_ids as _vps_peers,
+                    find_team_offer_ip_conflict as _team_ip_conflict,
+                )
                 _peer_uids = await _vps_peers(db, main_user_id)
-                for _peer_uid in _peer_uids:
-                    try:
+                _cand_ips = [x for x in list(_dup_check_ips or []) if x]
+                # O(1) team claim table first — does not grow with team size.
+                if _cand_ips and _offer_url_normalized:
+                    for _cip in _cand_ips[:4]:
+                        _conflict = await _team_ip_conflict(
+                            db, main_user_id, _offer_url_normalized, _cip
+                        )
+                        if _conflict:
+                            existing_click = {
+                                "ip_address": _cip,
+                                "matched_via": "vps_ledger_peer",
+                            }
+                            logger.info(
+                                f"[dup-block] code={short_code} matched via team claim {_cip}"
+                            )
+                            break
+                if not existing_click and _cand_ips:
+                    _ledger_uids = [main_user_id] + list(_peer_uids)
+                    _burnt = await db.rut_burnt_offer_ips.find_one(
+                        {
+                            "ip": {"$in": _cand_ips},
+                            "user_id": {"$in": _ledger_uids},
+                            "offer_scope_key": _offer_scope_key,
+                        },
+                        {"_id": 0, "ip": 1},
+                    )
+                    if not _burnt:
+                        _burnt = await db.rut_burnt_ips.find_one(
+                            {
+                                "ip": {"$in": _cand_ips},
+                                "user_ids": {"$in": _ledger_uids},
+                                "offer_scope_key": _offer_scope_key,
+                            },
+                            {"_id": 0, "ip": 1},
+                        )
+                    if _burnt and _burnt.get("ip"):
+                        existing_click = {
+                            "ip_address": _burnt["ip"],
+                            "matched_via": "vps_ledger_burnt",
+                        }
+                        logger.info(
+                            f"[dup-block] code={short_code} matched via DB VPS "
+                            f"burnt IP {_burnt['ip']}"
+                        )
+                # Historical per-tenant clicks: bounded parallel, never a
+                # serial 100-user stall on the redirect hot path.
+                if not existing_click and _peer_uids:
+                    async def _peer_dup_hit(_peer_uid: str):
                         _peer_db = get_user_db(_peer_uid)
                         _peer_offer_scope = {
                             "$or": [
@@ -19197,42 +19273,36 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                                 },
                             ]
                         }
-                        existing_click = await _peer_db.clicks.find_one(
+                        hit = await _peer_db.clicks.find_one(
                             {"$and": [{"$or": ip_conditions}, _peer_offer_scope]},
                             _DUP_PROJECTION,
                         )
-                        if existing_click:
-                            existing_click = dict(existing_click)
-                            existing_click["matched_via"] = "vps_ledger_peer"
-                            existing_click["matched_peer_user_id"] = _peer_uid
-                            logger.info(
-                                f"[dup-block] code={short_code} matched via DB VPS peer "
-                                f"{_peer_uid[:8]}…"
-                            )
-                            break
-                    except Exception:
-                        continue
-                if not existing_click:
-                    _cand_ips = list(_dup_check_ips)
-                    if _cand_ips:
-                        _ledger_uids = [main_user_id] + list(_peer_uids)
-                        _burnt = await db.rut_burnt_ips.find_one(
-                            {
-                                "ip": {"$in": _cand_ips},
-                                "user_ids": {"$in": _ledger_uids},
-                                "offer_scope_key": _offer_scope_key,
-                            },
-                            {"_id": 0, "ip": 1},
+                        if hit:
+                            hit = dict(hit)
+                            hit["matched_via"] = "vps_ledger_peer"
+                            hit["matched_peer_user_id"] = _peer_uid
+                            return hit
+                        return None
+                    try:
+                        _peer_hits = await asyncio.wait_for(
+                            asyncio.gather(
+                                *[_peer_dup_hit(u) for u in _peer_uids[:40]],
+                                return_exceptions=True,
+                            ),
+                            timeout=2.0,
                         )
-                        if _burnt and _burnt.get("ip"):
-                            existing_click = {
-                                "ip_address": _burnt["ip"],
-                                "matched_via": "vps_ledger_burnt",
-                            }
-                            logger.info(
-                                f"[dup-block] code={short_code} matched via DB VPS "
-                                f"burnt IP {_burnt['ip']}"
-                            )
+                        for _ph in _peer_hits:
+                            if isinstance(_ph, dict) and _ph:
+                                existing_click = _ph
+                                logger.info(
+                                    f"[dup-block] code={short_code} matched via DB VPS peer "
+                                    f"{str(_ph.get('matched_peer_user_id') or '')[:8]}…"
+                                )
+                                break
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[dup-check] peer click scan timed out; team claim still enforces uniqueness"
+                        )
             except Exception as _vps_dup_err:
                 logger.warning(f"[dup-check] VPS ledger peer scan failed: {_vps_dup_err}")
 
@@ -20005,6 +20075,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             _team_claim = await acquire_team_offer_ip_claim(
                 db, main_user_id, _offer_url_normalized,
                 _canonical_claim_ip, _claim_visit_token,
+                get_user_db=get_user_db,
             )
             if not _team_claim.get("acquired"):
                 return Response(

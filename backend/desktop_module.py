@@ -59,6 +59,11 @@ _STATS_CACHE: dict[str, Any] = {}
 _STATS_CACHE_TS: float = 0.0
 _STATS_CACHE_LOCK = threading.Lock()
 _STATS_CACHE_TTL_S = 2.5
+# Match native heartbeat retries + cloud online window so RUT load
+# does not flash yellow 'no recent heartbeat' on the Local PC Dashboard.
+CLOUD_LINK_FRESH_SEC = int(os.environ.get("KREXION_CLOUD_LINK_FRESH_SEC", "300") or 300)
+_LAST_GOOD_CLOUD_LINK: Optional[dict] = None
+_LAST_GOOD_CLOUD_TS: float = 0.0
 
 _HEAVY_BUSY = 0
 _HEAVY_BUSY_LOCK = threading.Lock()
@@ -347,7 +352,11 @@ async def _cloud_link_status() -> dict:
     v2.6.75: also check ProgramData (writer default). Pre-fix the
     dashboard only looked at /tmp/... so Windows native always showed
     yellow 'no recent heartbeat' even when heartbeats succeeded.
+
+    v2.6.76: 5-minute freshness window + last-good cache so a busy RUT
+    event loop / VPS blip does not flash yellow on every PC.
     """
+    global _LAST_GOOD_CLOUD_LINK, _LAST_GOOD_CLOUD_TS
     best: Optional[dict] = None
     for status_file in _sync_status_candidates():
         try:
@@ -358,12 +367,21 @@ async def _cloud_link_status() -> dict:
             if not last:
                 continue
             age_sec = int(time.time() - float(last))
-            cand = {"connected": age_sec < 120, "last_sync_age": age_sec}
+            cand = {"connected": age_sec < CLOUD_LINK_FRESH_SEC, "last_sync_age": age_sec}
             if best is None or age_sec < int(best.get("last_sync_age") or 10**9):
                 best = cand
         except Exception:  # noqa: BLE001
             continue
-    return best or {"connected": False, "last_sync_age": None}
+    if best and best.get("connected"):
+        _LAST_GOOD_CLOUD_LINK = dict(best)
+        _LAST_GOOD_CLOUD_TS = time.time()
+        return best
+    if best is not None:
+        return best
+    if _LAST_GOOD_CLOUD_TS and (time.time() - _LAST_GOOD_CLOUD_TS) < CLOUD_LINK_FRESH_SEC:
+        age = int(time.time() - _LAST_GOOD_CLOUD_TS)
+        return {"connected": True, "last_sync_age": age}
+    return {"connected": False, "last_sync_age": None}
 
 
 def _feature_to_label(feature: str) -> str:
@@ -753,7 +771,13 @@ async def desktop_stats():
     try:
         cloud_link = await asyncio.wait_for(_cloud_link_status(), timeout=1.5)
     except Exception:  # noqa: BLE001
-        cloud_link = {"connected": False, "last_sync_age": None}
+        if _LAST_GOOD_CLOUD_TS and (time.time() - _LAST_GOOD_CLOUD_TS) < CLOUD_LINK_FRESH_SEC:
+            cloud_link = {
+                "connected": True,
+                "last_sync_age": int(time.time() - _LAST_GOOD_CLOUD_TS),
+            }
+        else:
+            cloud_link = {"connected": False, "last_sync_age": None}
 
     if _is_local_mode():
         try:
