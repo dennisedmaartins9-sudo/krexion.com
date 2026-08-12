@@ -1,30 +1,14 @@
 name: Emergency VPS Runner Recovery (SSH-based)
 
-# 2026-07-22 — v2.6.22 emergency recovery workflow.
-#
-# Purpose: When the self-hosted `krexion-vps` runner goes offline (systemd
-# service died, VPS temporarily unreachable, etc.), the deploy.yml,
-# recover-services.yml, fix-caddy.yml, and Windows-build's "React frontend"
-# job all get stuck queued indefinitely because they require the
-# `krexion-vps` runner label.
-#
-# This workflow is the "chicken-and-egg" breaker: it runs on GitHub's
-# hosted `ubuntu-latest` runner, SSHes into the VPS using the existing
-# repository secrets (VPS_HOST, VPS_USER, VPS_PORT, VPS_SSH_KEY), and
-# restarts the `krexion-runner` systemd service. Once the runner reports
-# online in GitHub, the queued self-hosted jobs auto-pick up and run.
-#
-# Also frees up disk space (v2.6.21 failed with "No space left on device"
-# during docker build) so the subsequently-picked-up deploy doesn't hit
-# the same wall.
-#
-# Trigger: MANUAL ONLY (workflow_dispatch). Never fires on push.
+# OPS BRANCH OVERRIDE — safe installer cleanup for disk recovery.
+# Keeps: *-latest.exe, latest.yml (+ referenced desktop assets), last 2 versions.
+# Does NOT touch Mongo, .env, live containers, or app source.
 
 on:
   workflow_dispatch:
     inputs:
       cleanup_docker:
-        description: 'Also prune Docker images/builders to free disk space'
+        description: 'Also prune Docker dangling images/builders'
         required: false
         default: 'yes'
         type: choice
@@ -36,11 +20,11 @@ concurrency:
 
 jobs:
   restart-runner:
-    name: SSH into VPS, restart krexion-runner, free disk
+    name: SSH safe disk cleanup
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
     steps:
-      - name: SSH into VPS and restart runner + cleanup
+      - name: SSH into VPS — safe installer cleanup
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -48,102 +32,102 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: false
-          command_timeout: 6m
+          command_timeout: 15m
           script: |
             set -e
-            echo "===== VPS host uptime + disk BEFORE ====="
-            uptime
-            df -h / /var/lib/docker 2>/dev/null | head -5
+            echo "===== BEFORE ====="
+            df -h / | head -2
+            du -sh /opt/krexion/downloads/windows /opt/krexion/downloads/desktop 2>/dev/null || true
             echo ""
-            echo "===== DISK USAGE BREAKDOWN (what is filling the disk) ====="
-            set +e
-            echo "--- docker system df ---"
-            docker system df 2>/dev/null || true
-            echo "--- top-level / ---"
-            du -xh / --max-depth=1 2>/dev/null | sort -hr | head -15
-            echo "--- /opt ---"
-            du -xh /opt --max-depth=2 2>/dev/null | sort -hr | head -20
-            echo "--- /var ---"
-            du -xh /var --max-depth=2 2>/dev/null | sort -hr | head -20
-            echo "--- /opt/krexion ---"
-            du -xh /opt/krexion --max-depth=2 2>/dev/null | sort -hr | head -20
-            echo "--- installer downloads ---"
-            du -sh /opt/krexion/downloads/windows /opt/krexion/downloads/desktop 2>/dev/null
-            ls -lah /opt/krexion/downloads/windows 2>/dev/null | head -25
-            ls -lah /opt/krexion/downloads/desktop 2>/dev/null | head -15
-            echo "--- runner work ---"
-            du -sh /opt/krexion-runner/_work /opt/krexion-runner/_diag 2>/dev/null
-            du -xh /opt/krexion-runner --max-depth=1 2>/dev/null | sort -hr | head -12
-            echo "--- largest /opt files (>100M) ---"
-            find /opt -type f -size +100M 2>/dev/null | xargs -r du -h 2>/dev/null | sort -hr | head -20
-            echo "===== END BREAKDOWN ====="
-            set -e
-            echo ""
-            echo "===== Runner service state BEFORE ====="
-            systemctl status krexion-runner --no-pager -l 2>&1 | head -20 \
-              || systemctl status "actions.runner.krexion-com-final-krexion.com-final.krexion-vps.service" --no-pager -l 2>&1 | head -20 \
-              || echo "  (neither service unit found — will attempt to enable+start)"
-            echo ""
-            echo "===== Restart runner ====="
-            if systemctl list-unit-files | grep -q '^krexion-runner\.service'; then
-              sudo systemctl restart krexion-runner
-              sudo systemctl status krexion-runner --no-pager -l | head -15
-            elif systemctl list-unit-files | grep -q '^actions\.runner\.krexion-com-final'; then
-              sudo systemctl restart "actions.runner.krexion-com-final-krexion.com-final.krexion-vps.service"
-              sudo systemctl status "actions.runner.krexion-com-final-krexion.com-final.krexion-vps.service" --no-pager -l | head -15
-            else
-              echo "!! No runner service unit found. Trying start via svc.sh fallback."
-              if [ -f /opt/krexion-runner/svc.sh ]; then
-                cd /opt/krexion-runner
-                sudo ./svc.sh stop || true
-                sudo ./svc.sh start
-                sudo ./svc.sh status | head -20
-              else
-                echo "ERROR: /opt/krexion-runner/svc.sh missing — runner has to be reinstalled."
-                exit 1
-              fi
-            fi
-            echo ""
-            if [ "${{ github.event.inputs.cleanup_docker }}" = "yes" ]; then
-              echo "===== Docker disk cleanup ====="
-              docker image prune -af 2>&1 | tail -3 || true
-              docker builder prune -af --keep-storage 5GB 2>&1 | tail -3 || true
-              docker system prune -f 2>&1 | tail -3 || true
-              echo ""
-              echo "===== Disk AFTER cleanup ====="
-              df -h / /var/lib/docker 2>/dev/null | head -5
-            else
-              echo "(Docker cleanup skipped by user input)"
-            fi
-            echo ""
-            echo "===== Verify runner listener is reaching github ====="
-            sleep 4
-            tail -20 /opt/krexion-runner/_diag/Runner_*.log 2>/dev/null | tail -30 || echo "  (no runner diag logs yet — service just started)"
-            echo ""
-            echo "===== Recovery complete: $(date -u +%FT%TZ) ====="
 
-      - name: Poll GitHub API — confirm krexion-vps runner is ONLINE
-        env:
-          GH_PAT: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          for i in $(seq 1 12); do
-            sleep 5
-            RESPONSE=$(curl -sfH "Authorization: token $GH_PAT" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/runners")
-            STATUS=$(echo "$RESPONSE" | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          for r in d.get('runners', []):
-              if r['name'] == 'krexion-vps':
-                  print(r['status'])
-                  break
-          " 2>/dev/null || echo "unknown")
-            echo "  Poll #$i: krexion-vps = $STATUS"
-            if [ "$STATUS" = "online" ]; then
-              echo "  ✅ Runner is ONLINE — queued self-hosted jobs will pick up automatically."
-              exit 0
+            WIN_DIR=/opt/krexion/downloads/windows
+            DESK_DIR=/opt/krexion/downloads/desktop
+            KEEP_N=2
+
+            echo "===== WINDOWS cleanup (keep latest + last ${KEEP_N}) ====="
+            cd "$WIN_DIR"
+            echo "size before: $(du -sh . | awk '{print $1}')"
+            KEEP_LIST="Krexion-Setup-latest.exe"
+            mapfile -t NEWEST < <(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -n "$KEEP_N")
+            for f in "${NEWEST[@]}"; do KEEP_LIST="$KEEP_LIST $f"; done
+            echo "KEEP: $KEEP_LIST"
+            DELETED=0
+            for f in Krexion-Setup-v*.exe; do
+              [ -f "$f" ] || continue
+              keep=0
+              for k in $KEEP_LIST; do [ "$f" = "$k" ] && keep=1 && break; done
+              if [ "$keep" = "0" ]; then rm -f -- "$f"; DELETED=$((DELETED+1)); fi
+            done
+            if [ ! -f Krexion-Setup-latest.exe ]; then
+              NEWEST1=$(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -1 || true)
+              [ -n "$NEWEST1" ] || { echo "ERROR: no Windows installer left"; exit 1; }
+              cp -f "$NEWEST1" Krexion-Setup-latest.exe
             fi
-          done
-          echo "  ⚠️ Runner did NOT come back online after 60s. Check runner logs on VPS manually."
-          exit 1
+            echo "windows deleted=$DELETED size_after=$(du -sh . | awk '{print $1}')"
+            ls -lah
+
+            echo ""
+            echo "===== DESKTOP cleanup (keep latest.yml target + latest + last ${KEEP_N}) ====="
+            cd "$DESK_DIR"
+            echo "size before: $(du -sh . | awk '{print $1}')"
+            KEEP_LIST="Krexion-Desktop-Setup-latest.exe latest.yml"
+            if [ -f latest.yml ]; then
+              YML_PATH=$(grep -E '^[[:space:]]*path:' latest.yml | head -1 | sed 's/.*path:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d '\r')
+              echo "latest.yml path: [$YML_PATH]"
+              [ -n "$YML_PATH" ] && KEEP_LIST="$KEEP_LIST $YML_PATH ${YML_PATH}.blockmap"
+            fi
+            mapfile -t NEWEST < <(ls -1t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -n "$KEEP_N")
+            for f in "${NEWEST[@]}"; do KEEP_LIST="$KEEP_LIST $f ${f}.blockmap"; done
+            echo "KEEP: $KEEP_LIST"
+            DELETED=0
+            for f in Krexion-Desktop-Setup-*.exe Krexion-Desktop-Setup-*.exe.blockmap; do
+              [ -f "$f" ] || continue
+              keep=0
+              for k in $KEEP_LIST; do [ "$f" = "$k" ] && keep=1 && break; done
+              [ "$f" = "Krexion-Desktop-Setup-latest.exe" ] && keep=1
+              if [ "$keep" = "0" ]; then rm -f -- "$f"; DELETED=$((DELETED+1)); fi
+            done
+            if [ ! -f Krexion-Desktop-Setup-latest.exe ]; then
+              NEWEST1=$(ls -1t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -1 || true)
+              [ -n "$NEWEST1" ] || { echo "ERROR: no Desktop installer left"; exit 1; }
+              cp -f "$NEWEST1" Krexion-Desktop-Setup-latest.exe
+            fi
+            [ -f latest.yml ] || { echo "ERROR: latest.yml missing"; exit 1; }
+            echo "desktop deleted=$DELETED size_after=$(du -sh . | awk '{print $1}')"
+            ls -lah
+
+            echo ""
+            echo "===== Runner _work leftovers ====="
+            if [ -d /opt/krexion-runner/_work ]; then
+              echo "before: $(du -sh /opt/krexion-runner/_work | awk '{print $1}')"
+              rm -rf /opt/krexion-runner/_work/*/* 2>/dev/null || true
+              echo "after: $(du -sh /opt/krexion-runner/_work | awk '{print $1}')"
+            fi
+
+            if [ "${{ github.event.inputs.cleanup_docker }}" = "yes" ]; then
+              echo ""
+              echo "===== Light docker prune (dangling only) ====="
+              docker image prune -f 2>&1 | tail -5 || true
+              docker builder prune -f --keep-storage 5GB 2>&1 | tail -5 || true
+            fi
+
+            echo ""
+            echo "===== AFTER ====="
+            df -h / | head -2
+            echo "downloads total: $(du -sh /opt/krexion/downloads 2>/dev/null | awk '{print $1}')"
+            echo "windows: $(du -sh /opt/krexion/downloads/windows 2>/dev/null | awk '{print $1}')"
+            echo "desktop: $(du -sh /opt/krexion/downloads/desktop 2>/dev/null | awk '{print $1}')"
+            echo ""
+            echo "===== VERIFY ====="
+            test -f /opt/krexion/downloads/windows/Krexion-Setup-latest.exe && echo OK windows-latest || { echo FAIL windows-latest; exit 1; }
+            test -f /opt/krexion/downloads/desktop/Krexion-Desktop-Setup-latest.exe && echo OK desktop-latest || { echo FAIL desktop-latest; exit 1; }
+            test -f /opt/krexion/downloads/desktop/latest.yml && echo OK latest.yml || { echo FAIL latest.yml; exit 1; }
+            # Ensure yml-referenced file still exists
+            YML_PATH=$(grep -E '^[[:space:]]*path:' /opt/krexion/downloads/desktop/latest.yml | head -1 | sed 's/.*path:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d '\r')
+            if [ -n "$YML_PATH" ]; then
+              test -f "/opt/krexion/downloads/desktop/$YML_PATH" && echo "OK yml-target $YML_PATH" || { echo "FAIL yml-target $YML_PATH"; exit 1; }
+            fi
+            echo "===== CLEANUP DONE: $(date -u +%FT%TZ) ====="
+
+      - name: Skip runner poll (cleanup-only run)
+        run: echo "Installer cleanup finished — runner poll skipped for this ops cleanup run."

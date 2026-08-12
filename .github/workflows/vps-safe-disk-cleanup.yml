@@ -1,0 +1,173 @@
+name: VPS Safe Disk Cleanup
+
+# Manual only — deletes OLD mirrored installers while keeping:
+#   - *-latest.exe aliases
+#   - latest.yml (+ its referenced desktop exe + blockmap)
+#   - last 2 versioned Windows + Desktop installers
+# Never touches Mongo, .env, live containers, or app code.
+# Runs via SSH from ubuntu-latest (does NOT trigger deploy).
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: krexion-vps-safe-disk-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: SSH safe installer cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Safe cleanup on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: false
+          command_timeout: 12m
+          script: |
+            set -e
+            echo "===== BEFORE ====="
+            df -h / | head -2
+            echo ""
+
+            WIN_DIR=/opt/krexion/downloads/windows
+            DESK_DIR=/opt/krexion/downloads/desktop
+            KEEP_N=2
+
+            echo "===== WINDOWS: keep latest + last ${KEEP_N} versioned ====="
+            if [ -d "$WIN_DIR" ]; then
+              cd "$WIN_DIR"
+              echo "size before: $(du -sh . | awk '{print $1}')"
+              # Always keep alias
+              KEEP_LIST="Krexion-Setup-latest.exe"
+              # Newest versioned by mtime (exclude *latest*)
+              mapfile -t NEWEST < <(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -n "$KEEP_N")
+              for f in "${NEWEST[@]}"; do
+                KEEP_LIST="$KEEP_LIST $f"
+              done
+              echo "KEEP: $KEEP_LIST"
+              DELETED=0
+              FREED=0
+              for f in Krexion-Setup-v*.exe; do
+                [ -f "$f" ] || continue
+                keep=0
+                for k in $KEEP_LIST; do
+                  [ "$f" = "$k" ] && keep=1 && break
+                done
+                if [ "$keep" = "0" ]; then
+                  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                  rm -f -- "$f"
+                  DELETED=$((DELETED+1))
+                  FREED=$((FREED+sz))
+                fi
+              done
+              # Never delete the alias; ensure it still exists
+              if [ ! -f Krexion-Setup-latest.exe ]; then
+                echo "WARN: latest missing — restoring from newest kept version"
+                NEWEST1=$(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -1 || true)
+                if [ -n "$NEWEST1" ]; then
+                  cp -f "$NEWEST1" Krexion-Setup-latest.exe
+                else
+                  echo "ERROR: no Windows installer left to restore latest"
+                  exit 1
+                fi
+              fi
+              echo "deleted=$DELETED freed_bytes=$FREED"
+              echo "size after: $(du -sh . | awk '{print $1}')"
+              ls -lah | head -20
+            else
+              echo "(windows downloads dir missing — skip)"
+            fi
+
+            echo ""
+            echo "===== DESKTOP: keep latest.yml target + latest alias + last ${KEEP_N} ====="
+            if [ -d "$DESK_DIR" ]; then
+              cd "$DESK_DIR"
+              echo "size before: $(du -sh . | awk '{print $1}')"
+              KEEP_LIST="Krexion-Desktop-Setup-latest.exe latest.yml"
+              # Parse path from latest.yml (electron-updater)
+              YML_PATH=""
+              if [ -f latest.yml ]; then
+                YML_PATH=$(grep -E '^[[:space:]]*path:' latest.yml | head -1 | sed 's/.*path:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d '\r')
+                echo "latest.yml path: $YML_PATH"
+                if [ -n "$YML_PATH" ]; then
+                  KEEP_LIST="$KEEP_LIST $YML_PATH ${YML_PATH}.blockmap"
+                fi
+              fi
+              mapfile -t NEWEST < <(ls -1t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -n "$KEEP_N")
+              for f in "${NEWEST[@]}"; do
+                KEEP_LIST="$KEEP_LIST $f ${f}.blockmap"
+              done
+              echo "KEEP: $KEEP_LIST"
+              DELETED=0
+              FREED=0
+              for f in Krexion-Desktop-Setup-*.exe Krexion-Desktop-Setup-*.exe.blockmap; do
+                [ -f "$f" ] || continue
+                # never touch latest alias via this loop pattern... still check keep list
+                keep=0
+                for k in $KEEP_LIST; do
+                  [ "$f" = "$k" ] && keep=1 && break
+                done
+                # also keep exact latest alias name
+                [ "$f" = "Krexion-Desktop-Setup-latest.exe" ] && keep=1
+                if [ "$keep" = "0" ]; then
+                  sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                  rm -f -- "$f"
+                  DELETED=$((DELETED+1))
+                  FREED=$((FREED+sz))
+                fi
+              done
+              if [ ! -f Krexion-Desktop-Setup-latest.exe ]; then
+                echo "WARN: desktop latest missing — restoring"
+                NEWEST1=$(ls -1t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -1 || true)
+                if [ -n "$NEWEST1" ]; then
+                  cp -f "$NEWEST1" Krexion-Desktop-Setup-latest.exe
+                else
+                  echo "ERROR: no Desktop installer left"
+                  exit 1
+                fi
+              fi
+              if [ ! -f latest.yml ]; then
+                echo "ERROR: latest.yml missing after cleanup — abort"
+                exit 1
+              fi
+              echo "deleted=$DELETED freed_bytes=$FREED"
+              echo "size after: $(du -sh . | awk '{print $1}')"
+              ls -lah | head -25
+            else
+              echo "(desktop downloads dir missing — skip)"
+            fi
+
+            echo ""
+            echo "===== Runner _work cleanup (CI leftovers only) ====="
+            if [ -d /opt/krexion-runner/_work ]; then
+              echo "before: $(du -sh /opt/krexion-runner/_work | awk '{print $1}')"
+              # Only clear finished job work folders; keep runner tooling
+              find /opt/krexion-runner/_work -mindepth 1 -maxdepth 2 -type d -name '_actions' -prune -o -type d -print 2>/dev/null | head -5 || true
+              # Safe: remove old checkout caches under _work/*/*, keep structure
+              rm -rf /opt/krexion-runner/_work/*/* 2>/dev/null || true
+              echo "after: $(du -sh /opt/krexion-runner/_work | awk '{print $1}')"
+            fi
+
+            echo ""
+            echo "===== Light docker prune (dangling only, keep running) ====="
+            docker image prune -f 2>&1 | tail -3 || true
+            docker builder prune -f --keep-storage 5GB 2>&1 | tail -3 || true
+
+            echo ""
+            echo "===== AFTER ====="
+            df -h / | head -2
+            echo "downloads total: $(du -sh /opt/krexion/downloads 2>/dev/null | awk '{print $1}')"
+            echo "windows: $(du -sh /opt/krexion/downloads/windows 2>/dev/null | awk '{print $1}')"
+            echo "desktop: $(du -sh /opt/krexion/downloads/desktop 2>/dev/null | awk '{print $1}')"
+            echo ""
+            echo "===== VERIFY required files exist ====="
+            test -f /opt/krexion/downloads/windows/Krexion-Setup-latest.exe && echo OK windows-latest || echo FAIL windows-latest
+            test -f /opt/krexion/downloads/desktop/Krexion-Desktop-Setup-latest.exe && echo OK desktop-latest || echo FAIL desktop-latest
+            test -f /opt/krexion/downloads/desktop/latest.yml && echo OK latest.yml || echo FAIL latest.yml
+            echo "===== CLEANUP DONE: $(date -u +%FT%TZ) ====="
