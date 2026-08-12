@@ -100,6 +100,12 @@ async def _displayed_current_version() -> str:
     rule).
     """
     file_ver = current_version()
+    mode = (os.environ.get("KREXION_MODE") or "local").lower()
+    # Native/local installs must reflect the ACTUAL Python bundle on disk.
+    # Showing the cloud-published release here misled customers into thinking
+    # they were on v2.6.79 while the engine was still v2.6.74.
+    if mode in ("native", "local"):
+        return file_ver
     try:
         if _db is None:
             return file_ver

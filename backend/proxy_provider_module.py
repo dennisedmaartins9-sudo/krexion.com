@@ -240,6 +240,25 @@ def _smartproxy_smart_base(username: str) -> str:
     return u
 
 
+def _extract_embedded_gateway_targeting(username: str) -> Dict[str, Any]:
+    """Read country/state/life hints embedded in a gateway username string."""
+    out: Dict[str, Any] = {}
+    u = username or ""
+    m = re.search(r"_area-([A-Za-z0-9]+)", u, re.I)
+    if m:
+        out["country"] = m.group(1).upper()
+    m = re.search(r"_state-([a-z0-9]+(?:_[a-z0-9]+)*)", u, re.I)
+    if m:
+        out["state_slug"] = m.group(1).lower()
+    m = re.search(r"_life-([0-9]+)", u, re.I)
+    if m:
+        try:
+            out["sticky_minutes"] = int(m.group(1))
+        except ValueError:
+            pass
+    return out
+
+
 def _apply_smartproxy_smart_targeting(
     username_base: str,
     targeting: Dict[str, Any],

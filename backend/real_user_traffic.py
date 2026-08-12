@@ -3702,6 +3702,78 @@ def _host_from_proxy_server(server: str) -> str:
         return ""
 
 
+def _is_smartproxy_gateway_host(host: str) -> bool:
+    """True for Decodo / Smartproxy gateway hosts (incl. proxy.smartproxy.net)."""
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    return any(
+        needle in h
+        for needle in (
+            "decodo.com",
+            "smartproxy.com",
+            "smartproxy.net",
+            "smart-proxy.com",
+        )
+    )
+
+
+async def _enrich_geo_from_exit_ip(result: Dict[str, Any]) -> None:
+    """Fill region/country when a minimal probe returned only the exit IP."""
+    ip = (result.get("exit_ip") or "").strip()
+    if not ip:
+        return
+    if result.get("region") and result.get("country"):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as direct:
+            r = await direct.get(
+                f"http://ip-api.com/json/{ip}"
+                "?fields=status,country,countryCode,region,regionName,city,"
+                "timezone,lat,lon,proxy,hosting,isp,org,as,asname,mobile"
+            )
+            if r.status_code != 200:
+                return
+            data = r.json() or {}
+            if data.get("status") != "success":
+                return
+            result["country_name"] = data.get("country") or result.get("country_name")
+            result["country"] = data.get("countryCode") or result.get("country")
+            result["region"] = data.get("region") or result.get("region")
+            result["region_name"] = data.get("regionName") or result.get("region_name")
+            result["city"] = data.get("city") or result.get("city")
+            try:
+                result["lat"] = float(data.get("lat") or result.get("lat") or 0)
+                result["lon"] = float(data.get("lon") or result.get("lon") or 0)
+            except (TypeError, ValueError):
+                pass
+            result["timezone"] = data.get("timezone") or result.get("timezone")
+            result["isp"] = data.get("isp") or result.get("isp") or ""
+            result["org"] = data.get("org") or result.get("org") or ""
+            result["as_name"] = data.get("as") or data.get("asname") or result.get("as_name") or ""
+            if data.get("proxy") or data.get("hosting"):
+                result["is_vpn"] = True
+    except Exception as e:
+        logger.debug(f"exit-IP geo enrich failed for {ip}: {e}")
+
+
+def _proxy_url_scheme_variants(proxy_url: str) -> List[str]:
+    """Try both http:// and https:// proxy schemes — some gateways accept only one."""
+    url = (proxy_url or "").strip()
+    if not url:
+        return []
+    out = [url]
+    if url.startswith("http://"):
+        alt = "https://" + url[len("http://"):]
+        if alt not in out:
+            out.append(alt)
+    elif url.startswith("https://"):
+        alt = "http://" + url[len("https://"):]
+        if alt not in out:
+            out.append(alt)
+    return out
+
+
 def _proxy_url_for_http(proxy: Dict[str, Any]) -> str:
     """Build a single proxy URL for httpx/curl from a Krexion proxy dict.
 
@@ -3740,8 +3812,6 @@ def _build_state_targeted_proxy(
     _state = (state_code or "").strip().upper()
     # Static proxies — no gateway DSL to rewrite.
     if not base.get("is_rotating_gateway"):
-        return dict(base)
-    if not _state and not _country:
         return dict(base)
     try:
         from proxy_provider_module import (  # noqa: WPS433
@@ -3813,26 +3883,10 @@ def _build_state_targeted_proxy(
 
 
 def _rotate_gateway_session_proxy(base: Dict[str, Any]) -> Dict[str, Any]:
-    """Fresh session id per pick on rotating gateways (Smartproxy repeat-IP fix)."""
+    """Fresh session id per pick — preserve embedded geo targeting on the line."""
     if not base or not base.get("is_rotating_gateway"):
         return dict(base) if base else {}
-    try:
-        from proxy_provider_module import (  # noqa: WPS433
-            _gateway_base_username,
-            _rotate_session_in_username,
-        )
-    except Exception:
-        return dict(base)
-
-    server = base.get("server") or ""
-    scheme = "http"
-    if server.startswith("https://"):
-        scheme = "https"
-    elif server.startswith("http://"):
-        scheme = "http"
-
     username = (base.get("username") or "").strip()
-    password = base.get("password") or ""
     if not username:
         raw = (base.get("raw") or "").strip()
         if "@" in raw:
@@ -3840,30 +3894,18 @@ def _rotate_gateway_session_proxy(base: Dict[str, Any]) -> Dict[str, Any]:
             if "://" in auth:
                 auth = auth.split("://", 1)[1]
             if ":" in auth:
-                username, _, password = auth.partition(":")
-
-    host = _host_from_proxy_server(server)
-    username = _gateway_base_username(username, host)
-    rotated_user = _rotate_session_in_username(username)
-
-    port_part = server.split("@")[-1] if "@" in server else server.split("://", 1)[-1]
-    if not port_part and host:
-        port_part = f"{host}:80"
-
-    new_server = f"{scheme}://{port_part}"
-    raw_line = (
-        f"{scheme}://{rotated_user}:{password}@{port_part}"
-        if rotated_user
-        else new_server
-    )
-
-    out = dict(base)
-    out["server"] = new_server
-    out["username"] = rotated_user
-    out["password"] = password
-    out["raw"] = raw_line
-    out["is_rotating_gateway"] = True
-    return out
+                username, _, _pwd = auth.partition(":")
+    try:
+        from proxy_provider_module import _extract_embedded_gateway_targeting  # noqa: WPS433
+        embedded = _extract_embedded_gateway_targeting(username)
+    except Exception:
+        embedded = {}
+    _country = str(embedded.get("country") or "US").strip().upper() or "US"
+    _state = ""
+    _slug = embedded.get("state_slug") or ""
+    if _slug:
+        _state = _normalize_state(_slug.replace("_", " ")) or _slug.upper()[:2]
+    return _build_state_targeted_proxy(base, _state, _country)
 
 
 def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
@@ -3942,7 +3984,7 @@ async def _probe_proxy_geo(
         return result
 
     _probe_host = _host_from_proxy_server(server).lower()
-    _is_decodo = "decodo.com" in _probe_host or "smartproxy.com" in _probe_host
+    _is_decodo = _is_smartproxy_gateway_host(_probe_host)
 
     # Some commercial residential proxies (proxy-jet, brightdata, etc.) ONLY accept
     # HTTPS CONNECT tunnels and reject plain `GET http://…` forward-proxy requests,
@@ -4032,6 +4074,35 @@ async def _probe_proxy_geo(
             logger.debug(f"ip-api.com probe failed: {e}")
         return False
 
+    async def _try_minimal_ip(cli: httpx.AsyncClient) -> bool:
+        """Last-resort exit-IP discovery when geo APIs return no body."""
+        for url in (
+            "https://api.ipify.org?format=json",
+            "https://ifconfig.me/ip",
+            "http://ip-api.com/json/?fields=status,query",
+        ):
+            try:
+                r = await cli.get(url)
+                if r.status_code != 200:
+                    continue
+                ip = ""
+                if "ipify" in url:
+                    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    ip = str((data or {}).get("ip") or "").strip()
+                elif "ifconfig" in url:
+                    ip = (r.text or "").strip()
+                else:
+                    data = r.json() or {}
+                    if data.get("status") == "success":
+                        ip = str(data.get("query") or "").strip()
+                if ip and len(ip) <= 45 and not ip.startswith("<"):
+                    result["exit_ip"] = ip
+                    await _enrich_geo_from_exit_ip(result)
+                    return bool(result.get("exit_ip"))
+            except Exception as e:
+                logger.debug(f"minimal IP probe {url} failed: {e}")
+        return False
+
     try:
         # 2026-01-Phase1: Try TLS-impersonated probe FIRST (curl_cffi with
         # Chrome JA3/JA4/HTTP-2 fingerprint matching the visiting UA).
@@ -4112,6 +4183,15 @@ async def _probe_proxy_geo(
                         result["as_name"] = data_ia.get("as") or data_ia.get("asname") or ""
                         result["is_vpn"] = bool(data_ia.get("proxy") or data_ia.get("hosting"))
                         ok = True
+                if not ok:
+                    data_ipify = await _tls_ad.get_json(
+                        "https://api.ipify.org?format=json",
+                        proxy=proxy, ua=ua, timeout=30.0,
+                    )
+                    if data_ipify and (data_ipify.get("ip") or "").strip():
+                        result["exit_ip"] = str(data_ipify.get("ip")).strip()
+                        await _enrich_geo_from_exit_ip(result)
+                        ok = bool(result.get("exit_ip"))
             except Exception as _tls_e:
                 logger.debug(f"TLS-spoofed geo probe failed, falling back to httpx: {_tls_e}")
                 ok = False
@@ -4125,21 +4205,34 @@ async def _probe_proxy_geo(
         _last_probe_err = ""
         if not ok:
             for attempt in range(3):
-                try:
-                    async with httpx.AsyncClient(proxy=server, timeout=timeout_cfg, headers={"User-Agent": ua}, verify=False, http2=False) as cli:
-                        ok = False
-                        if _is_decodo:
-                            ok = await _try_decodo_ip(cli)
-                        if not ok:
-                            ok = await _try_https_ipwhois(cli)
-                        if not ok:
-                            ok = await _try_http_ipapi(cli)
-                    if ok:
-                        break
-                    _last_probe_err = "geo endpoints returned no IP"
-                except Exception as e:
-                    _last_probe_err = f"{type(e).__name__}: {e}"
-                    logger.debug(f"Proxy probe attempt {attempt+1} failed: {e}")
+                for _scheme_url in _proxy_url_scheme_variants(server):
+                    try:
+                        async with httpx.AsyncClient(
+                            proxy=_scheme_url,
+                            timeout=timeout_cfg,
+                            headers={"User-Agent": ua},
+                            verify=False,
+                            http2=False,
+                        ) as cli:
+                            ok = False
+                            if _is_decodo:
+                                ok = await _try_decodo_ip(cli)
+                            if not ok:
+                                ok = await _try_https_ipwhois(cli)
+                            if not ok:
+                                ok = await _try_http_ipapi(cli)
+                            if not ok:
+                                ok = await _try_minimal_ip(cli)
+                        if ok:
+                            break
+                        _last_probe_err = "geo endpoints returned no IP"
+                    except Exception as e:
+                        _last_probe_err = f"{type(e).__name__}: {e}"
+                        logger.debug(
+                            f"Proxy probe attempt {attempt+1} ({_scheme_url[:24]}…) failed: {e}"
+                        )
+                if ok:
+                    break
                 # Brief backoff before next attempt
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -9133,20 +9226,18 @@ async def run_real_user_traffic_job(
             if not _visit_pj_state and len(_pj_states_pool) >= 2:
                 _visit_pj_state = random.choice(_pj_states_pool)
 
-            # Rotating-gateway ROW-FIRST: one template line — state is
-            # injected per attempt via `_build_state_targeted_proxy`.
-            _gw_template: Optional[Dict[str, Any]] = None
-            if _row_first_state_match:
-                _gw_template = next(
-                    (p for p in parsed_proxies if p.get("is_rotating_gateway")),
-                    parsed_proxies[0] if parsed_proxies else None,
-                )
-                if not _gw_template:
-                    entry["status"] = "failed"
-                    entry["error"] = "ROW-FIRST state match requires at least one valid proxy/gateway line"
-                    push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
-                    await _record(job_id, entry, report, report_lock, db)
-                    return
+            # Rotating-gateway ROW-FIRST: rotate through EVERY uploaded gateway
+            # line as the rebuild template — previously only the first line was
+            # used and the other 8-9 uploaded Smartproxy lines were ignored.
+            _gw_candidates: List[Dict[str, Any]] = [
+                p for p in parsed_proxies if p.get("is_rotating_gateway")
+            ] or list(parsed_proxies)
+            if _row_first_state_match and not _gw_candidates:
+                entry["status"] = "failed"
+                entry["error"] = "ROW-FIRST state match requires at least one valid proxy/gateway line"
+                push_live_step(job_id, i + 1, "proxy", "failed", entry["error"])
+                await _record(job_id, entry, report, report_lock, db)
+                return
 
             while attempt < cap:
                 attempt += 1
@@ -9179,9 +9270,10 @@ async def run_real_user_traffic_job(
                     if not parsed:
                         last_reason = "ProxyJet line failed to parse"
                         continue
-                elif _row_first_state_match and _gw_template:
+                elif _row_first_state_match and _gw_candidates:
+                    _gw_pick = _gw_candidates[(attempt - 1) % len(_gw_candidates)]
                     parsed = _build_state_targeted_proxy(
-                        _gw_template,
+                        _gw_pick,
                         row_state_code or "",
                         _visit_pj_country,
                     )
@@ -9206,6 +9298,7 @@ async def run_real_user_traffic_job(
                             f"Attempt {attempt}/{cap}: probe failed — {last_reason}"
                             + (f" · user={_gw_user}" if _gw_user else ""),
                         )
+                    await asyncio.sleep(min(0.25 * attempt, 2.0))
                     continue
                 # Gateway ROW-FIRST: confirm exit-IP state matches the lead.
                 if _row_first_state_match and row_state_code:
