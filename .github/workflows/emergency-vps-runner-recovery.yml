@@ -55,6 +55,30 @@ jobs:
             uptime
             df -h / /var/lib/docker 2>/dev/null | head -5
             echo ""
+            echo "===== DISK USAGE BREAKDOWN (what is filling the disk) ====="
+            set +e
+            echo "--- docker system df ---"
+            docker system df 2>/dev/null || true
+            echo "--- top-level / ---"
+            du -xh / --max-depth=1 2>/dev/null | sort -hr | head -15
+            echo "--- /opt ---"
+            du -xh /opt --max-depth=2 2>/dev/null | sort -hr | head -20
+            echo "--- /var ---"
+            du -xh /var --max-depth=2 2>/dev/null | sort -hr | head -20
+            echo "--- /opt/krexion ---"
+            du -xh /opt/krexion --max-depth=2 2>/dev/null | sort -hr | head -20
+            echo "--- installer downloads ---"
+            du -sh /opt/krexion/downloads/windows /opt/krexion/downloads/desktop 2>/dev/null
+            ls -lah /opt/krexion/downloads/windows 2>/dev/null | head -25
+            ls -lah /opt/krexion/downloads/desktop 2>/dev/null | head -15
+            echo "--- runner work ---"
+            du -sh /opt/krexion-runner/_work /opt/krexion-runner/_diag 2>/dev/null
+            du -xh /opt/krexion-runner --max-depth=1 2>/dev/null | sort -hr | head -12
+            echo "--- largest /opt files (>100M) ---"
+            find /opt -type f -size +100M 2>/dev/null | xargs -r du -h 2>/dev/null | sort -hr | head -20
+            echo "===== END BREAKDOWN ====="
+            set -e
+            echo ""
             echo "===== Runner service state BEFORE ====="
             systemctl status krexion-runner --no-pager -l 2>&1 | head -20 \
               || systemctl status "actions.runner.krexion-com-final-krexion.com-final.krexion-vps.service" --no-pager -l 2>&1 | head -20 \
