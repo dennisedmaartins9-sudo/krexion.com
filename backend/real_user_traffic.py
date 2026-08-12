@@ -3805,25 +3805,26 @@ def _build_state_targeted_proxy(
     country: str = "US",
     *,
     state_literal: Optional[str] = None,
+    state_variant_index: int = 0,
 ) -> Dict[str, Any]:
     """Return a rotating-gateway proxy with state/country targeting and a
     fresh session id in the username (Smartproxy, Bright Data, etc.)."""
     if not base:
         return {}
     _country = (country or "US").strip().upper()
-    _state = (state_literal or state_code or "").strip()
-    if not state_literal:
-        _state = _state.upper()
-    # Static proxies — no gateway DSL to rewrite.
-    if not base.get("is_rotating_gateway"):
-        return dict(base)
+    _norm_state = _normalize_state(state_code) or _normalize_state(state_literal or "")
     try:
         from proxy_provider_module import (  # noqa: WPS433
             _apply_targeting_to_username,
+            _detect_profile as _pp_detect_profile,
             _gateway_base_username,
             _rotate_session_in_username,
+            _state_targeting_variants as _pp_state_variants,
         )
     except Exception:
+        return dict(base)
+    # Static proxies — no gateway DSL to rewrite.
+    if not base.get("is_rotating_gateway"):
         return dict(base)
 
     server = base.get("server") or ""
@@ -3845,17 +3846,23 @@ def _build_state_targeted_proxy(
                 username, _, password = auth.partition(":")
 
     host = _host_from_proxy_server(server)
-    # Strip stale geo/session from bulk-generated lines before injecting
-    # the lead row's state — otherwise Decodo rejects bad usernames and
-    # every probe fails with "exit-IP probe failed".
     username = _gateway_base_username(username, host)
+    _profile = _pp_detect_profile(host, "", username)
+    _state_for_target = ""
+    if _norm_state:
+        if state_literal:
+            _state_for_target = str(state_literal).strip()
+        else:
+            _variants = _pp_state_variants(_norm_state, _profile)
+            _idx = max(0, int(state_variant_index or 0)) % max(len(_variants), 1)
+            _state_for_target = _variants[_idx] if _variants else _norm_state
     _targeting: Dict[str, Any] = {
         "country": _country or "US",
         "_want_sid": True,
         "force_replace": True,
     }
-    if _state:
-        _targeting["state"] = _state
+    if _state_for_target:
+        _targeting["state"] = _state_for_target
     targeted_user = _apply_targeting_to_username(
         username,
         host,
@@ -3910,6 +3917,15 @@ def _rotate_gateway_session_proxy(base: Dict[str, Any]) -> Dict[str, Any]:
     if _slug:
         _state = _normalize_state(_slug.replace("_", " ")) or _slug.upper()[:2]
     return _build_state_targeted_proxy(base, _state, _country)
+
+
+def _geo_exit_state_code(geo: Dict[str, Any]) -> str:
+    """2-letter US state from a geo probe result."""
+    return (
+        _normalize_state(geo.get("region"))
+        or _normalize_state(geo.get("region_name"))
+        or ""
+    )
 
 
 def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
@@ -9299,14 +9315,14 @@ async def run_real_user_traffic_job(
                     _gw_pick = _gw_candidates[(attempt - 1) % len(_gw_candidates)]
                     _gw_host = _host_from_proxy_server(_gw_pick.get("server") or "")
                     _variant_cycle = max(1, len(_gw_candidates))
-                    _state_lit = _gw_state_variants[
-                        ((attempt - 1) // _variant_cycle) % len(_gw_state_variants)
-                    ]
+                    _variant_idx = ((attempt - 1) // _variant_cycle) % max(
+                        len(_gw_state_variants), 1
+                    )
                     parsed = _build_state_targeted_proxy(
                         _gw_pick,
                         row_state_code or "",
                         _visit_pj_country,
-                        state_literal=_state_lit,
+                        state_variant_index=_variant_idx,
                     )
                     if not parsed or not parsed.get("server"):
                         last_reason = "state-targeted gateway build failed"
@@ -9319,7 +9335,6 @@ async def run_real_user_traffic_job(
                             _built_user,
                             _gw_host,
                             row_state_code,
-                            state_literal=_state_lit,
                         )
                     ):
                         last_reason = (
@@ -9353,10 +9368,7 @@ async def run_real_user_traffic_job(
                     continue
                 # Gateway ROW-FIRST: confirm exit-IP state matches the lead.
                 if _row_first_state_match and row_state_code:
-                    _exit_st = (
-                        _normalize_state(_geo.get("region"))
-                        or _normalize_state(_geo.get("region_name"))
-                    )
+                    _exit_st = _geo_exit_state_code(_geo)
                     if _exit_st and _exit_st != row_state_code:
                         last_reason = f"exit state {_exit_st} != lead {row_state_code}"
                         _gw_user = (parsed.get("username") or "")[:72]

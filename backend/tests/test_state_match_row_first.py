@@ -2,10 +2,20 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+if "playwright.async_api" not in sys.modules:
+    sys.modules["playwright"] = MagicMock()
+    sys.modules["playwright.async_api"] = MagicMock(
+        async_playwright=MagicMock(),
+        Page=object,
+        BrowserContext=object,
+        Browser=object,
+    )
 
 from real_user_traffic import (  # noqa: E402
     _build_state_targeted_proxy,
@@ -23,13 +33,12 @@ class TestHostFromProxyServer:
 
 class TestBuildStateTargetedProxy:
     def test_smartproxy_state_injected(self):
-        base = _parse_proxy_line("http://user-sp123:secret@us.smartproxy.net:3128")
+        base = _parse_proxy_line("http://smart-u0test:secret@proxy.smartproxy.net:3120")
         assert base and base.get("is_rotating_gateway")
         out = _build_state_targeted_proxy(base, "NE", "US")
         assert out["username"]
         un = out["username"].lower()
-        assert "state" in un
-        assert "us_nebraska" in un or "nebraska" in un
+        assert "_state-nebraska" in un, un
         assert out["server"].startswith("http://")
         assert out["username"] != base.get("username")
 

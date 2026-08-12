@@ -240,6 +240,15 @@ def _smartproxy_smart_base(username: str) -> str:
     return u
 
 
+def _normalize_smartproxy_smart_account_base(username: str) -> str:
+    """Smart Region accounts must use smart-* — not legacy user-* on .net gateways."""
+    base = _smartproxy_smart_base(_strip_smartproxy_smart_params(username or ""))
+    low = base.lower().strip()
+    if low.startswith("user-") and not low.startswith("smart-"):
+        return "smart-" + base.split("-", 1)[1]
+    return base
+
+
 def _extract_embedded_gateway_targeting(username: str) -> Dict[str, Any]:
     """Read country/state/life hints embedded in a gateway username string."""
     out: Dict[str, Any] = {}
@@ -264,7 +273,8 @@ def _state_targeting_variants(
     profile: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Ordered state values to try when a gateway rejects geo targeting."""
-    st = (state_code or "").strip().upper()
+    raw = (state_code or "").strip()
+    st = _state_code(raw) or raw.upper()
     if not st:
         return [""]
     variants: List[str] = []
@@ -272,26 +282,52 @@ def _state_targeting_variants(
         primary = _format_state_for_profile(profile, st)
         if primary:
             variants.append(primary)
-        if profile.get("dsl") == "smart_underscore":
-            slug = _state_slug(st)
-            if slug and slug not in variants:
-                variants.append(slug)
-            code = _state_code(st)
-            if code and code not in variants:
-                variants.append(code)
-        elif profile.get("state_fmt") == "us_{slug}":
-            if st not in variants:
-                variants.append(st)
+        slug = _state_slug(st)
+        code = _state_code(st)
+        for extra in (slug, code, code.lower() if code else "", raw):
+            if extra and extra not in variants:
+                variants.append(extra)
+        if profile.get("state_fmt") == "us_{slug}" and slug:
+            us_slug = f"us_{slug}" if not slug.startswith("us_") else slug
+            if us_slug not in variants:
+                variants.append(us_slug)
     else:
         variants.append(st)
+        slug = _state_slug(st)
+        if slug and slug not in variants:
+            variants.append(slug)
     out: List[str] = []
     seen: set = set()
     for v in variants:
-        key = v.lower()
-        if key not in seen:
+        key = str(v or "").strip().lower()
+        if key and key not in seen:
             seen.add(key)
-            out.append(v)
+            out.append(str(v).strip())
     return out or [st]
+
+
+def _expected_state_tokens_in_username(
+    state_code: str,
+    profile: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Lowercase tokens that may appear in a correctly targeted gateway username."""
+    st = _state_code(state_code) or (state_code or "").strip().upper()
+    if not st:
+        return []
+    tokens: List[str] = []
+    for val in _state_targeting_variants(st, profile):
+        tok = str(val or "").strip().lower()
+        if tok and tok not in tokens:
+            tokens.append(tok)
+    slug = _state_slug(st)
+    if slug and slug not in tokens:
+        tokens.append(slug)
+    code = _state_code(st)
+    if code and code.lower() not in tokens:
+        tokens.append(code.lower())
+    if code and code not in tokens:
+        tokens.append(code)
+    return tokens
 
 
 def _username_includes_state_target(
@@ -302,32 +338,43 @@ def _username_includes_state_target(
     state_literal: str = "",
 ) -> bool:
     """True when the gateway username encodes the requested US state."""
-    st = (state_code or "").strip().upper()
+    st = _state_code(state_code) or (state_code or "").strip().upper()
     if not st:
         return True
     u = (username or "").lower()
     if not u:
         return False
     profile = _detect_profile(host or "", "", username or "")
-    literals = [state_literal] if state_literal else []
-    literals.extend(_state_targeting_variants(st, profile))
-    for lit in literals:
-        token = str(lit or "").strip().lower()
-        if not token:
-            continue
-        if profile and profile.get("dsl") == "smart_underscore":
-            if f"_state-{token}" in u:
+    tokens = _expected_state_tokens_in_username(st, profile)
+    if state_literal:
+        lit = str(state_literal).strip().lower()
+        if lit and lit not in tokens:
+            tokens.insert(0, lit)
+    if not tokens:
+        return False
+    if profile and profile.get("dsl") == "smart_underscore":
+        return any(f"_state-{t}" in u for t in tokens if t)
+    if profile:
+        pk = (profile.get("keys") or {}).get("state") or "state"
+        kv = profile.get("kv") or "-"
+        prefix = profile.get("prefix") or ""
+        delim = profile.get("delim") or ""
+        for t in tokens:
+            if not t:
+                continue
+            needles = [
+                f"_state-{t}",
+                f"{pk}{kv}{t}",
+                f"{prefix}{pk}{kv}{t}",
+                f"{delim}{pk}{kv}{t}",
+                f"__{pk}.{t}",
+                f";{pk}-{t}",
+                f"-{pk}-{t}",
+            ]
+            if any(n in u for n in needles):
                 return True
-            if token in u and "_state-" in u:
-                return True
-        elif profile and profile.get("state_fmt") == "us_{slug}":
-            pk = (profile.get("keys") or {}).get("state") or "state"
-            kv = profile.get("kv") or "-"
-            if f"{pk}{kv}{token}" in u:
-                return True
-        elif token in u:
-            return True
-    return False
+        return False
+    return any(t in u for t in tokens if t)
 
 
 def _apply_smartproxy_smart_targeting(
@@ -338,7 +385,7 @@ def _apply_smartproxy_smart_targeting(
 ) -> str:
     """Build smart-u0h51gc8hmdw_area-US_state-california_life-120_session-{sid}."""
     profile = _SMARTPROXY_SMART_PROFILE
-    base = _smartproxy_smart_base(_strip_smartproxy_smart_params(username_base))
+    base = _normalize_smartproxy_smart_account_base(username_base)
     parts: List[str] = []
     country = str(targeting.get("country") or "US").strip().upper() or "US"
     parts.append(f"_area-{country}")
@@ -375,6 +422,35 @@ def _strip_provider_session(username: str, profile: Optional[Dict[str, Any]] = N
     if _SESSION_TOKEN_RE.search(out):
         out = _SESSION_TOKEN_RE.sub("", out, count=1)
     out = re.sub(r"-{2,}", "-", out).strip("-")
+    return out
+
+
+def _strip_legacy_gateway_geo(username: str) -> str:
+    """Strip pasted geo/session tokens from ANY gateway username (mixed formats)."""
+    out = username or ""
+    if not out:
+        return out
+    for pat in (
+        r"-country-[a-z0-9]+",
+        r"-state-[a-z0-9_]+",
+        r"-city-[a-z0-9_]+",
+        r"-region-[a-z0-9_]+",
+        r"-cc-[a-z0-9]+",
+        r"-st-[a-z0-9_]+",
+        r"-session(?:duration)?-[a-z0-9]+",
+        r"-sessid-[a-z0-9]+",
+        r"-sesstime-[a-z0-9]+",
+        r"-sessttl-[a-z0-9]+",
+        r";country-[a-z0-9]+",
+        r";region-[a-z0-9_]+",
+        r";sessionid-[a-z0-9]+",
+        r"__cr\.[a-z0-9]+",
+        r";st\.[a-z0-9]+",
+        r";city\.[a-z0-9_]+",
+    ):
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    out = re.sub(r"-{2,}", "-", out).strip("-")
+    out = re.sub(r";{2,}", ";", out).strip(";")
     return out
 
 
@@ -429,10 +505,12 @@ def _gateway_base_username(
 ) -> str:
     """Return a clean gateway username (no geo/session) for ROW-FIRST rebuilds."""
     profile = _detect_profile(gateway_host or "", provider_name, username)
+    out = _strip_legacy_gateway_geo(username)
     if profile and profile.get("dsl") == "smart_underscore":
-        out = _strip_smartproxy_smart_params(username)
+        out = _normalize_smartproxy_smart_account_base(out)
+        out = _strip_smartproxy_smart_params(out)
     else:
-        out = _strip_provider_session(username, profile)
+        out = _strip_provider_session(out, profile)
         out = _strip_provider_geo_params(out, profile)
     out = _ensure_provider_user_prefix(out, profile)
     return out
@@ -774,13 +852,16 @@ def _apply_targeting_to_username(
     out = username_tpl
     original_username = username_tpl
     if force_replace and profile:
+        out = _strip_legacy_gateway_geo(out)
         if profile.get("dsl") == "smart_underscore":
+            out = _normalize_smartproxy_smart_account_base(out)
             out = _strip_smartproxy_smart_params(out)
         else:
             out = _strip_provider_geo_params(out, profile)
             out = _strip_provider_session(out, profile)
         out = _ensure_provider_user_prefix(out, profile)
     elif force_replace:
+        out = _strip_legacy_gateway_geo(out)
         out = _strip_provider_session(out)
 
     # Smartproxy Smart Region — rebuild _area/_state/_life/_session suffix.
