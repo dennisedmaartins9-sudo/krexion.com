@@ -179,16 +179,16 @@ _SMARTPROXY_SMART_PARAM_RES = (
     ("session", _SMARTPROXY_SMART_SESSION_RE),
 )
 
-# Smartproxy Smart Region — panel (proxy.smartproxy.net:3128) docs:
-#   state-California · city-NewYork · area-US · life-120 · session-…
-# Title-case state names match the generator table (not lowercase slug).
+# Smartproxy Smart Region — panel (proxy.smartproxy.net):
+#   state-California · state-NewYork · city-NewYork · area-US · life-120
+# Multi-word states use PascalCase (no underscores), matching the panel.
 _SMARTPROXY_SMART_PROFILE: Dict[str, Any] = {
     "name": "Smartproxy Smart Region",
     "hosts": ["smartproxy.net", "smartproxy.com"],
     "dsl": "smart_underscore",
-    "state_fmt": "{title}",
+    "state_fmt": "{pascal}",
     "default_life_minutes": 120,
-    "preferred_ports": ("3128", "3120", "7000"),
+    "preferred_ports": ("3120", "3128", "7000"),
 }
 
 
@@ -288,8 +288,8 @@ def _state_targeting_variants(
         # Smart Region panel accepts Title Case first (state-California).
         if profile.get("dsl") == "smart_underscore":
             for extra in (
-                _state_title(st),
                 _state_pascal(st),
+                _state_title(st),
                 _state_slug(st),
                 _state_code(st),
             ):
@@ -1007,9 +1007,6 @@ def _format_gateway_line(cfg: Dict[str, Any], proxy_type: str,
     pwd = str(cfg.get("password") or "").strip()
     if not host or not port:
         return None
-    # Smart Region panel port is 3128; 3120 often hangs.
-    if "smartproxy.net" in host.lower() and port == "3120":
-        port = "3128"
     if rotate_session and user:
         user = _rotate_session_in_username(user)
     scheme = proxy_type or "http"

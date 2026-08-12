@@ -124,7 +124,7 @@ def test_smartproxy_net_nebraska_from_data_row():
     user = (out.get("username") or "")
     assert "_state-Nebraska" in user or "_state-nebraska" in user.lower(), user
     assert user.lower().startswith("smart-")
-    assert ":3128" in (out.get("server") or "")
+    assert ":3120" in (out.get("server") or "")
 
 
 def test_variant_index_rotates_state_encoding():
@@ -147,4 +147,4 @@ def test_smartproxy_smart_profile_separate_from_legacy():
     com = _detect_profile("gate.smartproxy.com", "", "user-x")
     assert net and net.get("dsl") == "smart_underscore"
     assert com and com.get("name") == "Smartproxy / Decodo"
-    assert _SMARTPROXY_SMART_PROFILE["state_fmt"] == "{title}"
+    assert _SMARTPROXY_SMART_PROFILE["state_fmt"] == "{pascal}"

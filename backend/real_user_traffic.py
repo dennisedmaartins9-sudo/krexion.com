@@ -3873,10 +3873,6 @@ def _build_state_targeted_proxy(
     port_part = server.split("@")[-1] if "@" in server else server.split("://", 1)[-1]
     if not port_part and host:
         port_part = f"{host}:80"
-    # Smartproxy Smart Region panel generates :3128 — many customers save
-    # :3120 by mistake which hangs geo probes. Prefer panel port.
-    if host and "smartproxy.net" in host.lower() and ":3120" in port_part:
-        port_part = port_part.replace(":3120", ":3128", 1)
 
     # Keep server host:port ONLY (same as _parse_proxy_line). Credentials
     # live in username/password — embedding them in server breaks

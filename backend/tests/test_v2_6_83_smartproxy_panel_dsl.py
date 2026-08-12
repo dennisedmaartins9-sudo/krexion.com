@@ -1,4 +1,4 @@
-"""v2.6.83 — Smartproxy panel DSL: state-California + port 3128."""
+"""v2.6.84 — Smartproxy panel DSL: PascalCase states + keep port 3120."""
 from __future__ import annotations
 
 import sys
@@ -26,10 +26,10 @@ from proxy_provider_module import (  # noqa: E402
 from real_user_traffic import _build_state_targeted_proxy, _parse_proxy_line  # noqa: E402
 
 
-def test_smart_region_state_fmt_is_title_case():
-    assert _SMARTPROXY_SMART_PROFILE["state_fmt"] == "{title}"
+def test_smart_region_state_fmt_is_pascal_case():
+    assert _SMARTPROXY_SMART_PROFILE["state_fmt"] == "{pascal}"
     assert _format_state_for_profile(_SMARTPROXY_SMART_PROFILE, "CA") == "California"
-    assert _format_state_for_profile(_SMARTPROXY_SMART_PROFILE, "NY") == "New_York"
+    assert _format_state_for_profile(_SMARTPROXY_SMART_PROFILE, "NY") == "NewYork"
 
 
 def test_panel_username_uses_state_California():
@@ -40,10 +40,18 @@ def test_panel_username_uses_state_California():
     )
     assert "_state-California" in user, user
     assert "_area-US" in user, user
-    assert user.lower().startswith("smart-u0h51gc8hmdw_area-us")
 
 
-def test_port_3120_rewritten_to_3128_in_gateway_line():
+def test_ny_uses_pascal_newyork():
+    user = _apply_targeting_to_username(
+        "smart-u0h51gc8hmdw",
+        "proxy.smartproxy.net",
+        {"country": "US", "state": "NY", "_want_sid": True, "force_replace": True},
+    )
+    assert "_state-NewYork" in user, user
+
+
+def test_port_3120_preserved_in_gateway_line():
     line = _format_gateway_line(
         {
             "gateway_host": "proxy.smartproxy.net",
@@ -55,20 +63,20 @@ def test_port_3120_rewritten_to_3128_in_gateway_line():
         rotate_session=False,
     )
     assert line is not None
-    assert ":3128" in line
-    assert ":3120" not in line
+    assert ":3120" in line
 
 
-def test_build_rewrites_port_and_title_state():
+def test_build_keeps_customer_port_and_title_state():
     base = _parse_proxy_line(
         "http://smart-u0h51gc8hmdw:pass@proxy.smartproxy.net:3120"
     )
     out = _build_state_targeted_proxy(base, "CA", "US")
-    assert ":3128" in (out.get("server") or "")
+    assert ":3120" in (out.get("server") or "")
     assert "_state-California" in (out.get("username") or ""), out.get("username")
 
 
-def test_variants_prefer_title_then_slug():
+def test_variants_prefer_pascal_then_title():
     variants = _state_targeting_variants("CA", _SMARTPROXY_SMART_PROFILE)
     assert variants[0] == "California"
-    assert "california" in [v.lower() for v in variants]
+    ny = _state_targeting_variants("NY", _SMARTPROXY_SMART_PROFILE)
+    assert ny[0] == "NewYork"

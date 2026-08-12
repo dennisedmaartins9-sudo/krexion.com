@@ -38,6 +38,8 @@ def test_state_variants_include_slug_for_smart_region():
     variants = _state_targeting_variants("CA", prof)
     assert variants[0] == "California"
     assert any(v.lower() == "california" for v in variants)
+    ny = _state_targeting_variants("NY", prof)
+    assert ny[0] == "NewYork"
 
 
 def test_meaningful_attempts_budget_in_source():
