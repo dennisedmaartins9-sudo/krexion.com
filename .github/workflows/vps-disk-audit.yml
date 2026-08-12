@@ -1,0 +1,60 @@
+name: VPS Disk Audit
+
+# Manual only — prints what is using disk on the krexion VPS.
+# Runs via SSH from ubuntu-latest (does NOT trigger deploy).
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: krexion-vps-disk-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: SSH disk usage breakdown
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Audit VPS disk usage
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          port: ${{ secrets.VPS_PORT }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: false
+          command_timeout: 8m
+          script: |
+            set +e
+            echo "===== df -h ====="
+            df -h /
+            echo ""
+            echo "===== docker system df ====="
+            docker system df 2>/dev/null || echo "(docker df unavailable)"
+            echo ""
+            echo "===== Top-level / usage ====="
+            du -xh / --max-depth=1 2>/dev/null | sort -hr | head -20
+            echo ""
+            echo "===== /opt breakdown ====="
+            du -xh /opt --max-depth=2 2>/dev/null | sort -hr | head -25
+            echo ""
+            echo "===== /var breakdown ====="
+            du -xh /var --max-depth=2 2>/dev/null | sort -hr | head -25
+            echo ""
+            echo "===== Native/Desktop download installers ====="
+            du -sh /opt/krexion/downloads/windows /opt/krexion/downloads/desktop 2>/dev/null
+            ls -lah /opt/krexion/downloads/windows 2>/dev/null | head -30
+            ls -lah /opt/krexion/downloads/desktop 2>/dev/null | head -20
+            echo ""
+            echo "===== Runner work dirs ====="
+            du -sh /opt/krexion-runner/_work /opt/krexion-runner/_diag 2>/dev/null
+            du -xh /opt/krexion-runner --max-depth=1 2>/dev/null | sort -hr | head -15
+            echo ""
+            echo "===== /opt/krexion big folders ====="
+            du -xh /opt/krexion --max-depth=2 2>/dev/null | sort -hr | head -25
+            echo ""
+            echo "===== Largest files under /opt (top 20) ====="
+            find /opt -type f -size +100M 2>/dev/null | xargs -r du -h 2>/dev/null | sort -hr | head -20
+            echo ""
+            echo "===== AUDIT DONE ====="
