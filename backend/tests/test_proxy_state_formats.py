@@ -83,6 +83,7 @@ def test_smartproxy_smart_region_ca_panel_string():
     assert low.startswith("smart-u0h51gc8hmdw"), out
     assert "_area-us" in low, out
     assert "_state-california" in low, out
+    assert "_state-California" in out, out
     assert "_life-120" in low, out
     assert "_session-" in low, out
     assert "-country-us" not in low, out

@@ -179,13 +179,16 @@ _SMARTPROXY_SMART_PARAM_RES = (
     ("session", _SMARTPROXY_SMART_SESSION_RE),
 )
 
-# Smartproxy Smart Region — panel string from proxy.smartproxy.net:3120
+# Smartproxy Smart Region — panel (proxy.smartproxy.net:3128) docs:
+#   state-California · city-NewYork · area-US · life-120 · session-…
+# Title-case state names match the generator table (not lowercase slug).
 _SMARTPROXY_SMART_PROFILE: Dict[str, Any] = {
     "name": "Smartproxy Smart Region",
     "hosts": ["smartproxy.net", "smartproxy.com"],
     "dsl": "smart_underscore",
-    "state_fmt": "{slug}",
+    "state_fmt": "{title}",
     "default_life_minutes": 120,
+    "preferred_ports": ("3128", "3120", "7000"),
 }
 
 
@@ -282,20 +285,31 @@ def _state_targeting_variants(
         primary = _format_state_for_profile(profile, st)
         if primary:
             variants.append(primary)
-        slug = _state_slug(st)
-        code = _state_code(st)
-        for extra in (slug, code, code.lower() if code else "", raw):
-            if extra and extra not in variants:
-                variants.append(extra)
-        if profile.get("state_fmt") == "us_{slug}" and slug:
-            us_slug = f"us_{slug}" if not slug.startswith("us_") else slug
-            if us_slug not in variants:
-                variants.append(us_slug)
+        # Smart Region panel accepts Title Case first (state-California).
+        if profile.get("dsl") == "smart_underscore":
+            for extra in (
+                _state_title(st),
+                _state_pascal(st),
+                _state_slug(st),
+                _state_code(st),
+            ):
+                if extra and extra not in variants:
+                    variants.append(extra)
+        else:
+            slug = _state_slug(st)
+            code = _state_code(st)
+            for extra in (slug, code, code.lower() if code else "", raw):
+                if extra and extra not in variants:
+                    variants.append(extra)
+            if profile.get("state_fmt") == "us_{slug}" and slug:
+                us_slug = f"us_{slug}" if not slug.startswith("us_") else slug
+                if us_slug not in variants:
+                    variants.append(us_slug)
     else:
         variants.append(st)
-        slug = _state_slug(st)
-        if slug and slug not in variants:
-            variants.append(slug)
+        for extra in (_state_title(st), _state_slug(st)):
+            if extra and extra not in variants:
+                variants.append(extra)
     out: List[str] = []
     seen: set = set()
     for v in variants:
@@ -383,7 +397,7 @@ def _apply_smartproxy_smart_targeting(
     *,
     original_username: str = "",
 ) -> str:
-    """Build smart-u0h51gc8hmdw_area-US_state-california_life-120_session-{sid}."""
+    """Build smart-…_area-US_state-California_life-120_session-{sid} (panel DSL)."""
     profile = _SMARTPROXY_SMART_PROFILE
     base = _normalize_smartproxy_smart_account_base(username_base)
     parts: List[str] = []
@@ -391,12 +405,21 @@ def _apply_smartproxy_smart_targeting(
     parts.append(f"_area-{country}")
     state_val = targeting.get("state")
     if state_val:
-        slug = _format_state_for_profile(profile, str(state_val))
-        if slug:
-            parts.append(f"_state-{slug}")
+        # Sheet codes (CA) → panel Title Case (California).
+        # Variant rotation may already pass California / california / NewYork.
+        raw = str(state_val).strip()
+        st_code = _state_code(raw)
+        if not raw:
+            token = ""
+        elif len(raw) <= 2 or (st_code and raw.upper() == st_code):
+            token = _format_state_for_profile(profile, st_code or raw)
+        else:
+            token = raw.replace(" ", "_")
+        if token:
+            parts.append(f"_state-{token}")
     city_val = targeting.get("city")
     if city_val:
-        parts.append(f"_city-{str(city_val).lower().replace(' ', '')}")
+        parts.append(f"_city-{_state_pascal(str(city_val)) or str(city_val).replace(' ', '')}")
     life = targeting.get("sticky_minutes")
     if not life:
         life = _extract_smartproxy_life_minutes(original_username or username_base)
@@ -761,6 +784,22 @@ def _state_slug(val: str) -> str:
     return v.lower().replace(" ", "_")
 
 
+def _state_title(val: str) -> str:
+    """Smartproxy panel style: California / New_York."""
+    slug = _state_slug(val)
+    if not slug:
+        return ""
+    return "_".join(part.capitalize() for part in slug.split("_") if part)
+
+
+def _state_pascal(val: str) -> str:
+    """Compact PascalCase: California / NewYork (matches city-NewYork style)."""
+    slug = _state_slug(val)
+    if not slug:
+        return ""
+    return "".join(part.capitalize() for part in slug.split("_") if part)
+
+
 def _state_code(val: str) -> str:
     """Resolve CA / California / california → CA."""
     v = str(val or "").strip()
@@ -783,6 +822,8 @@ def _format_state_for_profile(profile: Optional[Dict[str, Any]], val: str) -> st
     """Encode sheet STATE for a provider gateway username (permanent DSL map)."""
     slug = _state_slug(val)
     code = _state_code(val)
+    title = _state_title(val)
+    pascal = _state_pascal(val)
     fmt = (profile or {}).get("state_fmt") or "{slug}"
     if fmt == "us_{slug}":
         if slug.startswith("us_"):
@@ -790,14 +831,24 @@ def _format_state_for_profile(profile: Optional[Dict[str, Any]], val: str) -> st
         return f"us_{slug}" if slug else ""
     if fmt == "{slug}":
         return slug
+    if fmt == "{title}":
+        return title
+    if fmt == "{pascal}":
+        return pascal
     if fmt == "{code}":
         return code
     if fmt == "{code_lower}":
         return code.lower()
     try:
-        return fmt.format(slug=slug, code=code, code_lower=code.lower())
+        return fmt.format(
+            slug=slug,
+            code=code,
+            code_lower=code.lower(),
+            title=title,
+            pascal=pascal,
+        )
     except Exception:
-        return slug
+        return slug or title
 
 
 def _norm_target_val(profile: Dict[str, Any], key: str, val: str) -> str:
@@ -956,6 +1007,9 @@ def _format_gateway_line(cfg: Dict[str, Any], proxy_type: str,
     pwd = str(cfg.get("password") or "").strip()
     if not host or not port:
         return None
+    # Smart Region panel port is 3128; 3120 often hangs.
+    if "smartproxy.net" in host.lower() and port == "3120":
+        port = "3128"
     if rotate_session and user:
         user = _rotate_session_in_username(user)
     scheme = proxy_type or "http"

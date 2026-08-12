@@ -27,14 +27,17 @@ def test_smartproxy_net_ca_username_has_state_california():
         {"country": "US", "state": "CA", "_want_sid": True, "force_replace": True},
     )
     low = user.lower()
-    assert "_state-california" in low, user
+    assert "_state-california" in low or "_state-California".lower() in low, user
+    # Panel docs use Title Case: state-California
+    assert "_state-california" in user.lower(), user
     assert _username_includes_state_target(user, "proxy.smartproxy.net", "CA")
 
 
 def test_state_variants_include_slug_for_smart_region():
     prof = _detect_profile("proxy.smartproxy.net", "", "smart-u0h51gc8hmdw")
     variants = _state_targeting_variants("CA", prof)
-    assert "california" in variants
+    assert variants[0] == "California"
+    assert any(v.lower() == "california" for v in variants)
 
 
 def test_meaningful_attempts_budget_in_source():

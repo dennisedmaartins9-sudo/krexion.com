@@ -3873,6 +3873,10 @@ def _build_state_targeted_proxy(
     port_part = server.split("@")[-1] if "@" in server else server.split("://", 1)[-1]
     if not port_part and host:
         port_part = f"{host}:80"
+    # Smartproxy Smart Region panel generates :3128 — many customers save
+    # :3120 by mistake which hangs geo probes. Prefer panel port.
+    if host and "smartproxy.net" in host.lower() and ":3120" in port_part:
+        port_part = port_part.replace(":3120", ":3128", 1)
 
     # Keep server host:port ONLY (same as _parse_proxy_line). Credentials
     # live in username/password — embedding them in server breaks
@@ -9346,6 +9350,15 @@ async def run_real_user_traffic_job(
                                 f"Attempt {attempt}/{cap}: {last_reason} · user={_built_user[:64]}",
                             )
                         continue
+                    # Surface dial target BEFORE the geo probe so Live Activity
+                    # is never stuck on "fetching unique IP…" with no proxy steps.
+                    if attempt <= 5 or attempt % 5 == 0:
+                        _dial = (parsed.get("server") or "").replace("http://", "").replace("https://", "")
+                        push_live_step(
+                            job_id, i + 1, "proxy", "info",
+                            f"Attempt {attempt}/{cap}: dialing {_dial} · "
+                            f"user={_built_user[:70]}",
+                        )
                 else:
                     last_reason = "ROW-FIRST proxy source unavailable"
                     break
@@ -9354,10 +9367,20 @@ async def run_real_user_traffic_job(
                 _probe_ua = pick_next_ua()
                 # Don't consume the UA pointer for probes — rewind
                 state["ua_idx"] = max(0, state["ua_idx"] - 1)
-                _geo = await _probe_proxy_geo(parsed, _probe_ua, user_id=engine_user_id)
+                try:
+                    _geo = await asyncio.wait_for(
+                        _probe_proxy_geo(parsed, _probe_ua, user_id=engine_user_id),
+                        timeout=45.0,
+                    )
+                except asyncio.TimeoutError:
+                    _geo = {
+                        "ok": False,
+                        "exit_ip": None,
+                        "probe_error": "geo probe timed out after 45s",
+                    }
                 if not _geo["ok"] or not _geo.get("exit_ip"):
                     last_reason = (_geo.get("probe_error") or "exit-IP probe failed")[:120]
-                    if attempt == 1 or attempt % 5 == 0:
+                    if attempt <= 5 or attempt % 3 == 0:
                         _gw_user = (parsed.get("username") or "")[:72]
                         push_live_step(
                             job_id, i + 1, "proxy", "failed",
@@ -9372,7 +9395,7 @@ async def run_real_user_traffic_job(
                     if _exit_st and _exit_st != row_state_code:
                         last_reason = f"exit state {_exit_st} != lead {row_state_code}"
                         _gw_user = (parsed.get("username") or "")[:72]
-                        if attempt <= 3 or attempt % 3 == 0:
+                        if attempt <= 5 or attempt % 2 == 0:
                             push_live_step(
                                 job_id, i + 1, "proxy", "info",
                                 f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying"

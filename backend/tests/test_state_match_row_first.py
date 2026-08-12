@@ -38,8 +38,10 @@ class TestBuildStateTargetedProxy:
         out = _build_state_targeted_proxy(base, "NE", "US")
         assert out["username"]
         un = out["username"].lower()
-        assert "_state-nebraska" in un, un
+        assert "_state-nebraska" in un or "_state-Nebraska".lower() in un, un
+        assert "nebraska" in un, un
         assert out["server"].startswith("http://")
+        assert ":3128" in out["server"] or ":3120" in out["server"]
         assert out["username"] != base.get("username")
 
     def test_smartproxy_california_format(self):
