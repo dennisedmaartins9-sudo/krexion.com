@@ -3812,6 +3812,60 @@ def _build_state_targeted_proxy(
     return out
 
 
+def _rotate_gateway_session_proxy(base: Dict[str, Any]) -> Dict[str, Any]:
+    """Fresh session id per pick on rotating gateways (Smartproxy repeat-IP fix)."""
+    if not base or not base.get("is_rotating_gateway"):
+        return dict(base) if base else {}
+    try:
+        from proxy_provider_module import (  # noqa: WPS433
+            _gateway_base_username,
+            _rotate_session_in_username,
+        )
+    except Exception:
+        return dict(base)
+
+    server = base.get("server") or ""
+    scheme = "http"
+    if server.startswith("https://"):
+        scheme = "https"
+    elif server.startswith("http://"):
+        scheme = "http"
+
+    username = (base.get("username") or "").strip()
+    password = base.get("password") or ""
+    if not username:
+        raw = (base.get("raw") or "").strip()
+        if "@" in raw:
+            auth = raw.split("@", 1)[0]
+            if "://" in auth:
+                auth = auth.split("://", 1)[1]
+            if ":" in auth:
+                username, _, password = auth.partition(":")
+
+    host = _host_from_proxy_server(server)
+    username = _gateway_base_username(username, host)
+    rotated_user = _rotate_session_in_username(username)
+
+    port_part = server.split("@")[-1] if "@" in server else server.split("://", 1)[-1]
+    if not port_part and host:
+        port_part = f"{host}:80"
+
+    new_server = f"{scheme}://{port_part}"
+    raw_line = (
+        f"{scheme}://{rotated_user}:{password}@{port_part}"
+        if rotated_user
+        else new_server
+    )
+
+    out = dict(base)
+    out["server"] = new_server
+    out["username"] = rotated_user
+    out["password"] = password
+    out["raw"] = raw_line
+    out["is_rotating_gateway"] = True
+    return out
+
+
 def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
     """ISO country code from a geo probe result."""
     return (geo.get("country") or "").strip().upper()
@@ -7448,6 +7502,57 @@ async def _resolve_tracker_via_localhost(
     return None
 
 
+async def _try_team_reserve_exit_ip(
+    *,
+    db: Any,
+    engine_user_id: str,
+    offer_url: str,
+    exit_ip: str,
+    visit_token: str,
+    skip_duplicate_ip: bool,
+    tracker_missing_offer: bool,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Reserve exit IP against team DB *before* logging proxy unique.
+
+    Returns (ok, claim_result). ``ok`` False → caller should retry another
+    proxy exit IP (team history / pending claim conflict).
+    """
+    if tracker_missing_offer:
+        return False, {}
+    if not (db and engine_user_id and offer_url and exit_ip and visit_token):
+        return True, {}
+    try:
+        from cross_user_ip_isolation import (
+            acquire_team_offer_ip_claim,
+            canonicalize_ip,
+            resolve_isolation_scope,
+            team_offer_claim_required,
+        )
+    except Exception:
+        return True, {}
+    canonical = canonicalize_ip(exit_ip)
+    if not canonical:
+        return False, {}
+    scope = await resolve_isolation_scope(db, engine_user_id)
+    if not team_offer_claim_required(scope, bool(skip_duplicate_ip)):
+        return True, {}
+    try:
+        from server import get_user_db as _rut_get_user_db
+    except Exception:
+        _rut_get_user_db = None
+    result = await acquire_team_offer_ip_claim(
+        db,
+        engine_user_id,
+        offer_url,
+        canonical,
+        visit_token,
+        get_user_db=_rut_get_user_db,
+    )
+    if result.get("acquired"):
+        return True, result
+    return False, result
+
+
 # ─── Job runner ──────────────────────────────────────────────────
 async def run_real_user_traffic_job(
     job_id: str,
@@ -8695,7 +8800,13 @@ async def run_real_user_traffic_job(
                 px = parsed_proxies[idx]
                 if px.get("is_rotating_gateway"):
                     # Rotating gateway — re-dialable, don't lock the URL.
-                    return px
+                    # v2.6.79 — fresh session id every pick so the gateway
+                    # does not sticky-return the same exit IP.
+                    _inj_st = (proxyjet_default_state or "").strip().upper()
+                    _inj_cc = (proxyjet_country or "US").strip().upper()
+                    if _inj_cc and _inj_cc != "ANY":
+                        return _build_state_targeted_proxy(px, _inj_st, _inj_cc)
+                    return _rotate_gateway_session_proxy(px)
                 raw = px["raw"]
                 if raw not in used_proxy_set:
                     used_proxy_set.add(raw)
@@ -8703,7 +8814,14 @@ async def run_real_user_traffic_job(
             return None
         idx = state["proxy_idx"] % len(parsed_proxies)
         state["proxy_idx"] += 1
-        return parsed_proxies[idx]
+        px = parsed_proxies[idx]
+        if px.get("is_rotating_gateway"):
+            _inj_st = (proxyjet_default_state or "").strip().upper()
+            _inj_cc = (proxyjet_country or "US").strip().upper()
+            if _inj_cc and _inj_cc != "ANY":
+                return _build_state_targeted_proxy(px, _inj_st, _inj_cc)
+            return _rotate_gateway_session_proxy(px)
+        return px
 
     def pick_next_ua() -> str:
         idx = state["ua_idx"] % len(uas_ok)
@@ -8839,6 +8957,9 @@ async def run_real_user_traffic_job(
         _team_claim_acquired = False
         _team_claim_completed = False
         _team_claim_released = False
+        # v2.6.79 — tracker/affiliate click already registered (S2S or browser).
+        # Prevents tunnel-retry double-clicks and pending-claim release after touch.
+        _affiliate_click_fired = False
         _underlying_offer_url = str(
             (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
             or (RUT_JOBS.get(job_id) or {}).get("offer_url")
@@ -8854,6 +8975,22 @@ async def run_real_user_traffic_job(
                 or (_offer_meta or {}).get("offer_url")
                 or ""
             )
+        try:
+            from urllib.parse import urlparse as _claim_up
+            _claim_host = (_claim_up(target_url).hostname or "").lower()
+        except Exception:
+            _claim_host = ""
+        _is_tracker_target = (
+            _claim_host in _bypass_hosts() or _url_host_matches_bypass(target_url)
+        )
+        _claim_offer_url = _underlying_offer_url or str(
+            (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
+            or (RUT_JOBS.get(job_id) or {}).get("offer_url")
+            or ""
+        )
+        if not _claim_offer_url and not _is_tracker_target:
+            _claim_offer_url = target_url
+        _claim_ip = ""
 
         # ── 2026-01 ROW-FIRST on-demand sequence ──────────────────────
         # When ProxyJet on-demand mode is on we INVERT the order:
@@ -9103,6 +9240,38 @@ async def run_real_user_traffic_job(
                         push_live_step(job_id, i + 1, "proxy", "info",
                                        f"Attempt {attempt}/{cap}: duplicate {exit_ip}, retrying for {row_state_code}")
                     continue
+                # v2.6.78 — team DB BEFORE "Unique IP" so proxy retries
+                # only exit IPs the isolation group will accept.
+                _team_ok, _team_pick = await _try_team_reserve_exit_ip(
+                    db=db,
+                    engine_user_id=engine_user_id or "",
+                    offer_url=_claim_offer_url,
+                    exit_ip=exit_ip,
+                    visit_token=_visit_claim_token,
+                    skip_duplicate_ip=skip_duplicate_ip,
+                    tracker_missing_offer=_is_tracker_target and not _claim_offer_url,
+                )
+                if not _team_ok:
+                    last_reason = f"team offer duplicate IP {exit_ip}"
+                    if duplicate_ip_set is not None:
+                        try:
+                            duplicate_ip_set.add(exit_ip)
+                        except Exception:
+                            pass
+                    if attempt % 5 == 0 or attempt == 1:
+                        push_live_step(
+                            job_id, i + 1, "proxy", "info",
+                            f"Attempt {attempt}/{cap}: team duplicate {exit_ip}, retrying for {row_state_code}",
+                        )
+                    continue
+                if _team_pick.get("acquired"):
+                    from cross_user_ip_isolation import canonicalize_ip as _canon_ip
+                    _team_claim_acquired = True
+                    _claim_ip = _canon_ip(exit_ip)
+                    entry["offer_scope_key"] = _team_pick.get("offer_key") or ""
+                    entry["offer_url_normalized"] = _team_pick.get(
+                        "offer_url_normalized"
+                    ) or ""
                 # Unique! Reserve it immediately so two parallel visits
                 # don't both pick the same IP from concurrent probes.
                 if duplicate_ip_set is not None:
@@ -9328,6 +9497,33 @@ async def run_real_user_traffic_job(
             push_live_step(job_id, i + 1, "filter", "skipped", f"Duplicate IP {geo['exit_ip']}")
             return await _record(job_id, entry, report, report_lock, db)
 
+        if not _team_claim_acquired and geo.get("exit_ip"):
+            _team_ok, _team_pick = await _try_team_reserve_exit_ip(
+                db=db,
+                engine_user_id=engine_user_id or "",
+                offer_url=_claim_offer_url,
+                exit_ip=geo["exit_ip"],
+                visit_token=_visit_claim_token,
+                skip_duplicate_ip=skip_duplicate_ip,
+                tracker_missing_offer=_is_tracker_target and not _claim_offer_url,
+            )
+            if not _team_ok:
+                entry["status"] = "skipped_duplicate_ip"
+                entry["error"] = "Exit IP already used by a teammate for this offer"
+                push_live_step(
+                    job_id, i + 1, "filter", "skipped",
+                    f"Team offer duplicate IP {geo['exit_ip']}",
+                )
+                return await _record(job_id, entry, report, report_lock, db)
+            if _team_pick.get("acquired"):
+                from cross_user_ip_isolation import canonicalize_ip as _canon_ip
+                _team_claim_acquired = True
+                _claim_ip = _canon_ip(geo["exit_ip"])
+                entry["offer_scope_key"] = _team_pick.get("offer_key") or ""
+                entry["offer_url_normalized"] = _team_pick.get(
+                    "offer_url_normalized"
+                ) or ""
+
         # ── 2026-07 v2.6.10 CUSTOMER-REQUEST FIX (duplicate-IP hardening) ──
         # Even when skip_duplicate_ip is ON, the previous non-ProxyJet
         # code path only CHECKED the set — it never ADDED the exit-IP
@@ -9382,12 +9578,6 @@ async def run_real_user_traffic_job(
         # browser-launch stage. On the user's actual VPS this branch
         # is rarely hit (local resolution works there), but it gives
         # the preview environment a useful filter too.
-        try:
-            from urllib.parse import urlparse as _t_up
-            _t_host = (_t_up(target_url).hostname or "").lower()
-        except Exception:
-            _t_host = ""
-        _is_tracker_target = _t_host in _bypass_hosts() or _url_host_matches_bypass(target_url)
         _url_to_probe = target_url
         # ── 2026-02 v2.6.16 DEFINITIVE DUPLICATE-IP FIX ─────────────
         # ROOT CAUSE (field-confirmed on samsclub01 / traxun.online):
@@ -9592,6 +9782,30 @@ async def run_real_user_traffic_job(
                             and _sm_geo["exit_ip"] in duplicate_ip_set
                         ):
                             continue
+                        _team_ok, _team_pick = await _try_team_reserve_exit_ip(
+                            db=db,
+                            engine_user_id=engine_user_id or "",
+                            offer_url=_claim_offer_url,
+                            exit_ip=_sm_geo.get("exit_ip") or "",
+                            visit_token=_visit_claim_token,
+                            skip_duplicate_ip=skip_duplicate_ip,
+                            tracker_missing_offer=_is_tracker_target and not _claim_offer_url,
+                        )
+                        if not _team_ok:
+                            if duplicate_ip_set is not None and _sm_geo.get("exit_ip"):
+                                try:
+                                    duplicate_ip_set.add(_sm_geo["exit_ip"])
+                                except Exception:
+                                    pass
+                            continue
+                        if _team_pick.get("acquired"):
+                            from cross_user_ip_isolation import canonicalize_ip as _canon_ip
+                            _team_claim_acquired = True
+                            _claim_ip = _canon_ip(_sm_geo.get("exit_ip") or "")
+                            entry["offer_scope_key"] = _team_pick.get("offer_key") or ""
+                            entry["offer_url_normalized"] = _team_pick.get(
+                                "offer_url_normalized"
+                            ) or ""
                         geo = _sm_geo
                         entry["exit_ip"] = geo["exit_ip"] or ""
                         entry["country"] = geo["country_name"]
@@ -9719,62 +9933,47 @@ async def run_real_user_traffic_job(
                 logger.debug(f"identity load failed: {_id_err}")
 
         try:
-            # DB-backed team invariant is mandatory for active shared scopes,
-            # even if the operator disabled the legacy per-job duplicate set.
-            _claim_offer_url = str(
-                (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
-                or (RUT_JOBS.get(job_id) or {}).get("offer_url")
-            )
-            if not _claim_offer_url and db is not None:
-                _claim_job_doc = await db.real_user_traffic_jobs.find_one(
-                    {"job_id": job_id},
-                    {"offer_url_normalized": 1, "offer_url": 1, "_id": 0},
-                )
-                _claim_offer_url = str(
-                    (_claim_job_doc or {}).get("offer_url_normalized")
-                    or (_claim_job_doc or {}).get("offer_url")
-                    or ""
-                )
-            if not _claim_offer_url:
-                # Direct-offer jobs can safely use target_url. Tracker jobs
-                # must have persisted underlying offer metadata and fail closed.
-                if _is_tracker_target:
-                    raise RuntimeError("underlying offer scope unavailable")
-                _claim_offer_url = target_url
-            if db is not None and engine_user_id and geo.get("exit_ip"):
-                from cross_user_ip_isolation import (
-                    acquire_team_offer_ip_claim,
-                    canonicalize_ip,
-                    resolve_isolation_scope,
-                    team_offer_claim_required,
-                )
-                _claim_ip = canonicalize_ip(geo.get("exit_ip"))
-                _claim_scope = await resolve_isolation_scope(db, engine_user_id)
-                if _claim_ip and team_offer_claim_required(
-                    _claim_scope, bool(skip_duplicate_ip)
-                ):
-                    try:
-                        from server import get_user_db as _rut_get_user_db
-                    except Exception:
-                        _rut_get_user_db = None
-                    _claim_result = await acquire_team_offer_ip_claim(
-                        db, engine_user_id, _claim_offer_url,
-                        _claim_ip, _visit_claim_token,
-                        get_user_db=_rut_get_user_db,
+            if not _team_claim_acquired:
+                # DB-backed team invariant is mandatory for active shared scopes,
+                # even if the operator disabled the legacy per-job duplicate set.
+                if not _claim_offer_url:
+                    if _is_tracker_target:
+                        raise RuntimeError("underlying offer scope unavailable")
+                    _claim_offer_url = target_url
+                if db is not None and engine_user_id and geo.get("exit_ip"):
+                    from cross_user_ip_isolation import (
+                        acquire_team_offer_ip_claim,
+                        canonicalize_ip,
+                        resolve_isolation_scope,
+                        team_offer_claim_required,
                     )
-                    if not _claim_result.get("acquired"):
-                        entry["status"] = "skipped_duplicate_ip"
-                        entry["error"] = "Exit IP already used by a teammate for this offer"
-                        push_live_step(
-                            job_id, i + 1, "filter", "skipped",
-                            f"Team offer duplicate IP {_claim_ip}",
+                    _claim_ip = canonicalize_ip(geo.get("exit_ip"))
+                    _claim_scope = await resolve_isolation_scope(db, engine_user_id)
+                    if _claim_ip and team_offer_claim_required(
+                        _claim_scope, bool(skip_duplicate_ip)
+                    ):
+                        try:
+                            from server import get_user_db as _rut_get_user_db
+                        except Exception:
+                            _rut_get_user_db = None
+                        _claim_result = await acquire_team_offer_ip_claim(
+                            db, engine_user_id, _claim_offer_url,
+                            _claim_ip, _visit_claim_token,
+                            get_user_db=_rut_get_user_db,
                         )
-                        return await _record(job_id, entry, report, report_lock, db)
-                    _team_claim_acquired = True
-                    entry["offer_scope_key"] = _claim_result.get("offer_key") or ""
-                    entry["offer_url_normalized"] = _claim_result.get(
-                        "offer_url_normalized"
-                    ) or ""
+                        if not _claim_result.get("acquired"):
+                            entry["status"] = "skipped_duplicate_ip"
+                            entry["error"] = "Exit IP already used by a teammate for this offer"
+                            push_live_step(
+                                job_id, i + 1, "filter", "skipped",
+                                f"Team offer duplicate IP {_claim_ip}",
+                            )
+                            return await _record(job_id, entry, report, report_lock, db)
+                        _team_claim_acquired = True
+                        entry["offer_scope_key"] = _claim_result.get("offer_key") or ""
+                        entry["offer_url_normalized"] = _claim_result.get(
+                            "offer_url_normalized"
+                        ) or ""
 
             # Use the SHARED browser launched once at job start. Per-visit
             # isolation comes from a fresh BrowserContext with its own proxy,
@@ -10275,6 +10474,7 @@ async def run_real_user_traffic_job(
                                 _resolved_offer_direct
                             )
                             _ptro_swapped = True
+                            _affiliate_click_fired = True
                             # ── 2026-06-15 (anti-tracker-leak): Now that
                             # we know the FINAL offer URL, rebuild the
                             # browser's outbound Referer so its embedded
@@ -10883,6 +11083,11 @@ async def run_real_user_traffic_job(
                         # response received) instead of full DOM — many
                         # transient tunnel hiccups resolve mid-flight.
                         _wait_until = "commit" if same_proxy_retry > 0 else "domcontentloaded"
+                        # v2.6.79 — legacy browser→tracker path: the outgoing
+                        # HTTP GET registers the affiliate click; never rotate
+                        # proxy and hit the tracker again on tunnel retry.
+                        if _is_tracker_target and not _ptro_swapped and not _affiliate_click_fired:
+                            _affiliate_click_fired = True
                         # 2026-06-12 (referrer header fix): explicit
                         # `referer=` kwarg — Chromium ignores
                         # extra_http_headers["Referer"] on the first
@@ -10943,6 +11148,7 @@ async def run_real_user_traffic_job(
                                 and not _cur_url.startswith("data:")
                             )
                             if _visit_already_fired:
+                                _affiliate_click_fired = True
                                 if _cur_host and _cur_host != _target_host:
                                     push_live_step(
                                         job_id, i + 1, "browser", "info",
@@ -10960,7 +11166,14 @@ async def run_real_user_traffic_job(
                             # error page. Retry once with wait_until=
                             # "commit" (server-response only, no DOM-load
                             # wait) if we haven't already.
-                            if _wait_until != "commit":
+                            if (
+                                _wait_until != "commit"
+                                and not (
+                                    _affiliate_click_fired
+                                    and _is_tracker_target
+                                    and not _ptro_swapped
+                                )
+                            ):
                                 try:
                                     push_live_step(
                                         job_id, i + 1, "browser", "info",
@@ -10991,6 +11204,14 @@ async def run_real_user_traffic_job(
                                         break
                         is_tunnel = any(tok in err_str for tok in _TUNNEL_ERR_TOKENS)
                         if not is_tunnel or tunnel_attempt >= MAX_TUNNEL_RETRIES:
+                            break
+                        # v2.6.79 — tracker click already sent; rotating proxy
+                        # would register a second affiliate click.
+                        if (
+                            _affiliate_click_fired
+                            and _is_tracker_target
+                            and not _ptro_swapped
+                        ):
                             break
                         # Pick a fresh proxy and rebuild context+page
                         new_proxy = pick_next_proxy()
@@ -11159,6 +11380,7 @@ async def run_real_user_traffic_job(
                                     allow_direct_xff=True,
                                 )
                                 if _bypass_offer_url:
+                                    _affiliate_click_fired = True
                                     push_live_step(
                                         job_id, i + 1, "bypass", "ok",
                                         f"✓ Click registered as PROXY IP {_exit_ip_for_bypass} "
@@ -11449,11 +11671,26 @@ async def run_real_user_traffic_job(
                 await _human_warmup(page, fp, paranoia=bool(behavioral_bio_enabled))
 
                 if follow_redirect:
-                    # Give the page a bit more time to do any JS redirect
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=4000)
-                    except Exception:
-                        pass
+                    # v2.6.79 — after pass-to-offer the browser is on the offer
+                    # domain; avoid networkidle waits that can pull tracker pixels.
+                    _fr_wait = True
+                    if _ptro_swapped and _visit_target_url:
+                        try:
+                            from urllib.parse import urlparse as _fr_up
+                            _fr_offer_host = (_fr_up(_visit_target_url).netloc or "").lower()
+                            _fr_cur_host = (_fr_up(page.url or "").netloc or "").lower()
+                            _fr_wait = bool(
+                                _fr_offer_host
+                                and _fr_cur_host
+                                and _fr_cur_host == _fr_offer_host
+                            )
+                        except Exception:
+                            _fr_wait = True
+                    if _fr_wait:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=4000)
+                        except Exception:
+                            pass
 
                 # ── 2026-05: Offer-site Duplicate-IP / VPN hard-block detection ──
                 # Some offers serve a "Duplicate IP / Access denied" or
@@ -11614,6 +11851,12 @@ async def run_real_user_traffic_job(
                     # customer stops seeing "No more proxies available"
                     # / "5/20 visits blocked" reports.
                     if _can_retry_offer_block:
+                        if _team_claim_acquired and not _team_claim_completed:
+                            from cross_user_ip_isolation import complete_team_offer_ip_claim
+                            _team_claim_completed = await complete_team_offer_ip_claim(
+                                db, engine_user_id or "", _claim_offer_url,
+                                _claim_ip, _visit_claim_token,
+                            )
                         raise _OfferBlockRetryNeeded(
                             reason=_block_reason,
                             burnt_ip=_burned_ip or "",
@@ -12860,14 +13103,28 @@ async def run_real_user_traffic_job(
                 and not _team_claim_released
             ):
                 try:
-                    from cross_user_ip_isolation import release_team_offer_ip_claim
-                    _team_claim_released = await release_team_offer_ip_claim(
-                        db, engine_user_id or "", _claim_offer_url,
-                        _claim_ip, _visit_claim_token,
+                    # v2.6.79 — never release after tracker/offer touch; burn IP
+                    # in team DB so the same exit IP cannot be reused.
+                    _claim_touch = bool(
+                        _affiliate_click_fired
+                        or entry.get("landing_url")
+                        or entry.get("bypass_used")
                     )
+                    if _claim_touch:
+                        from cross_user_ip_isolation import complete_team_offer_ip_claim
+                        _team_claim_completed = await complete_team_offer_ip_claim(
+                            db, engine_user_id or "", _claim_offer_url,
+                            _claim_ip, _visit_claim_token,
+                        )
+                    else:
+                        from cross_user_ip_isolation import release_team_offer_ip_claim
+                        _team_claim_released = await release_team_offer_ip_claim(
+                            db, engine_user_id or "", _claim_offer_url,
+                            _claim_ip, _visit_claim_token,
+                        )
                 except Exception as _release_err:
                     logger.error(
-                        "RUT pending team-offer claim release failed: %s",
+                        "RUT team-offer claim finalize failed: %s",
                         _release_err,
                     )
             # 2026-06 — Live Visual Grid cleanup: clear this visit's
