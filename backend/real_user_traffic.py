@@ -3803,13 +3803,17 @@ def _build_state_targeted_proxy(
     base: Dict[str, Any],
     state_code: str,
     country: str = "US",
+    *,
+    state_literal: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a rotating-gateway proxy with state/country targeting and a
     fresh session id in the username (Smartproxy, Bright Data, etc.)."""
     if not base:
         return {}
     _country = (country or "US").strip().upper()
-    _state = (state_code or "").strip().upper()
+    _state = (state_literal or state_code or "").strip()
+    if not state_literal:
+        _state = _state.upper()
     # Static proxies — no gateway DSL to rewrite.
     if not base.get("is_rotating_gateway"):
         return dict(base)
@@ -8276,6 +8280,7 @@ async def run_real_user_traffic_job(
         "started_at": datetime.now(timezone.utc).isoformat(),
         "total": total,
         "attempts_started": 0,
+        "meaningful_attempts": 0,
         "in_flight": 0,
         "processed": 0,
         "succeeded": 0,
@@ -9239,6 +9244,26 @@ async def run_real_user_traffic_job(
                 await _record(job_id, entry, report, report_lock, db)
                 return
 
+            _gw_state_variants: List[str] = [row_state_code or ""]
+            try:
+                from proxy_provider_module import (  # noqa: WPS433
+                    _detect_profile as _gw_detect_profile,
+                    _state_targeting_variants as _gw_state_variants_fn,
+                    _username_includes_state_target as _gw_has_state,
+                )
+                _gw_host0 = _host_from_proxy_server(
+                    (_gw_candidates[0].get("server") or "") if _gw_candidates else ""
+                )
+                _gw_prof0 = _gw_detect_profile(
+                    _gw_host0,
+                    "",
+                    (_gw_candidates[0].get("username") or "") if _gw_candidates else "",
+                )
+                if row_state_code:
+                    _gw_state_variants = _gw_state_variants_fn(row_state_code, _gw_prof0)
+            except Exception:
+                _gw_state_variants = [row_state_code or ""]
+
             while attempt < cap:
                 attempt += 1
                 if cancel_event.is_set():
@@ -9272,13 +9297,39 @@ async def run_real_user_traffic_job(
                         continue
                 elif _row_first_state_match and _gw_candidates:
                     _gw_pick = _gw_candidates[(attempt - 1) % len(_gw_candidates)]
+                    _gw_host = _host_from_proxy_server(_gw_pick.get("server") or "")
+                    _variant_cycle = max(1, len(_gw_candidates))
+                    _state_lit = _gw_state_variants[
+                        ((attempt - 1) // _variant_cycle) % len(_gw_state_variants)
+                    ]
                     parsed = _build_state_targeted_proxy(
                         _gw_pick,
                         row_state_code or "",
                         _visit_pj_country,
+                        state_literal=_state_lit,
                     )
                     if not parsed or not parsed.get("server"):
                         last_reason = "state-targeted gateway build failed"
+                        continue
+                    _built_user = (parsed.get("username") or "").strip()
+                    if (
+                        row_state_code
+                        and _built_user
+                        and not _gw_has_state(
+                            _built_user,
+                            _gw_host,
+                            row_state_code,
+                            state_literal=_state_lit,
+                        )
+                    ):
+                        last_reason = (
+                            f"gateway username missing state token for {row_state_code}"
+                        )
+                        if attempt <= 3 or attempt % 5 == 0:
+                            push_live_step(
+                                job_id, i + 1, "proxy", "failed",
+                                f"Attempt {attempt}/{cap}: {last_reason} · user={_built_user[:64]}",
+                            )
                         continue
                 else:
                     last_reason = "ROW-FIRST proxy source unavailable"
@@ -9308,11 +9359,14 @@ async def run_real_user_traffic_job(
                     )
                     if _exit_st and _exit_st != row_state_code:
                         last_reason = f"exit state {_exit_st} != lead {row_state_code}"
-                        if attempt % 5 == 0 or attempt == 1:
+                        _gw_user = (parsed.get("username") or "")[:72]
+                        if attempt <= 3 or attempt % 3 == 0:
                             push_live_step(
                                 job_id, i + 1, "proxy", "info",
-                                f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying",
+                                f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying"
+                                + (f" · user={_gw_user}" if _gw_user else ""),
                             )
+                        await asyncio.sleep(min(0.2 * attempt, 2.0))
                         continue
                 # Country gate — honour proxyjet_country / per-visit MIX pick.
                 if not _geo_matches_target_country(_geo, _visit_pj_country):
@@ -13568,12 +13622,7 @@ async def run_real_user_traffic_job(
                 # ProxyJet Auto users don't burn through max_attempts on
                 # offer/tracker duplicate-IP blocks.
                 _tunnel_fails_so_far = int(RUT_JOBS[job_id].get("tunnel_fail_count", 0) or 0)
-                _silent_skips_so_far = int(RUT_JOBS[job_id].get("silent_skip_count", 0) or 0)
-                _effective_attempts = (
-                    attempt_counter
-                    if _tunnel_counts_in_budget
-                    else max(attempt_counter - _tunnel_fails_so_far - _silent_skips_so_far, 0)
-                )
+                _effective_attempts = int(RUT_JOBS[job_id].get("meaningful_attempts") or 0)
                 if _effective_attempts >= max_att:
                     push_live_step(
                         job_id, 0, "done", "info",
@@ -13613,12 +13662,7 @@ async def run_real_user_traffic_job(
                     # too — otherwise we'd over-spawn when a burst of
                     # tunnel-fail entries lands between iterations.
                     _tunnel_fails_so_far = int(RUT_JOBS[job_id].get("tunnel_fail_count", 0) or 0)
-                    _silent_skips_so_far = int(RUT_JOBS[job_id].get("silent_skip_count", 0) or 0)
-                    _effective_attempts = (
-                        attempt_counter
-                        if _tunnel_counts_in_budget
-                        else max(attempt_counter - _tunnel_fails_so_far - _silent_skips_so_far, 0)
-                    )
+                    _effective_attempts = int(RUT_JOBS[job_id].get("meaningful_attempts") or 0)
 
                 if not in_flight:
                     await asyncio.sleep(0.2)
@@ -19405,6 +19449,7 @@ async def _record(
             return
 
         # ── Visible visit accounting (original logic, unchanged) ─────────
+        j["meaningful_attempts"] = int(j.get("meaningful_attempts") or 0) + 1
         j["processed"] = int(j.get("processed") or 0) + 1
         key_map = {
             "ok": "succeeded",
@@ -19818,6 +19863,7 @@ def create_rut_job(
         "form_fill_enabled": form_fill_enabled,
         "status": "queued",
         "attempts_started": 0,
+        "meaningful_attempts": 0,
         "in_flight": 0,
         "processed": 0,
         "succeeded": 0,

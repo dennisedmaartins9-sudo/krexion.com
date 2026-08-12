@@ -259,6 +259,77 @@ def _extract_embedded_gateway_targeting(username: str) -> Dict[str, Any]:
     return out
 
 
+def _state_targeting_variants(
+    state_code: str,
+    profile: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Ordered state values to try when a gateway rejects geo targeting."""
+    st = (state_code or "").strip().upper()
+    if not st:
+        return [""]
+    variants: List[str] = []
+    if profile:
+        primary = _format_state_for_profile(profile, st)
+        if primary:
+            variants.append(primary)
+        if profile.get("dsl") == "smart_underscore":
+            slug = _state_slug(st)
+            if slug and slug not in variants:
+                variants.append(slug)
+            code = _state_code(st)
+            if code and code not in variants:
+                variants.append(code)
+        elif profile.get("state_fmt") == "us_{slug}":
+            if st not in variants:
+                variants.append(st)
+    else:
+        variants.append(st)
+    out: List[str] = []
+    seen: set = set()
+    for v in variants:
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out or [st]
+
+
+def _username_includes_state_target(
+    username: str,
+    host: str,
+    state_code: str,
+    *,
+    state_literal: str = "",
+) -> bool:
+    """True when the gateway username encodes the requested US state."""
+    st = (state_code or "").strip().upper()
+    if not st:
+        return True
+    u = (username or "").lower()
+    if not u:
+        return False
+    profile = _detect_profile(host or "", "", username or "")
+    literals = [state_literal] if state_literal else []
+    literals.extend(_state_targeting_variants(st, profile))
+    for lit in literals:
+        token = str(lit or "").strip().lower()
+        if not token:
+            continue
+        if profile and profile.get("dsl") == "smart_underscore":
+            if f"_state-{token}" in u:
+                return True
+            if token in u and "_state-" in u:
+                return True
+        elif profile and profile.get("state_fmt") == "us_{slug}":
+            pk = (profile.get("keys") or {}).get("state") or "state"
+            kv = profile.get("kv") or "-"
+            if f"{pk}{kv}{token}" in u:
+                return True
+        elif token in u:
+            return True
+    return False
+
+
 def _apply_smartproxy_smart_targeting(
     username_base: str,
     targeting: Dict[str, Any],
@@ -562,8 +633,13 @@ def _detect_profile(
     h = (host or "").lower().strip()
     n = (provider_name or "").lower().strip()
     u = (username or "").lower().strip()
-    # Smartproxy Smart Region panel (proxy.smartproxy.net:3120) — underscore DSL
-    if any(needle in h for needle in ("smartproxy.net", "smartproxy.com")):
+    # Smartproxy Smart Region panel (proxy.smartproxy.net:3120) — ALWAYS
+    # underscore DSL. Using legacy Decodo dash DSL here yields random US
+    # exit IPs (e.g. DC when the lead needs CA).
+    if "smartproxy.net" in h:
+        return dict(_SMARTPROXY_SMART_PROFILE)
+    # smartproxy.com may be legacy Decodo OR Smart Region — detect from username.
+    if any(needle in h for needle in ("smartproxy.com",)):
         if _is_smartproxy_smart_username(u) or u.startswith("smart-"):
             return dict(_SMARTPROXY_SMART_PROFILE)
     for prof in _PROVIDER_PROFILES:
