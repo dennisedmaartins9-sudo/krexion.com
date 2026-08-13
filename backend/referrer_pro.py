@@ -1586,7 +1586,8 @@ def resolve_pro_visit(
         out["esp"] = esp
         out["utm_source"], out["utm_medium"] = pick_utm_variation("email", brand)
         out["utm_campaign"] = pick_utm_campaign("email", brand)
-        if _preset:
+        _is_paid_v2_em = detect_is_paid(traffic_type, campaign_type, "email")
+        if _preset and _is_paid_v2_em is not False:
             out["utm_medium"]  = _preset.get("medium", out["utm_medium"])
             out["utm_content"] = _preset.get("content", "")
             out["utm_term"]    = _preset.get("term", "")
@@ -1595,7 +1596,6 @@ def resolve_pro_visit(
         # (SendGrid/Mailchimp/Klaviyo etc. are 1:1 outreach). Expose the
         # decision anyway so the tracker can inject `sub2=organic` (cold
         # email → organic) or the operator's own macro.
-        _is_paid_v2_em = detect_is_paid(traffic_type, campaign_type, "email")
         out["is_paid"] = _is_paid_v2_em
         out["traffic_type"] = ("paid" if _is_paid_v2_em is True
                                else "organic" if _is_paid_v2_em is False
@@ -1657,10 +1657,12 @@ def resolve_pro_visit(
         out["platform"] = actual_signal
         out["utm_source"], out["utm_medium"] = pick_utm_variation(actual_signal, brand)
         out["utm_campaign"] = pick_utm_campaign(actual_signal, brand)
-        if _preset:
+        if _preset and _is_paid_v2_se is not False:
             out["utm_medium"]  = _preset.get("medium", out["utm_medium"])
             out["utm_content"] = _preset.get("content", "")
             out["utm_term"]    = _preset.get("term", "")
+        if _is_paid_v2_se is False:
+            out["utm_medium"] = random.choice(["organic", "referral", "search"])
         out["sec_fetch"] = build_sec_fetch_headers(ref, is_navigation=True)
         # v2.6.26 — expose paid/organic decision so the tracker can inject
         # `sub2=paid|organic` (or the operator-configured macro) into the
@@ -1748,10 +1750,34 @@ def resolve_pro_visit(
     out["platform"] = signal
     out["utm_source"], out["utm_medium"] = pick_utm_variation(signal, brand)
     out["utm_campaign"] = pick_utm_campaign(signal, brand)
-    if _preset:
+    # v2.6.88 — Campaign-type presets (video_ad → paid_social) must NOT
+    # override UTMs when Traffic Type is explicitly Organic. Previously
+    # detect_is_paid=False picked the organic Referer pool, but
+    # campaign_type=video_ad still forced utm_medium=paid_social.
+    if _preset and _is_paid_v2 is not False:
         out["utm_medium"]  = _preset.get("medium", out["utm_medium"])
         out["utm_content"] = _preset.get("content", "")
         out["utm_term"]    = _preset.get("term", "")
+    if _is_paid_v2 is False:
+        _org_med = {
+            "tiktok": ["social", "organic", "referral"],
+            "facebook": ["social", "organic", "referral"],
+            "instagram": ["social", "organic", "referral"],
+            "snapchat": ["social", "organic", "referral"],
+            "twitter": ["social", "organic", "referral"],
+            "x": ["social", "organic", "referral"],
+            "pinterest": ["social", "organic", "referral"],
+            "linkedin": ["social", "organic", "referral"],
+            "reddit": ["social", "organic", "referral"],
+            "youtube": ["social", "organic", "video"],
+            "google": ["organic", "referral"],
+            "bing": ["organic", "referral"],
+            "yahoo": ["organic", "referral"],
+            "duckduckgo": ["organic", "referral"],
+            "yandex": ["organic", "referral"],
+        }.get((signal or "").lower())
+        if _org_med:
+            out["utm_medium"] = random.choice(_org_med)
     out["sec_fetch"] = build_sec_fetch_headers(ref, is_navigation=True)
     # v2.6.26 — expose paid/organic decision (see comment above at search-
     # engine branch). Uses the SAME `_is_paid_v2` already computed at
@@ -3291,6 +3317,53 @@ def _build_inapp_deep_referer_v2(platform: str, target_url: str, is_paid: bool) 
 build_paid_organic_referer = _build_inapp_deep_referer_v2
 
 
+def apply_organic_platform_param_override(
+    params: Dict[str, Any],
+    platform: str,
+) -> Dict[str, Any]:
+    """v2.6.88 — Strip paid ad click-ids + rewrite utm_medium for organic.
+
+    Mutates and returns `params`. Used by tracker `generate_platform_params`
+    when RUT Traffic Type = Organic (`is_paid=False`).
+    """
+    out = params if isinstance(params, dict) else {}
+    for _paid_key in (
+        "ttclid", "ttp", "_t", "_r", "_f",
+        "fbclid", "fbc", "igshid",
+        "gclid", "gbraid", "wbraid", "gad_source",
+        "msclkid", "mclid", "yclid",
+        "twclid", "epik", "li_fat_id",
+        "sccid", "ScCid",
+    ):
+        out.pop(_paid_key, None)
+    _plat = (platform or "").strip().lower()
+    _org_medium = {
+        "tiktok": ("social", "organic", "referral"),
+        "facebook": ("social", "organic", "referral"),
+        "instagram": ("social", "organic", "referral"),
+        "snapchat": ("social", "organic", "referral"),
+        "twitter": ("social", "organic", "referral"),
+        "x": ("social", "organic", "referral"),
+        "pinterest": ("social", "organic", "referral"),
+        "linkedin": ("social", "organic", "referral"),
+        "reddit": ("social", "organic", "referral"),
+        "youtube": ("social", "organic", "video"),
+        "google": ("organic", "referral"),
+        "bing": ("organic", "referral"),
+        "yahoo": ("organic", "referral"),
+        "duckduckgo": ("organic", "referral"),
+        "yandex": ("organic", "referral"),
+    }.get(_plat)
+    if _org_medium:
+        out["utm_medium"] = random.choice(list(_org_medium))
+    elif (out.get("utm_medium") or "").strip().lower() in (
+        "paid_social", "cpc", "ppc", "paid_search", "retargeting",
+        "paid_video", "cpv", "sponsored",
+    ):
+        out["utm_medium"] = "organic"
+    return out
+
+
 def detect_is_paid(traffic_type: str, campaign_type: str = "auto",
                     platform: str = "") -> Optional[bool]:
     """Determine paid/organic mode from operator settings.
@@ -3377,6 +3450,7 @@ __all__ = [
     # v2.6.24 — Paid vs Organic split
     "build_paid_organic_referer",
     "detect_is_paid",
+    "apply_organic_platform_param_override",
     # Constants
     "VALID_PLATFORM_KEYS",
     "VALID_EMAIL_KEYS",

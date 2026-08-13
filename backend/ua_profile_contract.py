@@ -590,9 +590,23 @@ def validate_user_agent(
 
 
 def client_hint_headers_for_ua(ua: str) -> Dict[str, str]:
-    """Build coherent low-entropy Chromium hints; return none otherwise."""
+    """Build coherent low-entropy Chromium hints; return none otherwise.
+
+    v2.6.88 — In-app Android WebView identities (TikTok / Instagram /
+    Facebook / …) must NOT emit Chromium Sec-CH-UA brand lists.
+    Everflow / Voluum / RedTrack prioritize Client Hints over the UA
+    string; when hints say `"Android WebView"/"Chromium"` they label
+    the click Browser=Chrome even though the UA carries `TikTok/46…`.
+    iOS in-app already emits no CH (wkwebview engine) — that is why
+    "TikTok for iOS" worked while "TikTok for Android" showed Chrome.
+    Real original TikTok ads still get detected via the UA `TikTok/`
+    marker when Client Hints are absent or ignored.
+    """
     profile = classify_user_agent(ua)
     if profile["engine"] not in {"chromium", "android_webview"}:
+        return {}
+    app = (profile.get("app") or "").strip().lower()
+    if app and app not in {"browser", "gchrome"}:
         return {}
     match = re.search(r"(?:Chrome|Chromium)/(\d+)", ua or "", re.IGNORECASE)
     if not match:
@@ -618,10 +632,23 @@ def validate_header_coherence(ua: str, headers: Mapping[str, str]) -> list[str]:
     if not supplied:
         return []
     profile = classify_user_agent(ua)
-    if profile["engine"] not in {"chromium", "android_webview"}:
-        return [f"{profile['engine']} profiles must not receive Chrome sec-ch-ua client hints."]
-
     expected = client_hint_headers_for_ua(ua)
+    app = (profile.get("app") or "").strip().lower()
+    if not expected:
+        # wkwebview / gecko / in-app Android WebView (TikTok etc.): any
+        # Chromium Sec-CH-UA brand list is a coherence bug.
+        if profile["engine"] not in {"chromium", "android_webview"}:
+            return [
+                f"{profile['engine']} profiles must not receive Chrome "
+                "sec-ch-ua client hints."
+            ]
+        if app and app not in {"browser", "gchrome"}:
+            return [
+                f"in-app {app} profiles must not receive Chrome "
+                "sec-ch-ua client hints (Everflow would label them Chrome)."
+            ]
+        return ["this profile must not receive Chrome sec-ch-ua client hints."]
+
     issues = []
     for key in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"):
         if key not in supplied:

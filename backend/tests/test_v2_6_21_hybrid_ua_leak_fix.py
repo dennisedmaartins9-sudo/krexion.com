@@ -95,10 +95,9 @@ def _assert_tiktok_android_page_ua(ua: str):
     assert profile["engine"] == "android_webview"
     assert profile["runtime_compatible"] is True
     assert profile["issues"] == []
-    hints = client_hint_headers_for_ua(ua)
-    assert hints["sec-ch-ua"]
-    assert hints["sec-ch-ua-platform"] == '"Android"'
-    assert validate_header_coherence(ua, hints) == []
+    # v2.6.88 — in-app TikTok must not emit Chromium Client Hints
+    assert client_hint_headers_for_ua(ua) == {}
+    assert validate_header_coherence(ua, {}) == []
 
 
 # ─── version ────────────────────────────────────────────────────────

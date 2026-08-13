@@ -256,14 +256,15 @@ def test_unsupported_expected_app_accepts_generic_fallback_with_warning():
 
 
 def test_android_webview_and_chrome_get_distinct_exact_hints():
-    webview_hints = client_hint_headers_for_ua(INSTAGRAM_ANDROID)
-    assert webview_hints["sec-ch-ua"] == (
-        '"Android WebView";v="149", "Chromium";v="149", "Not=A?Brand";v="24"'
-    )
+    # v2.6.88 — In-app Android WebView (Instagram) must emit NO Chromium
+    # Client Hints so Everflow labels "Instagram" / "TikTok for Android"
+    # from the UA string instead of "Chrome".
+    assert client_hint_headers_for_ua(INSTAGRAM_ANDROID) == {}
+    assert validate_header_coherence(INSTAGRAM_ANDROID, {}) == []
     assert validate_header_coherence(
         INSTAGRAM_ANDROID,
-        {key.upper(): value for key, value in webview_hints.items()},
-    ) == []
+        {"Sec-CH-UA": '"Android WebView";v="149", "Chromium";v="149", "Not=A?Brand";v="24"'},
+    )
 
     chrome_hints = client_hint_headers_for_ua(ANDROID_CHROME)
     assert chrome_hints["sec-ch-ua"] == (

@@ -311,7 +311,7 @@ def test_context_accept_language_is_shared_by_every_outbound_request_path():
     tree = ast.parse(source)
     outbound_values = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not (9950 <= node.lineno <= 10950):
+        if not isinstance(node, ast.Call) or not (9950 <= node.lineno <= 12000):
             continue
         for keyword in node.keywords:
             if keyword.arg == "accept_language":

@@ -3139,7 +3139,12 @@ def categorize_referrer(referrer: str, url_params: dict = None) -> dict:
     # If no match, categorize as "other" with the domain
     return {"source": "other", "source_name": "Other", "domain": domain, "detected_from": "referrer"}
 
-def generate_platform_params(platform: str, custom_params: dict = None, brand: str = "") -> dict:
+def generate_platform_params(
+    platform: str,
+    custom_params: dict = None,
+    brand: str = "",
+    is_paid: Optional[bool] = None,
+) -> dict:
     """Generate platform-specific URL parameters to simulate traffic source.
 
     2026-06 — ID FORMATS modernised to match what the real platforms
@@ -3157,6 +3162,12 @@ def generate_platform_params(platform: str, custom_params: dict = None, brand: s
     single biggest cohort tell on the affiliate-side dashboard. The new
     pool produces unique realistic campaign names like
     "irestore_lookalike_m35_64_video_a" or "tt_irestore_interest_carousel_v2".
+
+    2026-08 v2.6.88 — `is_paid=False` (RUT Traffic Type = Organic) strips
+    paid ad click-ids (ttclid / fbclid / gclid / …) and rewrites
+    utm_medium away from paid_social/cpc so Everflow/Voluum no longer
+    look like a paid ad when the operator explicitly chose Organic.
+    `is_paid=True/None` keeps legacy paid-param behaviour.
     """
     import random
     import string
@@ -3457,6 +3468,31 @@ def generate_platform_params(platform: str, custom_params: dict = None, brand: s
     # Add custom params if provided
     if custom_params:
         params.update(custom_params)
+
+    # ── v2.6.88 — Organic traffic must NOT look like a paid ad click ──
+    # Root cause: Traffic Type=Organic only switched the Referer pool;
+    # this generator still always emitted ttclid + utm_medium=paid_social
+    # for TikTok (and fbclid/gclid equivalents), so Everflow Click Details
+    # still showed a paid-ad parameter set.
+    if is_paid is False:
+        try:
+            from referrer_pro import apply_organic_platform_param_override as _org_ovr
+            params = _org_ovr(params, platform)
+        except Exception:
+            # Defensive fallback — never break redirect on import issues.
+            for _paid_key in (
+                "ttclid", "ttp", "_t", "_r", "_f",
+                "fbclid", "fbc", "igshid",
+                "gclid", "gbraid", "wbraid", "gad_source",
+                "msclkid", "mclid", "yclid",
+                "twclid", "epik", "li_fat_id",
+                "sccid", "ScCid",
+            ):
+                params.pop(_paid_key, None)
+            if (params.get("utm_medium") or "").lower() in (
+                "paid_social", "cpc", "ppc", "paid_search", "retargeting",
+            ):
+                params["utm_medium"] = "organic"
 
     return params
 
@@ -20548,7 +20584,18 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 _brand_for_params = str(custom_params.get("__brand") or "")
         except Exception:
             _brand_for_params = ""
-        platform_params = generate_platform_params(simulate_platform, custom_params, brand=_brand_for_params)
+        _is_paid_for_params = None
+        try:
+            if isinstance(_pro_result, dict) and "is_paid" in _pro_result:
+                _is_paid_for_params = _pro_result.get("is_paid")
+        except Exception:
+            _is_paid_for_params = None
+        platform_params = generate_platform_params(
+            simulate_platform,
+            custom_params,
+            brand=_brand_for_params,
+            is_paid=_is_paid_for_params,
+        )
         destination_url = build_redirect_url(destination_url, platform_params)
     elif custom_params:
         destination_url = build_redirect_url(destination_url, custom_params)

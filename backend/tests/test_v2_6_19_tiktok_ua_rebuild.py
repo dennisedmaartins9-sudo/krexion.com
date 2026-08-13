@@ -27,12 +27,11 @@ from ua_profile_contract import (  # noqa: E402
 
 
 def _assert_chromium_hints_match(ua: str):
+    """v2.6.88 — TikTok Android in-app emits no Sec-CH-UA (Everflow Chrome leak fix)."""
     hints = client_hint_headers_for_ua(ua)
-    major = next(part.split("/", 1)[1].split(".", 1)[0] for part in ua.split() if part.startswith("Chrome/"))
-    assert f'"Chromium";v="{major}"' in hints["sec-ch-ua"]
-    assert hints["sec-ch-ua-platform"] == '"Android"'
-    assert hints["sec-ch-ua-mobile"] == "?1"
-    assert validate_header_coherence(ua, hints) == []
+    assert hints == {}
+    assert validate_header_coherence(ua, {}) == []
+    assert "TikTok/" in ua
 
 
 def test_version_bumped_to_2_6_19_or_higher():

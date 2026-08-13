@@ -79,9 +79,11 @@ def _client_hint_builder():
 
 # ── is_non_chrome_inapp_ua classifier ──────────────────────────
 
-def test_non_chrome_inapp_false_for_tiktok_android_webview():
+def test_non_chrome_inapp_true_for_tiktok_android_webview():
+    # v2.6.88 — TikTok Android suppresses Sec-CH-UA, so it classifies as
+    # non-chrome-inapp (same Everflow path as iOS TikTok).
     tt = coerce_ua_for_platform(BASE_ANDROID, "tiktok")
-    assert is_non_chrome_inapp_ua(tt) is False
+    assert is_non_chrome_inapp_ua(tt) is True
 
 def test_non_chrome_inapp_detects_tiktok_ios():
     tt = coerce_ua_for_platform(BASE_IOS, "tiktok")
@@ -98,14 +100,14 @@ def test_non_chrome_inapp_detects_ig_ios():
     ig = coerce_ua_for_platform(BASE_IOS, "instagram")
     assert is_non_chrome_inapp_ua(ig) is True
 
-def test_non_chrome_inapp_false_for_fb_android():
-    # FB Android IS Chrome WebView + FB_IAB bracket → keep chrome hints.
+def test_non_chrome_inapp_true_for_fb_android():
+    # v2.6.88 — FB Android also suppresses Chromium Client Hints.
     fb = coerce_ua_for_platform(BASE_ANDROID, "facebook")
-    assert is_non_chrome_inapp_ua(fb) is False
+    assert is_non_chrome_inapp_ua(fb) is True
 
-def test_non_chrome_inapp_false_for_ig_android():
+def test_non_chrome_inapp_true_for_ig_android():
     ig = coerce_ua_for_platform(BASE_ANDROID, "instagram")
-    assert is_non_chrome_inapp_ua(ig) is False
+    assert is_non_chrome_inapp_ua(ig) is True
 
 def test_non_chrome_inapp_false_for_plain_chrome():
     assert is_non_chrome_inapp_ua(BASE_ANDROID) is False
@@ -142,23 +144,20 @@ def test_server_ua_tiktok_android_generator_has_zhiliaoapp():
 # ── Client hint headers helper: non-chrome in-app UA suppresses Sec-CH-UA brand ──
 
 def test_client_hint_headers_match_tiktok_android_webview():
+    """v2.6.88 — TikTok Android must NOT emit Sec-CH-UA Chromium brands.
+
+    Otherwise Everflow labels Browser=Chrome instead of TikTok for Android
+    (iOS already had empty CH via wkwebview — that is why only Android broke).
+    """
     _build_client_hint_headers = _client_hint_builder()
     tt_ua = coerce_ua_for_platform(BASE_ANDROID, "tiktok")
     fp = {"os": "android", "is_mobile": True}
     h = _build_client_hint_headers(fp, tt_ua)
-    assert h == {
-        {
-            "sec-ch-ua": "Sec-CH-UA",
-            "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
-            "sec-ch-ua-platform": "Sec-CH-UA-Platform",
-        }[key]: value
-        for key, value in client_hint_headers_for_ua(tt_ua).items()
-    }
-    major = re.search(r"Chrome/(\d+)", tt_ua).group(1)
-    assert f'"Android WebView";v="{major}"' in h["Sec-CH-UA"]
-    assert h.get("Sec-CH-UA-Mobile") == "?1"
-    assert h.get("Sec-CH-UA-Platform") == '"Android"'
-    assert "Sec-CH-UA-Platform-Version" not in h
+    assert h == {}
+    assert client_hint_headers_for_ua(tt_ua) == {}
+    assert "TikTok/" in tt_ua
+    assert "musical_ly_" in tt_ua
+
 
 def test_client_hint_headers_normal_chrome_unchanged():
     _build_client_hint_headers = _client_hint_builder()
