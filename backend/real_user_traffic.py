@@ -7812,7 +7812,8 @@ async def _try_team_reserve_exit_ip(
     """
     if tracker_missing_offer:
         return False, {}
-    if not (db and engine_user_id and offer_url and exit_ip and visit_token):
+    # PyMongo Database has no truthiness — must use `is not None`.
+    if db is None or not (engine_user_id and offer_url and exit_ip and visit_token):
         return True, {}
     try:
         from cross_user_ip_isolation import (
