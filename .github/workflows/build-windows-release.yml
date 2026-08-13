@@ -894,6 +894,13 @@ jobs:
           VER: ${{ needs.build-backend.outputs.version }}
         run: |
           set -e
+          # Fail early if disk is critically low (mirror used to die mid-write).
+          AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
+          if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
+            echo "::error::Not enough free disk on VPS (<2.5GB). Run safe installer cleanup first."
+            df -h / /opt/krexion/downloads || true
+            exit 1
+          fi
           mkdir -p /opt/krexion/downloads/windows
           cp -f dist/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
           cd /opt/krexion/downloads/windows
@@ -907,7 +914,21 @@ jobs:
             NEWEST=$(ls -t Krexion-Setup-*.exe 2>/dev/null | grep -v latest | head -1)
             [ -n "$NEWEST" ] && cp -f "$NEWEST" "Krexion-Setup-latest.exe" || true
           fi
+          # Keep download button URL forever-stable AND disk healthy:
+          # always refresh *-latest.exe above, then prune older versioned
+          # EXEs (keep current + 1 previous). Site buttons already point at
+          # Krexion-Setup-latest.exe so customers always get newest.
+          KEEP_N=2
+          mapfile -t KEEP_VER < <(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -n "$KEEP_N")
+          echo "Keeping versioned Windows installers: ${KEEP_VER[*]:-none}"
+          for f in Krexion-Setup-v*.exe; do
+            [ -f "$f" ] || continue
+            keep=0
+            for k in "${KEEP_VER[@]}"; do [ "$f" = "$k" ] && keep=1 && break; done
+            [ "$keep" = "0" ] && rm -f -- "$f" && echo "pruned $f"
+          done
+          test -f Krexion-Setup-latest.exe
           ls -la
           chmod -R a+r .
-          echo "Self-hosted CDN updated:"
+          echo "Self-hosted CDN updated (always-latest):"
           echo "  https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"

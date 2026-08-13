@@ -3806,6 +3806,7 @@ def _build_state_targeted_proxy(
     *,
     state_literal: Optional[str] = None,
     state_variant_index: int = 0,
+    city: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a rotating-gateway proxy with state/country targeting and a
     fresh session id in the username (Smartproxy, Bright Data, etc.)."""
@@ -3863,6 +3864,9 @@ def _build_state_targeted_proxy(
     }
     if _state_for_target:
         _targeting["state"] = _state_for_target
+    _city = (city or "").strip()
+    if _city:
+        _targeting["city"] = _city
     targeted_user = _apply_targeting_to_username(
         username,
         host,
@@ -3919,13 +3923,80 @@ def _rotate_gateway_session_proxy(base: Dict[str, Any]) -> Dict[str, Any]:
     return _build_state_targeted_proxy(base, _state, _country)
 
 
+# Smartproxy Soft Region often needs a major-city token to actually land
+# in the requested state under load. Used from attempt 1 (not only retries).
+_SMARTPROXY_STATE_CITY: Dict[str, str] = {
+    "CA": "LosAngeles",
+    "NY": "NewYork",
+    "TX": "Houston",
+    "FL": "Miami",
+    "IL": "Chicago",
+    "PA": "Philadelphia",
+    "OH": "Columbus",
+    "GA": "Atlanta",
+    "NC": "Charlotte",
+    "MI": "Detroit",
+    "AZ": "Phoenix",
+    "WA": "Seattle",
+    "CO": "Denver",
+    "NV": "LasVegas",
+    "OR": "Portland",
+    "MA": "Boston",
+    "NJ": "Newark",
+    "VA": "VirginiaBeach",
+    "TN": "Nashville",
+    "MO": "KansasCity",
+}
+
+# Reverse hint when Decodo/ipwho return city but omit region.
+_CITY_NAME_TO_STATE: Dict[str, str] = {
+    "los angeles": "CA",
+    "san francisco": "CA",
+    "san diego": "CA",
+    "san jose": "CA",
+    "sacramento": "CA",
+    "new york": "NY",
+    "brooklyn": "NY",
+    "buffalo": "NY",
+    "houston": "TX",
+    "dallas": "TX",
+    "austin": "TX",
+    "san antonio": "TX",
+    "miami": "FL",
+    "orlando": "FL",
+    "tampa": "FL",
+    "chicago": "IL",
+    "philadelphia": "PA",
+    "columbus": "OH",
+    "atlanta": "GA",
+    "charlotte": "NC",
+    "detroit": "MI",
+    "phoenix": "AZ",
+    "seattle": "WA",
+    "denver": "CO",
+    "las vegas": "NV",
+    "portland": "OR",
+    "boston": "MA",
+    "newark": "NJ",
+    "virginia beach": "VA",
+    "nashville": "TN",
+    "kansas city": "MO",
+}
+
+
 def _geo_exit_state_code(geo: Dict[str, Any]) -> str:
     """2-letter US state from a geo probe result."""
-    return (
+    st = (
         _normalize_state(geo.get("region"))
         or _normalize_state(geo.get("region_name"))
         or ""
     )
+    if st:
+        return st
+    city = str(geo.get("city") or "").strip().lower()
+    if city:
+        return _CITY_NAME_TO_STATE.get(city, "")
+    return ""
 
 
 def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
@@ -3933,8 +4004,34 @@ def _geo_exit_country_code(geo: Dict[str, Any]) -> str:
     return (geo.get("country") or "").strip().upper()
 
 
+def _heal_california_canada_collision(geo: Dict[str, Any]) -> None:
+    """Fix CA/CA collision: Canada country code vs California state code.
+
+    Some geo payloads mark a California residential exit as country=CA
+    (Canada). When region/city clearly indicate California, USA, force US.
+    """
+    if not geo:
+        return
+    cc = (geo.get("country") or "").strip().upper()
+    if cc != "CA":
+        return
+    st = _geo_exit_state_code(geo)
+    blob = " ".join(
+        str(geo.get(k) or "") for k in ("region", "region_name", "city", "timezone", "country_name")
+    ).lower()
+    if st == "CA" or "california" in blob or "los_angeles" in blob or "los angeles" in blob:
+        if "ontario" in blob or "quebec" in blob or "toronto" in blob or "vancouver" in blob:
+            return
+        geo["country"] = "US"
+        geo["country_name"] = "United States"
+        if not st:
+            geo["region"] = "CA"
+            geo["region_name"] = geo.get("region_name") or "California"
+
+
 def _geo_matches_target_country(geo: Dict[str, Any], target_country: str) -> bool:
     """True when geo exit country matches target ISO code (e.g. US), or target unset."""
+    _heal_california_canada_collision(geo)
     tc = (target_country or "").strip().upper()
     if not tc or tc == "ANY":
         return True
@@ -3969,6 +4066,89 @@ def _assess_ip_quality(geo: Dict[str, Any]) -> Dict[str, Any]:
         "ip_quality_score": score,
         "is_low_quality": is_low,
     }
+
+
+def _apply_decodo_geo_payload(data: Any, result: Dict[str, Any]) -> bool:
+    """Parse Decodo/Smartproxy IP JSON (nested v2 or flat legacy) into result.
+
+    Nested shape (2026):
+      {"proxy":{"ip":"..."}, "country":{"code":"US"},
+       "city":{"name":"Los Angeles","code":"CA","state":"California"}}
+    Flat keys (ip / country_code / region) are still accepted.
+    Returns True when an exit IP was extracted.
+    """
+    if not isinstance(data, dict):
+        return False
+    proxy_obj = data.get("proxy") if isinstance(data.get("proxy"), dict) else {}
+    country_obj = data.get("country") if isinstance(data.get("country"), dict) else {}
+    city_obj = data.get("city") if isinstance(data.get("city"), dict) else {}
+    ip = (
+        data.get("ip")
+        or data.get("query")
+        or (proxy_obj.get("ip") if proxy_obj else None)
+    )
+    if not ip:
+        return False
+    result["exit_ip"] = str(ip).strip()
+
+    _cn = country_obj.get("name") if country_obj else None
+    if isinstance(_cn, str) and _cn.strip():
+        result["country_name"] = _cn.strip()
+    elif isinstance(data.get("country"), str) and data.get("country").strip():
+        result["country_name"] = data.get("country").strip()
+    _cc = (
+        (country_obj.get("code") if country_obj else None)
+        or data.get("country_code")
+        or data.get("countryCode")
+    )
+    if isinstance(_cc, str) and _cc.strip():
+        result["country"] = _cc.strip().upper()
+
+    _rname = (
+        (city_obj.get("state") if city_obj else None)
+        or data.get("regionName")
+        or data.get("region_name")
+        or data.get("region")
+    )
+    if isinstance(_rname, str) and _rname.strip():
+        result["region_name"] = _rname.strip()
+
+    # Prefer state name → code; city.code is usually the 2-letter state.
+    _st = (
+        _normalize_state(city_obj.get("state") if city_obj else None)
+        or _normalize_state(city_obj.get("code") if city_obj else None)
+        or _normalize_state(data.get("region_code"))
+        or _normalize_state(data.get("region"))
+        or _normalize_state(data.get("regionName"))
+    )
+    if _st:
+        result["region"] = _st
+
+    _city = (city_obj.get("name") if city_obj else None) or data.get("city")
+    if isinstance(_city, str) and _city.strip():
+        result["city"] = _city.strip()
+        if not result.get("region"):
+            _from_city = _CITY_NAME_TO_STATE.get(_city.strip().lower())
+            if _from_city:
+                result["region"] = _from_city
+
+    try:
+        if city_obj and city_obj.get("latitude") is not None:
+            result["lat"] = float(city_obj.get("latitude"))
+        if city_obj and city_obj.get("longitude") is not None:
+            result["lon"] = float(city_obj.get("longitude"))
+    except (TypeError, ValueError):
+        pass
+    _tz = city_obj.get("time_zone") if city_obj else None
+    if isinstance(_tz, str) and _tz.strip():
+        result["timezone"] = _tz.strip()
+
+    isp_obj = data.get("isp") if isinstance(data.get("isp"), dict) else {}
+    if isp_obj:
+        result["isp"] = str(isp_obj.get("isp") or "")
+        result["org"] = str(isp_obj.get("organization") or "")
+        result["as_name"] = str(isp_obj.get("asn") or "")
+    return True
 
 
 async def _probe_proxy_geo(
@@ -4012,20 +4192,12 @@ async def _probe_proxy_geo(
     # the original HTTP ip-api.com endpoint (which works on proxies that do allow
     # plain HTTP forwarding).
     async def _try_decodo_ip(cli: httpx.AsyncClient) -> bool:
-        """Decodo/Smartproxy official IP check endpoint."""
+        """Decodo/Smartproxy official IP check endpoint (nested + flat JSON)."""
         try:
             r = await cli.get("https://ip.decodo.com/json")
             if r.status_code == 200:
-                data = r.json()
-                ip = data.get("ip") or data.get("query")
-                if ip:
-                    result["exit_ip"] = ip
-                    result["country_name"] = data.get("country") or result["country_name"]
-                    result["country"] = data.get("country_code") or data.get("countryCode") or result["country"]
-                    result["region_name"] = data.get("region") or data.get("regionName") or result["region_name"]
-                    result["region"] = data.get("region_code") or data.get("region") or result["region"]
-                    result["city"] = data.get("city") or result["city"]
-                    return True
+                data = r.json() if r.content else {}
+                return _apply_decodo_geo_payload(data, result)
         except Exception as e:
             logger.debug(f"ip.decodo.com probe failed: {e}")
         return False
@@ -4129,21 +4301,14 @@ async def _probe_proxy_geo(
         # On success, skip the httpx fallback entirely. On any failure
         # (including curl_cffi unavailable), the existing httpx code
         # path below runs UNCHANGED — full backwards compatibility.
+        #
+        # v2.6.85 — Smartproxy/Decodo gateways: SKIP TLS path. curl_cffi
+        # CONNECT through rotating residential gateways often hangs 20–30s
+        # per attempt, so Live Activity sits on "dialing…" while httpx
+        # alone succeeds in ~2s. Prefer fast httpx for these hosts.
         ok = False
-        if _TLS_AD_OK and _tls_ad is not None:
+        if _TLS_AD_OK and _tls_ad is not None and not _is_decodo:
             try:
-                if _is_decodo:
-                    data_dc = await _tls_ad.get_json(
-                        "https://ip.decodo.com/json",
-                        proxy=proxy, ua=ua, timeout=30.0,
-                    )
-                    if data_dc and (data_dc.get("ip") or data_dc.get("query")):
-                        result["exit_ip"] = data_dc.get("ip") or data_dc.get("query")
-                        result["country"] = data_dc.get("country_code") or data_dc.get("countryCode") or result["country"]
-                        result["region_name"] = data_dc.get("region") or data_dc.get("regionName") or result["region_name"]
-                        result["region"] = data_dc.get("region_code") or data_dc.get("region") or result["region"]
-                        result["city"] = data_dc.get("city") or result["city"]
-                        ok = True
                 # Attempt 1: HTTPS ipwho.is via TLS-spoofed session
                 if not ok:
                     data_iw = await _tls_ad.get_json(
@@ -4221,11 +4386,22 @@ async def _probe_proxy_geo(
         # etc.) have ~10-20% per-request failure rate due to rotating exit
         # nodes; retrying the same proxy usually succeeds with a different
         # exit IP on the next attempt.
-        timeout_cfg = httpx.Timeout(30.0, connect=20.0)
+        #
+        # v2.6.85 — Smartproxy/Decodo: short timeouts + single retry +
+        # http-only scheme. These gateways answer in ~1–3s when healthy;
+        # long CONNECT timeouts made ROW-FIRST look "stuck on dialing".
+        if _is_decodo:
+            timeout_cfg = httpx.Timeout(12.0, connect=8.0)
+            _probe_attempts = 2
+            _scheme_urls = [server] if server else []
+        else:
+            timeout_cfg = httpx.Timeout(30.0, connect=20.0)
+            _probe_attempts = 3
+            _scheme_urls = _proxy_url_scheme_variants(server)
         _last_probe_err = ""
         if not ok:
-            for attempt in range(3):
-                for _scheme_url in _proxy_url_scheme_variants(server):
+            for attempt in range(_probe_attempts):
+                for _scheme_url in _scheme_urls:
                     try:
                         async with httpx.AsyncClient(
                             proxy=_scheme_url,
@@ -4254,8 +4430,8 @@ async def _probe_proxy_geo(
                 if ok:
                     break
                 # Brief backoff before next attempt
-                if attempt < 2:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                if attempt < (_probe_attempts - 1):
+                    await asyncio.sleep(0.4 if _is_decodo else (1.5 * (attempt + 1)))
         if not ok and _last_probe_err:
             result["probe_error"] = _last_probe_err
         if ok:
@@ -4280,6 +4456,10 @@ async def _probe_proxy_geo(
             result["accept_language"] = lang_map.get(cc, "en-US,en;q=0.9")
             result["locale"] = locale_map.get(cc, "en-US")
             result["ok"] = True
+            try:
+                _heal_california_canada_collision(result)
+            except Exception:
+                pass
             try:
                 result.update(_assess_ip_quality(result))
             except Exception:
@@ -8220,6 +8400,12 @@ async def run_real_user_traffic_job(
         and _has_rotating_gateway
         and not proxyjet_on_demand
     )
+    # One Smartproxy dial at a time per job. Parallel session opens make
+    # Soft Region ignore state (return TX/NY/AZ) and Live Activity sits on
+    # "dialing…" while 50 retries burn with 0 Unique IP.
+    _smartproxy_dial_sem: Optional[asyncio.Semaphore] = (
+        asyncio.Semaphore(1) if _row_first_state_match else None
+    )
     _use_row_first = bool(proxyjet_on_demand or _row_first_state_match)
     _can_retry_offer_block = bool(_use_row_first) or _has_rotating_gateway
     if _has_rotating_gateway:
@@ -9318,11 +9504,20 @@ async def run_real_user_traffic_job(
                     _variant_idx = ((attempt - 1) // _variant_cycle) % max(
                         len(_gw_state_variants), 1
                     )
+                    # Smartproxy Soft Region often misses state under concurrent
+                    # dial load. Attach a major-city token from attempt 1 so the
+                    # first dials are already tight (city-LosAngeles, etc.).
+                    _city_fb = None
+                    if _is_smartproxy_gateway_host(_gw_host):
+                        _city_fb = _SMARTPROXY_STATE_CITY.get(
+                            (row_state_code or "").upper()
+                        )
                     parsed = _build_state_targeted_proxy(
                         _gw_pick,
                         row_state_code or "",
                         _visit_pj_country,
                         state_variant_index=_variant_idx,
+                        city=_city_fb,
                     )
                     if not parsed or not parsed.get("server"):
                         last_reason = "state-targeted gateway build failed"
@@ -9364,16 +9559,40 @@ async def run_real_user_traffic_job(
                 # Don't consume the UA pointer for probes — rewind
                 state["ua_idx"] = max(0, state["ua_idx"] - 1)
                 try:
-                    _geo = await asyncio.wait_for(
-                        _probe_proxy_geo(parsed, _probe_ua, user_id=engine_user_id),
-                        timeout=45.0,
-                    )
+                    async def _do_probe():
+                        return await _probe_proxy_geo(
+                            parsed, _probe_ua, user_id=engine_user_id
+                        )
+
+                    if _smartproxy_dial_sem is not None:
+                        async with _smartproxy_dial_sem:
+                            _geo = await asyncio.wait_for(
+                                _do_probe(),
+                                timeout=18.0 if _row_first_state_match else 45.0,
+                            )
+                        # Brief settle so Soft Region does not thrash sessions.
+                        await asyncio.sleep(0.25)
+                    else:
+                        _geo = await asyncio.wait_for(
+                            _do_probe(),
+                            timeout=18.0 if _row_first_state_match else 45.0,
+                        )
                 except asyncio.TimeoutError:
                     _geo = {
                         "ok": False,
                         "exit_ip": None,
-                        "probe_error": "geo probe timed out after 45s",
+                        "probe_error": (
+                            "geo probe timed out after 18s"
+                            if _row_first_state_match
+                            else "geo probe timed out after 45s"
+                        ),
                     }
+                if _geo.get("ok") and _geo.get("exit_ip") and (attempt <= 5 or attempt % 5 == 0):
+                    push_live_step(
+                        job_id, i + 1, "proxy", "info",
+                        f"Attempt {attempt}/{cap}: unique IP {_geo.get('exit_ip')} · "
+                        f"state={_geo_exit_state_code(_geo) or '?'}",
+                    )
                 if not _geo["ok"] or not _geo.get("exit_ip"):
                     last_reason = (_geo.get("probe_error") or "exit-IP probe failed")[:120]
                     if attempt <= 5 or attempt % 3 == 0:
@@ -9386,15 +9605,19 @@ async def run_real_user_traffic_job(
                     await asyncio.sleep(min(0.25 * attempt, 2.0))
                     continue
                 # Gateway ROW-FIRST: confirm exit-IP state matches the lead.
+                # Unknown/empty region is a MISS (do not accept "any US IP").
                 if _row_first_state_match and row_state_code:
+                    _heal_california_canada_collision(_geo)
                     _exit_st = _geo_exit_state_code(_geo)
-                    if _exit_st and _exit_st != row_state_code:
-                        last_reason = f"exit state {_exit_st} != lead {row_state_code}"
+                    if not _exit_st or _exit_st != row_state_code:
+                        last_reason = (
+                            f"exit state {_exit_st or '?'} != lead {row_state_code}"
+                        )
                         _gw_user = (parsed.get("username") or "")[:72]
                         if attempt <= 5 or attempt % 2 == 0:
                             push_live_step(
                                 job_id, i + 1, "proxy", "info",
-                                f"Attempt {attempt}/{cap}: geo {_exit_st} != {row_state_code}, retrying"
+                                f"Attempt {attempt}/{cap}: geo {_exit_st or '?'} != {row_state_code}, retrying"
                                 + (f" · user={_gw_user}" if _gw_user else ""),
                             )
                         await asyncio.sleep(min(0.2 * attempt, 2.0))

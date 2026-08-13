@@ -496,6 +496,12 @@ jobs:
           VER: ${{ needs.build.outputs.version }}
         run: |
           set -e
+          AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
+          if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
+            echo "::error::Not enough free disk on VPS (<2.5GB). Run safe installer cleanup first."
+            df -h / /opt/krexion/downloads || true
+            exit 1
+          fi
           mkdir -p /opt/krexion/downloads/desktop
           cp -f dist/Krexion-Desktop-Setup-*.exe /opt/krexion/downloads/desktop/ 2>/dev/null || true
           cp -f dist/Krexion-Desktop-Setup-*.exe.blockmap /opt/krexion/downloads/desktop/ 2>/dev/null || true
@@ -508,8 +514,28 @@ jobs:
             NEWEST=$(ls -t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -1)
             [ -n "$NEWEST" ] && cp -f "$NEWEST" "Krexion-Desktop-Setup-latest.exe" || true
           fi
+          # Always-latest download button + auto-update: keep latest.yml
+          # target, *-latest.exe, and last 2 versioned builds; prune rest
+          # so VPS disk never fills again (that blocked mirror before).
+          KEEP_LIST="Krexion-Desktop-Setup-latest.exe latest.yml"
+          if [ -f latest.yml ]; then
+            YML_PATH=$(grep -E '^[[:space:]]*path:' latest.yml | head -1 | sed 's/.*path:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d '\r')
+            [ -n "$YML_PATH" ] && KEEP_LIST="$KEEP_LIST $YML_PATH ${YML_PATH}.blockmap"
+          fi
+          mapfile -t KEEP_VER < <(ls -1t Krexion-Desktop-Setup-*.exe 2>/dev/null | grep -v latest | head -n 2)
+          for f in "${KEEP_VER[@]}"; do KEEP_LIST="$KEEP_LIST $f ${f}.blockmap"; done
+          echo "Keeping desktop assets: $KEEP_LIST"
+          for f in Krexion-Desktop-Setup-*.exe Krexion-Desktop-Setup-*.exe.blockmap; do
+            [ -f "$f" ] || continue
+            keep=0
+            for k in $KEEP_LIST; do [ "$f" = "$k" ] && keep=1 && break; done
+            [ "$f" = "Krexion-Desktop-Setup-latest.exe" ] && keep=1
+            [ "$keep" = "0" ] && rm -f -- "$f" && echo "pruned $f"
+          done
+          test -f Krexion-Desktop-Setup-latest.exe
+          test -f latest.yml
           ls -la
           chmod -R a+r .
-          echo "Self-hosted CDN updated:"
+          echo "Self-hosted CDN updated (always-latest):"
           echo "  https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe"
           echo "  https://krexion.com/downloads/desktop/latest.yml"
