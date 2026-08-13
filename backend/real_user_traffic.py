@@ -9284,6 +9284,7 @@ async def run_real_user_traffic_job(
         _is_tracker_target = (
             _claim_host in _bypass_hosts() or _url_host_matches_bypass(target_url)
         )
+        _t_host = _claim_host or "tracker"
         _claim_offer_url = _underlying_offer_url or str(
             (RUT_JOBS.get(job_id) or {}).get("offer_url_normalized")
             or (RUT_JOBS.get(job_id) or {}).get("offer_url")
@@ -13745,6 +13746,16 @@ async def run_real_user_traffic_job(
         except asyncio.CancelledError:
             was_task_cancelled = True
             raise
+        except Exception as _visit_crash:
+            logger.exception(
+                f"[RUT job={job_id}] visit#{i + 1} crashed after Unique IP: "
+                f"{type(_visit_crash).__name__}: {_visit_crash}"
+            )
+            push_live_step(
+                job_id, i + 1, "browser", "failed",
+                f"Visit crashed before offer open: "
+                f"{type(_visit_crash).__name__}: {str(_visit_crash)[:160]}",
+            )
         finally:
             _mark_attempt_terminal(
                 j,
