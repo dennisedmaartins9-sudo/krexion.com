@@ -26,9 +26,9 @@ def test_jwt_secret_persists_to_file():
         assert (Path(tmp) / "jwt_secret").is_file()
 
 
-def test_tracker_offer_only_prewarm_in_source():
+def test_tracker_prewarm_skips_affiliate_touch():
     src = RUT.read_text(encoding="utf-8")
-    assert "TLS prewarm → offer only (not tracker)" in src
+    assert "TLS prewarm skipped — browser is the sole affiliate click" in src
     assert "_prewarm_url" in src
 
 

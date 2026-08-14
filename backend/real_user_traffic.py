@@ -11275,43 +11275,28 @@ async def run_real_user_traffic_job(
                 # (records a duplicate click). Resolve the OFFER URL
                 # server-side and prewarm THAT so cf_clearance / datadome
                 # cookies seed without touching the tracker.
+                #
+                # v2.6.89 — REGRESSION FIX (Clicks >> Hosts):
+                # prewarm_target() GETs the offer with allow_redirects=True
+                # → Everflow/Voluum counts a FULL click. pass-to-offer +
+                # browser goto was issuing 2-3 document GETs per exit IP
+                # (129 clicks / 14 hosts). Browser navigation (or the
+                # single pass-to-offer S2S resolve + browser goto) must
+                # be the ONLY affiliate touch — skip TLS prewarm entirely
+                # on tracker flows and whenever a click is already committed.
                 _tls_prewarm_effective = bool(tls_prewarm)
+                if _tls_prewarm_effective and (
+                    _is_tracker_target
+                    or _ptro_swapped
+                    or _affiliate_click_fired
+                ):
+                    _tls_prewarm_effective = False
+                    push_live_step(
+                        job_id, i + 1, "browser", "info",
+                        "TLS prewarm skipped — browser is the sole affiliate click "
+                        "touch (prevents Clicks>>Hosts inflation on Everflow/Voluum)",
+                    )
                 _prewarm_url = target_url
-                if _tls_prewarm_effective and _is_tracker_target:
-                    _prewarm_url = ""
-                    if _ptro_swapped and _visit_target_url:
-                        _prewarm_url = _visit_target_url
-                    else:
-                        try:
-                            _resolved_offer_prewarm = await _resolve_tracker_via_localhost(
-                                _visit_target_url or target_url,
-                                geo.get("exit_ip") or "",
-                                ua,
-                                timeout=8.0,
-                                referer=_ua_referer or "",
-                                accept_language=_context_accept_language,
-                                sec_ch_ua_headers={
-                                    k: v for k, v in (_ctx_headers or {}).items()
-                                    if k.lower().startswith("sec-ch-")
-                                },
-                                visit_token=_visit_claim_token,
-                                proxy=_effective_proxy or proxy,
-                            )
-                            if _resolved_offer_prewarm:
-                                _prewarm_url = _resolved_offer_prewarm
-                        except Exception:
-                            pass
-                    if not _prewarm_url:
-                        _tls_prewarm_effective = False
-                        push_live_step(
-                            job_id, i + 1, "browser", "info",
-                            "TLS prewarm skipped — could not resolve offer URL for tracker target",
-                        )
-                    else:
-                        push_live_step(
-                            job_id, i + 1, "browser", "info",
-                            f"TLS prewarm → offer only (not tracker): {_prewarm_url[:80]}",
-                        )
                 if _tls_prewarm_effective and _TLS_AD_OK and _tls_ad is not None:
                     try:
                         _pw_res = await _tls_ad.prewarm_target(

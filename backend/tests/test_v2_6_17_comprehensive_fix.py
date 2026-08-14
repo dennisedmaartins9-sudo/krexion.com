@@ -60,12 +60,13 @@ def test_detectors_accept_http_status_param():
     assert "async def _detect_offer_vpn_block(\n    page:" in src
 
 
-def test_tls_prewarm_offer_only_for_tracker():
-    """v2.6.34 — TLS prewarm hits offer URL only for tracker targets."""
+def test_tls_prewarm_skipped_for_tracker_targets():
+    """v2.6.89 — TLS prewarm must not GET tracker/offer when click is committed."""
     src = RUT_FILE.read_text(encoding="utf-8")
     assert "_tls_prewarm_effective = bool(tls_prewarm)" in src
-    assert "TLS prewarm → offer only (not tracker)" in src
-    assert "_resolved_offer_prewarm = await _resolve_tracker_via_localhost(" in src
+    assert "TLS prewarm skipped — browser is the sole affiliate click" in src
+    assert "_is_tracker_target" in src
+    assert "_affiliate_click_fired" in src
 
 
 def test_persist_burnt_ip_writes_bson_date():
