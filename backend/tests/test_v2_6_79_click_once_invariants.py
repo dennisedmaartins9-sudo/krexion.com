@@ -39,9 +39,13 @@ def test_affiliate_click_fired_set_on_ptro_swap():
     src = _src()
     assert "_affiliate_click_fired = False" in src
     assert "_affiliate_click_fired = True" in src
-    # v2.6.90 — pass-to-offer no longer pre-fires; browser goto sets flag.
-    goto = src.index("if _is_tracker_target and not _ptro_swapped and not _affiliate_click_fired:")
-    assert "_affiliate_click_fired = True" in src[goto : goto + 200]
+    # v2.6.92 — flag set only AFTER successful page.goto (not before).
+    goto = src.index("resp = await page.goto(_visit_target_url, timeout=35000")
+    before = src[goto - 400 : goto]
+    after = src[goto : goto + 900]
+    assert "_affiliate_click_fired = True" not in before
+    assert "_affiliate_click_fired = True" in after
+    assert "only AFTER a successful" in after
 
 
 def test_tunnel_retry_blocked_after_tracker_click():

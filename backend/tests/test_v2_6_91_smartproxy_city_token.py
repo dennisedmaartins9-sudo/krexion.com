@@ -40,6 +40,7 @@ def test_apply_targeting_username_has_correct_city_token():
     assert "_city-Losangeles" not in user
 
 
-def test_version_is_2_6_91():
+def test_version_at_least_2_6_91():
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.91"
+    parts = [int(x) for x in version.split(".")]
+    assert parts >= [2, 6, 91]

@@ -50,6 +50,7 @@ def test_tls_prewarm_skipped_when_skip_duplicate_ip():
     assert "_referer_cfg.get(\"pass_to_offer\")" in chunk
 
 
-def test_version_is_2_6_90():
+def test_version_at_least_2_6_90():
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.90"
+    parts = [int(x) for x in version.split(".")]
+    assert parts >= [2, 6, 90]

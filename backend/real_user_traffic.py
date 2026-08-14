@@ -4391,7 +4391,11 @@ async def _probe_proxy_geo(
         # http-only scheme. These gateways answer in ~1–3s when healthy;
         # long CONNECT timeouts made ROW-FIRST look "stuck on dialing".
         if _is_decodo:
-            timeout_cfg = httpx.Timeout(12.0, connect=8.0)
+            # Keep the whole probe under the 28s wait_for in ROW-FIRST.
+            # Sequential decodo+ipwho+ipapi at 12s each used to exceed
+            # that budget → "geo probe timed out after 28s" even when
+            # the gateway was healthy.
+            timeout_cfg = httpx.Timeout(8.0, connect=5.0)
             _probe_attempts = 2
             _scheme_urls = [server] if server else []
         else:
@@ -4413,12 +4417,14 @@ async def _probe_proxy_geo(
                             ok = False
                             if _is_decodo:
                                 ok = await _try_decodo_ip(cli)
-                            if not ok:
+                                if not ok:
+                                    ok = await _try_minimal_ip(cli)
+                            else:
                                 ok = await _try_https_ipwhois(cli)
-                            if not ok:
-                                ok = await _try_http_ipapi(cli)
-                            if not ok:
-                                ok = await _try_minimal_ip(cli)
+                                if not ok:
+                                    ok = await _try_http_ipapi(cli)
+                                if not ok:
+                                    ok = await _try_minimal_ip(cli)
                         if ok:
                             break
                         _last_probe_err = "geo endpoints returned no IP"
@@ -9646,6 +9652,16 @@ async def run_real_user_traffic_job(
                         )
                     continue
                 exit_ip = _geo["exit_ip"]
+                # ipapi/IPQS routinely score Smartproxy IPv6 as 100.
+                # Prefer IPv4 so skip_vpn does not burn the visit.
+                if ":" in str(exit_ip or ""):
+                    last_reason = f"IPv6 exit {exit_ip} — retrying for IPv4"
+                    if attempt <= 5 or attempt % 5 == 0:
+                        push_live_step(
+                            job_id, i + 1, "proxy", "info",
+                            f"Attempt {attempt}/{cap}: {last_reason}",
+                        )
+                    continue
                 if skip_duplicate_ip and duplicate_ip_set and exit_ip in duplicate_ip_set:
                     last_reason = f"duplicate IP {exit_ip}"
                     # Don't log every single duplicate — too chatty. Log
@@ -11404,11 +11420,6 @@ async def run_real_user_traffic_job(
                         # response received) instead of full DOM — many
                         # transient tunnel hiccups resolve mid-flight.
                         _wait_until = "commit" if same_proxy_retry > 0 else "domcontentloaded"
-                        # v2.6.79 — legacy browser→tracker path: the outgoing
-                        # HTTP GET registers the affiliate click; never rotate
-                        # proxy and hit the tracker again on tunnel retry.
-                        if _is_tracker_target and not _ptro_swapped and not _affiliate_click_fired:
-                            _affiliate_click_fired = True
                         # 2026-06-12 (referrer header fix): explicit
                         # `referer=` kwarg — Chromium ignores
                         # extra_http_headers["Referer"] on the first
@@ -11416,6 +11427,12 @@ async def run_real_user_traffic_job(
                         # to make the target see the configured referer
                         # (TikTok / custom URL / platform pool / …).
                         resp = await page.goto(_visit_target_url, timeout=35000, wait_until=_wait_until, **_goto_referer_kw)
+                        # v2.6.92 — mark click fired only AFTER a successful
+                        # goto. Setting this before goto blocked tunnel
+                        # retries (0 rotations) when Smartproxy never reached
+                        # krexion.com — the tracker was never hit.
+                        if _is_tracker_target and not _ptro_swapped:
+                            _affiliate_click_fired = True
                         goto_exc = None
                         break
                     except Exception as _ge:
