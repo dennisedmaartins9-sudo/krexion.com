@@ -419,7 +419,7 @@ def _apply_smartproxy_smart_targeting(
             parts.append(f"_state-{token}")
     city_val = targeting.get("city")
     if city_val:
-        parts.append(f"_city-{_state_pascal(str(city_val)) or str(city_val).replace(' ', '')}")
+        parts.append(f"_city-{_format_smartproxy_city(str(city_val))}")
     life = targeting.get("sticky_minutes")
     if not life:
         life = _extract_smartproxy_life_minutes(original_username or username_base)
@@ -798,6 +798,24 @@ def _state_pascal(val: str) -> str:
     if not slug:
         return ""
     return "".join(part.capitalize() for part in slug.split("_") if part)
+
+
+def _format_smartproxy_city(val: str) -> str:
+    """Smartproxy panel city token — LosAngeles / NewYork / LasVegas.
+
+    v2.6.91 fix: ``_state_pascal("LosAngeles")`` wrongly became ``Losangeles``
+    (only first letter capped), which makes the gateway hang until geo probe
+    times out for every customer on ROW-FIRST state match.
+    """
+    v = str(val or "").strip()
+    if not v:
+        return ""
+    if " " in v:
+        return "".join(part.capitalize() for part in v.split() if part)
+    # Already compact PascalCase (LosAngeles, KansasCity, VirginiaBeach, …).
+    if len(v) > 1 and v[0].isupper() and any(ch.isupper() for ch in v[1:]):
+        return v
+    return _state_pascal(v) or v.replace(" ", "")
 
 
 def _state_code(val: str) -> str:

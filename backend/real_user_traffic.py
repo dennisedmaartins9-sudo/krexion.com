@@ -9522,6 +9522,9 @@ async def run_real_user_traffic_job(
                         _city_fb = _SMARTPROXY_STATE_CITY.get(
                             (row_state_code or "").upper()
                         )
+                        # Relax to state-only after repeated probe timeouts.
+                        if attempt > 15:
+                            _city_fb = None
                     parsed = _build_state_targeted_proxy(
                         _gw_pick,
                         row_state_code or "",
@@ -9578,21 +9581,21 @@ async def run_real_user_traffic_job(
                         async with _smartproxy_dial_sem:
                             _geo = await asyncio.wait_for(
                                 _do_probe(),
-                                timeout=18.0 if _row_first_state_match else 45.0,
+                                timeout=28.0 if _row_first_state_match else 45.0,
                             )
                         # Brief settle so Soft Region does not thrash sessions.
                         await asyncio.sleep(0.25)
                     else:
                         _geo = await asyncio.wait_for(
                             _do_probe(),
-                            timeout=18.0 if _row_first_state_match else 45.0,
+                            timeout=28.0 if _row_first_state_match else 45.0,
                         )
                 except asyncio.TimeoutError:
                     _geo = {
                         "ok": False,
                         "exit_ip": None,
                         "probe_error": (
-                            "geo probe timed out after 18s"
+                            "geo probe timed out after 28s"
                             if _row_first_state_match
                             else "geo probe timed out after 45s"
                         ),

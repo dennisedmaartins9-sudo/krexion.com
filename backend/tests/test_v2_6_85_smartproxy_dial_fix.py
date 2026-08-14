@@ -87,7 +87,7 @@ def test_smartproxy_city_token_from_attempt_one_in_source():
     assert "_SMARTPROXY_STATE_CITY" in src
     assert "_smartproxy_dial_sem" in src
     assert "city-LosAngeles" in src or '"LosAngeles"' in src
-    assert "geo probe timed out after 18s" in src
+    assert "geo probe timed out after 28s" in src
     assert "not _is_decodo" in src  # skip TLS path for Smartproxy
     assert "_apply_decodo_geo_payload" in src
 
