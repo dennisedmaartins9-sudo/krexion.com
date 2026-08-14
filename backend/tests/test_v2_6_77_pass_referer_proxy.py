@@ -65,12 +65,13 @@ def test_tls_resolve_redirect_accepts_proxy():
     assert "proxy" in params
 
 
-def test_pass_to_offer_call_passes_visit_proxy():
+def test_pass_to_offer_bypass_still_uses_proxy_resolve():
+    """Emergency bypass when proxy cannot reach own tracker — not main path."""
     src = _rut_source()
-    assert "proxy=_effective_proxy or proxy," in src
     assert "allow_direct_xff=True," in src
     assert "proxy: Optional[Dict[str, Any]] = None," in src
     assert "allow_direct_xff: bool = False," in src
+    assert "Proxy can't reach your own tracker" in src
 
 
 def test_external_tracker_does_not_fallback_to_pc_xff():

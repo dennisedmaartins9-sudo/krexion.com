@@ -14,7 +14,7 @@ def _src() -> str:
 
 def test_tls_prewarm_skipped_for_tracker_and_ptro():
     src = _src()
-    idx = src.index("v2.6.89 — REGRESSION FIX (Clicks >> Hosts)")
+    idx = src.index("v2.6.89/90 — REGRESSION FIX")
     chunk = src[idx : idx + 2200]
     assert "_tls_prewarm_effective = bool(tls_prewarm)" in chunk
     assert "_is_tracker_target" in chunk
@@ -31,6 +31,7 @@ def test_no_offer_prewarm_resolve_after_v289():
     assert "TLS prewarm → offer only (not tracker)" not in src
 
 
-def test_version_is_2_6_89():
+def test_version_at_least_2_6_89():
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.89"
+    parts = [int(x) for x in version.split(".")]
+    assert parts >= [2, 6, 89]

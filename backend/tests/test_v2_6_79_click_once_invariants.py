@@ -38,10 +38,10 @@ def test_pick_next_proxy_rotates_gateway_session():
 def test_affiliate_click_fired_set_on_ptro_swap():
     src = _src()
     assert "_affiliate_click_fired = False" in src
-    assert "_ptro_swapped = True" in src
     assert "_affiliate_click_fired = True" in src
-    ptro = src.index("_ptro_swapped = True")
-    assert "_affiliate_click_fired = True" in src[ptro : ptro + 120]
+    # v2.6.90 — pass-to-offer no longer pre-fires; browser goto sets flag.
+    goto = src.index("if _is_tracker_target and not _ptro_swapped and not _affiliate_click_fired:")
+    assert "_affiliate_click_fired = True" in src[goto : goto + 200]
 
 
 def test_tunnel_retry_blocked_after_tracker_click():

@@ -7973,8 +7973,10 @@ async def run_real_user_traffic_job(
     # cookies (cf_clearance, datadome, …) into the Playwright context.
     # Bypass-rate on Cloudflare BM / DataDome / Akamai BM protected
     # offers: ~50% → ~75-80% on the very first navigation.
-    # v2.6.35: default ON (production anti-detect baseline).
-    tls_prewarm: bool = True,
+    # v2.6.90: default OFF — prewarm GETs the target and duplicates
+    # affiliate Clicks on Everflow/Voluum (Clicks >> Hosts). Enable
+    # only for direct non-tracker offers without skip_duplicate_ip.
+    tls_prewarm: bool = False,
     # ── 2026-02 v2.1.31 — Step 3: Multi-Hop Proxy Chains ─────────────
     # When True, every visit's proxy is wrapped through a local HTTP
     # CONNECT relay that internally chains Tor (first hop) → exit
@@ -8052,11 +8054,10 @@ async def run_real_user_traffic_job(
     referer_traffic_type: str = "auto",
     referer_campaign_type: str = "auto",
     # ── 2026-01: PASS-REFERER-TO-OFFER ───────────────────────────────
-    # When True, the bot RESOLVES the tracker through the visit's
-    # residential proxy (unique TCP exit IP for affiliate Hosts),
-    # then navigates Chromium DIRECTLY to the offer with the chosen
-    # Referer. Offer sees TikTok/custom Referer instead of Krexion
-    # origin. Default OFF — fully backwards-compatible.
+    # v2.6.90 — browser-only single click: Playwright page.goto hits
+    # the tracker URL once with the chosen Referer (TikTok/custom).
+    # NO server-side tracker/affiliate GET before browser — that path
+    # duplicated Everflow clicks (Clicks >> Hosts). Default OFF.
     referer_pass_to_offer: bool = False,
     # ── 2026-06-14: UA ↔ Referer consistency coercion ──────────────
     # When True (default for new jobs), the engine coerces the per-visit
@@ -8189,6 +8190,7 @@ async def run_real_user_traffic_job(
             # is an instant fraud tell on Anura/IPQS/Voluum.
             skip_vpn = True
             skip_duplicate_ip = True
+            tls_prewarm = False
             # Replace desktop UAs with mobile UAs (only mobile UAs
             # can be coerced with in-app markers — desktop UAs are
             # left unchanged by coerce_ua_for_platform by design).
@@ -8207,7 +8209,8 @@ async def run_real_user_traffic_job(
                 push_live_step(
                     job_id, 0, "preset", "info",
                     f"⚡ Strict Mode auto-enforced by preset: "
-                    f"skip_vpn=ON · skip_duplicate_ip=ON · match_ua_to_referer=ON · "
+                    f"skip_vpn=ON · skip_duplicate_ip=ON · tls_prewarm=OFF · "
+                    f"browser-only 1 click · match_ua_to_referer=ON · "
                     f"pass_referer_to_offer=ON · foreign_inapp_markers=STRIPPED · "
                     f"datacenter_isp_blocklist=ACTIVE"
                 )
@@ -8238,6 +8241,11 @@ async def run_real_user_traffic_job(
         # Custom URL only meaningful when override is enabled; otherwise
         # the resolver short-circuits to legacy UA-derived Referer.
         referer_override_enabled = True
+
+    # v2.6.90 — strict single-click: never TLS-prewarm affiliate/tracker
+    # targets when duplicate-IP guard or pass-to-offer referer mode is on.
+    if skip_duplicate_ip or referer_pass_to_offer:
+        tls_prewarm = False
 
     # ── 2026-02 v2.6.11 PRESET SAFETY NET ────────────────────────────
     # Customer report: "TikTok in app browser select kia th … kisi pr
@@ -8297,8 +8305,8 @@ async def run_real_user_traffic_job(
         "traffic_type": (referer_traffic_type or "auto").strip().lower(),
         "campaign_type": (referer_campaign_type or "auto").strip().lower(),
         "target_url": target_url or "",
-        # 2026-01 — Pass-Referer-To-Offer (server-side tracker resolve +
-        # direct offer navigation so the chosen Referer reaches the offer).
+        # 2026-01 / v2.6.90 — Pass-Referer-To-Offer: Referer on the
+        # single browser goto only (no S2S pre-resolve).
         "pass_to_offer": bool(referer_pass_to_offer),
         # 2026-06-14 — UA ↔ Referer coercion toggle (anti-fraud).
         "match_ua_to_platform": bool(referer_match_ua_to_platform),
@@ -10011,10 +10019,11 @@ async def run_real_user_traffic_job(
         # — those flows don't have a redirect chain, so the reachability
         # probe IS the first hit anyway (equivalent to the browser
         # goto), no duplicate risk.
-        if _is_tracker_target:
+        if _is_tracker_target or _referer_cfg.get("pass_to_offer") or skip_duplicate_ip:
             push_live_step(
                 job_id, i + 1, "filter", "info",
-                f"Tracker target detected ({_t_host}) — skipping pre-flight reachability probe to avoid duplicate-IP burn",
+                f"Single-click mode — skipping pre-flight reachability probe "
+                f"(tracker={_is_tracker_target} · no duplicate offer touch before browser goto)",
             )
         else:
             # Non-tracker direct offer URL — probe once via httpx.
@@ -10835,104 +10844,27 @@ async def run_real_user_traffic_job(
                 except Exception:
                     pass
                 try:
-                    # BUG #9 fix (2026-07): removed `_ua_referer` guard so
-                    # pass-to-offer also works with "direct" (blank
-                    # Referer) mode. Without this, operators who
-                    # explicitly wanted to hide the Krexion origin via
-                    # pass-to-offer but chose a direct-navigation ref
-                    # got a silent no-op — the offer still saw the
-                    # tracker URL as origin via the 302 hop. Now the
-                    # server-side tracker resolve fires regardless;
-                    # when Referer is blank we forward it as blank
-                    # (real "direct" browser navigation) which the
-                    # offer records as "direct traffic" — exactly what
-                    # the operator asked for.
-                    if (
-                        _referer_cfg.get("pass_to_offer")
-                        and _visit_target_url
-                    ):
-                        _resolved_offer_direct = await _resolve_tracker_via_localhost(
-                            _visit_target_url,
-                            geo.get("exit_ip") or "",
-                            ua,
-                            timeout=8.0,
-                            # 2026-06-14: forward the FULL realistic envelope
-                            # (Referer + Accept-Language + Sec-CH-UA-*) so the
-                            # tracker log + any S2S postback to the offer
-                            # carries exactly what the browser would send on
-                            # its actual navigation. Eliminates the "empty
-                            # UA / empty browser" bot-tell on offer dashboard.
-                            referer=_ua_referer or "",
-                            accept_language=_context_accept_language,
-                            sec_ch_ua_headers={
-                                k: v for k, v in _ctx_headers.items()
-                                if k.lower().startswith("sec-ch-")
-                            },
-                            visit_token=_visit_claim_token,
-                            proxy=_effective_proxy or proxy,
-                        )
-                        if _resolved_offer_direct:
-                            _visit_target_url = _resolved_offer_direct
-                            entry["_tracker_click_id"] = _click_id_from_resolved_url(
-                                _resolved_offer_direct
+                    # v2.6.90 — SINGLE CLICK (Clicks == Hosts):
+                    # pass_to_offer means Referer on the ONE browser goto —
+                    # never server-side GET tracker/affiliate/offer first.
+                    # (Old path: _resolve_tracker_via_localhost + browser goto
+                    # Everflow = 2+ affiliate clicks per exit IP.)
+                    if _referer_cfg.get("pass_to_offer") and _visit_target_url:
+                        try:
+                            push_live_step(
+                                job_id, i + 1, "referer",
+                                "info",
+                                f"Pass-Referer-To-Offer · browser-only 1 click · "
+                                f"Referer={(_ua_referer or 'direct')[:80]}",
                             )
-                            _ptro_swapped = True
-                            _affiliate_click_fired = True
-                            # ── 2026-06-15 (anti-tracker-leak): Now that
-                            # we know the FINAL offer URL, rebuild the
-                            # browser's outbound Referer so its embedded
-                            # `u=` / `url=` param wraps the OFFER URL
-                            # instead of the krexion tracker URL. Without
-                            # this, advertiser-side dashboards (Anura /
-                            # IPQS / Forensiq / Voluum click-fingerprint)
-                            # decode the wrapper's `u=` param, see the
-                            # tracker domain literally inside the Referer,
-                            # and cluster the click as "redirected
-                            # affiliate" rather than "direct social ad".
-                            # Real Facebook ads carry the AD's destination
-                            # URL inside `u=` — the offer landing page,
-                            # not any intermediate tracker. We now match
-                            # that exact behaviour. Safe under every
-                            # edge: rebuild_referer_with_target() returns
-                            # the original unchanged when the Referer is
-                            # not a recognised social link-shim (search,
-                            # direct, etc. all pass through).
-                            try:
-                                from referrer_pro import rebuild_referer_with_target as _rebuild_ref
-                                _new_referer = _rebuild_ref(_ua_referer, _resolved_offer_direct)
-                                if _new_referer and _new_referer != _ua_referer:
-                                    _ua_referer = _new_referer
-                                    # Propagate to BOTH downstream
-                                    # consumers so every navigation on
-                                    # this page (initial goto, AJAX
-                                    # follow-ups, frame loads) sees the
-                                    # offer-URL-wrapped Referer instead
-                                    # of the tracker-wrapped one.
-                                    _goto_referer_kw = {"referer": _ua_referer}
-                                    _ctx_headers["Referer"] = _ua_referer
-                            except Exception as _rb_e:
-                                # Never break the visit — leak protection
-                                # is additive. Log at debug only.
-                                try:
-                                    logger.debug(
-                                        f"rebuild_referer_with_target skipped: {_rb_e}"
-                                    )
-                                except Exception:
-                                    pass
-                            try:
-                                push_live_step(
-                                    job_id, i + 1, "referer",
-                                    "info",
-                                    f"Pass-Referer-To-Offer: tracker via unique proxy IP, browser → offer with Referer={_ua_referer[:80]}",
-                                )
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
                 except Exception as _ptro_e:
                     try:
                         push_live_step(
                             job_id, i + 1, "referer",
                             "warn",
-                            f"Pass-Referer-To-Offer fallback (legacy path): {str(_ptro_e)[:120]}",
+                            f"Pass-Referer-To-Offer setup: {str(_ptro_e)[:120]}",
                         )
                     except Exception:
                         pass
@@ -11276,19 +11208,17 @@ async def run_real_user_traffic_job(
                 # server-side and prewarm THAT so cf_clearance / datadome
                 # cookies seed without touching the tracker.
                 #
-                # v2.6.89 — REGRESSION FIX (Clicks >> Hosts):
+                # v2.6.89/90 — REGRESSION FIX (Clicks >> Hosts):
                 # prewarm_target() GETs the offer with allow_redirects=True
-                # → Everflow/Voluum counts a FULL click. pass-to-offer +
-                # browser goto was issuing 2-3 document GETs per exit IP
-                # (129 clicks / 14 hosts). Browser navigation (or the
-                # single pass-to-offer S2S resolve + browser goto) must
-                # be the ONLY affiliate touch — skip TLS prewarm entirely
-                # on tracker flows and whenever a click is already committed.
+                # → Everflow/Voluum counts a FULL click. Only the browser's
+                # single page.goto may touch tracker/affiliate/offer URLs.
                 _tls_prewarm_effective = bool(tls_prewarm)
                 if _tls_prewarm_effective and (
                     _is_tracker_target
                     or _ptro_swapped
                     or _affiliate_click_fired
+                    or skip_duplicate_ip
+                    or _referer_cfg.get("pass_to_offer")
                 ):
                     _tls_prewarm_effective = False
                     push_live_step(
