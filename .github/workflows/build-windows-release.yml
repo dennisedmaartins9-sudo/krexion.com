@@ -162,47 +162,26 @@ jobs:
       # Self-hosted Windows runner is rate-limited on codeload.github.com
       # (HTTP 429) when GitHub Actions tries to download marketplace
       # action zips at "Set up job". This job must use ZERO `uses:`
-      # steps — git checkout, local disk cache, and system/python.org
-      # Python only. pip cache already persists on the runner disk.
-      - name: Ensure Python 3.11
+      # steps. Host python only runs build-backend.py; that script
+      # downloads its own embeddable CPython 3.11. pip cache already
+      # persists on the runner disk.
+      - name: Resolve host Python
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          function Find-Python311 {
-            try {
-              $exe = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
-              if ($exe -and (Test-Path $exe.Trim())) { return $exe.Trim() }
-            } catch {}
-            $roots = @(
-              'C:\krexion-ci-cache\python311\python.exe',
-              'C:\Python311\python.exe',
-              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-              'C:\Program Files\Python311\python.exe'
-            )
-            foreach ($p in $roots) { if (Test-Path $p) { return $p } }
-            foreach ($root in @('C:\actions-runner\_work\_tool\Python', 'C:\hostedtoolcache\windows\Python')) {
-              if (-not (Test-Path $root)) { continue }
-              $hit = Get-ChildItem $root -Filter python.exe -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '\\3\.11' } | Select-Object -First 1
-              if ($hit) { return $hit.FullName }
-            }
-            return $null
-          }
-          $py = Find-Python311
+          $py = $null
+          $cmd = Get-Command python -ErrorAction SilentlyContinue
+          if ($cmd) { $py = $cmd.Source }
           if (-not $py) {
-            $inst = Join-Path $env:TEMP 'python-3.11.9-amd64.exe'
-            Write-Host "Python 3.11 not found — downloading python.org installer"
-            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe' -OutFile $inst -UseBasicParsing -TimeoutSec 180
-            $target = 'C:\krexion-ci-cache\python311'
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-            Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","TargetDir=$target","Include_pip=1","Include_launcher=1" -Wait
-            $py = Join-Path $target 'python.exe'
-            if (-not (Test-Path $py)) { throw "Python 3.11 install finished but $py is missing" }
+            foreach ($p in @('C:\Python314\python.exe','C:\Python311\python.exe','C:\Python312\python.exe')) {
+              if (Test-Path $p) { $py = $p; break }
+            }
           }
-          Write-Host "Using Python 3.11: $py"
+          if (-not $py) { throw 'python.exe not found on the Windows runner PATH' }
+          Write-Host "Host python: $py"
           & $py -c "import sys; print(sys.version)"
           Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $py -Parent)
-          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_PYTHON=$py"
+          Add-Content -Path $env:GITHUB_ENV -Value ('KREXION_PYTHON=' + $py)
 
       - name: Restore local FAST BUILD cache
         shell: powershell
@@ -216,7 +195,7 @@ jobs:
           }
           $hash = ([BitConverter]::ToString($sha.ComputeHash($ms.ToArray()))).Replace('-','').ToLower().Substring(0,16)
           $cache = "C:\krexion-ci-cache\deps-v1-$hash"
-          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_DEPS_CACHE=$cache"
+          Add-Content -Path $env:GITHUB_ENV -Value ('KREXION_DEPS_CACHE=' + $cache)
           $core = Join-Path $cache 'krexion-backend.dist\krexion-core.exe'
           if (Test-Path $core) {
             New-Item -ItemType Directory -Force -Path build\dist | Out-Null
@@ -376,7 +355,7 @@ jobs:
           $src = "C:\krexion-ci-cache\runs\$env:GITHUB_RUN_ID\krexion-backend.dist"
           $core = Join-Path $src 'krexion-core.exe'
           if (-not (Test-Path $core)) {
-            throw "Backend handoff missing at $src — build-backend job must copy krexion-backend.dist there"
+            throw "Backend handoff missing at $src"
           }
           New-Item -ItemType Directory -Force -Path build\dist | Out-Null
           $dest = 'build\dist\krexion-backend.dist'
@@ -400,7 +379,7 @@ jobs:
           $arts = Invoke-RestMethod -Uri $uri -Headers $headers
           $art = $arts.artifacts | Where-Object { $_.name -eq 'krexion-frontend-build' -and -not $_.expired } | Select-Object -First 1
           if (-not $art) {
-            Write-Host "No krexion-frontend-build artifact on this run — local rebuild fallback will run"
+            Write-Host "No krexion-frontend-build artifact on this run; local rebuild fallback will run"
             exit 0
           }
           $zip = Join-Path $env:TEMP 'krexion-frontend-build.zip'
@@ -415,48 +394,8 @@ jobs:
           if (Test-Path "$dest\index.html") {
             Write-Host "Frontend artifact extracted to $dest"
           } else {
-            Write-Host "Frontend zip extracted but index.html missing — local rebuild fallback will run"
+            Write-Host "Frontend zip extracted but index.html missing; local rebuild fallback will run"
           }
-
-      - name: Ensure Python 3.11 (Playwright greenlet wheels)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          function Find-Python311 {
-            try {
-              $exe = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
-              if ($exe -and (Test-Path $exe.Trim())) { return $exe.Trim() }
-            } catch {}
-            $roots = @(
-              'C:\krexion-ci-cache\python311\python.exe',
-              'C:\Python311\python.exe',
-              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-              'C:\Program Files\Python311\python.exe'
-            )
-            foreach ($p in $roots) { if (Test-Path $p) { return $p } }
-            foreach ($root in @('C:\actions-runner\_work\_tool\Python', 'C:\hostedtoolcache\windows\Python')) {
-              if (-not (Test-Path $root)) { continue }
-              $hit = Get-ChildItem $root -Filter python.exe -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '\\3\.11' } | Select-Object -First 1
-              if ($hit) { return $hit.FullName }
-            }
-            return $null
-          }
-          $py = Find-Python311
-          if (-not $py) {
-            $inst = Join-Path $env:TEMP 'python-3.11.9-amd64.exe'
-            Write-Host "Python 3.11 not found — downloading python.org installer"
-            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe' -OutFile $inst -UseBasicParsing -TimeoutSec 180
-            $target = 'C:\krexion-ci-cache\python311'
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-            Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","TargetDir=$target","Include_pip=1","Include_launcher=1" -Wait
-            $py = Join-Path $target 'python.exe'
-            if (-not (Test-Path $py)) { throw "Python 3.11 install finished but $py is missing" }
-          }
-          Write-Host "Using Python 3.11: $py"
-          & $py -c "import sys; print(sys.version)"
-          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $py -Parent)
-          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_PYTHON=$py"
 
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
@@ -647,9 +586,9 @@ jobs:
           # picks up via the `..\build\chromium-bundle\*` Source line.
           $env:PLAYWRIGHT_BROWSERS_PATH = "$PWD\build\chromium-bundle"
           New-Item -ItemType Directory -Force -Path $env:PLAYWRIGHT_BROWSERS_PATH | Out-Null
-          $py = $env:KREXION_PYTHON
-          if (-not $py) { $py = 'python' }
-          Write-Host "Installing Playwright + downloading Chromium to $env:PLAYWRIGHT_BROWSERS_PATH using $py"
+          $py = Join-Path $PWD 'build\dist\krexion-backend.dist\krexion-core.exe'
+          if (-not (Test-Path $py)) { throw "krexion-core.exe missing; cannot install Playwright Chromium" }
+          Write-Host "Installing Playwright Chromium with bundled $py"
           & $py -m pip install --upgrade pip
           & $py -m pip install playwright==1.49.1
           # Both chromium (full) and chromium-headless-shell (smaller,
