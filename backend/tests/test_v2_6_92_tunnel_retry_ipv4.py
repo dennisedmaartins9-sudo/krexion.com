@@ -31,6 +31,7 @@ def test_decodo_geo_probe_uses_short_timeout():
     assert "Keep the whole probe under the 28s wait_for" in src
 
 
-def test_version_is_2_6_92():
+def test_version_at_least_2_6_92():
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.92"
+    parts = [int(x) for x in version.split(".")]
+    assert parts >= [2, 6, 92]

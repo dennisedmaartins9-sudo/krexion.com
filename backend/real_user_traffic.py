@@ -7296,6 +7296,44 @@ def _url_host_matches_bypass(url: str) -> bool:
     return False
 
 
+def _url_is_affiliate_click_target(url: str) -> bool:
+    """True for Krexion tracker + common affiliate click URLs (Affise, Everflow).
+
+    One document GET per exit IP — extra retries/pixels inflate Clicks vs Hosts.
+    """
+    if not url:
+        return False
+    if _url_host_matches_bypass(url):
+        return True
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(str(url).strip())
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    for marker in (
+        "affise.com",
+        "everflowclient.io",
+        "eflow.team",
+        "go2cloud.org",
+        "voluumtrk",
+        "voluum.com",
+        "redtrack.io",
+        "clickflare.com",
+        "trackier.com",
+        "traxun",
+    ):
+        if marker in host:
+            return True
+    for marker in ("/aff_c", "/aff_click", "/click.php"):
+        if marker in path:
+            return True
+    return False
+
+
 async def _get_exit_ip_via_proxy(
     proxy: Dict[str, Any], timeout: float = 10.0
 ) -> Optional[str]:
@@ -10812,6 +10850,11 @@ async def run_real_user_traffic_job(
                 # SAFETY: if proxy resolve fails we silently fall back to
                 # the legacy browser→tracker path (still unique proxy IP).
                 _ptro_swapped = False
+                _click_once_nav = bool(
+                    _is_tracker_target
+                    or _url_is_affiliate_click_target(target_url)
+                    or _url_is_affiliate_click_target(_visit_target_url)
+                )
                 # ── 2026-06-15 (UA-leak defence): hard sanity guard on
                 # `ua`. Any UA shorter than 50 chars, or a literal "."
                 # (which has shown up on advertiser dashboards as the
@@ -11431,7 +11474,7 @@ async def run_real_user_traffic_job(
                         # goto. Setting this before goto blocked tunnel
                         # retries (0 rotations) when Smartproxy never reached
                         # krexion.com — the tracker was never hit.
-                        if _is_tracker_target and not _ptro_swapped:
+                        if _click_once_nav and not _ptro_swapped:
                             _affiliate_click_fired = True
                         goto_exc = None
                         break
@@ -11500,6 +11543,16 @@ async def run_real_user_traffic_job(
                                 resp = None
                                 goto_exc = None
                                 break
+                            # v2.6.93 — ERR_ABORTED on a click URL already
+                            # sent the document GET (Affise counted it).
+                            # A commit-retry would be click #2 on the same IP.
+                            if _click_once_nav:
+                                _affiliate_click_fired = True
+                                push_live_step(
+                                    job_id, i + 1, "browser", "info",
+                                    "ERR_ABORTED on click URL — not retrying goto (1 click / 1 host)",
+                                )
+                                break
                             # Genuine failure — URL is blank or chrome-
                             # error page. Retry once with wait_until=
                             # "commit" (server-response only, no DOM-load
@@ -11508,7 +11561,7 @@ async def run_real_user_traffic_job(
                                 _wait_until != "commit"
                                 and not (
                                     _affiliate_click_fired
-                                    and _is_tracker_target
+                                    and _click_once_nav
                                     and not _ptro_swapped
                                 )
                             ):
@@ -11547,7 +11600,7 @@ async def run_real_user_traffic_job(
                         # would register a second affiliate click.
                         if (
                             _affiliate_click_fired
-                            and _is_tracker_target
+                            and _click_once_nav
                             and not _ptro_swapped
                         ):
                             break
@@ -12009,21 +12062,11 @@ async def run_real_user_traffic_job(
                 await _human_warmup(page, fp, paranoia=bool(behavioral_bio_enabled))
 
                 if follow_redirect:
-                    # v2.6.79 — after pass-to-offer the browser is on the offer
-                    # domain; avoid networkidle waits that can pull tracker pixels.
-                    _fr_wait = True
-                    if _ptro_swapped and _visit_target_url:
-                        try:
-                            from urllib.parse import urlparse as _fr_up
-                            _fr_offer_host = (_fr_up(_visit_target_url).netloc or "").lower()
-                            _fr_cur_host = (_fr_up(page.url or "").netloc or "").lower()
-                            _fr_wait = bool(
-                                _fr_offer_host
-                                and _fr_cur_host
-                                and _fr_cur_host == _fr_offer_host
-                            )
-                        except Exception:
-                            _fr_wait = True
+                    # v2.6.93 — never networkidle on click-once flows:
+                    # landing pixels re-hit Affise/Everflow on the same IP.
+                    _fr_wait = not bool(
+                        _click_once_nav or _ptro_swapped or _affiliate_click_fired
+                    )
                     if _fr_wait:
                         try:
                             await page.wait_for_load_state("networkidle", timeout=4000)
@@ -12933,20 +12976,35 @@ async def run_real_user_traffic_job(
                             tried_row_ids.append(row_index)
                             retry_attempt += 1
 
-                            # Reload form page so invalid state is cleared
+                            # Reload the OFFER page only — never re-open the
+                            # tracker URL (that would be a second Affise click
+                            # on the same exit IP).
                             try:
-                                # 2026-06-12 (referrer fix): pass the
-                                # configured referer on the form-reload
-                                # too so retried leads still arrive with
-                                # the right Referer header.
-                                await page.goto(_visit_target_url, timeout=90000,
-                                                wait_until="domcontentloaded",
-                                                **_goto_referer_kw)
-                                await page.wait_for_timeout(700 + random.randint(0, 500))
+                                _reload_url = ""
                                 try:
-                                    await page.wait_for_load_state("networkidle", timeout=15000)
+                                    _reload_url = (page.url or "").strip()
                                 except Exception:
-                                    pass
+                                    _reload_url = ""
+                                _on_click_url = bool(
+                                    _url_host_matches_bypass(_reload_url)
+                                    or _url_is_affiliate_click_target(_reload_url)
+                                )
+                                if (
+                                    _reload_url
+                                    and _reload_url != "about:blank"
+                                    and not _reload_url.startswith("chrome-error://")
+                                    and not _on_click_url
+                                ):
+                                    await page.reload(
+                                        timeout=90000,
+                                        wait_until="domcontentloaded",
+                                    )
+                                else:
+                                    push_live_step(
+                                        job_id, i + 1, "form", "info",
+                                        "Invalid-lead retry on current page — not re-opening tracker URL",
+                                    )
+                                await page.wait_for_timeout(700 + random.randint(0, 500))
                             except Exception as e:
                                 entry["status"] = "invalid_data"
                                 entry["error"] = f"Page reload after invalid failed: {str(e)[:120]}"

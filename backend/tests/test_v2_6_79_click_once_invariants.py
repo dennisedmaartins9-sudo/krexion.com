@@ -58,8 +58,9 @@ def test_tunnel_retry_blocked_after_tracker_click():
 
 def test_follow_redirect_limited_after_ptro():
     src = _src()
-    assert "avoid networkidle waits that can pull tracker pixels" in src
-    assert "_fr_offer_host" in src
+    assert "never networkidle on click-once flows" in src
+    assert "_click_once_nav" in src
+    assert "landing pixels re-hit Affise" in src
 
 
 def test_finally_completes_claim_after_touch_not_release():
