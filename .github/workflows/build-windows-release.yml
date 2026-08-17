@@ -68,7 +68,25 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code via git
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          SHA="${{ github.sha }}"
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "$REPO"
+          else
+            git remote set-url origin "$REPO"
+          fi
+          git fetch --force origin "$SHA"
+          git checkout --force --detach "$SHA"
+          git reset --hard "$SHA"
+          echo "Checked out $SHA"
 
       - name: Compute version
         id: version
@@ -297,7 +315,25 @@ jobs:
     # slow GitHub-hosted Windows runners.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code via git
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          SHA="${{ github.sha }}"
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "$REPO"
+          else
+            git remote set-url origin "$REPO"
+          fi
+          git fetch --force origin "$SHA"
+          git checkout --force --detach "$SHA"
+          git reset --hard "$SHA"
+          echo "Checked out $SHA"
 
       # ── 2026-01: Restore from CACHE first (10GB quota, isolated
       #     from artifact 500MB quota). Fallback to artifact download
