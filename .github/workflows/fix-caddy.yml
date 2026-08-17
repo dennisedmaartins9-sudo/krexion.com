@@ -28,8 +28,24 @@ jobs:
     runs-on: [self-hosted, krexion-vps]
     timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout code via git
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          SHA="${{ github.sha }}"
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "$REPO"
+          else
+            git remote set-url origin "$REPO"
+          fi
+          git fetch --force origin "$SHA"
+          git checkout --force --detach "$SHA"
+          git reset --hard "$SHA"
+          echo "Checked out $SHA"
 
       - name: Inspect current /opt/krexion/Caddyfile state
         run: |

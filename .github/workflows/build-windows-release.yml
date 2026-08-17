@@ -49,6 +49,7 @@ concurrency:
 # ----------------------------------------------------------------------
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build-backend:
@@ -158,31 +159,76 @@ jobs:
           echo "Display version : $VER"
           echo "Numeric version : $NUM4"
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # Self-hosted Windows runner is rate-limited on codeload.github.com
+      # (HTTP 429) when GitHub Actions tries to download marketplace
+      # action zips at "Set up job". This job must use ZERO `uses:`
+      # steps — git checkout, local disk cache, and system/python.org
+      # Python only. pip cache already persists on the runner disk.
+      - name: Ensure Python 3.11
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Find-Python311 {
+            try {
+              $exe = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
+              if ($exe -and (Test-Path $exe.Trim())) { return $exe.Trim() }
+            } catch {}
+            $roots = @(
+              'C:\krexion-ci-cache\python311\python.exe',
+              'C:\Python311\python.exe',
+              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+              'C:\Program Files\Python311\python.exe'
+            )
+            foreach ($p in $roots) { if (Test-Path $p) { return $p } }
+            foreach ($root in @('C:\actions-runner\_work\_tool\Python', 'C:\hostedtoolcache\windows\Python')) {
+              if (-not (Test-Path $root)) { continue }
+              $hit = Get-ChildItem $root -Filter python.exe -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\3\.11' } | Select-Object -First 1
+              if ($hit) { return $hit.FullName }
+            }
+            return $null
+          }
+          $py = Find-Python311
+          if (-not $py) {
+            $inst = Join-Path $env:TEMP 'python-3.11.9-amd64.exe'
+            Write-Host "Python 3.11 not found — downloading python.org installer"
+            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe' -OutFile $inst -UseBasicParsing -TimeoutSec 180
+            $target = 'C:\krexion-ci-cache\python311'
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","TargetDir=$target","Include_pip=1","Include_launcher=1" -Wait
+            $py = Join-Path $target 'python.exe'
+            if (-not (Test-Path $py)) { throw "Python 3.11 install finished but $py is missing" }
+          }
+          Write-Host "Using Python 3.11: $py"
+          & $py -c "import sys; print(sys.version)"
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $py -Parent)
+          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_PYTHON=$py"
 
-      - name: Restore backend deps bundle cache
-        uses: actions/cache/restore@v4
-        id: deps-bundle-cache
-        with:
-          path: |
-            build/dist/krexion-backend.dist
-            build/.deps-fingerprint
-          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
-          restore-keys: |
-            krexion-backend-deps-v1-
-
-      - name: Restore pip wheel cache
-        uses: actions/cache/restore@v4
-        id: pip-cache
-        with:
-          path: |
-            ~\AppData\Local\pip\Cache
-          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
-          restore-keys: |
-            krexion-pip-win-
+      - name: Restore local FAST BUILD cache
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $ms = New-Object System.IO.MemoryStream
+          foreach ($f in @('backend/requirements.txt', 'build/build-backend.py')) {
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $f))
+            $ms.Write($bytes, 0, $bytes.Length)
+          }
+          $hash = ([BitConverter]::ToString($sha.ComputeHash($ms.ToArray()))).Replace('-','').ToLower().Substring(0,16)
+          $cache = "C:\krexion-ci-cache\deps-v1-$hash"
+          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_DEPS_CACHE=$cache"
+          $core = Join-Path $cache 'krexion-backend.dist\krexion-core.exe'
+          if (Test-Path $core) {
+            New-Item -ItemType Directory -Force -Path build\dist | Out-Null
+            $dest = 'build\dist\krexion-backend.dist'
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+            Copy-Item -Recurse -Force (Join-Path $cache 'krexion-backend.dist') $dest
+            $fp = Join-Path $cache '.deps-fingerprint'
+            if (Test-Path $fp) { Copy-Item $fp build\.deps-fingerprint -Force }
+            Write-Host "Restored FAST BUILD cache from $cache"
+          } else {
+            Write-Host "No local FAST BUILD cache at $cache"
+          }
 
       - name: Run embedded-Python build
         shell: powershell
@@ -190,23 +236,42 @@ jobs:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: '1'
         run: |
-          python build/build-backend.py
+          $py = $env:KREXION_PYTHON
+          if (-not $py) { $py = 'python' }
+          & $py build/build-backend.py
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::Build script returned exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
 
-      - name: Upload backend artifact
+      - name: Save local FAST BUILD cache + handoff to installer
         if: success()
-        # v2.6.55 — upload FIRST so job success isn't blocked by slow
-        # cache saves (#194 cancelled after pip OK but cache hung).
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: krexion-backend-bundle
-          path: build/dist/krexion-backend.dist/**
-          retention-days: 3
-          if-no-files-found: error
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = 'build\dist\krexion-backend.dist'
+          if (-not (Test-Path (Join-Path $src 'krexion-core.exe'))) {
+            throw "krexion-core.exe missing after build"
+          }
+          if ($env:KREXION_DEPS_CACHE) {
+            New-Item -ItemType Directory -Force -Path $env:KREXION_DEPS_CACHE | Out-Null
+            $cacheDest = Join-Path $env:KREXION_DEPS_CACHE 'krexion-backend.dist'
+            if (Test-Path $cacheDest) { Remove-Item -Recurse -Force $cacheDest }
+            Copy-Item -Recurse -Force $src $cacheDest
+            if (Test-Path 'build\.deps-fingerprint') {
+              Copy-Item 'build\.deps-fingerprint' $env:KREXION_DEPS_CACHE\ -Force
+            }
+            Write-Host "Saved FAST BUILD cache to $env:KREXION_DEPS_CACHE"
+          }
+          $runDir = "C:\krexion-ci-cache\runs\$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+          $runDest = Join-Path $runDir 'krexion-backend.dist'
+          if (Test-Path $runDest) { Remove-Item -Recurse -Force $runDest }
+          Copy-Item -Recurse -Force $src $runDest
+          Write-Host "Handoff copied to $runDest"
+          Get-ChildItem 'C:\krexion-ci-cache\runs' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.CreationTime -lt (Get-Date).AddDays(-3) } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Show build output (diagnostic)
         if: always()
@@ -224,29 +289,7 @@ jobs:
             Write-Host "No build/dist directory was produced."
           }
 
-      - name: Save pip wheel cache
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~\AppData\Local\pip\Cache
-          key: krexion-pip-win-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
-
-      - name: Save backend deps bundle cache
-        if: success()
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            build/dist/krexion-backend.dist
-            build/.deps-fingerprint
-          key: krexion-backend-deps-v1-${{ hashFiles('backend/requirements.txt', 'build/build-backend.py') }}
-
-      # v2.6.55 — removed per-run SHA cache save here; uploading the
-      # multi-GB backend bundle to actions/cache added 20+ min AFTER a
-      # successful build and caused #194 to hit the job timeout anyway.
-      # Installer job falls back to the artifact uploaded above.
+      # Installer job reads the local C:\krexion-ci-cache handoff.
 
   build-frontend:
     name: Build React frontend
@@ -276,29 +319,15 @@ jobs:
           echo "REACT_APP_BACKEND_URL=http://127.0.0.1:8001" > .env.production
           yarn build
 
-      - name: Upload frontend artifact (cache mirror)
-        # 2026-01: continue-on-error → quota-hit non-fatal. Installer
-        # job uses cache below as primary, artifact is just a mirror.
+      - name: Upload frontend artifact
+        # Installer job downloads this via GitHub API (no actions/cache
+        # on the self-hosted Windows runner — that zip hits 429).
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: krexion-frontend-build
           path: frontend/build
           retention-days: 3
-
-      # Cache for installer job (10 GB cache quota, separate from artifacts)
-      - name: Cache frontend build for installer job
-        uses: actions/cache/save@v4
-        with:
-          path: frontend/build
-          key: krexion-frontend-${{ github.sha }}-${{ github.run_id }}
-          # v1.0.21 — must be true so this Linux-built cache can be
-          # restored by the Windows installer job. Without it the
-          # restore step in build-installer reports "Cache not found"
-          # and the build falls through to artifact download, which
-          # silently fails when GitHub Actions artifact storage quota
-          # is exhausted → installer "Verify build outputs" hard-fails.
-          enableCrossOsArchive: true
 
   build-installer:
     name: Build Krexion-Setup.exe
@@ -335,72 +364,99 @@ jobs:
           git reset --hard "$SHA"
           echo "Checked out $SHA"
 
-      # ── 2026-01: Restore from CACHE first (10GB quota, isolated
-      #     from artifact 500MB quota). Fallback to artifact download
-      #     if cache miss — this dual-path ensures the installer job
-      #     can never be blocked by GitHub's artifact quota meter. ──
-      - name: Restore backend build from cache
-        id: backend-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: build/dist/krexion-backend.dist
-          key: krexion-backend-${{ github.sha }}-${{ github.run_id }}
+      # Same 429 rule as build-backend: ZERO marketplace `uses:` on
+      # this self-hosted Windows job. Backend handoff is a local copy
+      # on C:\krexion-ci-cache (same PC). Frontend comes from the
+      # ubuntu-latest artifact via the GitHub API (api.github.com, not
+      # codeload), with a local yarn rebuild fallback.
+      - name: Restore backend bundle from local handoff
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = "C:\krexion-ci-cache\runs\$env:GITHUB_RUN_ID\krexion-backend.dist"
+          $core = Join-Path $src 'krexion-core.exe'
+          if (-not (Test-Path $core)) {
+            throw "Backend handoff missing at $src — build-backend job must copy krexion-backend.dist there"
+          }
+          New-Item -ItemType Directory -Force -Path build\dist | Out-Null
+          $dest = 'build\dist\krexion-backend.dist'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Copy-Item -Recurse -Force $src $dest
+          Write-Host "Restored backend bundle from $src"
 
-      - name: Download backend artifact (fallback if cache miss)
-        if: steps.backend-cache.outputs.cache-hit != 'true'
+      - name: Download frontend artifact via GitHub API
         continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: krexion-backend-bundle
-          path: build/dist/krexion-backend.dist/
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept        = 'application/vnd.github+json'
+            'User-Agent'  = 'krexion-native'
+          }
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=50"
+          $arts = Invoke-RestMethod -Uri $uri -Headers $headers
+          $art = $arts.artifacts | Where-Object { $_.name -eq 'krexion-frontend-build' -and -not $_.expired } | Select-Object -First 1
+          if (-not $art) {
+            Write-Host "No krexion-frontend-build artifact on this run — local rebuild fallback will run"
+            exit 0
+          }
+          $zip = Join-Path $env:TEMP 'krexion-frontend-build.zip'
+          Write-Host "Downloading frontend artifact id=$($art.id) size=$($art.size_in_bytes)"
+          Invoke-WebRequest -Uri $art.archive_download_url -Headers $headers -OutFile $zip -UseBasicParsing -TimeoutSec 300
+          $dest = 'frontend\build'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          if (-not (Test-Path "$dest\index.html") -and (Test-Path "$dest\build\index.html")) {
+            Copy-Item -Recurse -Force "$dest\build\*" $dest
+          }
+          if (Test-Path "$dest\index.html") {
+            Write-Host "Frontend artifact extracted to $dest"
+          } else {
+            Write-Host "Frontend zip extracted but index.html missing — local rebuild fallback will run"
+          }
 
-      - name: Restore frontend build from cache
-        id: frontend-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: frontend/build
-          key: krexion-frontend-${{ github.sha }}-${{ github.run_id }}
-          # v1.0.21 — paired with the matching flag on the save step
-          # in build-frontend (which runs on ubuntu-latest). Windows
-          # installer job MUST use this flag too or it will refuse to
-          # restore a Linux-saved cache, masking the upstream success.
-          enableCrossOsArchive: true
-
-      - name: Download frontend artifact (fallback if cache miss)
-        if: steps.frontend-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: krexion-frontend-build
-          path: build/frontend-build/
-
-      - name: Set up Python 3.11 (required by Bundle Playwright Chromium step below)
-        # 2026-01-10 -- v2.5.1 native build failed at "Bundle Playwright
-        # Chromium" because THIS job (build-installer) never sets up a
-        # pinned Python. On the self-hosted Windows PC, bare `python` in
-        # PowerShell resolves to the system Python 3.14 install
-        # (C:\Python314). pip then tries to build greenlet==3.1.1 (a
-        # transitive dep of playwright==1.49.1) from source, and
-        # greenlet's C++ code references internal CPython structs
-        # (_PyInterpreterFrame, Py_C_RECURSION_LIMIT, ...) that were
-        # removed / renamed in Python 3.14 -- cl.exe hard-fails with
-        # C2079/C2027/C2065 errors, no chromium bundle is downloaded,
-        # and Inno Setup produces an incomplete installer.
-        # Pinning to Python 3.11 here (same as build-backend job) makes
-        # pip pick up the prebuilt greenlet 3.1.1 wheel, no compilation
-        # happens, and playwright installs cleanly.
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Set up Node 20 (for local frontend rebuild fallback)
-        # 2026-01-09 — the Windows PC has Node 24 installed via choco
-        # (nodejs-lts latest), but frontend/package.json declares
-        # engines.node = 20.x. Set up Node 20 explicitly for the
-        # local rebuild step below (no-op if cache/artifact worked).
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Ensure Python 3.11 (Playwright greenlet wheels)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Find-Python311 {
+            try {
+              $exe = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
+              if ($exe -and (Test-Path $exe.Trim())) { return $exe.Trim() }
+            } catch {}
+            $roots = @(
+              'C:\krexion-ci-cache\python311\python.exe',
+              'C:\Python311\python.exe',
+              "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+              'C:\Program Files\Python311\python.exe'
+            )
+            foreach ($p in $roots) { if (Test-Path $p) { return $p } }
+            foreach ($root in @('C:\actions-runner\_work\_tool\Python', 'C:\hostedtoolcache\windows\Python')) {
+              if (-not (Test-Path $root)) { continue }
+              $hit = Get-ChildItem $root -Filter python.exe -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\3\.11' } | Select-Object -First 1
+              if ($hit) { return $hit.FullName }
+            }
+            return $null
+          }
+          $py = Find-Python311
+          if (-not $py) {
+            $inst = Join-Path $env:TEMP 'python-3.11.9-amd64.exe'
+            Write-Host "Python 3.11 not found — downloading python.org installer"
+            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe' -OutFile $inst -UseBasicParsing -TimeoutSec 180
+            $target = 'C:\krexion-ci-cache\python311'
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","TargetDir=$target","Include_pip=1","Include_launcher=1" -Wait
+            $py = Join-Path $target 'python.exe'
+            if (-not (Test-Path $py)) { throw "Python 3.11 install finished but $py is missing" }
+          }
+          Write-Host "Using Python 3.11: $py"
+          & $py -c "import sys; print(sys.version)"
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $py -Parent)
+          Add-Content -Path $env:GITHUB_ENV -Value "KREXION_PYTHON=$py"
 
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
@@ -591,13 +647,15 @@ jobs:
           # picks up via the `..\build\chromium-bundle\*` Source line.
           $env:PLAYWRIGHT_BROWSERS_PATH = "$PWD\build\chromium-bundle"
           New-Item -ItemType Directory -Force -Path $env:PLAYWRIGHT_BROWSERS_PATH | Out-Null
-          Write-Host "Installing Playwright + downloading Chromium to $env:PLAYWRIGHT_BROWSERS_PATH"
-          python -m pip install --upgrade pip
-          python -m pip install playwright==1.49.1
+          $py = $env:KREXION_PYTHON
+          if (-not $py) { $py = 'python' }
+          Write-Host "Installing Playwright + downloading Chromium to $env:PLAYWRIGHT_BROWSERS_PATH using $py"
+          & $py -m pip install --upgrade pip
+          & $py -m pip install playwright==1.49.1
           # Both chromium (full) and chromium-headless-shell (smaller,
           # used by the production RUT runner) - the runtime selects
           # one based on the job kind, so we ship both.
-          python -m playwright install chromium chromium-headless-shell
+          & $py -m playwright install chromium chromium-headless-shell
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "Playwright install returned exit $LASTEXITCODE - continuing build (chromium-bundle may be partial)"
           }
@@ -706,144 +764,114 @@ jobs:
           Write-Host "=== installer/Output contents ==="
           Get-ChildItem installer/Output -ErrorAction SilentlyContinue
 
-      - name: Upload installer artifact
-        if: always()
-        # 2026-01: continue-on-error → GitHub Release step still runs.
-        # Releases bypass the artifact quota entirely.
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: krexion-installer
-          path: installer/Output/Krexion-Setup-*.exe
-          retention-days: 3
-          if-no-files-found: warn
-
-      - name: Create GitHub Release
-        # Publish whenever we have a real version (i.e. not a nightly
-        # placeholder). Covers BOTH triggers:
-        #   - workflow_dispatch with release_tag → uses the input
-        #   - push to main on backend/VERSION change → uses VERSION
-        # v1.0.18: previously gated only on the manual input which
-        # broke the new auto-trigger path (build ran but no Release
-        # was created so the customer couldn't download the .exe).
-        #
-        # 2026-01-10 v2.5.2: continue-on-error because the ~700 MB
-        # native installer .exe often ECONNRESETs mid-upload on
-        # residential ISP self-hosted runners. The "Verify + Repair"
-        # step below is idempotent and completes the release.
+      - name: Create GitHub Release + upload installer
+        # No marketplace actions (429 on self-hosted). Creates the
+        # vX.Y.Z release via API if missing, then uploads the .exe
+        # with 3 attempts for residential-ISP ECONNRESET.
         if: startsWith(needs.build-backend.outputs.version, 'v')
-        continue-on-error: true
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.build-backend.outputs.version }}
-          name: Krexion ${{ needs.build-backend.outputs.version }}
-          draft: false
-          prerelease: false
-          files: |
-            installer/Output/Krexion-Setup-*.exe
-          # Prefer a user-supplied Personal Access Token (added as the
-          # repo secret RELEASE_TOKEN) so this step works even when the
-          # repo has the strict default "Read repository contents and
-          # packages permissions" applied at Settings -> Actions ->
-          # General -> Workflow permissions. If RELEASE_TOKEN is not
-          # set, fall back to the workflow-scoped GITHUB_TOKEN which
-          # works as long as the repo has been flipped to "Read and
-          # write permissions" (or our top-level `permissions: contents:
-          # write` declaration is honoured). Either path -> release
-          # publishes successfully, no 403.
-          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        timeout-minutes: 40
+        shell: powershell
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.build-backend.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo  = $env:GITHUB_REPOSITORY
+          $tag   = $env:RELEASE_TAG
+          $token = $env:RELEASE_TOKEN
+          if (-not $token) { $token = $env:GITHUB_TOKEN }
+          $expected = @(Get-ChildItem installer/Output -Filter 'Krexion-Setup-*.exe' -File | ForEach-Object { $_.FullName })
+          if (-not $expected -or $expected.Count -eq 0) {
+            throw "No Krexion-Setup-*.exe files found in installer/Output. ISCC compile must have failed."
+          }
+          $headers = @{
+            'Authorization' = "token $token"
+            'Accept'        = 'application/vnd.github+json'
+            'User-Agent'    = 'krexion-release-uploader'
+          }
 
-      - name: Verify + Repair GH Release upload (network resilience)
-        # 2026-01-10 -- same resilience pattern as build-electron-desktop.yml.
-        # Native installer .exe from Inno Setup runs ~700 MB (includes
-        # MongoDB portable + Playwright Chromium bundle + embedded
-        # Python) so ECONNRESET risk is even higher than Electron.
-        # Idempotent: only re-uploads missing or size-mismatched assets,
-        # then publishes the release.
-        if: startsWith(needs.build-backend.outputs.version, 'v')
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 30
-          max_attempts: 3
-          retry_wait_seconds: 60
-          shell: powershell
-          command: |
-            $ErrorActionPreference = 'Stop'
-            $repo  = '${{ github.repository }}'
-            $tag   = '${{ needs.build-backend.outputs.version }}'
-            $token = '${{ secrets.RELEASE_TOKEN }}'
-            if (-not $token) { $token = '${{ secrets.GITHUB_TOKEN }}' }
-            $expected = Get-ChildItem installer/Output -Filter 'Krexion-Setup-*.exe' -File | ForEach-Object { $_.FullName }
-            if (-not $expected -or $expected.Count -eq 0) {
-              throw "No Krexion-Setup-*.exe files found in installer/Output. ISCC compile must have failed."
-            }
-            $headers = @{
-              'Authorization' = "token $token"
-              'Accept'        = 'application/vnd.github+json'
-              'User-Agent'    = 'krexion-release-uploader'
-            }
-            Write-Host "Locating release for tag=$tag ..."
-            $rel = $null
+          $lastErr = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
             try {
-              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -Headers $headers -Method Get
-            } catch {
-              Write-Host "  tag endpoint returned $($_.Exception.Message) -- scanning all releases (incl. drafts)"
-            }
-            if (-not $rel -or -not $rel.id) {
-              $all = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=30" -Headers $headers -Method Get
-              $rel = $all | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
-            }
-            if (-not $rel -or -not $rel.id) {
-              throw "Release with tag '$tag' does not exist. The preceding softprops step should have created a draft even on partial upload failure."
-            }
-            Write-Host "  found id=$($rel.id)  draft=$($rel.draft)  assets=$($rel.assets.Count)"
-
-            foreach ($file in $expected) {
-              $name      = [System.IO.Path]::GetFileName($file)
-              $localSize = (Get-Item $file).Length
-              $existing  = $rel.assets | Where-Object { $_.name -eq $name }
-              if ($existing -and $existing.size -eq $localSize) {
-                Write-Host "  [OK]     $name  ($localSize bytes already uploaded)"
-                continue
-              }
-              if ($existing) {
-                Write-Host "  [DELETE] $name  (attached size $($existing.size) != local $localSize)"
-                Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/assets/$($existing.id)" -Headers $headers -Method Delete | Out-Null
-              }
-              Write-Host "  [UPLOAD] $name  ($localSize bytes) ..."
-              $uploadUrl = ($rel.upload_url -replace '\{.*\}$', '') + "?name=$name"
-              Add-Type -AssemblyName System.Net.Http
-              $client = New-Object System.Net.Http.HttpClient
-              $client.Timeout = [TimeSpan]::FromMinutes(25)
-              [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', "token $token")
-              [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
-              [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'krexion-release-uploader')
-              $stream = [System.IO.File]::OpenRead($file)
+              Write-Host "=== Release attempt $attempt of 3 for tag=$tag ==="
+              $rel = $null
               try {
-                $content = New-Object System.Net.Http.StreamContent($stream)
-                $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
-                $content.Headers.ContentLength = $localSize
-                $resp = $client.PostAsync($uploadUrl, $content).GetAwaiter().GetResult()
-                if (-not $resp.IsSuccessStatusCode) {
-                  $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                  throw "Upload of $name failed: HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase) -- $body"
-                }
-                Write-Host "  [DONE]   $name"
-              } finally {
-                $stream.Dispose()
-                $client.Dispose()
+                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -Headers $headers -Method Get
+              } catch {
+                Write-Host "  tag endpoint: $($_.Exception.Message)"
               }
-              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Get
-            }
+              if (-not $rel -or -not $rel.id) {
+                $all = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=30" -Headers $headers -Method Get
+                $rel = $all | Where-Object { $_.tag_name -eq $tag } | Select-Object -First 1
+              }
+              if (-not $rel -or -not $rel.id) {
+                Write-Host "  creating release $tag ..."
+                $create = @{
+                  tag_name   = $tag
+                  name       = "Krexion $tag"
+                  draft      = $false
+                  prerelease = $false
+                } | ConvertTo-Json -Compress
+                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases" -Headers $headers -Method Post -Body $create -ContentType 'application/json'
+              }
+              Write-Host "  found id=$($rel.id)  draft=$($rel.draft)  assets=$($rel.assets.Count)"
 
-            if ($rel.draft) {
-              Write-Host "Publishing (undraft) release id=$($rel.id) ..."
-              $body = @{ draft = $false } | ConvertTo-Json -Compress
-              Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Patch -Body $body -ContentType 'application/json' | Out-Null
+              foreach ($file in $expected) {
+                $name      = [System.IO.Path]::GetFileName($file)
+                $localSize = (Get-Item $file).Length
+                $existing  = $rel.assets | Where-Object { $_.name -eq $name }
+                if ($existing -and $existing.size -eq $localSize) {
+                  Write-Host "  [OK]     $name  ($localSize bytes already uploaded)"
+                  continue
+                }
+                if ($existing) {
+                  Write-Host "  [DELETE] $name  (attached size $($existing.size) != local $localSize)"
+                  Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/assets/$($existing.id)" -Headers $headers -Method Delete | Out-Null
+                }
+                Write-Host "  [UPLOAD] $name  ($localSize bytes) ..."
+                $uploadUrl = ($rel.upload_url -replace '\{.*\}$', '') + "?name=$name"
+                Add-Type -AssemblyName System.Net.Http
+                $client = New-Object System.Net.Http.HttpClient
+                $client.Timeout = [TimeSpan]::FromMinutes(25)
+                [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', "token $token")
+                [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
+                [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'krexion-release-uploader')
+                $stream = [System.IO.File]::OpenRead($file)
+                try {
+                  $content = New-Object System.Net.Http.StreamContent($stream)
+                  $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+                  $content.Headers.ContentLength = $localSize
+                  $resp = $client.PostAsync($uploadUrl, $content).GetAwaiter().GetResult()
+                  if (-not $resp.IsSuccessStatusCode) {
+                    $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                    throw "Upload of $name failed: HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase) -- $body"
+                  }
+                  Write-Host "  [DONE]   $name"
+                } finally {
+                  $stream.Dispose()
+                  $client.Dispose()
+                }
+                $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Get
+              }
+
+              if ($rel.draft) {
+                Write-Host "Publishing (undraft) release id=$($rel.id) ..."
+                $body = @{ draft = $false } | ConvertTo-Json -Compress
+                Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Patch -Body $body -ContentType 'application/json' | Out-Null
+              }
+              Write-Host "Release $tag verified and published. Assets present:"
+              $final = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Get
+              foreach ($a in $final.assets) { Write-Host "  - $($a.name)  size=$($a.size)  state=$($a.state)" }
+              $lastErr = $null
+              break
+            } catch {
+              $lastErr = $_
+              Write-Warning "Release attempt $attempt failed: $($_.Exception.Message)"
+              if ($attempt -lt 3) { Start-Sleep -Seconds 60 }
             }
-            Write-Host "Release $tag verified and published. Assets present:"
-            $final = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/$($rel.id)" -Headers $headers -Method Get
-            foreach ($a in $final.assets) { Write-Host "  - $($a.name)  size=$($a.size)  state=$($a.state)" }
+          }
+          if ($lastErr) { throw $lastErr }
 
   # ─────────────────────────────────────────────────────────────────
   # 2026-06 — SELF-HOSTED MIRROR for the Native (Inno-Setup) installer.
