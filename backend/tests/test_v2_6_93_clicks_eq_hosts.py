@@ -53,8 +53,3 @@ def test_form_reload_skips_tracker_url():
 def test_networkidle_skipped_on_click_once():
     src = _src()
     assert "never networkidle on click-once flows" in src
-
-
-def test_version_is_2_6_93():
-    version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.93"

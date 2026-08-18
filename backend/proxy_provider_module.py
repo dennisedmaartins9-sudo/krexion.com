@@ -167,6 +167,19 @@ _SESSION_TOKEN_RE = re.compile(
     r"(-(?:session(?:id)?|sessid|sess)-)([A-Za-z0-9]+)",
     re.IGNORECASE,
 )
+# DataImpulse (and similar) use `;sessid.XXXX` / `__sessid.XXXX`, not `-sessid-`.
+_DOT_SESSID_ROTATE_RE = re.compile(
+    r"((?:;|__)(?:sessid|sessionid)\.)([A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+_DOT_SESSID_STRIP_RE = re.compile(
+    r"(?:;|__)(?:sessid|sessionid)\.[A-Za-z0-9_{}]+",
+    re.IGNORECASE,
+)
+_DOT_TTL_STRIP_RE = re.compile(
+    r"(?:;|__)sessttl\.[A-Za-z0-9]+",
+    re.IGNORECASE,
+)
 # Smartproxy Smart Region panel (proxy.smartproxy.net) — underscore DSL:
 #   smart-{subid}_area-US_state-california_life-120_session-{id}
 _SMARTPROXY_SMART_SESSION_RE = re.compile(r"(_session-)([A-Za-z0-9]+)", re.IGNORECASE)
@@ -444,7 +457,29 @@ def _strip_provider_session(username: str, profile: Optional[Dict[str, Any]] = N
         out = _SMARTPROXY_SMART_SESSION_RE.sub("", out, count=1)
     if _SESSION_TOKEN_RE.search(out):
         out = _SESSION_TOKEN_RE.sub("", out, count=1)
+    if profile:
+        delim = str(profile.get("delim") or "-")
+        prefix = str(profile.get("prefix") or "")
+        kv = str(profile.get("kv") or "-")
+        seps: List[str] = []
+        for sep in (prefix, delim):
+            if sep and sep not in seps:
+                seps.append(sep)
+        if seps:
+            sep_alt = "|".join(re.escape(s) for s in seps)
+            for key_name in ("sid_key", "ttl_key"):
+                pk = profile.get(key_name)
+                if not pk:
+                    continue
+                pat = (
+                    rf"(?:{sep_alt}){re.escape(str(pk))}"
+                    rf"{re.escape(kv)}[A-Za-z0-9_{{}}]+"
+                )
+                out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    out = _DOT_SESSID_STRIP_RE.sub("", out)
+    out = _DOT_TTL_STRIP_RE.sub("", out)
     out = re.sub(r"-{2,}", "-", out).strip("-")
+    out = re.sub(r";{2,}", ";", out).strip(";")
     return out
 
 
@@ -470,6 +505,9 @@ def _strip_legacy_gateway_geo(username: str) -> str:
         r"__cr\.[a-z0-9]+",
         r";st\.[a-z0-9]+",
         r";city\.[a-z0-9_]+",
+        r"(?:;|__)sessid\.[A-Za-z0-9_{}]+",
+        r"(?:;|__)sessionid\.[A-Za-z0-9_{}]+",
+        r"(?:;|__)sessttl\.[A-Za-z0-9]+",
     ):
         out = re.sub(pat, "", out, flags=re.IGNORECASE)
     out = re.sub(r"-{2,}", "-", out).strip("-")
@@ -560,6 +598,12 @@ def _rotate_session_in_username(username: str) -> str:
         )
     if _SESSION_TOKEN_RE.search(username):
         return _SESSION_TOKEN_RE.sub(
+            lambda m: f"{m.group(1)}{_make_session_id()}",
+            username,
+            count=1,
+        )
+    if _DOT_SESSID_ROTATE_RE.search(username):
+        return _DOT_SESSID_ROTATE_RE.sub(
             lambda m: f"{m.group(1)}{_make_session_id()}",
             username,
             count=1,

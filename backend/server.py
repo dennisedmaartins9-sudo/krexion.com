@@ -8719,8 +8719,8 @@ async def _rut_prepare_and_run(
                     ),
                 )
             except Exception as e:
-                logger.warning(f"dup-IP fetch failed (continuing without): {e}")
-                dup_ip_set = None
+                logger.warning(f"dup-IP fetch failed (continuing with empty in-job set): {e}")
+                dup_ip_set = set()
             await _set_step(
                 f"✓ Loaded blocklist ({len(dup_ip_set or [])} IPs — scoped to this offer)"
             )

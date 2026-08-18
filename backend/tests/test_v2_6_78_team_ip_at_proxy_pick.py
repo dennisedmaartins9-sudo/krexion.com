@@ -31,10 +31,11 @@ def test_proxy_loop_calls_team_before_unique_reserve():
     src = _src()
     assert "team DB BEFORE \"Unique IP\"" in src
     idx = src.index("team DB BEFORE")
-    chunk = src[idx : idx + 1200]
+    chunk = src[idx : idx + 1600]
     assert "_try_team_reserve_exit_ip(" in chunk
-    assert "duplicate_ip_set.add(exit_ip)" in chunk
-    assert chunk.index("_try_team_reserve_exit_ip(") < chunk.index("duplicate_ip_set.add(exit_ip)")
+    assert "team duplicate {exit_ip}, retrying" in chunk
+    # v2.6.94 — lock-reserve happens before this team call (not .add after).
+    assert "_reserve_unique_exit_ip(" in src[:idx]
 
 
 def test_team_claim_skipped_when_already_acquired_at_proxy():

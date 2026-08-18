@@ -3861,6 +3861,9 @@ def _build_state_targeted_proxy(
         "country": _country or "US",
         "_want_sid": True,
         "force_replace": True,
+        # Keep probe TCP and Chromium TCP on the same exit IP so the
+        # uniqueness check matches the IP Affise actually records.
+        "sticky_minutes": 10,
     }
     if _state_for_target:
         _targeting["state"] = _state_for_target
@@ -7334,6 +7337,65 @@ def _url_is_affiliate_click_target(url: str) -> bool:
     return False
 
 
+def _normalize_dup_ip(ip: str) -> str:
+    """Canonical form for duplicate-IP set membership (IPv4-mapped, etc.)."""
+    raw = str(ip or "").strip()
+    if not raw:
+        return ""
+    try:
+        from cross_user_ip_isolation import canonicalize_ip
+        return canonicalize_ip(raw) or raw
+    except Exception:
+        return raw
+
+
+def _dup_set_contains(dup_set: Optional[set], ip: str) -> bool:
+    """True when `ip` is already reserved. Empty set is active, not 'off'."""
+    if dup_set is None or not ip:
+        return False
+    n = _normalize_dup_ip(ip)
+    return n in dup_set or ip in dup_set
+
+
+def _dup_set_add(dup_set: Optional[set], ip: str) -> None:
+    if dup_set is None or not ip:
+        return
+    n = _normalize_dup_ip(ip)
+    if n:
+        dup_set.add(n)
+    if ip != n:
+        dup_set.add(ip)
+
+
+async def _reserve_unique_exit_ip(
+    dup_set: Optional[set],
+    lock: Optional[asyncio.Lock],
+    ip: str,
+) -> bool:
+    """Atomically reserve an exit IP. True = this visit owns it.
+
+    Empty `set()` is a live blocklist (first IP in a job). `None` means
+    uniqueness is off. A lock is required so concurrency=5 cannot all
+    pass `ip not in set` before any worker adds.
+    """
+    if dup_set is None:
+        return True
+    n = _normalize_dup_ip(ip)
+    if not n:
+        return False
+
+    async def _claim() -> bool:
+        if n in dup_set or ip in dup_set:
+            return False
+        _dup_set_add(dup_set, ip)
+        return True
+
+    if lock is None:
+        return await _claim()
+    async with lock:
+        return await _claim()
+
+
 async def _get_exit_ip_via_proxy(
     proxy: Dict[str, Any], timeout: float = 10.0
 ) -> Optional[str]:
@@ -8290,6 +8352,15 @@ async def run_real_user_traffic_job(
     # targets when duplicate-IP guard or pass-to-offer referer mode is on.
     if skip_duplicate_ip or referer_pass_to_offer:
         tls_prewarm = False
+
+    # v2.6.94 — skip_duplicate_ip must keep a shared set + lock for the
+    # whole job. Python treats empty set as falsy, so `if dup_set and ip
+    # in dup_set` skipped the first concurrent wave (e.g. 5 workers, 1
+    # sticky DataImpulse IP → 5 Affise clicks / 1 host). Fetch failure
+    # used to pass None and disable uniqueness entirely.
+    if skip_duplicate_ip and duplicate_ip_set is None:
+        duplicate_ip_set = set()
+    duplicate_ip_lock = asyncio.Lock()
 
     # ── 2026-02 v2.6.11 PRESET SAFETY NET ────────────────────────────
     # Customer report: "TikTok in app browser select kia th … kisi pr
@@ -9700,7 +9771,9 @@ async def run_real_user_traffic_job(
                             f"Attempt {attempt}/{cap}: {last_reason}",
                         )
                     continue
-                if skip_duplicate_ip and duplicate_ip_set and exit_ip in duplicate_ip_set:
+                if skip_duplicate_ip and not await _reserve_unique_exit_ip(
+                    duplicate_ip_set, duplicate_ip_lock, exit_ip,
+                ):
                     last_reason = f"duplicate IP {exit_ip}"
                     # Don't log every single duplicate — too chatty. Log
                     # every 5th attempt so the user sees progress.
@@ -9721,11 +9794,7 @@ async def run_real_user_traffic_job(
                 )
                 if not _team_ok:
                     last_reason = f"team offer duplicate IP {exit_ip}"
-                    if duplicate_ip_set is not None:
-                        try:
-                            duplicate_ip_set.add(exit_ip)
-                        except Exception:
-                            pass
+                    _dup_set_add(duplicate_ip_set, exit_ip)
                     if attempt % 5 == 0 or attempt == 1:
                         push_live_step(
                             job_id, i + 1, "proxy", "info",
@@ -9740,10 +9809,7 @@ async def run_real_user_traffic_job(
                     entry["offer_url_normalized"] = _team_pick.get(
                         "offer_url_normalized"
                     ) or ""
-                # Unique! Reserve it immediately so two parallel visits
-                # don't both pick the same IP from concurrent probes.
-                if duplicate_ip_set is not None:
-                    duplicate_ip_set.add(exit_ip)
+                # Unique IP already reserved under duplicate_ip_lock above.
                 # ── 2026-01 fix: CROSS-JOB persistence ────────────────
                 # Without this, the in-memory `duplicate_ip_set` is lost
                 # when the job ends, and the next job can pick the same
@@ -9959,7 +10025,13 @@ async def run_real_user_traffic_job(
 
         # Pre-filter: duplicate IP — already enforced inside the
         # on-demand loop above, so skip the redundant check.
-        if not _use_row_first and skip_duplicate_ip and duplicate_ip_set and geo["exit_ip"] and geo["exit_ip"] in duplicate_ip_set:
+        if (
+            not _use_row_first
+            and skip_duplicate_ip
+            and not await _reserve_unique_exit_ip(
+                duplicate_ip_set, duplicate_ip_lock, geo.get("exit_ip") or "",
+            )
+        ):
             entry["status"] = "skipped_duplicate_ip"
             entry["error"] = "Exit IP already clicked this link before"
             push_live_step(job_id, i + 1, "filter", "skipped", f"Duplicate IP {geo['exit_ip']}")
@@ -10009,11 +10081,8 @@ async def run_real_user_traffic_job(
         # will hit the "already in set" branch above and be skipped.
         # ProxyJet path already reserves at line 7710 — this closes
         # the gap for operator-supplied proxies.
-        if skip_duplicate_ip and duplicate_ip_set is not None and geo.get("exit_ip"):
-            try:
-                duplicate_ip_set.add(geo["exit_ip"])
-            except Exception:
-                pass
+        if skip_duplicate_ip and geo.get("exit_ip"):
+            _dup_set_add(duplicate_ip_set, geo["exit_ip"])
 
         # ── 2026-01: Target-URL reachability pre-check ──────────────
         # The geo probe (ipwho.is / ip-api.com) only confirms the
@@ -10244,11 +10313,10 @@ async def run_real_user_traffic_job(
                             continue
                         if skip_vpn and _sm_geo.get("is_vpn"):
                             continue
-                        if (
-                            skip_duplicate_ip
-                            and duplicate_ip_set
-                            and _sm_geo.get("exit_ip")
-                            and _sm_geo["exit_ip"] in duplicate_ip_set
+                        if skip_duplicate_ip and not await _reserve_unique_exit_ip(
+                            duplicate_ip_set,
+                            duplicate_ip_lock,
+                            _sm_geo.get("exit_ip") or "",
                         ):
                             continue
                         _team_ok, _team_pick = await _try_team_reserve_exit_ip(
@@ -10261,11 +10329,7 @@ async def run_real_user_traffic_job(
                             tracker_missing_offer=_is_tracker_target and not _claim_offer_url,
                         )
                         if not _team_ok:
-                            if duplicate_ip_set is not None and _sm_geo.get("exit_ip"):
-                                try:
-                                    duplicate_ip_set.add(_sm_geo["exit_ip"])
-                                except Exception:
-                                    pass
+                            _dup_set_add(duplicate_ip_set, _sm_geo.get("exit_ip") or "")
                             continue
                         if _team_pick.get("acquired"):
                             from cross_user_ip_isolation import canonicalize_ip as _canon_ip
@@ -11071,7 +11135,7 @@ async def run_real_user_traffic_job(
                 # TCP tunnel cold (→ chrome-error://chromewebdata on the
                 # second-leg CONNECT). Probing both warms up both
                 # tunnels AND measures both IPs.
-                if proxyjet_on_demand:
+                if proxyjet_on_demand or _url_host_matches_bypass(target_url):
                     # Build the probe URLs from target_url's origin.
                     # target_url is e.g. https://krexion.com/api/t/abc or
                     # https://api.krexion.com/api/t/abc — keep scheme+host.
@@ -11162,11 +11226,22 @@ async def run_real_user_traffic_job(
                         if _primary_ip and _primary_ip not in _BAD:
                             entry["exit_ip"] = _primary_ip
 
-                        # Check ALL tracker-visible IPs against duplicate_ip_set
+                        # Check tracker-visible IPs. This visit already
+                        # reserved its probe IP — that match is OK. A
+                        # *different* IP already owned by another visit
+                        # means Affise would record a duplicate host.
                         _dup_hit = None
-                        if skip_duplicate_ip and duplicate_ip_set is not None:
+                        _this_ip = _normalize_dup_ip(
+                            entry.get("exit_ip") or geo.get("exit_ip") or ""
+                        )
+                        if skip_duplicate_ip:
                             for _ip in _tracker_ips:
-                                if _ip in duplicate_ip_set:
+                                _n = _normalize_dup_ip(_ip)
+                                if _n and _this_ip and _n == _this_ip:
+                                    continue
+                                if not await _reserve_unique_exit_ip(
+                                    duplicate_ip_set, duplicate_ip_lock, _ip,
+                                ):
                                     _dup_hit = _ip
                                     break
 
@@ -11199,15 +11274,6 @@ async def run_real_user_traffic_job(
                                 burnt_ip=_dup_hit,
                             )
 
-                        # All tracker-visible IPs are unique. Reserve them
-                        # in duplicate_ip_set so concurrent visits don't
-                        # collide on the same exit.
-                        if duplicate_ip_set is not None:
-                            for _ip in _tracker_ips:
-                                try:
-                                    duplicate_ip_set.add(_ip)
-                                except Exception:
-                                    pass
                         push_live_step(
                             job_id, i + 1, "filter", "ok",
                             f"Tracker-side IP check passed · {_primary_ip or '?'} "
@@ -11613,6 +11679,12 @@ async def run_real_user_traffic_job(
                             # This handles transient tunnel errors when
                             # the proxy pool is otherwise exhausted.
                             if same_proxy_retry < MAX_SAME_PROXY_RETRIES:
+                                if _click_once_nav:
+                                    push_live_step(
+                                        job_id, i + 1, "browser", "info",
+                                        "Click-once: not retrying same proxy (would duplicate Affise click on this host)",
+                                    )
+                                    break
                                 same_proxy_retry += 1
                                 backoff_s = 1.5 * same_proxy_retry  # 1.5s, 3.0s
                                 push_live_step(
@@ -11903,7 +11975,9 @@ async def run_real_user_traffic_job(
                             )
                         except Exception:
                             pass
-                        if not _light_rep:
+                        if not _light_rep and not (
+                            _click_once_nav or _affiliate_click_fired
+                        ):
                             try:
                                 await page.wait_for_load_state("networkidle", timeout=8000)
                             except Exception:
@@ -12038,10 +12112,13 @@ async def run_real_user_traffic_job(
                 # NOTE (2026-02): networkidle already happened inside the
                 # landing-screenshot block above, so this is a short
                 # belt-and-braces wait — reduced from 20s to 6s.
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=6000)
-                except Exception:
-                    pass
+                # v2.6.94 — never networkidle on click-once: landing
+                # pixels re-hit Affise on the same host.
+                if not (_click_once_nav or _ptro_swapped or _affiliate_click_fired):
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        pass
 
                 # Capture landing URL (post-tracker redirect settle, PRE form fill).
                 # Used later to detect "conversion page reached" = host changed
@@ -12138,11 +12215,8 @@ async def run_real_user_traffic_job(
                 if _block_reason:
                     _burned_ip = (entry.get("exit_ip") or "").strip()
                     # In-job set update (instant — affects next probe in this job)
-                    if _burned_ip and duplicate_ip_set is not None:
-                        try:
-                            duplicate_ip_set.add(_burned_ip)
-                        except Exception:
-                            pass
+                    if _burned_ip:
+                        _dup_set_add(duplicate_ip_set, _burned_ip)
                     # Cross-job persistence (so future jobs load this IP)
                     if _burned_ip:
                         _spawn_live(_persist_burnt_ip(
@@ -13072,7 +13146,8 @@ async def run_real_user_traffic_job(
                 except Exception:
                     pass
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    if not (_click_once_nav or _affiliate_click_fired):
+                        await page.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
 
