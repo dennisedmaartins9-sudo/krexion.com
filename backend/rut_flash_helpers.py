@@ -384,6 +384,7 @@ async def complete_random_deals(
     count_min: int = 2,
     count_max: int = 3,
     per_deal_seconds: int = 18,
+    skip_repeat_click: Optional[Any] = None,
 ) -> int:
     """Click `count_min..count_max` random deals from a deals page.
 
@@ -414,6 +415,12 @@ async def complete_random_deals(
                         href = await el.get_attribute("href")
                         if href and href in visited_hrefs:
                             continue
+                        if skip_repeat_click and href:
+                            try:
+                                if skip_repeat_click(href, page.url or ""):
+                                    continue
+                            except Exception:
+                                pass
                         deal_links.append((el, href or ""))
                     except Exception:
                         continue
@@ -458,6 +465,8 @@ async def complete_random_deals(
                     await page.go_back(timeout=10000, wait_until="domcontentloaded")
                 except Exception:
                     try:
+                        if skip_repeat_click and skip_repeat_click(deals_root_url, ""):
+                            raise RuntimeError("skip repeat offer click")
                         await page.goto(deals_root_url, timeout=15000, wait_until="domcontentloaded")
                     except Exception:
                         pass
@@ -515,17 +524,32 @@ async def complete_random_deals(
 
             # Navigate back to deals root for next pick
             try:
-                await page.goto(deals_root_url, timeout=15000, wait_until="domcontentloaded")
-                await page.wait_for_timeout(1500)
+                await page.go_back(timeout=10000, wait_until="domcontentloaded")
             except Exception:
-                # If we can't go back, abandon further deals
-                break
+                try:
+                    if skip_repeat_click and skip_repeat_click(deals_root_url, ""):
+                        break
+                    await page.goto(deals_root_url, timeout=15000, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    # If we can't go back, abandon further deals
+                    break
+            else:
+                try:
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"deal iteration err: {e}")
             try:
-                await page.goto(deals_root_url, timeout=10000, wait_until="domcontentloaded")
+                await page.go_back(timeout=8000, wait_until="domcontentloaded")
             except Exception:
-                pass
+                try:
+                    if skip_repeat_click and skip_repeat_click(deals_root_url, ""):
+                        break
+                    await page.goto(deals_root_url, timeout=10000, wait_until="domcontentloaded")
+                except Exception:
+                    pass
             continue
 
     return completed

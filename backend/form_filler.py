@@ -529,7 +529,11 @@ async def _dismiss_popups(page: Page):
             continue
 
 
-async def _ensure_form_visible(page: Page, max_tries: int = 2) -> int:
+async def _ensure_form_visible(
+    page: Page,
+    max_tries: int = 2,
+    skip_repeat_click: Optional[Any] = None,
+) -> int:
     """If the current page has no fillable inputs, click a prominent CTA up to
     `max_tries` times. Returns the number of fillable inputs finally visible."""
     for attempt in range(max_tries + 1):
@@ -550,12 +554,20 @@ async def _ensure_form_visible(page: Page, max_tries: int = 2) -> int:
             return visible_count
         if attempt >= max_tries:
             return visible_count
-        # Click first visible CTA
+        # Click first visible CTA that is NOT the original offer/tracker URL.
         clicked = False
         for sel in _LANDING_CTA_SELECTORS:
             try:
                 el = await page.query_selector(sel)
                 if el and await el.is_visible():
+                    if skip_repeat_click:
+                        try:
+                            href = await el.get_attribute("href")
+                            page_url = page.url or ""
+                            if href and skip_repeat_click(href, page_url):
+                                continue
+                        except Exception:
+                            pass
                     await el.click(timeout=5000)
                     clicked = True
                     break

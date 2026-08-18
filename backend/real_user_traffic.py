@@ -3403,7 +3403,13 @@ async def _stuck_watchdog(page, job_id: str, visit_index: int,
 
 
 
-def _make_macro_guard(job_id: str, visit_index: int, force_referer: str = "", target_url: str = ""):
+def _make_macro_guard(
+    job_id: str,
+    visit_index: int,
+    force_referer: str = "",
+    target_url: str = "",
+    click_once_guard: Optional[Dict[str, Any]] = None,
+):
     """Return a Playwright route handler closure bound to this visit's
     `(job_id, visit_index)` so the macro-leak telemetry record contains
     the right context. Returned handler is `async def`.
@@ -3463,6 +3469,21 @@ def _make_macro_guard(job_id: str, visit_index: int, force_referer: str = "", ta
                     except Exception:
                         pass
                 return
+
+            # After the first tracker/offer document GET, abort any later
+            # hit on that same click URL (CTA <a href>, deal aff_c, goto,
+            # reload, pixel). Form/survey/deals stay on the already-open page.
+            if click_once_guard and click_once_guard.get("fired"):
+                orig = str(click_once_guard.get("click_url") or target_url or "")
+                if orig and _is_repeat_offer_click(url, orig):
+                    try:
+                        await route.abort()
+                    except Exception:
+                        try:
+                            await route.continue_()
+                        except Exception:
+                            pass
+                    return
 
             # 2026-02 v2.6.13 — Referer force-injection for document
             # navigations. Only applies when `force_referer` was set for
@@ -7337,6 +7358,58 @@ def _url_is_affiliate_click_target(url: str) -> bool:
     return False
 
 
+def _click_url_fingerprint(url: str) -> str:
+    """Stable identity for an offer/tracker click URL (host + path + offer_id).
+
+    Query noise (sub1, clickid) is ignored so a second GET to the same
+    Affise `/click?offer_id=X` still counts as the same click target.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import parse_qs, urlparse
+        p = urlparse(raw)
+        host = (p.hostname or "").lower()
+        path = (p.path or "/").rstrip("/").lower() or "/"
+        if not host:
+            return ""
+        if "/api/t/" in path:
+            code = path.split("/api/t/", 1)[-1].split("/", 1)[0]
+            return f"{host}/api/t/{code}"
+        qs = parse_qs(p.query or "")
+        oid = ""
+        for key in ("offer_id", "oid", "offerid", "o"):
+            vals = qs.get(key) or []
+            if vals and str(vals[0]).strip():
+                oid = str(vals[0]).strip()
+                break
+        if oid:
+            return f"{host}{path}?offer_id={oid}"
+        return f"{host}{path}"
+    except Exception:
+        return ""
+
+
+def _absolute_url(base: str, href: str) -> str:
+    raw = str(href or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import urljoin
+        return urljoin(str(base or "").strip() or "https://placeholder.local/", raw)
+    except Exception:
+        return raw
+
+
+def _is_repeat_offer_click(url: str, original_click_url: str, page_url: str = "") -> bool:
+    """True when `url` would register another click on the same offer/tracker."""
+    abs_url = _absolute_url(page_url, url) if url else ""
+    a = _click_url_fingerprint(abs_url)
+    b = _click_url_fingerprint(original_click_url)
+    return bool(a and b and a == b)
+
+
 def _normalize_dup_ip(ip: str) -> str:
     """Canonical form for duplicate-IP set membership (IPv4-mapped, etc.)."""
     raw = str(ip or "").strip()
@@ -10919,6 +10992,16 @@ async def run_real_user_traffic_job(
                     or _url_is_affiliate_click_target(target_url)
                     or _url_is_affiliate_click_target(_visit_target_url)
                 )
+                _click_once_guard: Dict[str, Any] = {
+                    "fired": False,
+                    "click_url": _visit_target_url or target_url or "",
+                }
+
+                def _skip_repeat_click_href(href: str, page_url: str = "") -> bool:
+                    orig = str(
+                        _click_once_guard.get("click_url") or _visit_target_url or ""
+                    )
+                    return _is_repeat_offer_click(href, orig, page_url)
                 # ── 2026-06-15 (UA-leak defence): hard sanity guard on
                 # `ua`. Any UA shorter than 50 chars, or a literal "."
                 # (which has shown up on advertiser dashboards as the
@@ -11095,6 +11178,7 @@ async def run_real_user_traffic_job(
                     # tracker's Referrer-Policy header.
                     force_referer=(_ua_referer or "") if bool(_referer_cfg.get("enabled")) else "",
                     target_url=_visit_target_url or "",
+                    click_once_guard=_click_once_guard,
                 ),
             )
 
@@ -11542,6 +11626,10 @@ async def run_real_user_traffic_job(
                         # krexion.com — the tracker was never hit.
                         if _click_once_nav and not _ptro_swapped:
                             _affiliate_click_fired = True
+                        _click_once_guard["fired"] = True
+                        _click_once_guard["click_url"] = (
+                            _visit_target_url or _click_once_guard.get("click_url") or ""
+                        )
                         goto_exc = None
                         break
                     except Exception as _ge:
@@ -11596,6 +11684,10 @@ async def run_real_user_traffic_job(
                             )
                             if _visit_already_fired:
                                 _affiliate_click_fired = True
+                                _click_once_guard["fired"] = True
+                                _click_once_guard["click_url"] = (
+                                    _visit_target_url or _click_once_guard.get("click_url") or ""
+                                )
                                 if _cur_host and _cur_host != _target_host:
                                     push_live_step(
                                         job_id, i + 1, "browser", "info",
@@ -11614,6 +11706,10 @@ async def run_real_user_traffic_job(
                             # A commit-retry would be click #2 on the same IP.
                             if _click_once_nav:
                                 _affiliate_click_fired = True
+                                _click_once_guard["fired"] = True
+                                _click_once_guard["click_url"] = (
+                                    _visit_target_url or _click_once_guard.get("click_url") or ""
+                                )
                                 push_live_step(
                                     job_id, i + 1, "browser", "info",
                                     "ERR_ABORTED on click URL — not retrying goto (1 click / 1 host)",
@@ -11767,6 +11863,7 @@ async def run_real_user_traffic_job(
                                     job_id, i + 1,
                                     force_referer=(_ua_referer or "") if bool(_referer_cfg.get("enabled")) else "",
                                     target_url=_visit_target_url or "",
+                                    click_once_guard=_click_once_guard,
                                 ),
                             )
                             page = await context.new_page()
@@ -11844,6 +11941,10 @@ async def run_real_user_traffic_job(
                                 )
                                 if _bypass_offer_url:
                                     _affiliate_click_fired = True
+                                    _click_once_guard["fired"] = True
+                                    _click_once_guard["click_url"] = (
+                                        _visit_target_url or _click_once_guard.get("click_url") or ""
+                                    )
                                     push_live_step(
                                         job_id, i + 1, "bypass", "ok",
                                         f"✓ Click registered as PROXY IP {_exit_ip_for_bypass} "
@@ -12657,6 +12758,7 @@ async def run_real_user_traffic_job(
                                 step_timeout_multiplier=step_timeout_multiplier,  # 2026-06: user-configurable slow-step wait
                                 skip_missing_steps=True,
                                 on_lead_submitted=_on_lead_submitted_early,
+                                click_once_guard=_click_once_guard,
                             )
                         )
 
@@ -12783,6 +12885,8 @@ async def run_real_user_traffic_job(
                                 " for(var i=0;i<nodes.length;i++){var el=nodes[i];if(!vis(el))continue;"
                                 "  var t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().replace(/\\s+/g,' ').trim();"
                                 "  if(!t)continue;"
+                                "  var href=((el.href||el.getAttribute&&el.getAttribute('href')||'')+'').toLowerCase();"
+                                "  if(href && /\\/aff_c|\\/aff_click|\\/click\\.php|affise\\.com|\\/api\\/t\\//.test(href)) continue;"
                                 "  for(var k=0;k<KW.length;k++){if(t===KW[k]||t.indexOf(KW[k])>=0){"
                                 "    try{el.scrollIntoView({block:'center'});}catch(_){};"
                                 "    if(el.tagName==='A'&&el.href&&!el.target){window.location.assign(el.href);return true;}"
@@ -12878,7 +12982,10 @@ async def run_real_user_traffic_job(
                     else:
                         # Click through any CTA ("UNLOCK NOW", "Get Started", etc.)
                         # — up to 3 tries because some offers have a 2-step warm-up.
-                        await _ensure_form_visible(page, max_tries=3)
+                        await _ensure_form_visible(
+                            page, max_tries=3,
+                            skip_repeat_click=_skip_repeat_click_href,
+                        )
                         if skip_captcha and await _page_has_captcha(page):
                             step_res = {"status": "skipped_captcha", "error": "Captcha after CTA click"}
                         else:
@@ -12912,6 +13019,7 @@ async def run_real_user_traffic_job(
                                 job_id=job_id,           # 2026-06: manual takeover pause hook (heuristic path)
                                 visit_idx=i + 1,         # 2026-06: manual takeover pause hook (heuristic path)
                                 fp=fp,                   # 2026-02 v2.6.13: fingerprint for lead-validation + CTIT (F821 fix)
+                                skip_repeat_click=_skip_repeat_click_href,
                             )
                             if _pre_submit_shots:
                                 entry["pre_submit_screenshots"] = _pre_submit_shots
@@ -16525,6 +16633,7 @@ async def _execute_automation_steps(
     step_timeout_multiplier: float = 1.0,  # 2026-06 — stretch per-step ceilings
     skip_missing_steps: bool = True,  # 2026-07 — skip absent steps, try next
     on_lead_submitted: Optional[Callable[[str], Awaitable[None]]] = None,
+    click_once_guard: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Execute a user-provided automation script step-by-step. Returns
     {status, error?, executed_steps, step_results?}.  Each step format:
@@ -17034,6 +17143,15 @@ async def _execute_automation_steps(
                         selector = resolved_sel
 
                 if action == "goto":
+                    _dest = str(value or selector or "")
+                    _orig = str((click_once_guard or {}).get("click_url") or "")
+                    if (
+                        (click_once_guard or {}).get("fired")
+                        and _orig
+                        and _is_repeat_offer_click(_dest, _orig)
+                    ):
+                        executed += 1
+                        continue
                     await page.goto(value or selector, timeout=timeout, wait_until="domcontentloaded")
                 elif action == "click":
                     if wait_nav:
@@ -19287,6 +19405,7 @@ async def _multi_step_fill(
     job_id: Optional[str] = None,        # 2026-06 — manual takeover pause hook
     visit_idx: Optional[int] = None,     # 2026-06 — manual takeover pause hook
     fp: Optional[Dict[str, Any]] = None, # 2026-02 v2.6.13 — fingerprint for lead-validation / CTIT helpers (F821 fix)
+    skip_repeat_click: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     The pre_submit_cb (if provided) is invoked RIGHT BEFORE each attempt
@@ -19374,7 +19493,8 @@ async def _multi_step_fill(
             if complete_random_deals is not None:
                 try:
                     deals_completed_count = await complete_random_deals(
-                        page, count_min=2, count_max=3
+                        page, count_min=2, count_max=3,
+                        skip_repeat_click=skip_repeat_click,
                     )
                     if deals_completed_count >= 2:
                         return {
@@ -19407,7 +19527,8 @@ async def _multi_step_fill(
             if complete_random_deals is not None:
                 try:
                     deals_completed_count = await complete_random_deals(
-                        page, count_min=2, count_max=3
+                        page, count_min=2, count_max=3,
+                        skip_repeat_click=skip_repeat_click,
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"deals completion err: {e}")
@@ -19503,7 +19624,10 @@ async def _multi_step_fill(
                     await _dismiss_popups(page)
                 except Exception:
                     pass
-                extra = await complete_random_deals(page, count_min=2, count_max=3)
+                extra = await complete_random_deals(
+                    page, count_min=2, count_max=3,
+                    skip_repeat_click=skip_repeat_click,
+                )
                 if extra:
                     deals_completed_count += extra
                     break

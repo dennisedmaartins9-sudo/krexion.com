@@ -112,8 +112,3 @@ def test_dup_fetch_failure_keeps_in_job_set():
     text = SERVER.read_text(encoding="utf-8")
     assert "continuing with empty in-job set" in text
     assert "dup_ip_set = None" not in text.split("dup-IP fetch failed")[1][:400]
-
-
-def test_version_is_2_6_94():
-    version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.94"
