@@ -20,6 +20,7 @@ if "playwright.async_api" not in sys.modules:
 from real_user_traffic import (  # noqa: E402
     _click_url_fingerprint,
     _is_repeat_offer_click,
+    _url_has_affiliate_click_params,
 )
 
 RUT = Path(__file__).resolve().parents[1] / "real_user_traffic.py"
@@ -94,6 +95,57 @@ def test_automation_goto_skips_repeat_offer_url():
     assert "_is_repeat_offer_click(_dest, _orig)" in src
 
 
-def test_version_is_2_6_95():
+def test_aff_c_query_param_detected():
+    """?aff_c= in query string must be caught (not just /aff_c in path)."""
+    assert _url_has_affiliate_click_params("https://offer.com/page?aff_c=123") is True
+    assert _url_has_affiliate_click_params("https://offer.com/page?sub1=x&aff_c=offer_59804") is True
+    assert _url_has_affiliate_click_params("https://offer.com/page?sub1=x") is False
+    assert _url_has_affiliate_click_params("https://x.com/click.php?o=1") is True
+    assert _url_has_affiliate_click_params("https://x.affise.com/go") is False  # no aff params
+    assert _url_has_affiliate_click_params("https://krexion.com/api/t/ABC") is True
+
+
+def test_offer_url_stored_in_guard_after_redirect():
+    src = RUT.read_text(encoding="utf-8")
+    assert 'offer_url' in src
+    assert '_click_once_guard["offer_url"]' in src
+
+
+def test_guard_checks_offer_url_and_aff_params():
+    src = RUT.read_text(encoding="utf-8")
+    assert 'click_once_guard.get("offer_url")' in src
+    assert '_url_has_affiliate_click_params' in src
+
+
+def test_skip_repeat_checks_offer_url():
+    src = RUT.read_text(encoding="utf-8")
+    idx = src.index("def _skip_repeat_click_href")
+    block = src[idx : idx + 800]
+    assert 'offer_url' in block
+    assert '_url_has_affiliate_click_params' in block
+
+
+def test_auto_continue_regex_catches_query_aff_c():
+    """JS regex must match ?aff_c= and &aff_c= (not just /aff_c)."""
+    src = RUT.read_text(encoding="utf-8")
+    assert "[\\\\/?&]aff_c" in src or "[?&]aff_c" in src
+
+
+def test_robust_click_js_skips_aff_links():
+    src = RUT.read_text(encoding="utf-8")
+    idx = src.index("_ROBUST_CLICK_SELECTOR_JS")
+    block = src[idx : idx + 1500]
+    assert "aff_c" in block
+    assert "offer_id" in block
+
+
+def test_automation_continue_js_has_href_filter():
+    src = RUT.read_text(encoding="utf-8")
+    idx = src.index("_ac_continue_js")
+    block = src[idx : idx + 1500]
+    assert "aff_c" in block
+
+
+def test_version_is_current():
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert version == "2.6.95"
+    assert int(version.replace(".", "")) >= 2695

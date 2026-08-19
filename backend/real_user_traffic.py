@@ -3473,9 +3473,26 @@ def _make_macro_guard(
             # After the first tracker/offer document GET, abort any later
             # hit on that same click URL (CTA <a href>, deal aff_c, goto,
             # reload, pixel). Form/survey/deals stay on the already-open page.
+            # v2.6.96: also check against the FINAL offer URL (after tracker
+            # redirect) AND any URL with aff_c/offer_id params that would
+            # register another Affise click.
             if click_once_guard and click_once_guard.get("fired"):
+                _should_abort = False
                 orig = str(click_once_guard.get("click_url") or target_url or "")
                 if orig and _is_repeat_offer_click(url, orig):
+                    _should_abort = True
+                if not _should_abort:
+                    offer_orig = str(click_once_guard.get("offer_url") or "")
+                    if offer_orig and _is_repeat_offer_click(url, offer_orig):
+                        _should_abort = True
+                if not _should_abort and _url_has_affiliate_click_params(url):
+                    try:
+                        _rtype_chk = (request.resource_type or "").lower()
+                    except Exception:
+                        _rtype_chk = "document"
+                    if _rtype_chk == "document":
+                        _should_abort = True
+                if _should_abort:
                     try:
                         await route.abort()
                     except Exception:
@@ -7410,6 +7427,31 @@ def _is_repeat_offer_click(url: str, original_click_url: str, page_url: str = ""
     return bool(a and b and a == b)
 
 
+_AFF_CLICK_PARAM_RE = re.compile(
+    r"[?&](aff_c|aff_click|offer_id|clickid)=",
+    re.IGNORECASE,
+)
+_AFF_CLICK_PATH_RE = re.compile(
+    r"/(?:aff_c|aff_click|click\.php|api/t/)",
+    re.IGNORECASE,
+)
+
+
+def _url_has_affiliate_click_params(url: str) -> bool:
+    """True when the URL contains parameters/paths that would register
+    an affiliate click if navigated (aff_c, offer_id, click.php, etc.).
+    Used by the network guard to block ANY request carrying these params
+    after the initial click has already fired."""
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    if _AFF_CLICK_PATH_RE.search(raw):
+        return True
+    if _AFF_CLICK_PARAM_RE.search(raw):
+        return True
+    return False
+
+
 def _normalize_dup_ip(ip: str) -> str:
     """Canonical form for duplicate-IP set membership (IPv4-mapped, etc.)."""
     raw = str(ip or "").strip()
@@ -11029,7 +11071,15 @@ async def run_real_user_traffic_job(
                     orig = str(
                         _click_once_guard.get("click_url") or _visit_target_url or ""
                     )
-                    return _is_repeat_offer_click(href, orig, page_url)
+                    if _is_repeat_offer_click(href, orig, page_url):
+                        return True
+                    offer_orig = str(_click_once_guard.get("offer_url") or "")
+                    if offer_orig and _is_repeat_offer_click(href, offer_orig, page_url):
+                        return True
+                    abs_href = _absolute_url(page_url, href) if href else href
+                    if _click_once_guard.get("fired") and _url_has_affiliate_click_params(abs_href):
+                        return True
+                    return False
                 # ── 2026-06-15 (UA-leak defence): hard sanity guard on
                 # `ua`. Any UA shorter than 50 chars, or a literal "."
                 # (which has shown up on advertiser dashboards as the
@@ -11658,6 +11708,17 @@ async def run_real_user_traffic_job(
                         _click_once_guard["click_url"] = (
                             _visit_target_url or _click_once_guard.get("click_url") or ""
                         )
+                        # v2.6.96 — also store the FINAL offer URL after
+                        # tracker redirect so the guard catches repeat
+                        # navigations to the offer domain (e.g.
+                        # offer.com/page?aff_c=X) — not just the
+                        # tracker URL (krexion.com/api/t/CODE).
+                        try:
+                            _landed_url = page.url or ""
+                            if _landed_url and _landed_url != _visit_target_url:
+                                _click_once_guard["offer_url"] = _landed_url
+                        except Exception:
+                            pass
                         goto_exc = None
                         break
                     except Exception as _ge:
@@ -11716,6 +11777,8 @@ async def run_real_user_traffic_job(
                                 _click_once_guard["click_url"] = (
                                     _visit_target_url or _click_once_guard.get("click_url") or ""
                                 )
+                                if _cur_url and _cur_url != _visit_target_url:
+                                    _click_once_guard["offer_url"] = _cur_url
                                 if _cur_host and _cur_host != _target_host:
                                     push_live_step(
                                         job_id, i + 1, "browser", "info",
@@ -12914,7 +12977,7 @@ async def run_real_user_traffic_job(
                                 "  var t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().replace(/\\s+/g,' ').trim();"
                                 "  if(!t)continue;"
                                 "  var href=((el.href||el.getAttribute&&el.getAttribute('href')||'')+'').toLowerCase();"
-                                "  if(href && /\\/aff_c|\\/aff_click|\\/click\\.php|affise\\.com|\\/api\\/t\\//.test(href)) continue;"
+                                "  if(href && /[\\/?&]aff_c|[\\/?&]aff_click|\\/click\\.php|affise\\.com|\\/api\\/t\\/|[\\/?&]offer_id=/.test(href)) continue;"
                                 "  for(var k=0;k<KW.length;k++){if(t===KW[k]||t.indexOf(KW[k])>=0){"
                                 "    try{el.scrollIntoView({block:'center'});}catch(_){};"
                                 "    if(el.tagName==='A'&&el.href&&!el.target){window.location.assign(el.href);return true;}"
@@ -16331,6 +16394,11 @@ _ROBUST_CLICK_SELECTOR_JS = """(sel) => {
       } catch (e) {}
     });
     if (el.tagName === 'A' && el.href && !el.target) {
+      var _rh = (el.href || '').toLowerCase();
+      if (/[\\/?&]aff_c|[\\/?&]aff_click|\\/click\\.php|affise\\.com|\\/api\\/t\\/|[\\/?&]offer_id=/.test(_rh)) {
+        try { el.click(); } catch (e) {}
+        return true;
+      }
       window.location.assign(el.href);
       return true;
     }
@@ -17984,6 +18052,8 @@ async def _execute_automation_steps(
                         " for(var i=0;i<nodes.length;i++){var el=nodes[i];if(!vis(el))continue;"
                         "  var t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().replace(/\\s+/g,' ').trim();"
                         "  if(!t)continue;"
+                        "  var href=((el.href||el.getAttribute&&el.getAttribute('href')||'')+'').toLowerCase();"
+                        "  if(href && /[\\/?&]aff_c|[\\/?&]aff_click|\\/click\\.php|affise\\.com|\\/api\\/t\\/|[\\/?&]offer_id=/.test(href)) continue;"
                         "  for(var k=0;k<KW.length;k++){if(t===KW[k]||t.indexOf(KW[k])>=0){"
                         "    try{el.scrollIntoView({block:'center'});}catch(_){};"
                         "    if(el.tagName==='A'&&el.href&&!el.target){window.location.assign(el.href);return true;}"
