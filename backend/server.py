@@ -16856,6 +16856,12 @@ async def get_clicks(
     else:
         query = {"link_id": {"$in": link_ids}}
     
+    # 2026-08: Align dashboard Clicks with Hosts.
+    # Hosts are effectively counted only for successful/converted
+    # visits (click_status="completed"). Early/pending/failed click docs
+    # inflate Clicks and break Clicks==Hosts.
+    query["click_status"] = "completed"
+    
     # Date filtering
     if start_date:
         try:
@@ -16980,6 +16986,10 @@ async def get_clicks_count(
         query = {"link_id": link_id}
     else:
         query = {"link_id": {"$in": link_ids}}
+    
+    # 2026-08: Align dashboard Clicks with Hosts.
+    # Count only completed clicks so Clicks==Hosts is guaranteed.
+    query["click_status"] = "completed"
     
     # ── Date filter: explicit range wins over filter_type ──────────────
     applied_explicit = False
