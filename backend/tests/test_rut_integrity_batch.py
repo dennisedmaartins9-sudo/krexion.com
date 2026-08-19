@@ -47,6 +47,13 @@ class _Collection:
                 break
         return SimpleNamespace(matched_count=matched)
 
+    async def find_one(self, query, projection=None):
+        wanted = query.get("id") or query.get("click_id")
+        for doc in self.docs:
+            if doc.get("id") == wanted or doc.get("click_id") == wanted:
+                return dict(doc)
+        return None
+
     async def delete_one(self, query):
         self.docs = [doc for doc in self.docs if doc.get("id") != query.get("id")]
         return SimpleNamespace(deleted_count=1)
@@ -114,7 +121,7 @@ def test_retired_network_chain_cannot_be_reenabled_in_resolver():
     assert result["network_click_referer"] == ""
 
 
-def test_pending_click_uses_one_id_and_counts_only_after_success():
+def test_pending_click_uses_one_id_and_counts_on_landing():
     db = _db()
     entry = _entry()
     entry["_tracker_click_id"] = "trk-123"
@@ -126,30 +133,32 @@ def test_pending_click_uses_one_id_and_counts_only_after_success():
     assert click["id"] == click["click_id"] == "trk-123"
     assert click["job_id"] == "job-1"
     assert click["visit_id"] == "7"
-    assert click["visit_status"] == click["click_status"] == "pending"
-    assert db.links.updates == []
+    assert click["visit_status"] == "pending"
+    assert click["click_status"] == "completed"
+    assert db.links.updates[-1][1]["$inc"]["clicks"] == 1
 
     entry["status"] = "ok"
     asyncio.run(rut._log_click_for_link(entry, _job(), db, early=False))
     assert click["id"] == click["click_id"] == "trk-123"
     assert click["visit_status"] == "ok"
     assert click["click_status"] == "completed"
-    assert db.links.updates[-1][1]["$inc"]["clicks"] == 1
+    assert len(db.links.updates) == 1
     asyncio.run(rut._log_click_for_link(entry, _job(), db, early=False))
     assert len(db.links.updates) == 1
 
 
-def test_failed_pending_click_remains_failed_without_aggregate_increment():
+def test_failed_visit_keeps_completed_click_without_second_increment():
     db = _db()
     entry = _entry()
     asyncio.run(rut._log_click_for_link(entry, _job(), db, early=True))
+    assert db.links.updates[-1][1]["$inc"]["clicks"] == 1
     entry["status"] = "failed"
     asyncio.run(rut._log_click_for_link(entry, _job(), db, early=False))
 
     click = db.client["krexion_user_owner_1"].clicks.docs[0]
     assert click["visit_status"] == "failed"
-    assert click["click_status"] == "failed"
-    assert db.links.updates == []
+    assert click["click_status"] == "completed"
+    assert len(db.links.updates) == 1
 
 
 def test_silent_skip_deletes_pending_row_without_negative_link_count():
@@ -167,7 +176,7 @@ def test_silent_skip_deletes_pending_row_without_negative_link_count():
         entry["status"] = "skipped_duplicate_ip"
         asyncio.run(rut._record("job-1", entry, [], asyncio.Lock(), db))
         assert db.client["krexion_user_owner_1"].clicks.docs == []
-        assert db.links.updates == []
+        assert db.links.updates[-1][1]["$inc"]["clicks"] == -1
         assert rut.RUT_JOBS["job-1"]["skipped"] == 1
     finally:
         rut.RUT_JOBS.pop("job-1", None)

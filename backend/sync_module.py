@@ -12,6 +12,7 @@ Endpoints (all under `/api/sync/`):
   GET  /clicks/pull      — local pulls clicks captured by the cloud edge
                            (i.e. when someone clicked /r/xxx while the
                             customer's PC was offline)
+  POST /clicks/push      — local pushes RUT click rows to cloud dashboard
   POST /clicks/ack       — local marks pulled clicks as stored locally
   POST /heartbeat        — local announces itself ("I'm online")
   GET  /status           — local checks what cloud knows about it
@@ -115,6 +116,48 @@ async def push_links(
         )
         upserted += 1
     return {"upserted": upserted, "received": len(links)}
+
+
+@sync_router.post("/clicks/push")
+async def push_click(
+    body: dict,
+    x_krexion_license: Optional[str] = Header(None),
+):
+    """Local/native RUT pushes click rows to cloud so krexion.com dashboard sees them."""
+    _, user = await _validate_license(x_krexion_license)
+    if not _get_db_for_user:
+        raise HTTPException(status_code=503, detail="Sync not fully configured")
+
+    click = body.get("click") or {}
+    if not isinstance(click, dict):
+        raise HTTPException(status_code=400, detail="`click` must be an object")
+    cid = str(click.get("id") or click.get("click_id") or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="click.id is required")
+
+    user_db = _get_db_for_user(user)
+    link_id = click.get("link_id")
+    existing = await user_db.clicks.find_one({"id": cid}, {"click_status": 1, "_id": 0})
+    was_completed = bool(existing and existing.get("click_status") == "completed")
+
+    clean = {k: v for k, v in click.items() if k != "_id"}
+    clean["id"] = cid
+    clean["click_id"] = click.get("click_id") or cid
+    clean["synced_from_local"] = True
+
+    if body.get("update"):
+        await user_db.clicks.update_one({"id": cid}, {"$set": clean}, upsert=True)
+    else:
+        await user_db.clicks.update_one({"id": cid}, {"$set": clean}, upsert=True)
+
+    now_completed = clean.get("click_status") == "completed"
+    if now_completed and not was_completed and link_id:
+        await _db.links.update_one(
+            {"id": link_id},
+            {"$inc": {"clicks": 1, "consecutive_no_conversions": 1}},
+        )
+
+    return {"ok": True, "id": cid, "updated": bool(body.get("update"))}
 
 
 @sync_router.get("/clicks/pull")

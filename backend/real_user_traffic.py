@@ -13135,16 +13135,18 @@ async def run_real_user_traffic_job(
                         entry["_smart_funnel_min_deals"] = int(_sf_cfg.min_deals)
                         if step_res.get("deal_flow_complete"):
                             entry["_smart_funnel_deal_flow_complete"] = True
+                        _sf_min_gate = int(_sf_cfg.min_deals)
+                        _sf_url_deals_gate = int(
+                            step_res.get("url_deals") or step_res.get("deals_done") or 0
+                        )
+                        if step_res.get("status") == "ok" and step_res.get("conversion_signal"):
+                            if (
+                                _sf_url_deals_gate >= _sf_min_gate
+                                or step_res.get("deal_flow_complete")
+                            ):
+                                entry["_smart_funnel_conversion"] = True
                     if step_res.get("deals_done") is not None:
                         entry["deals_completed"] = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
-                    _sf_min_gate = int(_sf_cfg.min_deals)
-                    _sf_url_deals_gate = int(step_res.get("url_deals") or step_res.get("deals_done") or 0)
-                    if step_res.get("status") == "ok" and step_res.get("conversion_signal"):
-                        if (
-                            _sf_url_deals_gate >= _sf_min_gate
-                            or step_res.get("deal_flow_complete")
-                        ):
-                            entry["_smart_funnel_conversion"] = True
                     if step_res.get("error"):
                         entry["error"] = step_res["error"]
                     # ── 2026-05: best-effort `screenshot` steps on failure ──
@@ -17240,14 +17242,18 @@ async def _execute_automation_steps(
 
                 if action == "goto":
                     _dest = str(value or selector or "")
-                    _orig = str((click_once_guard or {}).get("click_url") or "")
-                    if (
-                        (click_once_guard or {}).get("fired")
-                        and _orig
-                        and _is_repeat_offer_click(_dest, _orig)
-                    ):
-                        executed += 1
-                        continue
+                    if (click_once_guard or {}).get("fired"):
+                        _orig = str((click_once_guard or {}).get("click_url") or "")
+                        if _orig and _is_repeat_offer_click(_dest, _orig):
+                            executed += 1
+                            continue
+                        _offer_orig = str((click_once_guard or {}).get("offer_url") or "")
+                        if _offer_orig and _is_repeat_offer_click(_dest, _offer_orig):
+                            executed += 1
+                            continue
+                        if _url_has_affiliate_click_params(_dest):
+                            executed += 1
+                            continue
                     await page.goto(value or selector, timeout=timeout, wait_until="domcontentloaded")
                 elif action == "click":
                     if wait_nav:
@@ -19740,6 +19746,49 @@ async def _multi_step_fill(
     }
 
 
+async def _push_rut_click_to_cloud(click_doc: Dict[str, Any], *, update: bool = False) -> None:
+    """Native/local installs log clicks into local Mongo, but the dashboard
+    reads cloud Mongo. Push each RUT click doc to the cloud sync endpoint."""
+    if (os.environ.get("KREXION_MODE") or "local").lower().strip() == "cloud":
+        return
+    license_key = (os.environ.get("LICENSE_KEY") or "").strip()
+    if not license_key:
+        key_file = (os.environ.get("LICENSE_KEY_FILE") or "").strip()
+        if key_file:
+            try:
+                license_key = Path(key_file).read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                license_key = ""
+    if not license_key:
+        try:
+            candidate = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Krexion" / "license-key.txt"
+            if candidate.exists():
+                license_key = candidate.read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            license_key = ""
+    if not license_key:
+        return
+    cloud_url = (os.environ.get("KREXION_CLOUD_URL") or "https://krexion.com").rstrip("/")
+    payload = {
+        "click": {k: v for k, v in click_doc.items() if k != "_id"},
+        "update": bool(update),
+    }
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{cloud_url}/api/sync/clicks/push",
+                json=payload,
+                headers={"X-Krexion-License": license_key},
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"RUT cloud click push HTTP {resp.status_code}: {resp.text[:180]}"
+                )
+    except Exception as exc:
+        logger.warning(f"RUT cloud click push failed: {exc}")
+
+
 async def _log_click_for_link(
     entry: Dict[str, Any],
     job_info: Dict[str, Any],
@@ -19792,16 +19841,16 @@ async def _log_click_for_link(
         early_id = entry.get("_early_click_id")
         if (not early) and early_id:
             try:
-                _final_st = (entry.get("status") or "").strip().lower()
                 transition = await user_db.clicks.update_one(
                     {
                         "id": early_id,
                         "click_id": early_id,
-                        "click_status": "pending",
                     },
                     {"$set": {
                         "visit_status": entry.get("status") or "",
-                        "click_status": "completed" if _final_st == "ok" else "failed",
+                        # Landing already counted as 1 completed click on
+                        # early insert — never downgrade when form fails.
+                        "click_status": "completed",
                         "final_url": entry.get("final_url") or "",
                         "conversion_page_reached": bool(entry.get("conversion_page_reached")),
                         "is_vpn": is_vpn,
@@ -19809,13 +19858,13 @@ async def _log_click_for_link(
                         **({"ipv4": exit_ip} if exit_ip and ":" not in exit_ip else {}),
                     }},
                 )
-                # A pending row is not a completed click. Aggregate only
-                # after the browser visit reaches its successful terminal.
-                if _final_st == "ok" and int(getattr(transition, "matched_count", 0) or 0) == 1:
-                    await main_db.links.update_one(
-                        {"id": link_id},
-                        {"$inc": {"clicks": 1, "consecutive_no_conversions": 1}},
-                    )
+                if int(getattr(transition, "matched_count", 0) or 0) == 1:
+                    try:
+                        updated = await user_db.clicks.find_one({"id": early_id}, {"_id": 0})
+                        if updated:
+                            await _push_rut_click_to_cloud(updated, update=True)
+                    except Exception:
+                        pass
             except Exception as _ue:
                 logger.warning(f"RUT click UPDATE failed: {_ue}")
             return
@@ -19909,7 +19958,9 @@ async def _log_click_for_link(
             "referrer_source_name": "Real User Traffic",
             "source": "real_user_traffic",
             "visit_status": ("pending" if early else (entry.get("status") or "")),
-            "click_status": ("pending" if early else "completed"),
+            # 2026-08: 1 browser landing = 1 completed click (Clicks == Hosts).
+            # Form/conversion failure must not hide the click that already fired.
+            "click_status": "completed",
             "final_url": entry.get("final_url") or "",
             "conversion_page_reached": bool(entry.get("conversion_page_reached")),
             "created_at": entry.get("timestamp") or datetime.now(timezone.utc).isoformat(),
@@ -19917,9 +19968,15 @@ async def _log_click_for_link(
         await user_db.clicks.insert_one(click_doc)
         if early:
             entry["_early_click_id"] = new_id
+            await main_db.links.update_one(
+                {"id": link_id},
+                {"$inc": {"clicks": 1, "consecutive_no_conversions": 1}},
+            )
+            await _push_rut_click_to_cloud(click_doc, update=False)
         else:
             _link_inc: Dict[str, Any] = {"clicks": 1, "consecutive_no_conversions": 1}
             await main_db.links.update_one({"id": link_id}, {"$inc": _link_inc})
+            await _push_rut_click_to_cloud(click_doc, update=False)
     except Exception as e:
         # Best-effort — never crash the visit because click logging failed
         logger.warning(f"RUT click log failed (job_id-unknown, early={early}): {e}")
@@ -19983,11 +20040,18 @@ async def _record(
                     client = db.client
                     db_name = f"krexion_user_{_owner_id.replace('-', '_')[:20]}"
                     user_db = client[db_name]
+                    existing = await user_db.clicks.find_one(
+                        {"id": _early_id},
+                        {"click_status": 1},
+                    )
                     await user_db.clicks.delete_one({"id": _early_id})
+                    if existing and existing.get("click_status") == "completed":
+                        await db.links.update_one(
+                            {"id": _link_id},
+                            {"$inc": {"clicks": -1, "consecutive_no_conversions": -1}},
+                        )
                 except Exception as _de:
                     logger.debug(f"silent-skip click delete failed: {_de}")
-                # Pending rows no longer increment the link aggregate, so
-                # deleting one must not decrement the aggregate either.
             # Bump diagnostics counter only.
             j["silent_skip_count"] = int(j.get("silent_skip_count") or 0) + 1
             j["skipped"] = int(j.get("skipped") or 0) + 1
