@@ -8040,11 +8040,14 @@ async def _try_team_reserve_exit_ip(
         from cross_user_ip_isolation import (
             acquire_team_offer_ip_claim,
             canonicalize_ip,
+            is_canonical_ipv4,
             resolve_isolation_scope,
             team_offer_claim_required,
         )
     except Exception:
         return True, {}
+    if not is_canonical_ipv4(exit_ip):
+        return False, {}
     canonical = canonicalize_ip(exit_ip)
     if not canonical:
         return False, {}
@@ -8066,6 +8069,77 @@ async def _try_team_reserve_exit_ip(
     if result.get("acquired"):
         return True, result
     return False, result
+
+
+async def _refresh_team_claim_pending(
+    *,
+    db: Any,
+    engine_user_id: str,
+    offer_url: str,
+    claim_ip: str,
+    visit_token: str,
+) -> bool:
+    """Extend pending team-offer claim TTL while visit is still running."""
+    if db is None or not (engine_user_id and offer_url and claim_ip and visit_token):
+        return False
+    try:
+        from cross_user_ip_isolation import refresh_team_offer_ip_claim
+    except Exception:
+        return False
+    try:
+        return await refresh_team_offer_ip_claim(
+            db, engine_user_id, offer_url, claim_ip, visit_token,
+        )
+    except Exception:
+        return False
+
+
+async def _sync_team_claim_exit_ip(
+    *,
+    db: Any,
+    engine_user_id: str,
+    offer_url: str,
+    visit_token: str,
+    old_ip: str,
+    new_exit_ip: str,
+    skip_duplicate_ip: bool,
+    tracker_missing_offer: bool,
+) -> Tuple[bool, str]:
+    """Re-bind pending team claim when tunnel rotation changes exit IP."""
+    from cross_user_ip_isolation import canonicalize_ip as _canon_ip
+
+    new_canon = _canon_ip(new_exit_ip)
+    old_canon = _canon_ip(old_ip)
+    if not new_canon or new_canon == old_canon:
+        if old_canon:
+            await _refresh_team_claim_pending(
+                db=db,
+                engine_user_id=engine_user_id,
+                offer_url=offer_url,
+                claim_ip=old_canon,
+                visit_token=visit_token,
+            )
+        return True, old_canon or ""
+    if old_canon:
+        try:
+            from cross_user_ip_isolation import release_team_offer_ip_claim
+            await release_team_offer_ip_claim(
+                db, engine_user_id, offer_url, old_canon, visit_token,
+            )
+        except Exception:
+            pass
+    ok, pick = await _try_team_reserve_exit_ip(
+        db=db,
+        engine_user_id=engine_user_id,
+        offer_url=offer_url,
+        exit_ip=new_exit_ip,
+        visit_token=visit_token,
+        skip_duplicate_ip=skip_duplicate_ip,
+        tracker_missing_offer=tracker_missing_offer,
+    )
+    if ok and pick.get("acquired"):
+        return True, new_canon
+    return False, old_canon or ""
 
 
 # ─── Job runner ──────────────────────────────────────────────────
@@ -10595,6 +10669,14 @@ async def run_real_user_traffic_job(
                                     f"Identity rate-limit: waiting {wait_s:.1f}s before visit (target={pacing_per_hour}/hr)",
                                 )
                                 await asyncio.sleep(wait_s)
+                                if _team_claim_acquired and _claim_ip:
+                                    await _refresh_team_claim_pending(
+                                        db=db,
+                                        engine_user_id=engine_user_id or "",
+                                        offer_url=_claim_offer_url,
+                                        claim_ip=_claim_ip,
+                                        visit_token=_visit_claim_token,
+                                    )
                         except Exception as _rl_err:  # noqa: BLE001
                             logger.debug(f"identity rate-limit failed: {_rl_err}")
                     if _identity_storage_state:
@@ -11447,6 +11529,16 @@ async def run_real_user_traffic_job(
                     # glitch; the existing post-load detector remains the
                     # safety net.
 
+                if _team_claim_acquired and _claim_ip:
+                    await _refresh_team_claim_pending(
+                        db=db,
+                        engine_user_id=engine_user_id or "",
+                        offer_url=_claim_offer_url,
+                        claim_ip=_claim_ip,
+                        visit_token=_visit_claim_token,
+                    )
+
+                _browser_open_attempt = 0
                 push_live_step(job_id, i + 1, "browser", "info", f"Opening {target_url}")
 
                 # ── 2026-02 Step 4 (P1 #11) — IP warm-up ─────────────
@@ -11679,6 +11771,12 @@ async def run_real_user_traffic_job(
                 resp = None
                 goto_exc = None
                 while True:
+                    _browser_open_attempt += 1
+                    if _browser_open_attempt > 1:
+                        push_live_step(
+                            job_id, i + 1, "browser", "info",
+                            f"Navigation retry #{_browser_open_attempt} → {target_url[:90]}",
+                        )
                     try:
                         # 2026-01 — lowered from 90s → 35s. Residential
                         # proxies that haven't started serving traffic
@@ -11905,6 +12003,26 @@ async def run_real_user_traffic_job(
                             # v2.6.33 — Re-probe geo on rotated proxy so locale/TZ match exit IP.
                             _new_geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
                             if _new_geo.get("ok"):
+                                _new_exit = _new_geo.get("exit_ip") or ""
+                                if _team_claim_acquired and _claim_ip and _new_exit:
+                                    _sync_ok, _new_claim_ip = await _sync_team_claim_exit_ip(
+                                        db=db,
+                                        engine_user_id=engine_user_id or "",
+                                        offer_url=_claim_offer_url,
+                                        visit_token=_visit_claim_token,
+                                        old_ip=_claim_ip,
+                                        new_exit_ip=_new_exit,
+                                        skip_duplicate_ip=skip_duplicate_ip,
+                                        tracker_missing_offer=_is_tracker_target and not _claim_offer_url,
+                                    )
+                                    if not _sync_ok:
+                                        push_live_step(
+                                            job_id, i + 1, "browser", "info",
+                                            "Tunnel rotate: could not re-bind team IP claim — stopping proxy rotation",
+                                        )
+                                        break
+                                    if _new_claim_ip:
+                                        _claim_ip = _new_claim_ip
                                 geo = _new_geo
                                 entry["exit_ip"] = geo.get("exit_ip") or entry.get("exit_ip", "")
                                 entry["country"] = geo.get("country_name") or entry.get("country", "")
@@ -12080,10 +12198,20 @@ async def run_real_user_traffic_job(
                                         )
                                         goto_exc = None  # clear → success path
                                     except Exception as _bp_e:
-                                        # Bypass-page itself failed too;
-                                        # fall through to the original
-                                        # failure-recording code.
-                                        goto_exc = _bp_e
+                                        try:
+                                            push_live_step(
+                                                job_id, i + 1, "bypass", "info",
+                                                "Bypass offer goto failed — retrying with wait_until=commit",
+                                            )
+                                            resp = await page.goto(
+                                                _bypass_offer_url,
+                                                timeout=90000,
+                                                wait_until="commit",
+                                                **_goto_referer_kw,
+                                            )
+                                            goto_exc = None
+                                        except Exception as _bp_e2:
+                                            goto_exc = _bp_e2
                                 else:
                                     push_live_step(
                                         job_id, i + 1, "bypass", "failed",
@@ -12366,16 +12494,22 @@ async def run_real_user_traffic_job(
                     _landing_http_status = int(entry.get("http_status") or 0) or None
                 except Exception:
                     _landing_http_status = None
+                if _landing_http_status == 403:
+                    _block_reason = "duplicate_ip"
+                    _block_snippet = "HTTP 403 Forbidden at landing"
+                _is_dup_block = False
+                _dup_snippet = ""
                 try:
-                    _is_dup_block, _dup_snippet = await _detect_offer_duplicate_ip_block(
-                        page, http_status=_landing_http_status,
-                    )
+                    if not _block_reason:
+                        _is_dup_block, _dup_snippet = await _detect_offer_duplicate_ip_block(
+                            page, http_status=_landing_http_status,
+                        )
                 except Exception:
                     _is_dup_block, _dup_snippet = (False, "")
                 if _is_dup_block:
                     _block_reason = "duplicate_ip"
                     _block_snippet = _dup_snippet
-                else:
+                elif not _block_reason:
                     try:
                         _is_vpn_block, _vpn_snippet = await _detect_offer_vpn_block(
                             page, http_status=_landing_http_status,
@@ -12515,11 +12649,40 @@ async def run_real_user_traffic_job(
                 # must not free an IP that already touched the offer.
                 if _team_claim_acquired and not _team_claim_completed:
                     from cross_user_ip_isolation import complete_team_offer_ip_claim
+                    await _refresh_team_claim_pending(
+                        db=db,
+                        engine_user_id=engine_user_id or "",
+                        offer_url=_claim_offer_url,
+                        claim_ip=_claim_ip,
+                        visit_token=_visit_claim_token,
+                    )
                     _team_claim_completed = await complete_team_offer_ip_claim(
                         db, engine_user_id or "", _claim_offer_url,
                         _claim_ip, _visit_claim_token,
                     )
                     if not _team_claim_completed:
+                        await _refresh_team_claim_pending(
+                            db=db,
+                            engine_user_id=engine_user_id or "",
+                            offer_url=_claim_offer_url,
+                            claim_ip=_claim_ip,
+                            visit_token=_visit_claim_token,
+                        )
+                        _team_claim_completed = await complete_team_offer_ip_claim(
+                            db, engine_user_id or "", _claim_offer_url,
+                            _claim_ip, _visit_claim_token,
+                        )
+                    if not _team_claim_completed:
+                        if _can_retry_offer_block:
+                            push_live_step(
+                                job_id, i + 1, "filter", "info",
+                                f"Team offer claim expired for {_claim_ip or '?'} — retrying visit with fresh IP",
+                            )
+                            raise _OfferBlockRetryNeeded(
+                                reason="team_claim_expired",
+                                burnt_ip=_claim_ip or "",
+                            )
+                        entry["team_claim_infra"] = True
                         raise RuntimeError("team offer claim completion failed")
 
                 # No form fill AND no custom automation JSON → plain
@@ -13380,7 +13543,21 @@ async def run_real_user_traffic_job(
                 except Exception:
                     pass
 
-                # ALWAYS capture a post-submit screenshot — regardless of
+                _final_after_submit = (entry.get("final_url") or "").strip()
+                if (
+                    entry.get("status") == "ok"
+                    and not entry.get("conversion_page_reached")
+                    and (
+                        not _final_after_submit
+                        or _final_after_submit == "about:blank"
+                        or _final_after_submit.startswith("about:")
+                    )
+                ):
+                    entry["status"] = "failed"
+                    entry["error"] = "Post-submit page is blank — conversion not detected"
+                    entry["blank_final"] = True
+
+                # ALWAYS capture a post-submit screenshot
                 # whether the visit is ultimately counted as a conversion.
                 # User explicitly asked for this: "jab submit hone k 7 second
                 # bad jo page ay os k ss ay". File lands in the results ZIP
@@ -19789,6 +19966,33 @@ async def _push_rut_click_to_cloud(click_doc: Dict[str, Any], *, update: bool = 
         logger.warning(f"RUT cloud click push failed: {exc}")
 
 
+async def _resolve_click_link_id(
+    main_db,
+    owner_id: str,
+    link_id: str,
+    short_code: str,
+) -> str:
+    """Prefer the local links.id when cloud and local IDs diverge."""
+    try:
+        existing = await main_db.links.find_one(
+            {"id": link_id, "user_id": owner_id},
+            {"_id": 0, "id": 1},
+        )
+        if existing:
+            return link_id
+        sc = (short_code or "").strip()
+        if sc:
+            local = await main_db.links.find_one(
+                {"short_code": sc, "user_id": owner_id},
+                {"_id": 0, "id": 1},
+            )
+            if local and local.get("id"):
+                return str(local["id"])
+    except Exception:
+        pass
+    return link_id
+
+
 async def _log_click_for_link(
     entry: Dict[str, Any],
     job_info: Dict[str, Any],
@@ -19815,6 +20019,7 @@ async def _log_click_for_link(
     if not link_id or not owner_id or main_db is None:
         return
     try:
+        link_id = await _resolve_click_link_id(main_db, owner_id, link_id, short_code)
         # Access the per-user DB on the same client. IMPORTANT: Must match
         # server.py::get_user_db() exactly — that helper uses a 20-char
         # truncated, underscore-normalised key:
@@ -20069,8 +20274,13 @@ async def _record(
             return
 
         # ── Visible visit accounting (original logic, unchanged) ─────────
-        j["meaningful_attempts"] = int(j.get("meaningful_attempts") or 0) + 1
         j["processed"] = int(j.get("processed") or 0) + 1
+        _infra_noise = bool(
+            entry.get("tunnel_failed")
+            or entry.get("team_claim_infra")
+        )
+        if not _infra_noise:
+            j["meaningful_attempts"] = int(j.get("meaningful_attempts") or 0) + 1
         key_map = {
             "ok": "succeeded",
             "skipped_captcha": "skipped_captcha",

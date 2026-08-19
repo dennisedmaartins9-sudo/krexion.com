@@ -25,7 +25,9 @@ def test_dup_ip_loader_uses_vps_ledger_peers():
     assert "vps_ip_db_enabled" in text
     iso = (ROOT / "backend" / "cross_user_ip_isolation.py").read_text(encoding="utf-8")
     assert "async def list_team_shared_used_ips" in iso
-    assert "PENDING_CLAIM_SECONDS = 90" in iso
+    assert "PENDING_CLAIM_SECONDS = 180" in iso
+    assert "refresh_team_offer_ip_claim" in iso
+    assert "is_canonical_ipv4" in iso
 
 
 def test_persist_burnt_ip_tags_vps_ledger_members():

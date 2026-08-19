@@ -14,7 +14,9 @@ from cross_user_ip_isolation import (
     canonicalize_ip,
     complete_team_offer_ip_claim,
     invalidate_group_cache,
+    is_canonical_ipv4,
     list_team_shared_used_ips,
+    refresh_team_offer_ip_claim,
     release_team_offer_ip_claim,
     resolve_isolation_scope,
     team_offer_claim_required,
@@ -331,3 +333,37 @@ def test_group_id_index_reuses_existing_production_name():
     ).read_text(encoding="utf-8")
     assert 'create_index("id", unique=True)' in source
     assert 'name="uniq_isolation_group_id"' not in source
+
+
+def test_is_canonical_ipv4_rejects_ipv6():
+    assert is_canonical_ipv4("198.51.100.9")
+    assert not is_canonical_ipv4("2600:1700:8af0:c140:a913:b597:7396:8076")
+
+
+@_async_test
+async def test_refresh_extends_pending_claim():
+    db = _DB()
+    invalidate_group_cache()
+    offer = "https://offer.example/a"
+    ip = "198.51.100.44"
+    token = "visit-refresh"
+    got = await acquire_team_offer_ip_claim(
+        db, "office01", offer, ip, token,
+    )
+    assert got["acquired"]
+    coll = db["team_offer_ip_claims"]
+    before = coll.docs[0]["expires_at"]
+    assert await refresh_team_offer_ip_claim(db, "office01", offer, ip, token)
+    after = coll.docs[0]["expires_at"]
+    assert after >= before
+    assert await complete_team_offer_ip_claim(db, "office01", offer, ip, token)
+
+
+def test_rut_team_claim_refresh_and_retry_hooks():
+    src = (Path(__file__).resolve().parents[1] / "real_user_traffic.py").read_text(encoding="utf-8")
+    assert "_refresh_team_claim_pending" in src
+    assert "_sync_team_claim_exit_ip" in src
+    assert "team_claim_expired" in src
+    assert "HTTP 403 Forbidden at landing" in src
+    assert "Post-submit page is blank" in src
+    assert "team_claim_infra" in src

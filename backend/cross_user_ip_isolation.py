@@ -26,9 +26,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 COLLECTION = "cross_user_ip_groups"
 CLAIMS_COLLECTION = "vps_ip_claims"
 TEAM_OFFER_CLAIMS_COLLECTION = "team_offer_ip_claims"
-# Pending claim TTL — was 240s which locked an IP for the WHOLE team
-# when one visit hung. 90s is enough for geo/VPN + first navigation.
-PENDING_CLAIM_SECONDS = 90
+# Pending claim TTL — extended from 90s: identity pacing can wait up to
+# 90s BEFORE browser launch, so a fixed 90s window expired claims mid-
+# visit (team_offer_claim completion failed). Refresh extends this window
+# while the visit is actively progressing; TTL still deletes stale claims.
+PENDING_CLAIM_SECONDS = 180
 
 _PLACEHOLDER_IPS = frozenset(
     {"", "unknown", "Unknown", "no-ipv4-detected", "no-ip-detected"}
@@ -38,6 +40,17 @@ _GROUP_CACHE: Dict[str, Any] = {"at": 0.0, "user_to_peers": {}}
 _GROUP_CACHE_TTL = 60.0
 _SCOPE_CACHE: Dict[str, Any] = {}
 _SCOPE_CACHE_TTL = 30.0
+
+
+def is_canonical_ipv4(raw: Any) -> bool:
+    """True when *raw* resolves to a usable IPv4 exit (team claims are IPv4-only)."""
+    canonical = canonicalize_ip(raw)
+    if not canonical:
+        return False
+    try:
+        return isinstance(ipaddress.ip_address(canonical), ipaddress.IPv4Address)
+    except ValueError:
+        return False
 
 
 def canonicalize_ip(raw: Any) -> Optional[str]:
@@ -331,6 +344,29 @@ async def acquire_team_offer_ip_claim(
             "scope_key": scope["scope_key"], "offer_key": offer_key,
             "offer_url_normalized": normalized_url, "ip": canonical_ip,
         }
+
+
+async def refresh_team_offer_ip_claim(
+    db, user_id: str, offer_url: str, ip: str, visit_token: str
+) -> bool:
+    """Extend a pending claim while the visit is still in progress."""
+    scope = await resolve_isolation_scope(db, user_id)
+    _, offer_key = canonical_offer_identity(offer_url)
+    canonical_ip = canonicalize_ip(ip)
+    if not canonical_ip:
+        return False
+    now = datetime.now(timezone.utc)
+    result = await db[TEAM_OFFER_CLAIMS_COLLECTION].update_one(
+        {
+            "scope_key": scope["scope_key"],
+            "offer_key": offer_key,
+            "ip": canonical_ip,
+            "visit_token": (visit_token or "").strip(),
+            "status": "pending",
+        },
+        {"$set": {"expires_at": now + timedelta(seconds=PENDING_CLAIM_SECONDS)}},
+    )
+    return bool(result.modified_count)
 
 
 async def complete_team_offer_ip_claim(

@@ -280,7 +280,11 @@ def get_db_for_user(user: dict):
         return get_user_db(user["id"])
 
 
-# ─── Per-user-DB index bootstrap (runs once per process per user) ──────
+from click_scope import (
+    apply_click_created_at_filter,
+    build_user_clicks_scope_query,
+    merge_click_filters,
+)
 # Each user has their own MongoDB database (`krexion_user_<id>`). The
 # heavy collections (`uploaded_resources`, `items`, `realuser_jobs`) need
 # indexes for the queries that run on every request — without these,
@@ -16847,26 +16851,17 @@ async def get_clicks(
     if user.get("is_sub_user"):
         link_query["created_by"] = user.get("sub_user_id")
     
-    user_links = await db.links.find(link_query, {"_id": 0, "id": 1}).to_list(1000000)
-    link_ids = [link["id"] for link in user_links]
+    user_links = await db.links.find(link_query, {"_id": 0, "id": 1, "short_code": 1}).to_list(1000000)
     
-    # If specific link requested, filter by that link only
-    if link_id and link_id in link_ids:
-        query = {"link_id": link_id}
-    else:
-        query = {"link_id": {"$in": link_ids}}
-    
-    # 2026-08: Align dashboard Clicks with Hosts.
-    # Hosts are effectively counted only for successful/converted
-    # visits (click_status="completed"). Early/pending/failed click docs
-    # inflate Clicks and break Clicks==Hosts.
-    query["click_status"] = "completed"
+    scope = build_user_clicks_scope_query(user, user_links, link_id=link_id)
+    query = merge_click_filters(scope, {"click_status": "completed"})
     
     # Date filtering
+    created_at: dict = {}
     if start_date:
         try:
             start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query["created_at"] = {"$gte": start_dt.isoformat()}
+            created_at["$gte"] = start_dt.isoformat()
         except Exception:
             pass
     
@@ -16874,10 +16869,7 @@ async def get_clicks(
         try:
             end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
             end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            if "created_at" in query:
-                query["created_at"]["$lte"] = end_dt.isoformat()
-            else:
-                query["created_at"] = {"$lte": end_dt.isoformat()}
+            created_at["$lte"] = end_dt.isoformat()
         except Exception:
             pass
     
@@ -16885,17 +16877,20 @@ async def get_clicks(
     if not start_date and not end_date:
         if filter_type == "today":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            query["created_at"] = {"$gte": today.isoformat()}
+            created_at["$gte"] = today.isoformat()
         elif filter_type == "yesterday":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday = today - timedelta(days=1)
-            query["created_at"] = {"$gte": yesterday.isoformat(), "$lt": today.isoformat()}
+            created_at["$gte"] = yesterday.isoformat()
+            created_at["$lt"] = today.isoformat()
         elif filter_type == "week":
             week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-            query["created_at"] = {"$gte": week_ago.isoformat()}
+            created_at["$gte"] = week_ago.isoformat()
         elif filter_type == "month":
             month_ago = datetime.now(timezone.utc) - timedelta(days=30)
-            query["created_at"] = {"$gte": month_ago.isoformat()}
+            created_at["$gte"] = month_ago.isoformat()
+    if created_at:
+        query = apply_click_created_at_filter(query, created_at)
     
     # Query from user's database first, then also from main db for legacy data
     cursor = user_db.clicks.find(query, {"_id": 0}).sort("created_at", -1)
@@ -16979,24 +16974,18 @@ async def get_clicks_count(
     # Get user's database
     user_db = get_db_for_user(user)
     
-    user_links = await db.links.find({"user_id": user["id"]}, {"_id": 0, "id": 1}).to_list(100000)
-    link_ids = [link["id"] for link in user_links]
+    user_links = await db.links.find({"user_id": user["id"]}, {"_id": 0, "id": 1, "short_code": 1}).to_list(100000)
     
-    if link_id and link_id in link_ids:
-        query = {"link_id": link_id}
-    else:
-        query = {"link_id": {"$in": link_ids}}
-    
-    # 2026-08: Align dashboard Clicks with Hosts.
-    # Count only completed clicks so Clicks==Hosts is guaranteed.
-    query["click_status"] = "completed"
+    scope = build_user_clicks_scope_query(user, user_links, link_id=link_id)
+    query = merge_click_filters(scope, {"click_status": "completed"})
     
     # ── Date filter: explicit range wins over filter_type ──────────────
     applied_explicit = False
+    created_at: dict = {}
     if start_date:
         try:
             start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query["created_at"] = {"$gte": start_dt.isoformat()}
+            created_at["$gte"] = start_dt.isoformat()
             applied_explicit = True
         except Exception:
             pass
@@ -17004,10 +16993,7 @@ async def get_clicks_count(
         try:
             end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
             end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            if "created_at" in query:
-                query["created_at"]["$lte"] = end_dt.isoformat()
-            else:
-                query["created_at"] = {"$lte": end_dt.isoformat()}
+            created_at["$lte"] = end_dt.isoformat()
             applied_explicit = True
         except Exception:
             pass
@@ -17018,17 +17004,20 @@ async def get_clicks_count(
     if not applied_explicit:
         if filter_type == "today":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            query["created_at"] = {"$gte": today.isoformat()}
+            created_at["$gte"] = today.isoformat()
         elif filter_type == "yesterday":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday = today - timedelta(days=1)
-            query["created_at"] = {"$gte": yesterday.isoformat(), "$lt": today.isoformat()}
+            created_at["$gte"] = yesterday.isoformat()
+            created_at["$lt"] = today.isoformat()
         elif filter_type == "week":
             week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-            query["created_at"] = {"$gte": week_ago.isoformat()}
+            created_at["$gte"] = week_ago.isoformat()
         elif filter_type == "month":
             month_ago = datetime.now(timezone.utc) - timedelta(days=30)
-            query["created_at"] = {"$gte": month_ago.isoformat()}
+            created_at["$gte"] = month_ago.isoformat()
+    if created_at:
+        query = apply_click_created_at_filter(query, created_at)
     
     # Count from BOTH user_db and main db — dedupe by id/click_id (same as /clicks list)
     _id_rows_u = await user_db.clicks.find(query, {"_id": 0, "id": 1, "click_id": 1}).to_list(None)
@@ -17096,18 +17085,16 @@ async def export_clicks(
     link_ids = [link["id"] for link in user_links]
     link_names = {link["id"]: link.get("name") or link.get("short_code", "Unknown") for link in user_links}
     
-    # Build query
-    if link_id and link_id in link_ids:
-        query = {"link_id": link_id}
-    else:
-        query = {"link_id": {"$in": link_ids}}
+    scope = build_user_clicks_scope_query(user, user_links, link_id=link_id)
+    query = dict(scope)
     
     # ── Date filter: explicit range wins over filter_type ──────────────
     applied_explicit = False
+    created_at: dict = {}
     if start_date:
         try:
             start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query["created_at"] = {"$gte": start_dt.isoformat()}
+            created_at["$gte"] = start_dt.isoformat()
             applied_explicit = True
         except Exception:
             pass
@@ -17115,10 +17102,7 @@ async def export_clicks(
         try:
             end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
             end_dt = end_dt.replace(hour=23, minute=59, second=59)
-            if "created_at" in query:
-                query["created_at"]["$lte"] = end_dt.isoformat()
-            else:
-                query["created_at"] = {"$lte": end_dt.isoformat()}
+            created_at["$lte"] = end_dt.isoformat()
             applied_explicit = True
         except Exception:
             pass
@@ -17127,17 +17111,20 @@ async def export_clicks(
     if not applied_explicit:
         if filter_type == "today":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            query["created_at"] = {"$gte": today.isoformat()}
+            created_at["$gte"] = today.isoformat()
         elif filter_type == "yesterday":
             today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             yesterday = today - timedelta(days=1)
-            query["created_at"] = {"$gte": yesterday.isoformat(), "$lt": today.isoformat()}
+            created_at["$gte"] = yesterday.isoformat()
+            created_at["$lt"] = today.isoformat()
         elif filter_type == "week":
             week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-            query["created_at"] = {"$gte": week_ago.isoformat()}
+            created_at["$gte"] = week_ago.isoformat()
         elif filter_type == "month":
             month_ago = datetime.now(timezone.utc) - timedelta(days=30)
-            query["created_at"] = {"$gte": month_ago.isoformat()}
+            created_at["$gte"] = month_ago.isoformat()
+    if created_at:
+        query = apply_click_created_at_filter(query, created_at)
     
     # 2026-07 (Bug #2 fix) — cap the export at EXPORT_CLICKS_MAX rows
     # to prevent VPS OOM when users with millions of clicks hit Export
@@ -17591,20 +17578,21 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     if user.get("is_sub_user"):
         link_query["created_by"] = user.get("sub_user_id")
     
-    user_links = await db.links.find(link_query, {"_id": 0, "id": 1}).to_list(100000)
-    link_ids = [link["id"] for link in user_links]
+    user_links = await db.links.find(link_query, {"_id": 0, "id": 1, "short_code": 1}).to_list(100000)
+    scope = build_user_clicks_scope_query(user, user_links)
     
     # Count clicks from BOTH user_db and main db (legacy data)
-    user_db_clicks = await user_db.clicks.count_documents({"link_id": {"$in": link_ids}})
-    main_db_clicks = await db.clicks.count_documents({"link_id": {"$in": link_ids}})
+    user_db_clicks = await user_db.clicks.count_documents(scope)
+    main_db_clicks = await db.clicks.count_documents(scope)
     total_clicks = user_db_clicks + main_db_clicks
     
     # Get unique IPs from both databases
-    user_db_ips = await user_db.clicks.distinct("ip_address", {"link_id": {"$in": link_ids}})
-    main_db_ips = await db.clicks.distinct("ip_address", {"link_id": {"$in": link_ids}})
+    user_db_ips = await user_db.clicks.distinct("ip_address", scope)
+    main_db_ips = await db.clicks.distinct("ip_address", scope)
     unique_ips = set(user_db_ips + main_db_ips)
     unique_clicks = len(unique_ips)
     
+    link_ids = [link["id"] for link in user_links if link.get("id")]
     total_conversions = await db.conversions.count_documents({"link_id": {"$in": link_ids}})
     
     conversions = await db.conversions.find({"link_id": {"$in": link_ids}}, {"_id": 0}).to_list(100000)
@@ -17615,7 +17603,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     # Aggregate clicks by country from user_db
     clicks_by_country = await user_db.clicks.aggregate([
-        {"$match": {"link_id": {"$in": link_ids}}},
+        {"$match": scope},
         {"$group": {"_id": "$country", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
         {"$limit": 10}
@@ -17623,13 +17611,13 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     # Aggregate clicks by device from user_db
     clicks_by_device = await user_db.clicks.aggregate([
-        {"$match": {"link_id": {"$in": link_ids}}},
+        {"$match": scope},
         {"$group": {"_id": "$device", "count": {"$sum": 1}}}
     ]).to_list(10)
     
     # Aggregate clicks by date from user_db
     clicks_by_date = await user_db.clicks.aggregate([
-        {"$match": {"link_id": {"$in": link_ids}}},
+        {"$match": scope},
         {"$group": {
             "_id": {"$substr": ["$created_at", 0, 10]},
             "count": {"$sum": 1}
