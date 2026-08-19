@@ -504,6 +504,7 @@ def _strip_legacy_gateway_geo(username: str) -> str:
         r";sessionid-[a-z0-9]+",
         r"__cr\.[a-z0-9]+",
         r";st\.[a-z0-9]+",
+        r";state\.[a-z0-9_]+",
         r";city\.[a-z0-9_]+",
         r"(?:;|__)sessid\.[A-Za-z0-9_{}]+",
         r"(?:;|__)sessionid\.[A-Za-z0-9_{}]+",
@@ -650,10 +651,10 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
         "delim": ";",             # between params
         "kv": ".",                # key.value
         "keys": {
-            "country": "cr", "state": "st", "city": "city",
+            "country": "cr", "state": "state", "city": "city",
             "zip": "zip", "asn": "asn",
         },
-        "state_fmt": "{code_lower}",
+        "state_fmt": "{slug}",
         "sid_key": "sessid",
         "ttl_key": "sessttl",     # minutes
         "ttl_unit": "min",

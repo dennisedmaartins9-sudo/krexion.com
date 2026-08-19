@@ -9811,18 +9811,46 @@ async def run_real_user_traffic_job(
                     _heal_california_canada_collision(_geo)
                     _exit_st = _geo_exit_state_code(_geo)
                     if not _exit_st or _exit_st != row_state_code:
-                        last_reason = (
-                            f"exit state {_exit_st or '?'} != lead {row_state_code}"
-                        )
-                        _gw_user = (parsed.get("username") or "")[:72]
-                        if attempt <= 5 or attempt % 2 == 0:
-                            push_live_step(
-                                job_id, i + 1, "proxy", "info",
-                                f"Attempt {attempt}/{cap}: geo {_exit_st or '?'} != {row_state_code}, retrying"
-                                + (f" · user={_gw_user}" if _gw_user else ""),
+                        # ── v2.6.96 IP-FIRST SWAP ──────────────────────
+                        # Provider returned a valid IP for a *different*
+                        # US state.  Instead of discarding this perfectly
+                        # good IP and burning another attempt for the
+                        # original state, check whether an unconsumed
+                        # lead row exists for the exit state.  If yes,
+                        # swap to that row+state — zero wasted dials.
+                        _swapped = False
+                        if _exit_st and _exit_st != row_state_code:
+                            _swap_pick = pick_next_row_for_state(_exit_st)
+                            if _swap_pick is not None:
+                                # Release original row back to the pool.
+                                try:
+                                    consumed_row_indices.discard(_row_idx)
+                                except Exception:
+                                    pass
+                                _row_idx, _row = _swap_pick
+                                on_demand_row_pick = _swap_pick
+                                row_state_code = _exit_st
+                                entry["row_index"] = _row_idx + 1
+                                entry["lead_state"] = row_state_code
+                                push_live_step(
+                                    job_id, i + 1, "proxy", "ok",
+                                    f"Attempt {attempt}/{cap}: IP state {_exit_st} — swapped to row {_row_idx + 1} "
+                                    f"(lead has {_exit_st} data) · {_geo.get('exit_ip')}",
+                                )
+                                _swapped = True
+                        if not _swapped:
+                            last_reason = (
+                                f"exit state {_exit_st or '?'} != lead {row_state_code}"
                             )
-                        await asyncio.sleep(min(0.2 * attempt, 2.0))
-                        continue
+                            _gw_user = (parsed.get("username") or "")[:72]
+                            if attempt <= 5 or attempt % 2 == 0:
+                                push_live_step(
+                                    job_id, i + 1, "proxy", "info",
+                                    f"Attempt {attempt}/{cap}: geo {_exit_st or '?'} != {row_state_code}, retrying"
+                                    + (f" · user={_gw_user}" if _gw_user else ""),
+                                )
+                            await asyncio.sleep(min(0.2 * attempt, 2.0))
+                            continue
                 # Country gate — honour proxyjet_country / per-visit MIX pick.
                 if not _geo_matches_target_country(_geo, _visit_pj_country):
                     _exit_cc = _geo_exit_country_code(_geo)
