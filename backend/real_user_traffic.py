@@ -13,7 +13,7 @@ If form_fill_enabled is on, after the tracker click we multi-step-fill the
 landing form with a row from the uploaded Excel / Google Sheet, take a
 final-page screenshot, capture TrustedForm/LeadID proof, and zip everything.
 
-Output:  results.zip  containing  screenshots/*.png  +  report.xlsx
+Output:  results.zip  containing  screenshots/* (complete visits only)  +  report.xlsx
 """
 from __future__ import annotations
 import asyncio
@@ -698,6 +698,89 @@ def _full_chromium_binary_path() -> Optional[Path]:
 def lightweight_reporting_enabled() -> bool:
     from hardware_tune import lightweight_reporting_enabled as _fn
     return _fn()
+
+
+def _report_visit_is_complete(entry: Optional[Dict[str, Any]]) -> bool:
+    """True when a visit belongs in the downloadable report screenshot set.
+
+    Complete = form/automation finished cleanly (status ok) OR conversion /
+    thank-you page reached. Incomplete / failed / skipped visits keep Live
+    Activity + Visual Grid behavior during the run, but their on-disk shots
+    are excluded from results.zip (and purged after zip build).
+    """
+    if not isinstance(entry, dict):
+        return False
+    status = str(entry.get("status") or "").strip().lower()
+    if status == "ok":
+        return True
+    if entry.get("conversion_page_reached") or entry.get("thank_you_reached"):
+        return True
+    return False
+
+
+def _iter_report_shot_files(shots_dir: Path) -> List[Path]:
+    """All report evidence image files under shots_dir (png/jpeg/webp)."""
+    out: List[Path] = []
+    try:
+        root = Path(shots_dir)
+    except Exception:
+        return out
+    if not root.is_dir():
+        return out
+    for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+        try:
+            out.extend(root.glob(pat))
+        except Exception:
+            continue
+    return out
+
+
+def _shots_matching_visit_indexes(shots_dir: Path, indexes: set) -> List[Path]:
+    """Return shot files whose visit_NNNNN prefix is in `indexes` (1-based)."""
+    if not indexes:
+        return []
+    matched: List[Path] = []
+    for p in _iter_report_shot_files(shots_dir):
+        try:
+            name = p.name
+            if not name.startswith("visit_"):
+                continue
+            num = int(name[6:11])  # visit_00001...
+            if num in indexes:
+                matched.append(p)
+        except Exception:
+            continue
+    return matched
+
+
+def _purge_incomplete_report_screenshots(
+    shots_dir: Path,
+    report: List[Dict[str, Any]],
+) -> int:
+    """Delete on-disk report screenshots for visits that did not complete.
+
+    Called after results.zip is built so Live Activity / Grid were unaffected
+    during the job. Returns number of files removed.
+    """
+    complete_idxs = {
+        int(e.get("visit_index") or 0)
+        for e in (report or [])
+        if _report_visit_is_complete(e) and e.get("visit_index") is not None
+    }
+    removed = 0
+    for p in _iter_report_shot_files(shots_dir):
+        try:
+            name = p.name
+            if not name.startswith("visit_"):
+                continue
+            num = int(name[6:11])
+            if num in complete_idxs:
+                continue
+            p.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            continue
+    return removed
 
 
 def _use_full_chromium() -> bool:
@@ -14740,25 +14823,21 @@ async def run_real_user_traffic_job(
 
         succeeded_visits = _bucket_visits(lambda e: str(e.get("status", "")) == "ok")
         conversion_visits = _bucket_visits(lambda e: bool(e.get("conversion_page_reached")))
+        # Report ZIP screenshots: only complete visits (ok and/or conversion).
+        # Live Activity + Visual Grid are unchanged during the run.
+        complete_report_visits = _bucket_visits(_report_visit_is_complete)
+        complete_shot_idxs = {
+            int(v.get("visit_index") or 0)
+            for v in complete_report_visits
+            if v.get("visit_index") is not None
+        }
+        complete_shot_files = _shots_matching_visit_indexes(shots_dir, complete_shot_idxs)
 
         def _shots_for_visits(visits: List[Dict[str, Any]]) -> List[Path]:
             idxs = {int(v.get("visit_index") or 0) for v in visits if v.get("visit_index") is not None}
             if not idxs:
                 return []
-            out: List[Path] = []
-            for p in shots_dir.glob("*.png"):
-                # filenames look like visit_00001.png / visit_00001_thankyou.png /
-                # visit_00001_capture02_xyz.png — extract the leading numeric id.
-                try:
-                    name = p.name
-                    if not name.startswith("visit_"):
-                        continue
-                    num = int(name[6:11])  # 5-digit zero-padded
-                    if num in idxs:
-                        out.append(p)
-                except Exception:
-                    continue
-            return out
+            return _shots_matching_visit_indexes(shots_dir, idxs)
 
         # Build per-bucket Excel reports (filtered subset of `report`).
         processed_report_path = job_dir / "_bucket_processed_report.xlsx"
@@ -14782,7 +14861,8 @@ async def run_real_user_traffic_job(
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             # ── 1. Top-level legacy artefacts (kept for backward compat) ──
-            for p in shots_dir.glob("*.png"):
+            # Screenshots: complete visits only (ok / conversion).
+            for p in complete_shot_files:
                 zf.write(p, arcname=f"screenshots/{p.name}")
             if (job_dir / "report.xlsx").exists():
                 zf.write(job_dir / "report.xlsx", arcname="report.xlsx")
@@ -14791,10 +14871,10 @@ async def run_real_user_traffic_job(
             if pending_path and pending_path.exists():
                 zf.write(pending_path, arcname="pending_leads.xlsx")
 
-            # ── 2. Processed/ (every visit) ──
+            # ── 2. Processed/ (every visit in Excel; SS only if complete) ──
             if processed_report_path and processed_report_path.exists():
                 zf.write(processed_report_path, arcname="Processed/report.xlsx")
-            for p in shots_dir.glob("*.png"):
+            for p in complete_shot_files:
                 zf.write(p, arcname=f"Processed/screenshots/{p.name}")
 
             # ── 3. Succeeded/ (status == ok) ──
@@ -14816,6 +14896,17 @@ async def run_real_user_traffic_job(
                 zf.write(status_path, arcname="Leads_Left/leads_with_status.xlsx")
     except Exception as e:
         logger.warning(f"zip build failed: {e}")
+    else:
+        # Free disk after ZIP: drop incomplete-visit evidence shots.
+        try:
+            _n_purged = _purge_incomplete_report_screenshots(shots_dir, report)
+            if _n_purged:
+                logger.info(
+                    f"RUT job {job_id}: purged {_n_purged} incomplete-visit "
+                    f"report screenshots (ZIP keeps complete visits only)"
+                )
+        except Exception as _purge_err:
+            logger.debug(f"incomplete screenshot purge failed: {_purge_err}")
     finally:
         # Clean up the temporary per-bucket Excel files (they're already
         # inside the zip; no need to leave them in the job dir).
