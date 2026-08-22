@@ -70,6 +70,17 @@ from ua_profile_contract import (
     replace_verified_app_releases,
     validate_user_agent,
 )
+from email_profile_checker import (
+    GmailProfileIndex,
+    check_email_profile_pic,
+    check_with_google_people_api,
+    delete_google_oauth_record,
+    get_valid_google_access_token,
+    load_google_oauth_record,
+    normalize_check_mode,
+    refresh_google_oauth_token,
+    save_google_oauth_record,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -11999,7 +12010,7 @@ import hashlib
 
 class EmailCheckRequest(BaseModel):
     emails: List[str]
-    check_mode: Optional[str] = "all"  # "contacts_only" = Google People API only | "all" = Google + free fallbacks
+    check_mode: Optional[str] = "gmail"  # gmail | all | contacts_only | public
 
 
 class EmailDownloadRequest(BaseModel):
@@ -12013,8 +12024,12 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
 
-# Store Google OAuth tokens in memory (in production, use database)
-google_oauth_tokens = {}
+GOOGLE_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts.other.readonly",
+    "https://www.googleapis.com/auth/directory.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 
 @api_router.get("/google/auth-url")
 async def get_google_auth_url(user: dict = Depends(get_current_user)):
@@ -12022,12 +12037,8 @@ async def get_google_auth_url(user: dict = Depends(get_current_user)):
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Please set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI in environment variables.")
     
-    # Scopes needed for People API
-    scopes = [
-        "https://www.googleapis.com/auth/contacts.readonly",
-        "https://www.googleapis.com/auth/directory.readonly",
-        "https://www.googleapis.com/auth/userinfo.email"
-    ]
+    # Scopes needed for People API (Contacts + Other Contacts + Directory)
+    scopes = GOOGLE_OAUTH_SCOPES
     
     state = user["id"]  # Use user ID as state to link back
     
@@ -12086,12 +12097,14 @@ async def google_oauth_callback(code: str, state: str):
     except Exception as e:
         logger.debug(f"Failed to fetch google userinfo: {e}")
 
-    google_oauth_tokens[user_id] = {
-        "access_token": tokens.get("access_token"),
-        "refresh_token": tokens.get("refresh_token"),
-        "expires_at": datetime.now(timezone.utc).timestamp() + tokens.get("expires_in", 3600),
-        "google_email": google_email,
-    }
+    await save_google_oauth_record(
+        db,
+        user_id,
+        access_token=tokens.get("access_token"),
+        refresh_token=tokens.get("refresh_token"),
+        expires_at=datetime.now(timezone.utc).timestamp() + tokens.get("expires_in", 3600),
+        google_email=google_email,
+    )
     
     # Return HTML that closes the popup and notifies parent
     return Response(
@@ -12113,23 +12126,25 @@ async def google_oauth_callback(code: str, state: str):
 async def google_auth_status(user: dict = Depends(get_current_user)):
     """Check if user has connected Google account (and which one)."""
     user_id = user["id"]
-    token_data = google_oauth_tokens.get(user_id)
-    
+    token_data = await load_google_oauth_record(db, user_id)
+
     if not token_data:
         return {"connected": False, "email": None}
-    
-    # Check if token is expired
+
     if token_data.get("expires_at", 0) < datetime.now(timezone.utc).timestamp():
-        # Try to refresh
         if token_data.get("refresh_token"):
             try:
-                await refresh_google_token(user_id)
-                token_data = google_oauth_tokens.get(user_id)
+                token_data = await refresh_google_oauth_token(
+                    db,
+                    user_id,
+                    client_id=GOOGLE_CLIENT_ID,
+                    client_secret=GOOGLE_CLIENT_SECRET,
+                )
             except Exception:
                 return {"connected": False, "email": None}
         else:
             return {"connected": False, "email": None}
-    
+
     return {
         "connected": True,
         "email": token_data.get("google_email") if token_data else None,
@@ -12141,7 +12156,7 @@ async def google_auth_disconnect(user: dict = Depends(get_current_user)):
     """Disconnect/forget the connected Google account for this user."""
     import aiohttp
     user_id = user["id"]
-    token_data = google_oauth_tokens.pop(user_id, None)
+    token_data = await delete_google_oauth_record(db, user_id)
 
     # Best-effort revoke at Google (non-fatal if it fails)
     if token_data and token_data.get("access_token"):
@@ -12159,284 +12174,44 @@ async def google_auth_disconnect(user: dict = Depends(get_current_user)):
     return {"disconnected": True}
 
 async def refresh_google_token(user_id: str):
-    """Refresh Google OAuth token"""
-    import aiohttp
-    
-    token_data = google_oauth_tokens.get(user_id)
-    if not token_data or not token_data.get("refresh_token"):
-        raise Exception("No refresh token")
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post("https://oauth2.googleapis.com/token", data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": token_data["refresh_token"],
-            "grant_type": "refresh_token"
-        }) as resp:
-            if resp.status != 200:
-                raise Exception("Failed to refresh token")
-            
-            tokens = await resp.json()
-    
-    google_oauth_tokens[user_id]["access_token"] = tokens.get("access_token")
-    google_oauth_tokens[user_id]["expires_at"] = datetime.now(timezone.utc).timestamp() + tokens.get("expires_in", 3600)
-    # google_email stays the same across refreshes
+    """Refresh Google OAuth token (legacy wrapper)."""
+    await refresh_google_oauth_token(
+        db,
+        user_id,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+    )
 
 async def check_profile_with_google_api(email: str, access_token: str) -> dict:
-    """Check profile picture using Google People API"""
-    import aiohttp
-    
-    result = {
-        "email": email,
-        "has_pic": False,
-        "pic_url": None,
-        "method": None
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json"
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        # Method 1: Search in contacts
-        search_url = f"https://people.googleapis.com/v1/people:searchContacts?query={email}&readMask=photos,emailAddresses"
-        
-        try:
-            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("results", [])
-                    for r in results:
-                        person = r.get("person", {})
-                        photos = person.get("photos", [])
-                        for photo in photos:
-                            url = photo.get("url")
-                            if url and "default" not in url.lower():
-                                result["has_pic"] = True
-                                result["pic_url"] = url
-                                result["method"] = "google_people_api"
-                                return result
-        except Exception as e:
-            logger.debug(f"Google People API search failed: {e}")
-        
-        # Method 2: Search in directory (for Google Workspace)
-        directory_url = f"https://people.googleapis.com/v1/people:searchDirectoryPeople?query={email}&readMask=photos,emailAddresses&sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"
-        
-        try:
-            async with session.get(directory_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    people = data.get("people", [])
-                    for person in people:
-                        photos = person.get("photos", [])
-                        for photo in photos:
-                            url = photo.get("url")
-                            if url and "default" not in url.lower():
-                                result["has_pic"] = True
-                                result["pic_url"] = url
-                                result["method"] = "google_directory"
-                                return result
-        except Exception as e:
-            logger.debug(f"Google Directory search failed: {e}")
-        
-        # Method 3: Try to get profile by resource name pattern
-        # This works for profiles you've interacted with
-        try:
-            # Get all contacts and check emails
-            contacts_url = "https://people.googleapis.com/v1/people/me/connections?pageSize=1000&personFields=emailAddresses,photos"
-            
-            async with session.get(contacts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    connections = data.get("connections", [])
-                    
-                    for person in connections:
-                        emails_list = person.get("emailAddresses", [])
-                        for e in emails_list:
-                            if e.get("value", "").lower() == email.lower():
-                                photos = person.get("photos", [])
-                                for photo in photos:
-                                    url = photo.get("url")
-                                    if url and "default" not in url.lower():
-                                        result["has_pic"] = True
-                                        result["pic_url"] = url
-                                        result["method"] = "google_contacts"
-                                        return result
-        except Exception as e:
-            logger.debug(f"Google Contacts check failed: {e}")
-    
-    return result
-
-async def check_google_profile_pic(email: str, google_access_token: str = None) -> dict:
-    """
-    Check if an email has a profile picture using FREE methods:
-    1. Unavatar.io (FREE - aggregates Google, Gravatar, GitHub, Twitter, etc.)
-    2. Gravatar (FREE)
-    3. Google's public endpoint (FREE but limited)
-    """
-    import aiohttp
-    
-    result = {
+    """Check profile picture using Google People API (legacy wrapper)."""
+    hit = await check_with_google_people_api(email, access_token)
+    if hit:
+        return hit
+    return {
         "email": email,
         "has_pic": False,
         "pic_url": None,
         "method": None,
-        # 2026-06 — set on miss so the UI can explain *why* a Gmail
-        # address that the customer can see in their own Gmail inbox
-        # still reports "No Pic" here. Google's public profile-pic
-        # endpoints (s2/photos, Google+ avatars) were deprecated in
-        # 2019; Gmail avatars are now only accessible via OAuth-
-        # authenticated People API. Without an access_token we can
-        # only see avatars exposed by Gravatar / Unavatar's social
-        # aggregator (GitHub / Twitter / Facebook / Instagram / etc).
-        "note": None,
     }
-    
-    email = email.lower().strip()
-    
-    # If Google access token is available, use People API first
-    if google_access_token:
-        try:
-            google_result = await check_profile_with_google_api(email, google_access_token)
-            if google_result["has_pic"]:
-                return google_result
-        except Exception as e:
-            logger.debug(f"Google API check failed for {email}: {e}")
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            
-            # Method 1: Unavatar.io - FREE aggregator service
-            # Checks: Google, Gravatar, GitHub, Twitter, Facebook, Instagram, YouTube, etc.
-            # v2.1.28 — Bug-fix: previous logic required image > 1000 bytes
-            # AND URL not containing "unavatar.io/fallback". This produced
-            # false-negatives because (a) some real avatars (initials/SVG
-            # rasterised at 64x64) are 200-800 bytes, and (b) when called
-            # with `?fallback=false` Unavatar returns HTTP 404 (NOT a
-            # fallback URL) if no image was found, so the URL substring
-            # check is redundant + only ever excludes real hits. We now
-            # trust: status==200 + content-type=image/* + non-trivially-
-            # small payload (>=200 bytes — filters truly empty/1px gifs)
-            # because `fallback=false` already guarantees a real source.
-            unavatar_url = f"https://unavatar.io/{email}?fallback=false"
 
-            try:
-                async with session.get(
-                    unavatar_url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    }
-                ) as resp:
-                    if resp.status == 200:
-                        content_type = resp.headers.get("content-type", "")
-                        if "image" in content_type:
-                            content = await resp.read()
-                            # >=200 bytes: even a 16x16 monochrome PNG is
-                            # ~200-400 B. Empty/1px placeholder gifs are
-                            # typically 35-80 B, so this cleanly separates.
-                            if len(content) >= 200:
-                                result["has_pic"] = True
-                                result["pic_url"] = f"https://unavatar.io/{email}"
-                                result["method"] = "unavatar"
-                                return result
-            except Exception as e:
-                logger.debug(f"Unavatar check failed for {email}: {e}")
-            
-            # Method 2: Direct Gravatar check (FREE)
-            email_hash = hashlib.md5(email.encode()).hexdigest()
-            gravatar_url = f"https://www.gravatar.com/avatar/{email_hash}?d=404&s=200"
-            
-            try:
-                async with session.get(
-                    gravatar_url, 
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status == 200:
-                        result["has_pic"] = True
-                        result["pic_url"] = f"https://www.gravatar.com/avatar/{email_hash}?s=200"
-                        result["method"] = "gravatar"
-                        return result
-            except Exception as e:
-                logger.debug(f"Gravatar check failed for {email}: {e}")
-            
-            # Method 3: Google's public s2 endpoint (FREE but limited)
-            if email.endswith("@gmail.com"):
-                s2_url = f"https://www.google.com/s2/photos/public/{email}"
-                
-                try:
-                    async with session.get(
-                        s2_url,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                        allow_redirects=True,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        }
-                    ) as resp:
-                        if resp.status == 200:
-                            content_type = resp.headers.get("content-type", "")
-                            if "image" in content_type:
-                                content = await resp.read()
-                                # v2.1.28: was >5000 — too strict for Google's
-                                # newer compressed avatars (real custom pics
-                                # often range 1-4 KB after their server-side
-                                # WebP transcode). Lowered to >=800 B which
-                                # still excludes the default monogram (~200 B).
-                                if len(content) >= 800:
-                                    result["has_pic"] = True
-                                    result["pic_url"] = str(resp.url)
-                                    result["method"] = "google_s2"
-                                    return result
-                except Exception as e:
-                    logger.debug(f"Google s2 check failed for {email}: {e}")
-            
-            # Method 4: Try Libravatar (FREE alternative to Gravatar)
-            try:
-                libravatar_url = f"https://seccdn.libravatar.org/avatar/{email_hash}?d=404&s=200"
-                async with session.get(
-                    libravatar_url, 
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    if resp.status == 200:
-                        result["has_pic"] = True
-                        result["pic_url"] = f"https://seccdn.libravatar.org/avatar/{email_hash}?s=200"
-                        result["method"] = "libravatar"
-                        return result
-            except Exception:
-                pass
-                
-    except Exception as e:
-        logger.error(f"Error checking profile for {email}: {e}")
-    
-    # 2026-06 — explain why a Gmail/Workspace address with an obvious
-    # picture (when viewed by its owner) still reports "No Pic" here.
-    # See note field docstring above for the full reason.
-    if not result["has_pic"]:
-        if email.endswith("@gmail.com") or email.endswith(
-            ("@googlemail.com",)
-        ):
-            result["note"] = (
-                "No public profile pic — Gmail avatars are private since 2019. "
-                "Connect Google to see your contacts' real pics via the People API."
-            )
-        else:
-            result["note"] = (
-                "No public profile pic across Gravatar / GitHub / Twitter / "
-                "Facebook / Instagram / YouTube / Libravatar."
-            )
 
-    return result
+async def check_google_profile_pic(email: str, google_access_token: str = None) -> dict:
+    """Legacy wrapper — delegates to email_profile_checker."""
+    return await check_email_profile_pic(
+        email,
+        access_token=google_access_token,
+        check_mode="all",
+    )
 
 @api_router.post("/emails/check-profile-pics")
 async def check_email_profile_pics(request: EmailCheckRequest, user: dict = Depends(get_current_user)):
     """
     Check which emails have profile pictures.
-    * check_mode="contacts_only" -> use Google People API ONLY (fast, finds only
-      contacts you have in your connected Google account).
-    * check_mode="all" (default)  -> use Google + free fallbacks (Unavatar,
-      Gravatar, Libravatar, Google s2). Higher hit rate but not 100% accurate.
+    * check_mode="gmail" (default) -> Google People API (Contacts + Other Contacts)
+      with public fallback; closest to Gmail compose when Google is connected.
+    * check_mode="contacts_only" -> Google People API ONLY.
+    * check_mode="all" -> legacy: Google + public fallbacks.
+    * check_mode="public" -> public sources only (Gravatar, Unavatar, etc.).
     Returns results as a stream for real-time updates.
     """
     check_user_feature(user, "email_checker")
@@ -12448,25 +12223,14 @@ async def check_email_profile_pics(request: EmailCheckRequest, user: dict = Depe
     if len(emails) > 5000:
         raise HTTPException(status_code=400, detail="Maximum 5000 emails per request")
 
-    check_mode = (request.check_mode or "all").lower()
-    if check_mode not in ("contacts_only", "all"):
-        check_mode = "all"
-
-    # Get Google access token if available
+    check_mode = normalize_check_mode(request.check_mode)
     user_id = user["id"]
-    google_access_token = None
-    token_data = google_oauth_tokens.get(user_id)
-
-    if token_data:
-        # Check if token needs refresh
-        if token_data.get("expires_at", 0) < datetime.now(timezone.utc).timestamp():
-            try:
-                await refresh_google_token(user_id)
-                token_data = google_oauth_tokens.get(user_id)
-            except Exception:
-                pass
-
-        google_access_token = token_data.get("access_token") if token_data else None
+    google_access_token = await get_valid_google_access_token(
+        db,
+        user_id,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+    )
 
     if check_mode == "contacts_only" and not google_access_token:
         raise HTTPException(
@@ -12474,24 +12238,38 @@ async def check_email_profile_pics(request: EmailCheckRequest, user: dict = Depe
             detail="'Contacts only' mode requires a connected Google account. Please connect Google first.",
         )
 
+    gmail_index = None
+    if google_access_token and check_mode in ("gmail", "all", "contacts_only"):
+        try:
+            gmail_index = GmailProfileIndex(google_access_token)
+            await gmail_index.warm()
+        except Exception as e:
+            logger.debug("Gmail profile index warm failed: %s", e)
+            gmail_index = None
+
     async def generate():
         with_pic = 0
         without_pic = 0
 
         for i, email in enumerate(emails):
-            if check_mode == "contacts_only":
-                # Only Google People API (contacts + directory)
-                try:
-                    result = await check_profile_with_google_api(email, google_access_token)
-                except Exception as e:
-                    logger.debug(f"Google-only check failed for {email}: {e}")
-                    result = {"email": email, "has_pic": False, "pic_url": None, "method": None}
-                # Ensure the email key is present
-                result["email"] = email
-            else:
-                result = await check_google_profile_pic(email, google_access_token)
+            try:
+                result = await check_email_profile_pic(
+                    email,
+                    access_token=google_access_token,
+                    check_mode=check_mode,
+                    index=gmail_index,
+                )
+            except Exception as e:
+                logger.debug("Profile check failed for %s: %s", email, e)
+                result = {
+                    "email": email,
+                    "has_pic": False,
+                    "pic_url": None,
+                    "method": None,
+                    "note": str(e),
+                }
 
-            if result["has_pic"]:
+            if result.get("has_pic"):
                 with_pic += 1
             else:
                 without_pic += 1
@@ -12500,7 +12278,7 @@ async def check_email_profile_pics(request: EmailCheckRequest, user: dict = Depe
                 "type": "result",
                 "email": result["email"],
                 "has_pic": result["has_pic"],
-                "pic_url": result["pic_url"],
+                "pic_url": result.get("pic_url"),
                 "method": result.get("method"),
                 "note": result.get("note"),
             }) + "\n"
@@ -13129,7 +12907,7 @@ async def download_phone_results(
         logger.error(f"Phone export error: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating file: {e}")
 
-# ==================== SEPARATE DATA (EMAIL ROW FILTER) ====================
+# ==================== SEPARATE DATA (GENERIC ROW FILTER v2) ====================
 
 @api_router.post("/emails/preview-file")
 async def preview_email_file(
@@ -13138,61 +12916,46 @@ async def preview_email_file(
 ):
     """
     Preview an uploaded spreadsheet without filtering.
-    Returns columns, total row count, detected email column, and the first
-    few rows so the UI can show a preview.
+    Returns columns, row count, suggested match column/type, and preview rows.
     """
     check_user_feature(user, "separate_data")
-    import pandas as pd
-    import io
     import re
 
-    filename = file.filename.lower()
-    if not any(filename.endswith(ext) for ext in ['.xlsx', '.xls', '.csv', '.txt']):
-        raise HTTPException(status_code=400, detail="Supported formats: .xlsx, .xls, .csv, .txt")
+    from separate_data_utils import (
+        build_column_suggestions,
+        detect_best_column,
+        read_spreadsheet,
+        rows_from_dataframe,
+    )
 
-    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+    filename = file.filename.lower()
+    if not any(filename.endswith(ext) for ext in [".xlsx", ".xls", ".csv", ".txt"]):
+        raise HTTPException(status_code=400, detail="Supported formats: .xlsx, .xls, .csv, .txt")
 
     try:
         contents = await file.read()
-
-        if filename.endswith('.csv') or filename.endswith('.txt'):
-            df = pd.read_csv(io.BytesIO(contents), dtype=str, keep_default_na=False)
-        else:
-            engine = 'openpyxl' if filename.endswith('.xlsx') else 'xlrd'
-            df = pd.read_excel(io.BytesIO(contents), engine=engine, dtype=str)
-
-        df = df.fillna("")
-        df.columns = [str(c) for c in df.columns]
+        df = read_spreadsheet(contents, filename)
         columns = list(df.columns)
-
-        # Build rows
-        rows = df.to_dict(orient="records")
-        # Ensure all values are strings
-        rows = [{k: ("" if v is None else str(v)) for k, v in r.items()} for r in rows]
-
-        # Detect email column (column with most email matches in first 200 rows)
-        best_col = None
-        best_count = 0
-        for c in columns:
-            count = 0
-            for r in rows[:200]:
-                if email_pattern.search(str(r.get(c, ""))):
-                    count += 1
-            if count > best_count:
-                best_count = count
-                best_col = c
-
-        email_column = best_col if best_count > 0 else None
+        rows = rows_from_dataframe(df, limit=300)
+        preview_rows = rows_from_dataframe(df, limit=10)
+        column_suggestions = build_column_suggestions(columns, rows)
+        match_column, match_type = detect_best_column(columns, rows)
 
         return {
             "filename": file.filename,
             "columns": columns,
-            "total_rows": len(rows),
-            "email_column": email_column,
-            "preview_rows": rows[:10],
+            "total_rows": len(df),
+            # Backward compat — legacy UI read email_column
+            "email_column": match_column if match_type == "email" else None,
+            "match_column": match_column,
+            "match_type": match_type,
+            "column_suggestions": column_suggestions,
+            "preview_rows": preview_rows,
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Preview error: {e}")
         raise HTTPException(status_code=400, detail=f"Error parsing file: {str(e)}")
@@ -13201,149 +12964,139 @@ async def preview_email_file(
 @api_router.post("/emails/filter-rows")
 async def filter_rows_by_emails(
     file: UploadFile = File(...),
-    emails: str = Form(...),
+    emails: str = Form(""),
+    values: str = Form(""),
+    values_file: Optional[UploadFile] = File(None),
     email_column: Optional[str] = Form(None),
+    match_column: Optional[str] = Form(None),
+    match_type: Optional[str] = Form("auto"),
     user: dict = Depends(get_current_user),
 ):
     """
-    SEPARATE DATA feature.
-    * Accepts a master spreadsheet (`file`) + a list of emails (`emails` — newline,
-      comma, or semicolon separated).
-    * Finds every row in the master whose email matches any of the provided
-      emails (case-insensitive, all whitespace trimmed).
-    * Returns an Excel file with:
-        - Sheet "Matched Rows": only the matched rows, ALL original columns preserved.
-        - Sheet "Not Found":    the emails from the list that did NOT appear in the file.
-        - Sheet "Summary":      counts.
-    * `email_column` is optional — if not provided, it is auto-detected.
+    SEPARATE DATA v2 — filter master spreadsheet rows by ANY column.
+
+    * Master file + pasted value list (emails param kept for backward compat).
+    * match_column / email_column — column to match (auto-detect if omitted).
+    * match_type — auto | email | phone | text | date
+    * Optional values_file — .txt/.csv with one value per line.
+    * Returns Excel: Matched Rows (all original columns), Summary, Not Found.
     """
     check_user_feature(user, "separate_data")
-    import pandas as pd
-    import io
     import re
 
+    from separate_data_utils import (
+        build_filter_workbook,
+        detect_best_column,
+        filter_dataframe,
+        merge_values_text,
+        parse_values_text,
+        read_spreadsheet,
+        resolve_match_type,
+        rows_from_dataframe,
+    )
+
     filename = file.filename.lower()
-    if not any(filename.endswith(ext) for ext in ['.xlsx', '.xls', '.csv', '.txt']):
+    if not any(filename.endswith(ext) for ext in [".xlsx", ".xls", ".csv", ".txt"]):
         raise HTTPException(status_code=400, detail="Supported formats: .xlsx, .xls, .csv, .txt")
 
-    # Parse the pasted email list
-    raw_emails = re.split(r'[\n,;]+', emails or "")
-    target_emails = []
-    seen = set()
-    for e in raw_emails:
-        el = (e or "").strip().lower()
-        if el and "@" in el and el not in seen:
-            seen.add(el)
-            target_emails.append(el)
+    raw_values = merge_values_text(values or "", emails or "")
+    if values_file is not None:
+        try:
+            vf_name = (values_file.filename or "").lower()
+            vf_bytes = await values_file.read()
+            if vf_name.endswith((".xlsx", ".xls")):
+                import pandas as pd
+                import io as _io
 
-    if not target_emails:
-        raise HTTPException(status_code=400, detail="No valid emails provided in the list")
+                engine = "openpyxl" if vf_name.endswith(".xlsx") else "xlrd"
+                vdf = pd.read_excel(_io.BytesIO(vf_bytes), engine=engine, dtype=str, header=None)
+                vf_lines = [
+                    str(v).strip()
+                    for v in vdf.fillna("").astype(str).values.flatten().tolist()
+                    if str(v).strip()
+                ]
+                raw_values = merge_values_text(raw_values, "\n".join(vf_lines))
+            else:
+                vf_text = vf_bytes.decode("utf-8", errors="ignore")
+                raw_values = merge_values_text(raw_values, vf_text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read values file: {e}")
 
-    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+    if not (raw_values or "").strip():
+        raise HTTPException(status_code=400, detail="No values provided — paste a list or upload a values file")
 
     try:
         contents = await file.read()
-
-        if filename.endswith('.csv') or filename.endswith('.txt'):
-            df = pd.read_csv(io.BytesIO(contents), dtype=str, keep_default_na=False)
-        else:
-            engine = 'openpyxl' if filename.endswith('.xlsx') else 'xlrd'
-            df = pd.read_excel(io.BytesIO(contents), engine=engine, dtype=str)
-
-        df = df.fillna("")
-        df.columns = [str(c) for c in df.columns]
+        df = read_spreadsheet(contents, filename)
         columns = list(df.columns)
-
         if not columns:
             raise HTTPException(status_code=400, detail="Uploaded file has no columns")
 
-        # Determine which column to match on
-        chosen_col = email_column if email_column and email_column in columns else None
-        if not chosen_col:
-            # Auto-detect: the column with the most email-like cells
-            best_col = None
-            best_count = 0
-            sample = df.head(300)
-            for c in columns:
-                count = sum(1 for v in sample[c].tolist() if email_pattern.search(str(v)))
-                if count > best_count:
-                    best_count = count
-                    best_col = c
-            chosen_col = best_col
-
-        if not chosen_col:
-            raise HTTPException(status_code=400, detail="Could not detect an email column in the file")
-
-        target_set = set(target_emails)
-
-        def _extract_email(cell_value: str) -> Optional[str]:
-            """Pull the first email-looking substring from a cell and normalise it."""
-            if cell_value is None:
-                return None
-            m = email_pattern.search(str(cell_value))
-            if m:
-                return m.group(0).strip().lower()
-            return None
-
-        # Filter
-        matched_mask = df[chosen_col].apply(
-            lambda v: (_extract_email(v) in target_set) if _extract_email(v) else False
+        rows = rows_from_dataframe(df, limit=300)
+        preferred_col = match_column or email_column
+        chosen_col, detected_type = detect_best_column(
+            columns, rows, preferred_column=preferred_col,
         )
-        matched_df = df[matched_mask].copy()
+        if not chosen_col:
+            raise HTTPException(status_code=400, detail="Could not determine a match column")
 
-        # Emails that were found (from the target list) - for "Not Found" sheet
-        found_emails = set()
-        for v in matched_df[chosen_col].tolist():
-            e = _extract_email(v)
-            if e:
-                found_emails.add(e)
+        sample_vals = [str(r.get(chosen_col, "")) for r in rows[:300]]
+        resolved_type = resolve_match_type(match_type, chosen_col, sample_vals)
 
-        not_found = [e for e in target_emails if e not in found_emails]
-        not_found_df = pd.DataFrame({"Email (not found in file)": not_found}) if not_found else None
+        target_keys, target_display = parse_values_text(raw_values, resolved_type)
+        if not target_keys:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No valid {resolved_type} values in your list for column '{chosen_col}'",
+            )
 
-        summary_df = pd.DataFrame([
-            {"Metric": "Total emails in your list", "Value": len(target_emails)},
-            {"Metric": "Rows in uploaded file",      "Value": int(len(df))},
-            {"Metric": "Matched rows returned",      "Value": int(len(matched_df))},
-            {"Metric": "Emails not found",           "Value": len(not_found)},
-            {"Metric": "Email column used",          "Value": chosen_col},
-            {"Metric": "Source filename",            "Value": file.filename},
-        ])
+        target_set = set(target_keys)
+        matched_df, found_keys = filter_dataframe(df, chosen_col, resolved_type, target_set)
 
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Matched rows keep ALL original columns, in original order.
-            if len(matched_df) > 0:
-                matched_df.to_excel(writer, sheet_name='Matched Rows', index=False)
-            else:
-                # Always write an empty sheet with headers so the user sees the columns
-                empty = pd.DataFrame(columns=columns)
-                empty.to_excel(writer, sheet_name='Matched Rows', index=False)
+        key_to_display = dict(zip(target_keys, target_display))
+        not_found = [key_to_display[k] for k in target_keys if k not in found_keys]
 
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        summary_rows = [
+            {"Metric": "Total values in your list", "Value": len(target_keys)},
+            {"Metric": "Rows in uploaded file", "Value": int(len(df))},
+            {"Metric": "Matched rows returned", "Value": int(len(matched_df))},
+            {"Metric": "Values not found", "Value": len(not_found)},
+            {"Metric": "Match column used", "Value": chosen_col},
+            {"Metric": "Match type used", "Value": resolved_type},
+            {"Metric": "Source filename", "Value": file.filename},
+        ]
 
-            if not_found_df is not None:
-                not_found_df.to_excel(writer, sheet_name='Not Found', index=False)
+        xlsx_bytes = build_filter_workbook(
+            matched_df=matched_df,
+            all_columns=columns,
+            not_found_display=not_found,
+            summary_rows=summary_rows,
+        )
 
-        output.seek(0)
-
-        base_name = re.sub(r'\.[^.]+$', '', file.filename or 'filtered')
+        base_name = re.sub(r"\.[^.]+$", "", file.filename or "filtered")
         download_name = f"{base_name}_filtered.xlsx"
 
         return Response(
-            content=output.getvalue(),
+            content=xlsx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
                 "Content-Disposition": f'attachment; filename="{download_name}"',
                 "X-Matched-Count": str(len(matched_df)),
                 "X-Not-Found-Count": str(len(not_found)),
                 "X-Email-Column": str(chosen_col),
-                "Access-Control-Expose-Headers": "X-Matched-Count, X-Not-Found-Count, X-Email-Column, Content-Disposition",
-            }
+                "X-Match-Column": str(chosen_col),
+                "X-Match-Type": str(resolved_type),
+                "Access-Control-Expose-Headers": (
+                    "X-Matched-Count, X-Not-Found-Count, X-Email-Column, "
+                    "X-Match-Column, X-Match-Type, Content-Disposition"
+                ),
+            },
         )
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Filter-rows error: {e}")
         raise HTTPException(status_code=500, detail=f"Error filtering rows: {str(e)}")

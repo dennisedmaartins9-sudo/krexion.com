@@ -39,8 +39,8 @@ export default function EmailCheckerPage() {
   const [checkingGoogle, setCheckingGoogle] = useState(true);
   const [disconnecting, setDisconnecting] = useState(false);
 
-  // Mode: "contacts_only" (Google People API only) | "all" (Google + free fallbacks)
-  const [checkMode, setCheckMode] = useState("all");
+  // Mode: "gmail" (recommended) | "public" | "contacts_only" | "all"
+  const [checkMode, setCheckMode] = useState("gmail");
 
   // Original uploaded file data preserved for export
   const [originalRows, setOriginalRows] = useState([]);      // list of row dicts
@@ -200,6 +200,12 @@ export default function EmailCheckerPage() {
       return;
     }
 
+    if (checkMode === "gmail" && !googleConnected) {
+      toast.warning(
+        "Gmail mode works best with Google connected — results may miss photos you see in Gmail compose."
+      );
+    }
+
     setChecking(true);
     setProgress(0);
     setWithPic([]);
@@ -296,6 +302,7 @@ export default function EmailCheckerPage() {
         has_pic: false,
         pic_url: "",
         method: r.method || "",
+        note: r.note || "",
       };
     }
 
@@ -355,6 +362,13 @@ export default function EmailCheckerPage() {
     }
   };
 
+  const modeLabel = (mode) => {
+    if (mode === "gmail") return "Gmail assisted";
+    if (mode === "public") return "Public only";
+    if (mode === "contacts_only") return "Contacts only";
+    return "All sources";
+  };
+
   const clearAll = () => {
     setEmailInput("");
     setResults(null);
@@ -373,8 +387,8 @@ export default function EmailCheckerPage() {
         <div>
           <h1 className="text-2xl font-bold text-white">Email Profile Checker</h1>
           <p className="text-zinc-400">
-            Check which emails have profile pictures — connect Google for the
-            most accurate results (only finds emails in your Google Contacts).
+            Check which emails have profile pictures — connect Google and use
+            Gmail mode for results closest to Gmail compose.
           </p>
         </div>
         {(withPic.length > 0 || withoutPic.length > 0) && (
@@ -423,12 +437,12 @@ export default function EmailCheckerPage() {
                     ? "Checking Google status…"
                     : googleConnected
                     ? `Google Connected${googleEmail ? ` — ${googleEmail}` : ""}`
-                    : "Connect Google for Better Results"}
+                    : "Connect Google (Gmail Login)"}
                 </p>
                 <p className="text-zinc-400 text-sm">
                   {googleConnected
-                    ? "People API will look up profile pics for emails saved in this Google account's Contacts."
-                    : "Google People API only finds profile pics for emails in your Google Contacts — cold/random emails will show as 'No Pic'."}
+                    ? "Gmail mode uses Contacts + Other Contacts via People API — much closer to Gmail compose than public lookups alone."
+                    : "Sign in with Google to unlock Gmail-assisted mode. Without login, only public avatars (Gravatar/Unavatar) are checked."}
                 </p>
               </div>
             </div>
@@ -485,7 +499,33 @@ export default function EmailCheckerPage() {
                 Choose how strictly to look up profile pictures.
               </p>
             </div>
-            <div className="flex gap-2" data-testid="mode-selector">
+            <div className="flex gap-2 flex-wrap" data-testid="mode-selector">
+              <Button
+                variant={checkMode === "gmail" ? "default" : "outline"}
+                onClick={() => setCheckMode("gmail")}
+                className={
+                  checkMode === "gmail"
+                    ? "bg-blue-600 hover:bg-blue-700"
+                    : "border-zinc-700 text-zinc-300"
+                }
+                data-testid="mode-gmail-btn"
+                title="Recommended: Google People API (Contacts + Other Contacts) + public fallback"
+              >
+                Gmail assisted (Recommended)
+              </Button>
+              <Button
+                variant={checkMode === "public" ? "default" : "outline"}
+                onClick={() => setCheckMode("public")}
+                className={
+                  checkMode === "public"
+                    ? "bg-blue-600 hover:bg-blue-700"
+                    : "border-zinc-700 text-zinc-300"
+                }
+                data-testid="mode-public-btn"
+                title="Gravatar, Unavatar, Libravatar only — no Google login needed"
+              >
+                Public sources only
+              </Button>
               <Button
                 variant={checkMode === "contacts_only" ? "default" : "outline"}
                 onClick={() => setCheckMode("contacts_only")}
@@ -513,9 +553,9 @@ export default function EmailCheckerPage() {
                     : "border-zinc-700 text-zinc-300"
                 }
                 data-testid="mode-all-btn"
-                title="Google Contacts + free public lookups (Gravatar, Unavatar, Libravatar)"
+                title="Legacy: Google (if connected) + all public lookups"
               >
-                All sources (Google + public)
+                All sources
               </Button>
             </div>
           </div>
@@ -633,9 +673,7 @@ export default function EmailCheckerPage() {
                   )}
                   {results.check_mode && (
                     <Badge className="bg-zinc-700 text-xs">
-                      {results.check_mode === "contacts_only"
-                        ? "Contacts only"
-                        : "All sources"}
+                      {modeLabel(results.check_mode)}
                     </Badge>
                   )}
                 </div>
@@ -727,6 +765,11 @@ export default function EmailCheckerPage() {
                       <span className="text-white flex-1 truncate text-sm">
                         {result.email}
                       </span>
+                      {result.method && (
+                        <Badge className="bg-zinc-700 text-xs hidden sm:inline">
+                          {result.method}
+                        </Badge>
+                      )}
                       <Badge className="bg-green-600 text-xs">Has Pic</Badge>
                       <button
                         onClick={() => removeEmail(result.email, true)}
@@ -783,21 +826,28 @@ export default function EmailCheckerPage() {
                   withoutPic.map((result, i) => (
                     <div
                       key={i}
-                      className="flex items-center gap-3 p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700"
+                      className="flex flex-col gap-1 p-2 bg-zinc-800 rounded-lg hover:bg-zinc-700"
                     >
-                      <div className="w-10 h-10 rounded-full bg-zinc-700 flex items-center justify-center border-2 border-red-500">
-                        <UserX className="w-5 h-5 text-zinc-500" />
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-full bg-zinc-700 flex items-center justify-center border-2 border-red-500 shrink-0">
+                          <UserX className="w-5 h-5 text-zinc-500" />
+                        </div>
+                        <span className="text-white flex-1 truncate text-sm">
+                          {result.email}
+                        </span>
+                        <Badge className="bg-red-600 text-xs shrink-0">No Pic</Badge>
+                        <button
+                          onClick={() => removeEmail(result.email, false)}
+                          className="text-zinc-500 hover:text-red-500 text-lg"
+                        >
+                          ×
+                        </button>
                       </div>
-                      <span className="text-white flex-1 truncate text-sm">
-                        {result.email}
-                      </span>
-                      <Badge className="bg-red-600 text-xs">No Pic</Badge>
-                      <button
-                        onClick={() => removeEmail(result.email, false)}
-                        className="text-zinc-500 hover:text-red-500 text-lg"
-                      >
-                        ×
-                      </button>
+                      {result.note && (
+                        <p className="text-zinc-500 text-xs pl-[52px] leading-snug">
+                          {result.note}
+                        </p>
+                      )}
                     </div>
                   ))
                 )}
@@ -846,11 +896,11 @@ GOOGLE_REDIRECT_URI=http://your-domain/api/google/callback`}
               <li>Restart the backend and click "Connect Google" above</li>
             </ol>
             <p className="text-zinc-500 text-xs mt-4">
-              Reminder: Google's People API only returns profile pictures for
-              emails that are saved in the connected Google account's
-              <strong> Contacts</strong>. This is a Google privacy restriction,
-              not a bug. For cold/unknown emails, switch to "All sources" mode
-              to also try public avatars (Gravatar, Libravatar, Unavatar).
+              Gmail mode uses Google People API (Contacts + Other Contacts you've
+              emailed). Google does not expose the same private identity graph
+              Gmail compose uses for every cold email — some photos visible in
+              Gmail may still show as "No Pic" here. Re-connect Google after
+              deploy if you previously connected (tokens are now saved per user).
             </p>
           </CardContent>
         </Card>

@@ -7547,6 +7547,45 @@ def _normalize_dup_ip(ip: str) -> str:
         return raw
 
 
+def _exit_ips_match(reserved: str, candidate: str) -> bool:
+    """True when two probe readings refer to the same exit node."""
+    a = _normalize_dup_ip(reserved)
+    b = _normalize_dup_ip(candidate)
+    return bool(a and b and a == b)
+
+
+def _is_ipv6_exit_ip(ip: str) -> bool:
+    return ":" in str(ip or "").strip()
+
+
+def _spawn_persist_used_exit_ip(
+    db: Any,
+    *,
+    ip: str,
+    user_id: str,
+    offer_url: str,
+    state: str,
+    job_id: str,
+    reason: str = "visit_used",
+) -> None:
+    """Cross-job ledger: persist exit IP only after confirmed tracker/offer touch."""
+    _ip = str(ip or "").strip()
+    if not _ip or db is None:
+        return
+    try:
+        _spawn_live(_persist_burnt_ip(
+            db,
+            ip=_ip,
+            reason=reason,
+            user_id=user_id or "",
+            offer_url=offer_url or "",
+            state=(state or "").upper(),
+            job_id=job_id or "",
+        ))
+    except Exception:
+        pass
+
+
 def _dup_set_contains(dup_set: Optional[set], ip: str) -> bool:
     """True when `ip` is already reserved. Empty set is active, not 'off'."""
     if dup_set is None or not ip:
@@ -10109,32 +10148,9 @@ async def run_real_user_traffic_job(
                     entry["offer_url_normalized"] = _team_pick.get(
                         "offer_url_normalized"
                     ) or ""
-                # Unique IP already reserved under duplicate_ip_lock above.
-                # ── 2026-01 fix: CROSS-JOB persistence ────────────────
-                # Without this, the in-memory `duplicate_ip_set` is lost
-                # when the job ends, and the next job can pick the same
-                # exit IP again from ProxyJet's pool (because clicks-DB
-                # writes only happen on a successful click — a visit that
-                # never reached a click would leak its IP back into the
-                # pool for the next run). Persisting every picked exit
-                # IP to `rut_burnt_ips` means EVERY future job loads it
-                # into its `duplicate_ip_set` at startup → ProxyJet pool
-                # IPs we've handed out are NEVER picked twice across runs.
-                # Fire-and-forget so the request stays fast.
-                try:
-                    _spawn_live(_persist_burnt_ip(
-                        db,
-                        ip=exit_ip,
-                        reason="proxyjet_picked",
-                        user_id=engine_user_id or "",
-                        offer_url=_underlying_offer_url or target_url or "",
-                        state=row_state_code or "",
-                        job_id=job_id or "",
-                    ))
-                except Exception:
-                    # Never let persistence failure block the visit —
-                    # in-memory set still protects within this job.
-                    pass
+                # v2.6.102 — in-memory reserve only at pick time; cross-job
+                # rut_burnt_ips persist happens after confirmed tracker/offer
+                # touch (see _spawn_persist_used_exit_ip in process_one finally).
                 chosen_proxy = parsed
                 chosen_geo = _geo
                 break
@@ -10268,6 +10284,23 @@ async def run_real_user_traffic_job(
             push_live_step(
                 job_id, i + 1, "geo", "skipped",
                 "Proxy unreachable / blank IP — skipped (no UA / lead consumed)",
+            )
+            return await _record(job_id, entry, report, report_lock, db)
+
+        # v2.6.102 — team offer claims require canonical IPv4; reject IPv6 early.
+        if _is_ipv6_exit_ip(geo.get("exit_ip") or ""):
+            _v6_ip = (geo.get("exit_ip") or "").strip()
+            if _can_retry_offer_block:
+                push_live_step(
+                    job_id, i + 1, "filter", "info",
+                    f"IPv6 exit {_v6_ip} — retrying for IPv4 (team/offer isolation)",
+                )
+                raise _OfferBlockRetryNeeded(reason="ipv6_exit", burnt_ip=_v6_ip)
+            entry["status"] = "skipped_duplicate_ip"
+            entry["error"] = f"IPv6 exit {_v6_ip} not supported for team offer isolation"
+            push_live_step(
+                job_id, i + 1, "filter", "skipped",
+                entry["error"],
             )
             return await _record(job_id, entry, report, report_lock, db)
 
@@ -10523,7 +10556,16 @@ async def run_real_user_traffic_job(
         # NET EFFECT: one redundant httpx GET removed per visit; the
         # browser goto remains the SOLE tracker touch → 1 IP == 1 click,
         # matching what strict duplicate detectors expect.
-        if False and _can_retry_offer_block:
+        #
+        # v2.6.102 — re-enable ONLY for direct (non-tracker) offer URLs.
+        # Tracker targets and pass-to-offer single-click flows keep the
+        # browser goto as the sole HTTP touch (v2.6.15 duplicate fix).
+        _pre_probe_offer = (
+            _can_retry_offer_block
+            and not _is_tracker_target
+            and not bool(_referer_cfg.get("pass_to_offer"))
+        )
+        if _pre_probe_offer:
             try:
                 _pre_blk, _pre_reason, _pre_snip = await _probe_offer_duplicate_via_proxy(
                     proxy, _url_to_probe, ua, timeout_s=12.0,
@@ -10606,6 +10648,8 @@ async def run_real_user_traffic_job(
                         entry["proxy"] = proxy.get("server", "")
                         _sm_geo = await _probe_proxy_geo(proxy, ua, user_id=engine_user_id)
                         if not _sm_geo.get("ok") or not (_sm_geo.get("exit_ip") or "").strip():
+                            continue
+                        if _is_ipv6_exit_ip(_sm_geo.get("exit_ip") or ""):
                             continue
                         if allowed_countries_lc and _sm_geo["country_name"].lower() not in allowed_countries_lc:
                             continue
@@ -12101,9 +12145,31 @@ async def run_real_user_traffic_job(
                                     if not _sync_ok:
                                         push_live_step(
                                             job_id, i + 1, "browser", "info",
-                                            "Tunnel rotate: could not re-bind team IP claim — stopping proxy rotation",
+                                            f"Tunnel rotate: team claim re-bind failed for "
+                                            f"{_new_exit} (was {_claim_ip}) — retrying visit "
+                                            f"slot with fresh IP",
                                         )
-                                        break
+                                        try:
+                                            await context.close()
+                                        except Exception:
+                                            pass
+                                        if _team_claim_acquired and _claim_ip:
+                                            try:
+                                                from cross_user_ip_isolation import release_team_offer_ip_claim
+                                                await release_team_offer_ip_claim(
+                                                    db, engine_user_id or "", _claim_offer_url,
+                                                    _claim_ip, _visit_claim_token,
+                                                )
+                                                _team_claim_released = True
+                                                _team_claim_acquired = False
+                                            except Exception:
+                                                pass
+                                        if _new_exit:
+                                            _dup_set_add(duplicate_ip_set, _new_exit)
+                                        raise _OfferBlockRetryNeeded(
+                                            reason="tunnel_rebind_failed",
+                                            burnt_ip=_new_exit or _claim_ip or "",
+                                        )
                                     if _new_claim_ip:
                                         _claim_ip = _new_claim_ip
                                 geo = _new_geo
@@ -12224,8 +12290,52 @@ async def run_real_user_traffic_job(
                                 "Proxy can't reach your own tracker — internal server→server hit "
                                 "(click will still be recorded as the PROXY exit IP)…",
                             )
+                            _reserved_for_bypass = (
+                                (entry.get("exit_ip") or geo.get("exit_ip") or "").strip()
+                            )
                             _exit_ip_for_bypass = await _get_exit_ip_via_proxy(proxy)
                             if _exit_ip_for_bypass:
+                                if (
+                                    _reserved_for_bypass
+                                    and not _exit_ips_match(
+                                        _reserved_for_bypass, _exit_ip_for_bypass,
+                                    )
+                                ):
+                                    push_live_step(
+                                        job_id, i + 1, "bypass", "skipped",
+                                        f"Bypass IP mismatch — reserved {_reserved_for_bypass} "
+                                        f"≠ proxy echo {_exit_ip_for_bypass} · no click "
+                                        f"registered · retrying with fresh IP",
+                                    )
+                                    _dup_set_add(duplicate_ip_set, _exit_ip_for_bypass)
+                                    _spawn_live(_persist_burnt_ip(
+                                        db,
+                                        ip=_exit_ip_for_bypass,
+                                        reason="bypass_ip_mismatch",
+                                        user_id=engine_user_id or "",
+                                        offer_url=_underlying_offer_url or target_url or "",
+                                        state=(entry.get("lead_state") or "").upper(),
+                                        job_id=job_id or "",
+                                    ))
+                                    try:
+                                        await context.close()
+                                    except Exception:
+                                        pass
+                                    if _team_claim_acquired and _claim_ip:
+                                        try:
+                                            from cross_user_ip_isolation import release_team_offer_ip_claim
+                                            await release_team_offer_ip_claim(
+                                                db, engine_user_id or "", _claim_offer_url,
+                                                _claim_ip, _visit_claim_token,
+                                            )
+                                            _team_claim_released = True
+                                            _team_claim_acquired = False
+                                        except Exception:
+                                            pass
+                                    raise _OfferBlockRetryNeeded(
+                                        reason="bypass_ip_mismatch",
+                                        burnt_ip=_exit_ip_for_bypass,
+                                    )
                                 _bypass_offer_url = await _resolve_tracker_via_localhost(
                                     target_url, _exit_ip_for_bypass, ua,
                                     visit_token=_visit_claim_token,
@@ -12240,7 +12350,8 @@ async def run_real_user_traffic_job(
                                     push_live_step(
                                         job_id, i + 1, "bypass", "ok",
                                         f"✓ Click registered as PROXY IP {_exit_ip_for_bypass} "
-                                        f"(your machine's IP is NOT exposed — tracker is on your "
+                                        f"(matches reserved {_reserved_for_bypass or _exit_ip_for_bypass}; "
+                                        f"your machine's IP is NOT exposed — tracker is on your "
                                         f"own server). Browser → {_bypass_offer_url[:90]}",
                                     )
                                     try:
@@ -14029,6 +14140,25 @@ async def run_real_user_traffic_job(
             entry["status"] = "failed"
             entry["error"] = f"{type(e).__name__}: {str(e)[:180]}"
         finally:
+            # v2.6.102 — cross-job burnt ledger only after confirmed use.
+            if (
+                entry.get("exit_ip")
+                and (
+                    _affiliate_click_fired
+                    or entry.get("bypass_used")
+                    or entry.get("status") == "ok"
+                    or entry.get("thank_you_reached")
+                )
+            ):
+                _spawn_persist_used_exit_ip(
+                    db,
+                    ip=entry.get("exit_ip") or "",
+                    user_id=engine_user_id or "",
+                    offer_url=_underlying_offer_url or target_url or "",
+                    state=(entry.get("lead_state") or "").upper(),
+                    job_id=job_id or "",
+                    reason="visit_used",
+                )
             if (
                 _team_claim_acquired
                 and not _team_claim_completed
@@ -17796,8 +17926,16 @@ async def _execute_automation_steps(
                     _native_handled = False
                     _native_picked: Optional[str] = None
                     try:
-                        _step_sel = (step.get("selector") or "").strip()
-                        if _step_sel and not _native_handled:
+                        # Per-step opt-out: native text/random click can cost
+                        # many seconds of failed locator retries. Set
+                        # native_click:false / js_only:true → JS only.
+                        _skip_native = (
+                            step.get("native_click") is False
+                            or bool(step.get("js_only"))
+                        )
+                        if not _skip_native:
+                          _step_sel = (step.get("selector") or "").strip()
+                          if _step_sel and not _native_handled:
                             try:
                                 await _robust_click_scoped(
                                     page, step, _step_sel,
@@ -17810,12 +17948,12 @@ async def _execute_automation_steps(
                                     f"[evaluate→selector_click] '{_step_sel}' failed: "
                                     f"{str(_sel_e)[:100]} — falling back to JS"
                                 )
-                        # ── Option Pick / Gender Pick (sheet-bound) ──
-                        # VR: capture Male+Female → bind {{gender}} →
-                        # row M/F/Male/Female → native click exact label.
-                        # Must run BEFORE random-pick / fuzzy text-click
-                        # (fuzzy 'Male' can match 'Female').
-                        if not _native_handled:
+                          # ── Option Pick / Gender Pick (sheet-bound) ──
+                          # VR: capture Male+Female → bind {{gender}} →
+                          # row M/F/Male/Female → native click exact label.
+                          # Must run BEFORE random-pick / fuzzy text-click
+                          # (fuzzy 'Male' can match 'Female').
+                          if not _native_handled:
                             _sheet_label = _resolve_sheet_option_pick_label(step, row)
                             if _sheet_label:
                                 _native_picked = _sheet_label
@@ -17890,8 +18028,8 @@ async def _execute_automation_steps(
                                         f"native_click option-pick failed ({_err_n[:60]}), "
                                         f"fell back to JS"
                                     )
-                        _rp_labels = _extract_random_pick_labels(js)
-                        if _rp_labels and not _native_handled:
+                          _rp_labels = _extract_random_pick_labels(js)
+                          if _rp_labels and not _native_handled:
                             # 2026-06 — Customer ask: random_pick should
                             # be TRULY different per visit ("har bar
                             # random mix"). The previous code used
@@ -17935,7 +18073,7 @@ async def _execute_automation_steps(
                                     f"failed: {_err_n[:100]} — falling back to JS"
                                 )
                                 _step_note = f"native_click random-pick failed ({_err_n[:60]}), fell back to JS"
-                        elif not _native_handled:
+                          elif not _native_handled:
                             _tc_label = _extract_text_click_label(js)
                             if _tc_label:
                                 _native_picked = _normalize_gender_click_label(_tc_label)

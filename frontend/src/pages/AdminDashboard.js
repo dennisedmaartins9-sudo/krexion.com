@@ -2883,7 +2883,7 @@ MASTER_ADMIN_PASSWORD=YourVeryLongSecretPassword`}
                   { key: "ua_checker", label: "User Agent Checker" },
                   { key: "email_checker", label: "Email Profile Checker" },
                   { key: "phone_checker", label: "Phone Checker (free libphonenumber)" },
-                  { key: "separate_data", label: "Separate Data (row filter)" },
+                  { key: "separate_data", label: "Separate Data (any column filter)" },
                   { key: "form_filler", label: "Form Filler / Survey Bot" },
                   { key: "real_user_traffic", label: "Real User Traffic (anti-detect)" },
                   { key: "profile_builder", label: "Profile Builder (AdsPower bulk profiles + Proxy Provider)" },
