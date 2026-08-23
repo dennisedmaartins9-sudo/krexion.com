@@ -46,6 +46,7 @@ from ua_profile_contract import (
     APP_SUPPORT_MATRIX,
     classify_user_agent,
     client_hint_headers_for_ua,
+    fbav_tracker_version,
     validate_user_agent,
 )
 
@@ -2021,14 +2022,15 @@ def _identity_suffix(app: str, family: str, parts: Dict[str, str], locale: str) 
             f"{posix}; {lang}; scale={scale}; {resolution})"
         )
     if app == "facebook":
+        fbav = fbav_tracker_version(version)
         if family == "android":
             return (
-                f"[FB_IAB/FB4A;FBAV/{version};IABMV/1;"
+                f"[FB_IAB/FB4A;FBAV/{fbav};IABMV/1;"
                 f"FBBV/{release['build']};]"
             )
         device_family = parts["family"]
         return (
-            f"[FBAN/FBIOS;FBAV/{version};FBDV/{parts['model']};"
+            f"[FBAN/FBIOS;FBAV/{fbav};FBDV/{parts['model']};"
             f"FBMD/{device_family};FBSN/iOS;FBSV/{parts['version'].replace('_', '.')};"
             f"FBSS/{2 if device_family == 'iPad' else 3};"
             f"FBID/{'tablet' if device_family == 'iPad' else 'phone'};"
@@ -2059,7 +2061,8 @@ def _identity_suffix(app: str, family: str, parts: Dict[str, str], locale: str) 
             marker += " AppId/1233 WKWebView/1"
         return marker
     if app == "pinterest":
-        return f"[Pinterest/{'Android' if family == 'android' else 'iOS'}]"
+        os_label = "Android" if family == "android" else "iOS"
+        return f"[Pinterest/{os_label}] Pinterest/{version}"
     if app == "snapchat":
         return f"Snapchat/{version}"
     if app == "whatsapp":

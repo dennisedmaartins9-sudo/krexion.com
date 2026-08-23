@@ -157,6 +157,24 @@ async def push_click(
             {"$inc": {"clicks": 1, "consecutive_no_conversions": 1}},
         )
 
+    # Flat team IP ledger — native RUT clicks must block teammates too.
+    try:
+        _offer_url = (
+            clean.get("offer_url_normalized")
+            or clean.get("destination_url")
+            or clean.get("final_url")
+            or clean.get("offer_url")
+            or ""
+        )
+        _ip = clean.get("ip_address") or clean.get("ipv4") or clean.get("detected_ip") or ""
+        if _offer_url and _ip:
+            from cross_user_ip_isolation import record_team_offer_ip_used_for_user
+            await record_team_offer_ip_used_for_user(
+                _db, user["id"], str(_offer_url), str(_ip), source="click_push"
+            )
+    except Exception:
+        pass
+
     return {"ok": True, "id": cid, "updated": bool(body.get("update"))}
 
 

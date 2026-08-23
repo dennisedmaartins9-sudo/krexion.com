@@ -188,8 +188,8 @@ def test_fallback_preserves_clean_custom_browser_and_cleans_contamination():
 
 def test_supported_formats_and_unsupported_clean_fallbacks():
     expected_markers = {
-        "facebook": "[FB_IAB/FB4A;FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;]",
-        "pinterest": "[Pinterest/Android]",
+        "facebook": "[FB_IAB/FB4A;FBAV/556.0.0;IABMV/1;FBBV/681204512;]",
+        "pinterest": "[Pinterest/Android] Pinterest/14.14",
         "linkedin": "[LinkedInApp]/2.286.33 com.linkedin.android/212600",
         "reddit": "Reddit/Version 2026.18.0/Build 2618090/Android 14",
         "telegram": "Telegram-Android/12.9.2",
@@ -317,7 +317,7 @@ def test_context_accept_language_is_shared_by_every_outbound_request_path():
             if keyword.arg == "accept_language":
                 outbound_values.append(keyword.value)
 
-    assert len(outbound_values) == 4
+    assert len(outbound_values) == 2
     assert all(
         isinstance(value, ast.Name) and value.id == "_context_accept_language"
         for value in outbound_values

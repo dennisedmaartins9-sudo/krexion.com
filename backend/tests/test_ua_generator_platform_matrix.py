@@ -18,6 +18,7 @@ from ua_profile_contract import (  # noqa: E402
     ANDROID_DEVICE_SNAPSHOTS,
     APP_RELEASES_BY_PLATFORM,
     APP_SUPPORT_MATRIX,
+    fbav_tracker_version,
     validate_user_agent,
 )
 
@@ -87,6 +88,7 @@ def _templates():
         "_CHROME_VERSIONS": [DESKTOP_CHROME],
         "_ANDROID_WEBVIEW_VERSIONS": [WEBVIEW],
         "_FIREFOX_VERSIONS": ["141.0.2"],
+        "fbav_tracker_version": fbav_tracker_version,
         "_pick_region": lambda _code: REGION,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER_FILE), "exec"), namespace)
@@ -171,7 +173,8 @@ def test_exact_android_mapped_fields_and_no_fabricated_builds():
     }
     assert "1011909233; IABMV/1" in samples["instagram"]
     assert samples["facebook"].count("[FB_IAB/FB4A;") == 1
-    assert "FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;" in samples["facebook"]
+    assert "FBAV/556.0.0;IABMV/1;FBBV/681204512;" in samples["facebook"]
+    assert "FBAV/556.0.0.59.68;" not in samples["facebook"]
     assert "FBAN/" not in samples["facebook"] and "FBOP/" not in samples["facebook"]
     assert "musical_ly_2024604010" in samples["tiktok"]
     assert "app_version/46.4.1" in samples["tiktok"]
@@ -181,8 +184,9 @@ def test_exact_android_mapped_fields_and_no_fabricated_builds():
 
 
 def test_required_marker_shapes_and_reduced_chrome():
-    assert "[Pinterest/Android]" in _generate("pinterest", "android")
-    assert "Pinterest/" not in _generate("pinterest", "android").replace("[Pinterest/Android]", "")
+    pin = _generate("pinterest", "android")
+    assert "[Pinterest/Android]" in pin
+    assert "Pinterest/14.14" in pin or "Pinterest/14.10" in pin or "Pinterest/14.5" in pin
     assert "WhatsApp/2.26.5.10 A" in _generate("whatsapp", "android")
     assert "WhatsApp/2.26.5.10/A" not in _generate("whatsapp", "android")
     assert "TwitterAndroid/11.95.1-release.0" in _generate("twitter", "android")

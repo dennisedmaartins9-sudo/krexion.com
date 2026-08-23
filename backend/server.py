@@ -67,6 +67,7 @@ from ua_profile_contract import (
     APP_RELEASES_BY_PLATFORM,
     APP_SUPPORT_MATRIX,
     detect_app as detect_profile_app,
+    fbav_tracker_version,
     replace_verified_app_releases,
     validate_user_agent,
 )
@@ -13817,46 +13818,48 @@ def _ua_facebook_android(d: dict, app_ver: str, chrome_ver: str, region: Optiona
         record for record in _APP_RELEASES_RUNTIME["facebook"]["android"]
         if record["version"] == app_ver
     )
+    # Everflow / Voluum expect FBAV as exactly X.Y.Z — 5-part full builds
+    # detect as "Facebook for Android (Unknown)". Keep FBBV full.
+    fbav = fbav_tracker_version(app_ver)
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
-        f"[FB_IAB/FB4A;FBAV/{app_ver};IABMV/1;FBBV/{release['build']};]"
+        f"[FB_IAB/FB4A;FBAV/{fbav};IABMV/1;FBBV/{release['build']};]"
     )
 
 def _ua_facebook_ios(d: dict, app_ver: str, region: Optional[dict] = None) -> str:
     fblc = (region or {}).get("posix_locale", "en_US")
     is_ipad = d["brand"] == "iPad"
     family = "iPad" if is_ipad else "iPhone"
+    fbav = fbav_tracker_version(app_ver)
     return (
         f"Mozilla/5.0 ({d['brand']}; CPU {family} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        f"(KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/{app_ver};FBDV/{d['model']};"
+        f"(KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/{fbav};FBDV/{d['model']};"
         f"FBMD/{family};FBSN/iOS;FBSV/{d['ios'].replace('_','.')};"
         f"FBSS/{int(float(d['scale']))};FBID/{'tablet' if is_ipad else 'phone'};FBLC/{fblc};IABMV/1]"
     )
 
 def _ua_pinterest_android(d: dict, app_ver: str) -> str:
     """
-    In-app webview format (same shape as Instagram/Facebook).
-    Example: Mozilla/5.0 (Linux; Android 14; Pixel 7 Build/UP1A.231105.003; wv) AppleWebKit/537.36
-             (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.63 Mobile Safari/537.36
-             [Pinterest/Android]
+    In-app webview format. Bracket identifies the app; trailing
+    Pinterest/{version} is required so advertiser dashboards do not
+    render Browser=Pinterest (Unknown).
     """
     chrome_ver = random.choice(_ANDROID_WEBVIEW_VERSIONS)
     return (
         f"Mozilla/5.0 (Linux; Android {d['and_ver']}; {d['model']} Build/{d['build']}; wv) "
         f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/{chrome_ver} Mobile Safari/537.36 "
-        "[Pinterest/Android]"
+        f"[Pinterest/Android] Pinterest/{app_ver}"
     )
 
 def _ua_pinterest_ios(d: dict, app_ver: str) -> str:
     """
     In-app webview format for iOS Pinterest.
-    Example: Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15
-             (KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS] Pinterest/11.37.0
+    Example: ... [Pinterest/iOS] Pinterest/14.14
     """
     return (
         f"Mozilla/5.0 ({d['brand']}; CPU {'iPad' if d['brand']=='iPad' else 'iPhone'} OS {d['ios']} like Mac OS X) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS]"
+        f"(KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS] Pinterest/{app_ver}"
     )
 
 def _ua_snapchat_android(d: dict, app_ver: str) -> str:
@@ -26313,6 +26316,22 @@ async def startup_db_indexes():
         await ensure_vps_ip_claim_indexes(db)  # legacy compatibility
         await ensure_team_offer_claim_indexes(db)
         logger.info("team_offer_ip_claims unique + TTL indexes ready")
+        # Heal flat ledger from completed claims (idempotent). Background so
+        # a large history set never blocks API readiness.
+        try:
+            from cross_user_ip_isolation import backfill_team_offer_ledger_from_claims
+            import asyncio as _asyncio_ledger
+
+            async def _ledger_backfill():
+                try:
+                    n = await backfill_team_offer_ledger_from_claims(db)
+                    logger.info(f"team_offer_ip_ledger backfill wrote/ensured {n} row(s)")
+                except Exception as _bf_err:  # noqa: BLE001
+                    logger.warning(f"team_offer_ip_ledger backfill skipped: {_bf_err}")
+
+            _asyncio_ledger.create_task(_ledger_backfill())
+        except Exception as _ledger_start_err:  # noqa: BLE001
+            logger.warning(f"team_offer_ip_ledger backfill schedule failed: {_ledger_start_err}")
         
         # Links collection indexes - short_code is critical for redirects
         await db.links.create_index([("user_id", 1)])

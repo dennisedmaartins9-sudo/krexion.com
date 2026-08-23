@@ -1,3 +1,21 @@
+# v2.7.3 — 2026-08 — Flat team IP ledger (no-duplicate, less VPS load)
+#
+# - New permanent collection team_offer_ip_ledger (scope_key + offer_key + ip).
+# - Duplicate IP rules UNCHANGED: team + individual still fail-closed blocked.
+# - Acquire path checks ledger O(1) first, then burnt, then peer clicks (heal).
+# - Writes ledger on claim complete, burnt persist, and sync clicks/push.
+# - Startup backfill from completed claims (background, idempotent).
+# - Does NOT weaken isolation — only speeds large-team checks on shared VPS DB.
+#
+# v2.7.2 — 2026-08 — Everflow Browser (Unknown) fix: Facebook FBAV + Pinterest version
+#
+# - Facebook Android/iOS now emit FBAV as exactly X.Y.Z (e.g. 556.0.0 / 557.0.0)
+#   so Everflow no longer shows "Facebook for Android (Unknown)". FBBV stays full.
+# - Pinterest Android/iOS now append Pinterest/{version} after the bracket marker
+#   so trackers can extract an app version instead of (Unknown).
+# - Shared helpers: ua_profile_contract.fbav_tracker_version / match_facebook_release.
+# - Generators: server.py + referrer_pro._identity_suffix; contract validation updated.
+#
 # v2.6.53 — 2026-08 — Visual Recorder: Gender, Fix Type, Sheet Pick, zip fix
 #
 # - Gender tool: click Male + Female pool, bind {{gender}} — M/F/male/female auto-detect.

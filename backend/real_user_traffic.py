@@ -7137,6 +7137,15 @@ async def _persist_burnt_ip(
                 },
                 upsert=True,
             )
+            # Flat team IP ledger — same no-duplicate rules, O(1) later checks.
+            if user_id and offer_url:
+                try:
+                    from cross_user_ip_isolation import record_team_offer_ip_used_for_user
+                    await record_team_offer_ip_used_for_user(
+                        db, user_id, offer_url, canonical_ip, source="burnt"
+                    )
+                except Exception:
+                    pass
         await db.rut_burnt_ips.update_one(
             {"ip": canonical_ip},
             {

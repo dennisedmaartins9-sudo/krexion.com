@@ -172,6 +172,36 @@ APP_DISPLAY_NAMES = {
 }
 
 
+def fbav_tracker_version(version: str) -> str:
+    """Normalize Facebook app versions to Everflow-compatible `X.Y.Z`.
+
+    Advertiser trackers (Everflow / Voluum / similar) extract FBAV with a
+    strict three-part regex. Emitting 2-part (`557.0`) or 5-part
+    (`556.0.0.59.68`) leaves Browser version as `(Unknown)` even though
+    the Facebook family is detected. FBBV / package build stays full.
+    """
+    parts = re.findall(r"\d+", version or "")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts[:3])
+
+
+def match_facebook_release(
+    releases: list[Dict[str, Any]],
+    fbav_or_version: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Match a release by exact version or by tracker-normalized FBAV."""
+    raw = (fbav_or_version or "").strip()
+    if not raw or not releases:
+        return None
+    want = fbav_tracker_version(raw)
+    for record in releases:
+        ver = record.get("version") or ""
+        if ver == raw or fbav_tracker_version(ver) == want:
+            return record
+    return None
+
+
 def _collect_app_identities(ua: str) -> list[Dict[str, Any]]:
     """Collect every distinct app identity, preserving its first UA position."""
     text = ua or ""
@@ -473,9 +503,23 @@ def validate_user_agent(
             )
             if not re.search(expected_bracket, text, re.IGNORECASE):
                 issues.append(f"Pinterest {platform} requires its verified bracket marker.")
-            if re.search(r"\bPinterest/[\d.]+", text, re.IGNORECASE):
-                issues.append("Pinterest UA contains an unsupported app-version suffix.")
-            release = releases[0]
+            pin_ver = re.search(r"\bPinterest/([\d.]+)", text, re.IGNORECASE)
+            if not pin_ver:
+                issues.append(
+                    "Pinterest UA requires a Pinterest/{version} marker for tracker parsers."
+                )
+                release = None
+            else:
+                release = next(
+                    (
+                        record
+                        for record in releases
+                        if record["version"] == pin_ver.group(1)
+                    ),
+                    None,
+                )
+        elif app == "facebook":
+            release = match_facebook_release(releases, profile["app_version"])
         else:
             release = next(
                 (record for record in releases if record["version"] == profile["app_version"]),
@@ -496,10 +540,24 @@ def validate_user_agent(
             else:
                 versions = re.findall(r"\bFBAV/([\d.]+)", blocks[0], re.IGNORECASE)
                 builds = re.findall(r"\bFBBV/(\d+)", blocks[0], re.IGNORECASE)
-                if len(versions) != 1 or len(versions[0].split(".")) != 5:
-                    issues.append("Facebook Android FBAV must be one full five-part version.")
+                if len(versions) != 1 or len(versions[0].split(".")) != 3:
+                    issues.append(
+                        "Facebook Android FBAV must be exactly three-part X.Y.Z "
+                        "for advertiser tracker parsers."
+                    )
+                elif versions[0] != fbav_tracker_version(release["version"]):
+                    issues.append("Facebook Android FBAV does not match its release.")
                 if builds != [release["build"]]:
                     issues.append("Facebook Android FBBV does not match its release.")
+        elif app == "facebook" and platform == "iOS":
+            versions = re.findall(r"\bFBAV/([\d.]+)", text, re.IGNORECASE)
+            if len(versions) != 1 or len(versions[0].split(".")) != 3:
+                issues.append(
+                    "Facebook iOS FBAV must be exactly three-part X.Y.Z "
+                    "for advertiser tracker parsers."
+                )
+            elif versions[0] != fbav_tracker_version(release["version"]):
+                issues.append("Facebook iOS FBAV does not match its release.")
         elif app == "tiktok" and platform == "Android":
             if "fban/tiktokandroid" in low or re.search(
                 r"\[FB_IAB/[^\]]*TikTokAndroid", text, re.IGNORECASE
@@ -668,6 +726,8 @@ __all__ = [
     "classify_user_agent",
     "client_hint_headers_for_ua",
     "detect_app",
+    "fbav_tracker_version",
+    "match_facebook_release",
     "replace_verified_app_releases",
     "validate_header_coherence",
     "validate_user_agent",

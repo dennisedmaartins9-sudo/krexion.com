@@ -12,7 +12,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import referrer_pro
 import visual_recorder
-from ua_profile_contract import APP_RELEASES_BY_PLATFORM
+from ua_profile_contract import APP_RELEASES_BY_PLATFORM, fbav_tracker_version
 
 
 SERVER_FILE = pathlib.Path(__file__).resolve().parents[1] / "server.py"
@@ -53,6 +53,7 @@ def _templates():
         "_APP_RELEASES_RUNTIME": runtime_releases,
         "_CHROME_VERSIONS": ["149.0.7827.114"],
         "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
+        "fbav_tracker_version": fbav_tracker_version,
         "_pick_region": lambda _code: REGION,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER_FILE), "exec"), namespace)
@@ -101,14 +102,14 @@ class TestFacebookUAs:
             DEV, "556.0.0.59.68", "149.0.7827.114"
         )
         assert ua.count("[FB_IAB/FB4A;") == 1
-        assert "FBAV/556.0.0.59.68;IABMV/1;FBBV/681204512;" in ua
+        assert "FBAV/556.0.0;IABMV/1;FBBV/681204512;" in ua
         assert "FBAN/FB4A;" not in ua
-        assert "FBAV/556.0.0;" not in ua
+        assert "FBAV/556.0.0.59.68;" not in ua
 
     def test_fb_ios_keeps_audited_release(self):
         ios_dev = {"brand": "iPhone", "ios": "17_5", "model": "iPhone15,3", "scale": "3"}
         ua = TEMPLATES._ua_facebook_ios(ios_dev, "557.0")
-        assert "FBAV/557.0;" in ua
+        assert "FBAV/557.0.0;" in ua
         assert "FBAN/FBIOS;" in ua
         assert re.search(r"FBSN/iOS;FBSV/\d", ua)
 
@@ -129,7 +130,8 @@ class TestCoerceIdempotency:
         assert out == ua
         assert "FB_IAB/FB4A" in out
         assert "FBAN/FB4A" not in out
-        assert "FBAV/556.0.0.59.68" in out
+        assert "FBAV/556.0.0;" in out
+        assert "FBAV/556.0.0.59.68" not in out
 
 
 class TestCoerceCrossPlatform:

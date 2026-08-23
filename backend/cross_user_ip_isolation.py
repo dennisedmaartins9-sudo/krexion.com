@@ -26,6 +26,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 COLLECTION = "cross_user_ip_groups"
 CLAIMS_COLLECTION = "vps_ip_claims"
 TEAM_OFFER_CLAIMS_COLLECTION = "team_offer_ip_claims"
+# Permanent used-IP diary for a team/solo scope + offer. Unique on
+# (scope_key, offer_key, ip). Checked FIRST so large teams do not N-scan
+# every member clicks DB on every visit. Rules stay fail-closed:
+# duplicate IPs are still blocked for the whole team + individual users.
+TEAM_OFFER_LEDGER_COLLECTION = "team_offer_ip_ledger"
 # Pending claim TTL — extended from 90s: identity pacing can wait up to
 # 90s BEFORE browser launch, so a fixed 90s window expired claims mid-
 # visit (team_offer_claim completion failed). Refresh extends this window
@@ -184,6 +189,15 @@ async def ensure_team_offer_claim_indexes(db) -> None:
     await db[TEAM_OFFER_CLAIMS_COLLECTION].create_index(
         [("visit_token", 1), ("scope_key", 1)], name="visit_scope_lookup"
     )
+    await db[TEAM_OFFER_LEDGER_COLLECTION].create_index(
+        [("scope_key", 1), ("offer_key", 1), ("ip", 1)],
+        unique=True,
+        name="uniq_ledger_scope_offer_ip",
+    )
+    await db[TEAM_OFFER_LEDGER_COLLECTION].create_index(
+        [("scope_key", 1), ("offer_key", 1)],
+        name="ledger_scope_offer_list",
+    )
     # This collection already has the production index named ``id_1`` from
     # server startup. Let Mongo/PyMongo derive that same name so deployment is
     # idempotent; requesting a second custom name for the identical key raises
@@ -199,6 +213,150 @@ async def ensure_team_offer_claim_indexes(db) -> None:
         pass
 
 
+async def record_team_offer_ip_used(
+    db,
+    *,
+    scope_key: str,
+    offer_key: str,
+    ip: str,
+    user_id: str = "",
+    offer_url_normalized: str = "",
+    source: str = "unknown",
+) -> bool:
+    """Upsert one permanent used-IP row. Never deletes — IPs stay blocked."""
+    sk = (scope_key or "").strip()
+    ok = (offer_key or "").strip()
+    canonical_ip = canonicalize_ip(ip)
+    if not sk or not ok or not canonical_ip:
+        return False
+    now = datetime.now(timezone.utc)
+    uid = str(user_id or "").strip() or None
+    src = (source or "unknown").strip()[:64] or "unknown"
+    try:
+        await db[TEAM_OFFER_LEDGER_COLLECTION].update_one(
+            {"scope_key": sk, "offer_key": ok, "ip": canonical_ip},
+            {
+                "$set": {
+                    "offer_url_normalized": (offer_url_normalized or "").strip(),
+                    "last_user_id": uid,
+                    "last_source": src,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "id": str(uuid.uuid4()),
+                    "scope_key": sk,
+                    "offer_key": ok,
+                    "ip": canonical_ip,
+                    "first_user_id": uid,
+                    "first_source": src,
+                    "recorded_at": now,
+                },
+            },
+            upsert=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def record_team_offer_ip_used_for_user(
+    db,
+    user_id: str,
+    offer_url: str,
+    ip: str,
+    *,
+    source: str = "unknown",
+) -> bool:
+    """Resolve isolation scope then write the flat ledger row."""
+    uid = (user_id or "").strip()
+    if not uid or not offer_url:
+        return False
+    try:
+        scope = await resolve_isolation_scope(db, uid)
+        normalized_url, offer_key = canonical_offer_identity(offer_url)
+    except Exception:
+        return False
+    return await record_team_offer_ip_used(
+        db,
+        scope_key=scope["scope_key"],
+        offer_key=offer_key,
+        ip=ip,
+        user_id=uid,
+        offer_url_normalized=normalized_url,
+        source=source,
+    )
+
+
+async def ledger_has_team_offer_ip(
+    db, scope_key: str, offer_key: str, canonical_ip: str
+) -> bool:
+    sk = (scope_key or "").strip()
+    ok = (offer_key or "").strip()
+    if not sk or not ok or not canonical_ip:
+        return False
+    try:
+        hit = await db[TEAM_OFFER_LEDGER_COLLECTION].find_one(
+            {"scope_key": sk, "offer_key": ok, "ip": canonical_ip},
+            {"_id": 1},
+        )
+        return bool(hit)
+    except Exception:
+        # Fail closed for shared scopes is handled by the caller; here return
+        # False so burnt/peer fallback still runs when ledger is temporarily down.
+        return False
+
+
+async def list_team_offer_ledger_ips(db, scope_key: str, offer_key: str) -> Set[str]:
+    out: Set[str] = set()
+    sk = (scope_key or "").strip()
+    ok = (offer_key or "").strip()
+    if not sk or not ok:
+        return out
+    try:
+        async for doc in db[TEAM_OFFER_LEDGER_COLLECTION].find(
+            {"scope_key": sk, "offer_key": ok},
+            {"ip": 1, "_id": 0},
+        ):
+            canonical = canonicalize_ip(doc.get("ip"))
+            if canonical:
+                out.add(canonical)
+    except Exception:
+        pass
+    return out
+
+
+async def backfill_team_offer_ledger_from_claims(db, *, limit: int = 50000) -> int:
+    """One-time / startup heal: completed claims → flat ledger (idempotent)."""
+    written = 0
+    try:
+        cursor = db[TEAM_OFFER_CLAIMS_COLLECTION].find(
+            {"status": "completed"},
+            {
+                "scope_key": 1,
+                "offer_key": 1,
+                "ip": 1,
+                "user_id": 1,
+                "offer_url_normalized": 1,
+                "_id": 0,
+            },
+        ).limit(max(1, min(int(limit or 50000), 200000)))
+        async for doc in cursor:
+            ok = await record_team_offer_ip_used(
+                db,
+                scope_key=str(doc.get("scope_key") or ""),
+                offer_key=str(doc.get("offer_key") or ""),
+                ip=str(doc.get("ip") or ""),
+                user_id=str(doc.get("user_id") or ""),
+                offer_url_normalized=str(doc.get("offer_url_normalized") or ""),
+                source="backfill_claim",
+            )
+            if ok:
+                written += 1
+    except Exception:
+        return written
+    return written
+
+
 async def _team_ip_already_used(
     db,
     scope: Dict[str, Any],
@@ -208,13 +366,27 @@ async def _team_ip_already_used(
 ) -> bool:
     """Strict history check for THIS ip+offer across the whole team.
 
-    Does not load every teammate IP. Looks up one IP in burnt + each
-    member clicks DB (parallel, capped). Timeout on a shared team fails
-    closed so a slow Mongo never accidentally allows a duplicate.
+    Order (same no-duplicate rules, less VPS load):
+      1. Flat ledger O(1) — permanent used-IP diary
+      2. Burnt offer IPs — heal into ledger on hit
+      3. Peer clicks DBs (legacy / pre-ledger) — heal into ledger on hit
+    Shared-team timeouts / burnt errors fail closed so a slow Mongo never
+    accidentally allows a duplicate.
     """
     members = [str(m).strip() for m in (scope.get("member_ids") or []) if str(m).strip()]
     if not members or not canonical_ip or not offer_key:
         return False
+    scope_key = str(scope.get("scope_key") or "").strip()
+    shared = bool(scope.get("shared"))
+
+    if scope_key:
+        try:
+            if await ledger_has_team_offer_ip(db, scope_key, offer_key, canonical_ip):
+                return True
+        except Exception:
+            if shared:
+                return True
+
     burnt = getattr(db, "rut_burnt_offer_ips", None)
     if burnt is None:
         try:
@@ -232,9 +404,17 @@ async def _team_ip_already_used(
                 {"_id": 1},
             )
             if hit:
+                if scope_key:
+                    await record_team_offer_ip_used(
+                        db,
+                        scope_key=scope_key,
+                        offer_key=offer_key,
+                        ip=canonical_ip,
+                        source="heal_burnt",
+                    )
                 return True
         except Exception:
-            if scope.get("shared"):
+            if shared:
                 return True
     if get_user_db is None:
         return False
@@ -268,8 +448,18 @@ async def _team_ip_already_used(
             timeout=2.5,
         )
     except asyncio.TimeoutError:
-        return bool(scope.get("shared"))
-    return any(item is True for item in results)
+        return shared
+    if any(item is True for item in results):
+        if scope_key:
+            await record_team_offer_ip_used(
+                db,
+                scope_key=scope_key,
+                offer_key=offer_key,
+                ip=canonical_ip,
+                source="heal_click",
+            )
+        return True
+    return False
 
 
 async def acquire_team_offer_ip_claim(
@@ -373,7 +563,7 @@ async def complete_team_offer_ip_claim(
     db, user_id: str, offer_url: str, ip: str, visit_token: str
 ) -> bool:
     scope = await resolve_isolation_scope(db, user_id)
-    _, offer_key = canonical_offer_identity(offer_url)
+    normalized_url, offer_key = canonical_offer_identity(offer_url)
     canonical_ip = canonicalize_ip(ip)
     if not canonical_ip:
         return False
@@ -385,13 +575,27 @@ async def complete_team_offer_ip_claim(
         {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)},
          "$unset": {"expires_at": ""}},
     )
-    if result.modified_count:
-        return True
-    existing = await db[TEAM_OFFER_CLAIMS_COLLECTION].find_one({
-        "scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip,
-        "visit_token": (visit_token or "").strip(), "status": "completed",
-    })
-    return bool(existing)
+    completed = bool(result.modified_count)
+    if not completed:
+        existing = await db[TEAM_OFFER_CLAIMS_COLLECTION].find_one({
+            "scope_key": scope["scope_key"], "offer_key": offer_key, "ip": canonical_ip,
+            "visit_token": (visit_token or "").strip(), "status": "completed",
+        })
+        completed = bool(existing)
+    if completed:
+        # Permanent diary — must not rely only on pending claims (TTL) or
+        # N-way peer click scans. Failures here do not undo completion; the
+        # next acquire still has burnt + peer fail-closed fallbacks.
+        await record_team_offer_ip_used(
+            db,
+            scope_key=scope["scope_key"],
+            offer_key=offer_key,
+            ip=canonical_ip,
+            user_id=str(user_id or "").strip(),
+            offer_url_normalized=normalized_url,
+            source="claim_complete",
+        )
+    return completed
 
 
 async def release_team_offer_ip_claim(
@@ -435,7 +639,7 @@ async def list_team_offer_claimed_ips(db, user_id: str, offer_url: str) -> Set[s
 
 
 async def list_team_shared_used_ips(db, user_id: str, offer_url: str) -> Set[str]:
-    """Team used-IPs in 1–2 queries (claims + burnt), never N full peer scans.
+    """Team used-IPs via flat ledger + claims + burnt (never N full peer scans).
 
     Calling ``_load_ips_for_user`` per teammate was O(N) distinct/aggregate
     over every tenant clicks DB — 10–100 VPS-ON users in one group stalled
@@ -447,6 +651,9 @@ async def list_team_shared_used_ips(db, user_id: str, offer_url: str) -> Set[str
         if not offer_url or not scope.get("member_ids"):
             return out
         _, offer_key = canonical_offer_identity(offer_url)
+        scope_key = str(scope.get("scope_key") or "").strip()
+        if scope_key:
+            out.update(await list_team_offer_ledger_ips(db, scope_key, offer_key))
         members = list(scope.get("member_ids") or [])
         burnt = getattr(db, "rut_burnt_offer_ips", None)
         if burnt is None:

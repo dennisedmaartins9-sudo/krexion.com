@@ -16,6 +16,7 @@ from cross_user_ip_isolation import (
     invalidate_group_cache,
     is_canonical_ipv4,
     list_team_shared_used_ips,
+    record_team_offer_ip_used,
     refresh_team_offer_ip_claim,
     release_team_offer_ip_claim,
     resolve_isolation_scope,
@@ -105,13 +106,28 @@ class _Collection:
                     raise DuplicateKeyError("duplicate")
             self.docs.append(dict(doc))
 
-    async def update_one(self, query, update):
+    async def update_one(self, query, update, upsert=False):
         for doc in self.docs:
             if _matches(doc, query):
                 doc.update(update.get("$set", {}))
                 for key in update.get("$unset", {}):
                     doc.pop(key, None)
+                for key, value in update.get("$setOnInsert", {}).items():
+                    doc.setdefault(key, value)
                 return _Result(modified=1)
+        if upsert:
+            row = dict(query)
+            row.update(update.get("$set", {}))
+            row.update(update.get("$setOnInsert", {}))
+            if self.unique_claim:
+                key = (row.get("scope_key"), row.get("offer_key"), row.get("ip"))
+                if any(
+                    (d.get("scope_key"), d.get("offer_key"), d.get("ip")) == key
+                    for d in self.docs
+                ):
+                    raise DuplicateKeyError("duplicate")
+            self.docs.append(row)
+            return _Result(modified=1)
         return _Result()
 
     async def delete_one(self, query):
@@ -132,6 +148,7 @@ class _DB:
             {"id": "office02", "vps_ip_db_enabled": True},
         ])
         self.claims = _Collection(unique_claim=True)
+        self.ledger = _Collection(unique_claim=True)
         self.rut_burnt_offer_ips = _Collection()
 
     def __getitem__(self, name):
@@ -139,6 +156,8 @@ class _DB:
             return self.groups
         if name == "team_offer_ip_claims":
             return self.claims
+        if name == "team_offer_ip_ledger":
+            return self.ledger
         if name == "rut_burnt_offer_ips":
             return self.rut_burnt_offer_ips
         raise KeyError(name)
@@ -367,3 +386,107 @@ def test_rut_team_claim_refresh_and_retry_hooks():
     assert "HTTP 403 Forbidden at landing" in src
     assert "Post-submit page is blank" in src
     assert "team_claim_infra" in src
+    assert "record_team_offer_ip_used_for_user" in src
+
+
+@_async_test
+async def test_complete_writes_flat_ledger_and_blocks_without_peer_scan():
+    """Completed visit → ledger row; teammate blocked via O(1) ledger only."""
+    invalidate_group_cache()
+    db = _DB()
+    offer = "https://offer.example/ledger"
+    ip = "203.0.113.55"
+    got = await acquire_team_offer_ip_claim(
+        db, "office01", offer, ip, "ledger-visit"
+    )
+    assert got["acquired"]
+    assert await complete_team_offer_ip_claim(
+        db, "office01", offer, ip, "ledger-visit"
+    )
+    assert len(db.ledger.docs) == 1
+    assert db.ledger.docs[0]["ip"] == ip
+    assert db.ledger.docs[0]["last_source"] == "claim_complete"
+
+    # No get_user_db — must still conflict from flat ledger alone.
+    blocked = await acquire_team_offer_ip_claim(
+        db, "office02", offer, ip, "other-visit"
+    )
+    assert blocked["status"] == "conflict"
+    assert blocked["acquired"] is False
+
+
+@_async_test
+async def test_flat_ledger_row_blocks_before_peer_clicks():
+    invalidate_group_cache()
+    db = _DB()
+    offer = "https://offer.example/preseed"
+    _, offer_key = canonical_offer_identity(offer)
+    scope = await resolve_isolation_scope(db, "office01")
+    await record_team_offer_ip_used(
+        db,
+        scope_key=scope["scope_key"],
+        offer_key=offer_key,
+        ip="198.51.100.90",
+        user_id="office01",
+        source="manual",
+    )
+    blocked = await acquire_team_offer_ip_claim(
+        db, "office02", offer, "198.51.100.90", "v-preseed"
+    )
+    assert blocked["acquired"] is False
+
+
+@_async_test
+async def test_list_team_shared_used_ips_includes_flat_ledger():
+    invalidate_group_cache()
+    db = _DB()
+    offer = "https://offer.example/list"
+    _, offer_key = canonical_offer_identity(offer)
+    scope = await resolve_isolation_scope(db, "office01")
+    await record_team_offer_ip_used(
+        db,
+        scope_key=scope["scope_key"],
+        offer_key=offer_key,
+        ip="203.0.113.99",
+        source="manual",
+    )
+    used = await list_team_shared_used_ips(db, "office01", offer)
+    assert "203.0.113.99" in used
+
+
+@_async_test
+async def test_historical_click_heals_into_flat_ledger():
+    """Peer click hit must self-heal ledger so next check is O(1)."""
+    invalidate_group_cache()
+    db = _DB()
+    offer = "https://offer.example/heal"
+    offer_key = canonical_offer_identity(offer)[1]
+
+    class _Clicks:
+        async def find_one(self, query, projection=None):
+            blob = str(query)
+            if "198.51.100.66" in blob and offer_key in blob:
+                return {"ip_address": "198.51.100.66", "offer_scope_key": offer_key}
+            return None
+
+    class _UserDB:
+        def __init__(self, clicks):
+            self.clicks = clicks
+
+    def get_user_db(uid):
+        if uid == "office01":
+            return _UserDB(_Clicks())
+        return _UserDB(_Collection())
+
+    blocked = await acquire_team_offer_ip_claim(
+        db, "office02", offer, "198.51.100.66", "heal-1",
+        get_user_db=get_user_db,
+    )
+    assert blocked["acquired"] is False
+    assert any(d.get("ip") == "198.51.100.66" for d in db.ledger.docs)
+
+    # Second attempt: ledger alone (no get_user_db) still blocks.
+    blocked2 = await acquire_team_offer_ip_claim(
+        db, "office02", offer, "198.51.100.66", "heal-2",
+    )
+    assert blocked2["acquired"] is False

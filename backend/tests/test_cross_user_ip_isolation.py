@@ -28,6 +28,11 @@ def test_dup_ip_loader_uses_vps_ledger_peers():
     assert "PENDING_CLAIM_SECONDS = 180" in iso
     assert "refresh_team_offer_ip_claim" in iso
     assert "is_canonical_ipv4" in iso
+    assert "TEAM_OFFER_LEDGER_COLLECTION" in iso
+    assert "record_team_offer_ip_used" in iso
+    assert "team_offer_ip_ledger" in iso
+    assert "backfill_team_offer_ledger_from_claims" in iso
+    assert "ledger_has_team_offer_ip" in iso
 
 
 def test_persist_burnt_ip_tags_vps_ledger_members():

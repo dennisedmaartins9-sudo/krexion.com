@@ -45,7 +45,7 @@ INSTAGRAM_ANDROID = (
 )
 FACEBOOK_ANDROID = (
     ANDROID_WEBVIEW
-    + "[FB_IAB/FB4A;FBAV/556.0.0.59.68;"
+    + "[FB_IAB/FB4A;FBAV/556.0.0;"
     "IABMV/1;FBBV/681204512;]"
 )
 TIKTOK_ANDROID = (
@@ -112,6 +112,7 @@ def test_detect_app_collects_every_identity_and_observed_markers():
         "[LinkedInApp]/2.286.33": ("linkedin", "2.286.33"),
         "Twitter for iPhone/10.98.0": ("twitter", "10.98.0"),
         "Telegram-Android/12.9.2": ("telegram", "12.9.2"),
+        "[Pinterest/Android] Pinterest/14.14": ("pinterest", "14.14"),
         "[Pinterest/Android]": ("pinterest", None),
         "GoogleApp/332.0.755318947": ("gsearch", "332.0.755318947"),
         "GSA/332.0.755318947": ("gsearch", "332.0.755318947"),
@@ -158,20 +159,29 @@ def test_tiktok_release_fields_must_all_agree():
         assert any("conflict" in issue.lower() for issue in result["issues"])
 
 
-def test_facebook_requires_one_full_verified_android_block():
-    truncated = FACEBOOK_ANDROID.replace("556.0.0.59.68", "556.0.0")
-    result = validate_user_agent(truncated, expected_app="facebook")
-    assert any("five-part" in issue or "verified release" in issue for issue in result["issues"])
+def test_facebook_requires_tracker_compatible_three_part_fbav():
+    """Everflow needs FBAV X.Y.Z; five-part full builds render as (Unknown)."""
+    five_part = FACEBOOK_ANDROID.replace("556.0.0", "556.0.0.59.68")
+    result = validate_user_agent(five_part, expected_app="facebook")
+    assert any("three-part" in issue.lower() for issue in result["issues"])
+
+    assert validate_user_agent(FACEBOOK_ANDROID, expected_app="facebook")["valid"]
 
     duplicate = validate_user_agent(
         FACEBOOK_ANDROID + " "
-        "[FB_IAB/FB4A;FBAV/556.0.0.59.68;"
+        "[FB_IAB/FB4A;FBAV/556.0.0;"
         "IABMV/1;FBBV/681204512;]",
         expected_app="facebook",
     )
     assert any("duplicate facebook" in issue.lower() for issue in duplicate["issues"])
     assert any("exactly one" in issue.lower() for issue in duplicate["issues"])
 
+
+def test_pinterest_requires_version_marker_for_trackers():
+    bare = ANDROID_WEBVIEW + "[Pinterest/Android]"
+    assert not validate_user_agent(bare, expected_app="pinterest")["valid"]
+    good = ANDROID_WEBVIEW + "[Pinterest/Android] Pinterest/14.14"
+    assert validate_user_agent(good, expected_app="pinterest")["valid"]
 
 def test_malformed_linkedin_telegram_and_twitter_formats_are_rejected():
     malformed = {
@@ -212,7 +222,7 @@ def test_android_16_capture_tuples_validate():
             f"Mozilla/5.0 (Linux; Android 16; {model} Build/{build}; wv) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
             "Chrome/151.0.7922.83 Mobile Safari/537.36 "
-            "[Pinterest/Android]"
+            "[Pinterest/Android] Pinterest/14.14"
         )
         result = validate_user_agent(ua, expected_app="pinterest")
         assert result["valid"], result

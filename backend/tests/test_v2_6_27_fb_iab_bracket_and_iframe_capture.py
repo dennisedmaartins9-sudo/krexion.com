@@ -23,7 +23,11 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import referrer_pro  # noqa: E402
-from ua_profile_contract import APP_RELEASES_BY_PLATFORM, validate_user_agent  # noqa: E402
+from ua_profile_contract import (  # noqa: E402
+    APP_RELEASES_BY_PLATFORM,
+    fbav_tracker_version,
+    validate_user_agent,
+)
 
 
 def _server_templates():
@@ -43,6 +47,7 @@ def _server_templates():
         "_APP_RELEASES_RUNTIME": APP_RELEASES_BY_PLATFORM,
         "_CHROME_VERSIONS": ["149.0.7827.114"],
         "_ANDROID_WEBVIEW_VERSIONS": ["151.0.7922.83"],
+        "fbav_tracker_version": fbav_tracker_version,
         "_pick_region": lambda _code: {
             "code": "US", "byte_locale": "en-US",
             "posix_locale": "en_US", "lang_tag": "en-US",
@@ -83,7 +88,8 @@ def test_ua_facebook_android_uses_release_and_matching_build():
     d = {"and_ver": "14", "model": "SM-S928B",
          "build": "UP1A.231005.007", "sdk": "34"}
     ua = server._ua_facebook_android(d, "556.0.0.59.68", "149.0.7827.114")
-    assert "FBAV/556.0.0.59.68;" in ua
+    assert "FBAV/556.0.0;" in ua
+    assert "FBAV/556.0.0.59.68;" not in ua
     assert "FBBV/681204512;" in ua
     assert "FBAN/FB4A;" not in ua
     assert validate_user_agent(ua, expected_app="facebook")["issues"] == []
@@ -93,7 +99,7 @@ def test_ua_facebook_ios_uses_audited_release():
     d = {"ios": "18_3", "brand": "iPhone", "model": "iPhone15,3",
          "build": "22D63", "sdk": "18", "scale": "3.0"}
     ua = server._ua_facebook_ios(d, "557.0")
-    assert "FBAV/557.0;" in ua
+    assert "FBAV/557.0.0;" in ua
     assert "FBAN/FBIOS;" in ua
     assert validate_user_agent(ua, expected_app="facebook")["issues"] == []
 
@@ -153,7 +159,8 @@ def test_coerce_fb_to_fb_preserves_fb_bracket():
     out = referrer_pro.coerce_ua_for_platform(ua, "facebook")
     assert "[FB_IAB/FB4A;" in out
     assert "FBAN/FB4A;" not in out
-    assert "FBAV/556.0.0.59.68;" in out
+    assert "FBAV/556.0.0;" in out
+    assert "FBAV/556.0.0.59.68;" not in out
     assert "FBBV/681204512;" in out
 
 
