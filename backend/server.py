@@ -13580,7 +13580,9 @@ async def refresh_ua_versions() -> dict:
         if latest_chrome:
             old_head = _CHROME_VERSIONS[0] if _CHROME_VERSIONS else None
             _CHROME_VERSIONS.clear()
-            _CHROME_VERSIONS.extend(latest_chrome)
+            _CHROME_VERSIONS.extend(
+                _clamp_chrome_versions(latest_chrome, _chromium_honesty_max_major())
+            )
             sources["chrome"] = "Google Version History"
             if latest_chrome[0] != old_head:
                 updated.append(f"chrome:{latest_chrome[0]}")
@@ -13599,7 +13601,9 @@ async def refresh_ua_versions() -> dict:
                 if _ANDROID_WEBVIEW_VERSIONS else None
             )
             _ANDROID_WEBVIEW_VERSIONS.clear()
-            _ANDROID_WEBVIEW_VERSIONS.extend(latest_webview)
+            _ANDROID_WEBVIEW_VERSIONS.extend(
+                _clamp_chrome_versions(latest_webview, _chromium_honesty_max_major())
+            )
             sources["android_webview"] = "Google Version History (WebView)"
             if latest_webview[0] != old_head:
                 updated.append(f"android_webview:{latest_webview[0]}")
@@ -13712,11 +13716,15 @@ async def _load_ua_versions_snapshot():
         chrome_stored = doc.get("chrome_versions") or []
         if isinstance(chrome_stored, list) and chrome_stored:
             _CHROME_VERSIONS.clear()
-            _CHROME_VERSIONS.extend(chrome_stored[:7])
+            _CHROME_VERSIONS.extend(
+                _clamp_chrome_versions(chrome_stored[:7], _chromium_honesty_max_major())
+            )
         webview_stored = doc.get("android_webview_versions") or []
         if isinstance(webview_stored, list) and webview_stored:
             _ANDROID_WEBVIEW_VERSIONS.clear()
-            _ANDROID_WEBVIEW_VERSIONS.extend(webview_stored[:7])
+            _ANDROID_WEBVIEW_VERSIONS.extend(
+                _clamp_chrome_versions(webview_stored[:7], _chromium_honesty_max_major())
+            )
         firefox_stored = doc.get("firefox_versions") or []
         if isinstance(firefox_stored, list) and firefox_stored:
             _FIREFOX_VERSIONS.clear()
@@ -13750,13 +13758,52 @@ async def _auto_refresh_ua_versions_task():
 # Browser-version cold-start snapshots. Runtime refreshes can replace these
 # from the recorded upstream source; hardcoded values are not labelled live.
 _CHROME_VERSIONS = [
-    "151.0.7922.109", "151.0.7922.108", "151.0.7922.77",
-    "151.0.7922.76", "151.0.7922.75",
+    "136.0.7103.125", "136.0.7103.113", "136.0.7103.92",
+    "136.0.7103.87", "136.0.7103.69",
 ]
 _ANDROID_WEBVIEW_VERSIONS = [
-    "151.0.7922.83", "151.0.7922.71", "151.0.7922.47",
-    "151.0.7922.29", "150.0.7871.183",
+    "136.0.7103.125", "136.0.7103.113", "136.0.7103.92",
+    "136.0.7103.87", "136.0.7103.69",
 ]
+
+
+def _chromium_honesty_max_major(default: int = 136) -> int:
+    """Installed Playwright Chromium major, else 136."""
+    try:
+        from anti_detect_v230 import detect_installed_chromium_major
+        maj = detect_installed_chromium_major()
+        if maj and int(maj) > 0:
+            return int(maj)
+    except Exception:
+        pass
+    return int(default)
+
+
+def _clamp_chrome_versions(versions: List[str], max_major: int = 136) -> List[str]:
+    """Drop Chrome/WebView versions whose major exceeds max_major."""
+    out: List[str] = []
+    for v in versions or []:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        try:
+            major = int(s.split(".", 1)[0])
+        except Exception:
+            continue
+        if major <= int(max_major):
+            out.append(s)
+    if out:
+        return out
+    return [f"{int(max_major)}.0.0.0"]
+
+
+# Clamp cold-start lists immediately (honesty vs PW Chromium binary).
+_CHROME_VERSIONS[:] = _clamp_chrome_versions(
+    list(_CHROME_VERSIONS), _chromium_honesty_max_major()
+)
+_ANDROID_WEBVIEW_VERSIONS[:] = _clamp_chrome_versions(
+    list(_ANDROID_WEBVIEW_VERSIONS), _chromium_honesty_max_major()
+)
 # Firefox — June 2026 stable around 140-141, ESR 128.x for slow tail.
 _FIREFOX_VERSIONS = ["141.0.2", "141.0", "140.0.4", "140.0.1", "139.0.4", "139.0", "128.12.0esr"]
 
@@ -15673,18 +15720,14 @@ async def preview_referrer_settings(
 
     # A small pool of realistic UAs so the preview reflects the actual
     # mix (desktop + mobile) the customer's audience will click from.
-    # 2026-02 — Refreshed to current stable browsers so the preview
-    # matches what the auto-refreshed `_CHROME_VERSIONS` / `_IOS_OS_VERSIONS`
-    # pools will emit in production. Chrome 146 (Feb 2026 stable),
-    # macOS 15.2 Sequoia, Android 15 flagships, iOS UA frozen at
-    # `iPhone OS 18_6` (Apple privacy freeze — Version/26.x is the
-    # only token that increments now).
+    # v2.7.7 — Sample UAs aligned to Chromium 136 (Playwright binary).
+    # iOS Safari samples kept for referrer-preview realism only.
     _SAMPLE_UAS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.116 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.116 Mobile Safari/537.36",
-        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.107 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.113 Mobile Safari/537.36",
     ]
 
     n = max(1, min(int(req.sample_count or 20), 100))
@@ -15921,13 +15964,13 @@ async def qa_check_link(link_id: str, user: dict = Depends(get_current_user_with
 
     # Also run 5 sample visits so the UI can show real referer output.
     samples: List[Dict[str, Any]] = []
-    # 2026-02 — Refreshed to current stable browsers (see _SAMPLE_UAS above).
+    # v2.7.7 — Sample UAs aligned to Chromium 136 (see _SAMPLE_UAS above).
     _sample_uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.116 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Safari/537.36",
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.116 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
-        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7432.107 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.113 Mobile Safari/537.36",
     ]
     if link.get("referrer_pro_enabled"):
         for i, ua in enumerate(_sample_uas):
@@ -26478,10 +26521,37 @@ async def startup_db_indexes():
         except Exception as e:
             logger.warning(f"Playwright install startup hook failed (non-fatal): {e}")
 
+    async def _ensure_playwright_webkit():
+        """Native EXE should ship WebKit in browser-engine; this is a safety net
+        for older installs / partial bundles so iOS dual-engine still works
+        without the user running playwright install manually."""
+        try:
+            from real_user_traffic import (
+                _ensure_webkit_available,
+                _webkit_runtime_available,
+            )
+            if _webkit_runtime_available():
+                logger.info("Playwright WebKit already present — skipping install.")
+                return
+            logger.warning(
+                "Playwright WebKit not ready — installing in background "
+                "(iOS dual-engine; one-time)."
+            )
+            ok = await _ensure_webkit_available()
+            if ok:
+                logger.info("Playwright WebKit install: OK")
+            else:
+                logger.warning(
+                    "Playwright WebKit install FAILED — iOS visits fall back "
+                    "to Android Chrome until browser-engine includes webkit-*"
+                )
+        except Exception as e:
+            logger.warning(f"Playwright WebKit startup hook failed (non-fatal): {e}")
+
     if IS_CLOUD and STRICT_CLOUD_HEAVY_BLOCK:
         logger.info(
             "Cloud edge with STRICT_CLOUD_HEAVY_BLOCK=true — skipping "
-            "Playwright Chromium install on startup. Heavy features run "
+            "Playwright Chromium/WebKit install on startup. Heavy features run "
             "on customer desktop app, not on VPS."
         )
     else:
@@ -26489,6 +26559,11 @@ async def startup_db_indexes():
             asyncio.create_task(_ensure_playwright_chromium())
         except Exception as e:
             logger.warning(f"Could not schedule Playwright install check: {e}")
+        try:
+            # Native + any non-strict-cloud path: ensure WebKit for iOS engine.
+            asyncio.create_task(_ensure_playwright_webkit())
+        except Exception as e:
+            logger.warning(f"Could not schedule Playwright WebKit install check: {e}")
 
     # Reap orphan Real-User-Traffic jobs whose worker died before they could
     # mark themselves done. Without this, the UI keeps showing a permanent

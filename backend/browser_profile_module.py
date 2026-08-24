@@ -57,7 +57,7 @@ import secrets
 import string
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -125,23 +125,20 @@ _VIEWPORTS_MOBILE = [
 ]
 
 _FALLBACK_UAS_DESKTOP = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.114 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.7827.114 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7752.93 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.102 Safari/537.36 Edg/147.0.2917.71",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
 ]
 _FALLBACK_UAS_MOBILE = [
-    # 2026-02 — Apple froze the iOS UA OS token at `iPhone OS 18_6` since
-    # iOS 26 (privacy / fingerprint protection). Only Safari `Version/26.x`
-    # increments per point release. Using `26_4` in the OS token like the
-    # earlier version did is NOT what real Safari emits — anti-fraud
-    # parsers that cross-check the UA against Apple's spec would flag it.
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
+    # v2.7.8 — Chromium profiles: Android Chrome/136 only (no pure Safari).
+    # Mix Chrome *app* (no wv) ~50% + WebView (wv) ~50% for in-app realism.
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.92 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.125 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-A556B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.92 Mobile Safari/537.36",
 ]
 
 
@@ -178,6 +175,73 @@ def _infer_os_from_ua(ua: str, *, is_mobile: bool = False, fallback: str = "wind
             return "ios"
         return "android"
     return fallback
+
+
+def _allow_ios_safari_ua() -> bool:
+    return (os.environ.get("KREXION_ALLOW_IOS_SAFARI_UA") or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def _normalize_profile_ua_honesty(ua: str) -> Tuple[str, Dict[str, Any]]:
+    """Profile create/update UA honesty (v2.7.9 dual-engine).
+
+    Prefer storing iOS UAs as the user requested — launch path picks
+    Playwright WebKit or Android Chrome fallback. Non-iOS UAs go through
+    ``_normalize_mobile_ua_for_visit`` (Chromium path).
+    """
+    try:
+        from real_user_traffic import (
+            _ua_prefers_webkit,
+            _normalize_mobile_ua_for_visit,
+            _os_from_mobile_ua,
+        )
+        raw = ua or ""
+        if _ua_prefers_webkit(raw):
+            # Store as requested; launch decides WebKit vs Chromium fallback.
+            return raw.strip(), {
+                "swapped_ios": False,
+                "os": _os_from_mobile_ua(raw) or "ios",
+                "is_mobile": True,
+                "engine": "webkit",
+                "note": "iOS UA stored as requested; launch picks WebKit or Chromium fallback",
+            }
+        return _normalize_mobile_ua_for_visit(raw)
+    except Exception:
+        try:
+            from real_user_traffic import _normalize_mobile_ua_for_visit
+            return _normalize_mobile_ua_for_visit(ua or "")
+        except Exception:
+            return ua or "", {
+                "swapped_ios": False,
+                "os": "",
+                "is_mobile": False,
+                "engine": "chromium",
+                "note": "",
+            }
+
+
+def _coerce_profile_ua_for_chromium(ua: str) -> Tuple[str, Dict[str, Any]]:
+    """Backward-compatible alias → ``_normalize_profile_ua_honesty``."""
+    return _normalize_profile_ua_honesty(ua)
+
+
+def _honest_ua_platform_for_profiles(platform: str, *, is_mobile: bool) -> str:
+    """Default mobile platform is android; allow ios when WebKit available."""
+    plat = (platform or "").strip().lower()
+    if not plat or plat == "any":
+        return "android" if is_mobile else "desktop"
+    if is_mobile and plat == "ios":
+        if _allow_ios_safari_ua():
+            return "ios"
+        try:
+            from real_user_traffic import _webkit_runtime_available
+            if _webkit_runtime_available():
+                return "ios"
+        except Exception:
+            pass
+        return "android"
+    return plat or ("android" if is_mobile else "desktop")
 
 
 def _parse_proxy_line(line: str) -> Dict[str, str]:
@@ -275,7 +339,8 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
     if status == "running":
         prof_update = {"status": "running", "session_id": sid, "last_error": ""}
     elif status == "queued":
-        prof_update = {"status": "launching", "session_id": sid}
+        # Distinct from "launching" so UI can show tray-wait vs Chromium starting.
+        prof_update = {"status": "queued", "session_id": sid}
     elif status == "stopping":
         prof_update = {"status": "stopping", "session_id": sid}
     elif status in ("stopped", "closed", "error"):
@@ -472,7 +537,26 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     """Convert ProfileBody → MongoDB document with metadata."""
     # Auto-fill UA + viewport if blank
     is_mobile = bool(body.is_mobile or body.device_type == "mobile")
+    has_touch = bool(body.has_touch or is_mobile)
     ua = body.user_agent.strip() or _gen_random_ua(is_mobile)
+    # v2.7.9 — Dual-engine honesty: keep iOS UAs as requested (launch picks
+    # WebKit or Android fallback); Chromium path for non-iOS.
+    ua, _meta = _normalize_profile_ua_honesty(ua)
+    requested_os = (body.os or "").strip().lower()
+    os_val = _infer_os_from_ua(
+        ua,
+        is_mobile=is_mobile,
+        fallback=requested_os or ("android" if is_mobile else "windows"),
+    )
+    if _meta.get("os") in ("android", "ios"):
+        os_val = _meta["os"]
+    if os_val == "android" and requested_os == "ios":
+        os_val = "android"
+        is_mobile = True
+        has_touch = True
+    if os_val in ("android", "ios"):
+        is_mobile = True
+        has_touch = True
     viewport = body.viewport if body.viewport.get("width") else _gen_random_viewport(is_mobile)
     pid = str(uuid.uuid4())
     # 2026-01 — auto-generate unique name if blank
@@ -485,12 +569,12 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "country": body.country.lower(),
         "language": body.language,
         "timezone": body.timezone,
-        "device_type": body.device_type,
-        "os": body.os,
+        "device_type": body.device_type if not is_mobile else (body.device_type or "mobile"),
+        "os": os_val,
         "user_agent": ua,
         "viewport": viewport,
         "is_mobile": is_mobile,
-        "has_touch": bool(body.has_touch or is_mobile),
+        "has_touch": has_touch,
         "device_scale_factor": float(body.device_scale_factor or (3.0 if is_mobile else 1.0)),
         "locale": body.locale,
         "accept_language": body.accept_language,
@@ -656,7 +740,7 @@ async def launch_profile(request: Request, profile_id: str,
         raise HTTPException(status_code=404, detail="Profile not found")
 
     cur_status = str(doc.get("status") or "idle").lower()
-    if cur_status in ("running", "launching", "stopping"):
+    if cur_status in ("running", "launching", "stopping", "queued"):
         raise HTTPException(
             status_code=409,
             detail=f"Profile is already {cur_status}. Stop it first or wait for the current session to finish.",
@@ -731,15 +815,14 @@ async def launch_profile(request: Request, profile_id: str,
 
     bridge_job_id: Optional[str] = None
     desktop_available = False
+    launch_message = ""
 
-    # 2026-06-11 (v2.1.41): When we ARE the customer's desktop client
-    # (Electron / Inno-Setup Native install, KREXION_MODE=native), bypass
-    # the bridge entirely and drive `browser_profile_launcher` in-process.
-    # The bridge queue is a cloud → customer's-PC relay; on the customer's
-    # PC there's nothing on the other side to pick the job up, so prior
-    # versions returned desktop_available=false and showed the misleading
-    # "install the Krexion desktop app" toast inside the desktop app.
-    _is_local_desktop = (os.environ.get("KREXION_MODE", "cloud").lower() == "native")
+    # Local desktop install (Electron + Inno Native + User-Package) must
+    # launch in-process / via tray queue — NOT the cloud bridge. Prior
+    # bug: only KREXION_MODE=native was treated as local, so `local`
+    # installs enqueued orphan bridge jobs and cards stuck on "launching".
+    _mode = (os.environ.get("KREXION_MODE") or "cloud").lower().strip()
+    _is_local_desktop = _mode in ("native", "local")
     if _is_local_desktop:
         try:
             from browser_profile_launcher import launch_profile_session
@@ -768,24 +851,66 @@ async def launch_profile(request: Request, profile_id: str,
                 except Exception as e:
                     logger.debug(f"local on_update failed: {e}")
 
+            async def _run_local_launch():
+                try:
+                    await launch_profile_session(
+                        doc,
+                        session_id=session_id,
+                        start_url=session["start_url"],
+                        on_session_update=_on_update,
+                    )
+                except Exception as _launch_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"local browser-profile session crashed: {_launch_exc}"
+                    )
+                    try:
+                        await _on_update({
+                            "profile_id": profile_id,
+                            "session_id": session_id,
+                            "status": "error",
+                            "error_message": str(_launch_exc)[:512],
+                        })
+                    except Exception:
+                        pass
+
             # Fire-and-forget the headed browser. The launcher blocks for
             # the lifetime of the user's manual browsing session, so we
             # MUST background it — otherwise the HTTP request would hang
             # until the user closes Chromium.
-            asyncio.create_task(launch_profile_session(
-                doc,
-                session_id=session_id,
-                start_url=session["start_url"],
-                on_session_update=_on_update,
-            ))
+            asyncio.create_task(_run_local_launch())
             desktop_available = True
             bridge_job_id = f"local:{session_id}"
+            launch_message = (
+                "Opening Chromium on this PC — if nothing appears in ~1 minute, "
+                "open the Krexion tray icon and click Launch again."
+            )
         except Exception as e:
             logger.warning(f"local browser-profile launch failed: {e}")
             # Don't fall through to the bridge on the local desktop —
             # the bridge_enqueue would return None (no PC to relay to)
             # and the user would see the misleading "install" toast.
             desktop_available = False
+            _local_err = (
+                f"Could not start browser on this PC: {e}. "
+                "Restart Krexion Local Engine / tray, then Launch again."
+            )[:512]
+            await _DB.browser_profiles.update_one(
+                {"id": profile_id, "user_id": uid},
+                {"$set": {
+                    "status": "error",
+                    "session_id": "",
+                    "last_error": _local_err,
+                }},
+            )
+            await _DB.browser_profile_sessions.update_one(
+                {"id": session_id},
+                {"$set": {
+                    "status": "error",
+                    "error_message": _local_err,
+                    "ended_at": _now_iso(),
+                }},
+            )
+            launch_message = _local_err
 
     elif _BRIDGE_QUEUE is not None:
         try:
@@ -800,13 +925,19 @@ async def launch_profile(request: Request, profile_id: str,
             }
             bridge_job_id = await _BRIDGE_QUEUE(uid, bridge_payload)
             desktop_available = bool(bridge_job_id)
+            if desktop_available:
+                launch_message = (
+                    "Launch queued — your Krexion desktop app will open the browser shortly."
+                )
         except Exception as e:
             logger.warning(f"bridge enqueue failed: {e}")
 
-    # v2.6.32 — Desktop offline on cloud: don't leave card stuck on "launching".
-    if not desktop_available and not _is_local_desktop:
+    # Cloud offline OR local start failed: don't leave card stuck on "launching".
+    if not desktop_available and not launch_message:
         _offline_err = (
             "Krexion desktop app is offline. Start the desktop app on your PC, then click Launch again."
+            if not _is_local_desktop else
+            "Could not start the browser on this PC. Restart Krexion and try Launch again."
         )
         await _DB.browser_profiles.update_one(
             {"id": profile_id, "user_id": uid},
@@ -816,12 +947,13 @@ async def launch_profile(request: Request, profile_id: str,
             {"id": session_id},
             {"$set": {"status": "error", "error_message": _offline_err, "ended_at": _now_iso()}},
         )
+        launch_message = _offline_err
 
     return {
         "session_id": session_id,
         "bridge_job_id": bridge_job_id,
         "desktop_available": desktop_available,
-        "message": (
+        "message": launch_message or (
             "Launch queued — your Krexion desktop app will open the browser shortly."
             if desktop_available else
             "Profile is configured but launching requires the Krexion desktop app. "
@@ -840,7 +972,7 @@ async def stop_profile(request: Request, profile_id: str):
         raise HTTPException(status_code=404, detail="Profile not found")
     sid = doc.get("session_id") or ""
     cur_status = str(doc.get("status") or "idle").lower()
-    if not sid and cur_status not in ("running", "launching", "stopping"):
+    if not sid and cur_status not in ("running", "launching", "stopping", "queued"):
         return {"stopped": True, "message": "No active session"}
 
     stop_sent = False
@@ -857,7 +989,8 @@ async def stop_profile(request: Request, profile_id: str):
     # write a stop_requested flag into the `browser_launch_queue`
     # record instead so the tray app's polling loop closes the browser
     # in its own process.
-    _is_local_desktop = (os.environ.get("KREXION_MODE", "cloud").lower() == "native")
+    _mode = (os.environ.get("KREXION_MODE") or "cloud").lower().strip()
+    _is_local_desktop = _mode in ("native", "local")
     _is_session0_service = bool(_is_local_desktop and (os.environ.get("KREXION_BUILD_TYPE") or "").strip().lower() == "binary")
     if _is_session0_service and sid:
         try:
@@ -1031,9 +1164,15 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             # the model lazily so this module doesn't hard-depend on
             # server.py at import time.
             from server import UAGenerateRequest  # type: ignore
+            # v2.7.9 — Allow ios platform when WebKit is installed; else
+            # map ios→android for Chromium-honest mobile profiles.
+            _ua_platform = _honest_ua_platform_for_profiles(
+                body.ua.platform or "",
+                is_mobile=is_mobile,
+            )
             ua_payload = UAGenerateRequest(
                 app=body.ua.app or "browser",
-                platform=body.ua.platform or ("ios" if is_mobile else "desktop"),
+                platform=_ua_platform,
                 brand=body.ua.brand,
                 device_id=body.ua.device_id,
                 app_version=body.ua.app_version,
@@ -1071,6 +1210,12 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
     while len(uas) < count:
         uas.append(_gen_random_ua(is_mobile))
     uas = uas[:count]
+    # v2.7.9 — Normalize residual UAs (keep iOS when preferred; launch decides).
+    _coerced_uas: List[str] = []
+    for _u in uas:
+        _cu, _ = _normalize_profile_ua_honesty(_u)
+        _coerced_uas.append(_cu)
+    uas = _coerced_uas
 
     # ── 2. Generate proxies (if requested) ─────────────────────────
     proxy_lines: List[str] = []

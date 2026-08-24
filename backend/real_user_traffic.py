@@ -53,13 +53,13 @@ if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH") and os.path.isdir("/pw-browser
 # ──────────────────────────────────────────────────────────────────────
 _REALISTIC_FALLBACK_UAS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
 )
 
 
@@ -107,21 +107,18 @@ _MOBILE_UA_POOL_IOS: Tuple[str, ...] = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
 )
 _MOBILE_UA_POOL_ANDROID: Tuple[str, ...] = (
-    # 2026-02 v2.2.6 update — Chrome 146 is stable (rolled out Feb 25,
-    # 2026 per chromereleases.googleblog.com). Android 15 dominates on
-    # 2025-2026 flagship models (Galaxy S25, Pixel 9, OnePlus 13);
-    # Android 14 remains the largest tail on 2024 devices. Fresh build
-    # tags + model diversity so the pool never sends the exact same
-    # WebView UA back-to-back — matches the browser_profile_module.py
-    # Chrome 147-149 desktop pool the operator's own UA generator uses.
-    "Mozilla/5.0 (Linux; Android 15; SM-S931B Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7432.116 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7432.107 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/145.0.7632.120 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 15; SM-S928B Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7432.116 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-A556B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/145.0.7632.99 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/146.0.7432.107 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/145.0.7632.99 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-G998B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7527.183 Mobile Safari/537.36",
+    # v2.7.8 — ~50/50 Chrome Mobile *app* (no wv) + Android WebView (wv).
+    # All majors locked to Chromium 136 (Playwright binary honesty).
+    # Chrome Mobile app (non-WebView) — organic / browser-referrer visits
+    "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.92 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
+    # Android System WebView — in-app / WebView realism
+    "Mozilla/5.0 (Linux; Android 15; SM-S931B Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.125 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro Build/AP3A.240905.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-A556B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.113 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.92 Mobile Safari/537.36",
 )
 
 # Maps preset value → Referer URL used by the engine.
@@ -150,13 +147,312 @@ _INAPP_PRESET_REFERER: Dict[str, str] = {
 }
 
 
+def _allow_ios_safari_ua() -> bool:
+    return (os.environ.get("KREXION_ALLOW_IOS_SAFARI_UA") or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def _is_pure_ios_safari_ua(ua: str) -> bool:
+    """True for iPhone/iPad + Version/ + Safari/ with no CriOS/Chrome/."""
+    u = ua or ""
+    ul = u.lower()
+    if "iphone" not in ul and "ipad" not in ul:
+        return False
+    if "crios/" in ul or "chrome/" in ul:
+        return False
+    return "version/" in ul and "safari/" in ul
+
+
+def _is_ios_webkit_ua(ua: str) -> bool:
+    """True for iPhone/iPad + like Mac OS X with no Chrome/ or CriOS/.
+
+    Covers pure Safari *and* WKWebView in-app shells (Mobile/15E148 +
+    app marker, no Version/Safari required) that Chromium cannot
+    honestly present.
+    """
+    ul = (ua or "").lower()
+    if "iphone" not in ul and "ipad" not in ul:
+        return False
+    if "crios/" in ul or "chrome/" in ul:
+        return False
+    return "like mac os x" in ul
+
+
+def _is_ios_claiming_ua(ua: str) -> bool:
+    """True when UA claims iPhone/iPad (WebKit or CriOS)."""
+    ul = (ua or "").lower()
+    if "iphone" not in ul and "ipad" not in ul:
+        return False
+    return "like mac os x" in ul
+
+
+def _os_from_mobile_ua(ua: str) -> str:
+    """Detect android|ios|… from a (possibly coerced) UA string."""
+    ul = (ua or "").lower()
+    if "android" in ul and "android tv" not in ul:
+        return "android"
+    if ("iphone" in ul or "ipad" in ul) and "like mac os x" in ul:
+        return "ios"
+    if "windows nt" in ul:
+        return "windows"
+    if "macintosh" in ul or "mac os x" in ul:
+        return "macos"
+    if "linux" in ul or "x11" in ul:
+        return "linux"
+    return ""
+
+
+def _coerce_ua_off_webkit_on_chromium(ua: str) -> str:
+    """Unless KREXION_ALLOW_IOS_SAFARI_UA=1, swap iOS WebKit (Safari or
+    WKWebView-without-Chrome) to Android Chrome from
+    `_MOBILE_UA_POOL_ANDROID` — Chromium cannot honestly present a
+    WebKit-only iOS UA."""
+    if _allow_ios_safari_ua() or not _is_ios_webkit_ua(ua):
+        return ua
+    replacement = random.choice(_MOBILE_UA_POOL_ANDROID)
+    logging.getLogger(__name__).warning(
+        "Swapped iOS/WebKit UA → Android Chrome for Chromium runtime "
+        "(set KREXION_ALLOW_IOS_SAFARI_UA=1 to keep iOS Safari UAs)"
+    )
+    return replacement
+
+
+def _coerce_ios_webview_off_chromium(ua: str) -> str:
+    """Alias — broader iOS WebKit coerce (Safari + WKWebView in-app)."""
+    return _coerce_ua_off_webkit_on_chromium(ua)
+
+
+def _normalize_mobile_ua_for_chromium(ua: str) -> Tuple[str, Dict[str, Any]]:
+    """Returns (ua, meta) for Chromium-honest mobile visits.
+
+    meta keys:
+      swapped_ios: bool
+      os: 'android'|'ios'|…
+      is_mobile: bool
+      note: str
+
+    After WebKit coerce:
+    - If UA still claims iOS but has Chromium (CriOS) — keep only when
+      KREXION_ALLOW_IOS_SAFARI_UA=1; else prefer Android Chrome.
+    - Detect Android vs iOS from the final UA.
+    """
+    original = (ua or "").strip()
+    allow = _allow_ios_safari_ua()
+    note = ""
+    swapped_ios = False
+    out = original
+
+    coerced = _coerce_ua_off_webkit_on_chromium(out)
+    if coerced != out:
+        swapped_ios = True
+        note = "iOS/WebKit UA → Android Chrome (Chromium honesty)"
+        out = coerced
+
+    # CriOS on iPhone/iPad: Chromium Blink ≠ iOS WebKit engine story.
+    # Unless explicitly allowed, swap to Android Chrome.
+    ul = (out or "").lower()
+    if (
+        not allow
+        and ("iphone" in ul or "ipad" in ul)
+        and "like mac os x" in ul
+        and "crios/" in ul
+    ):
+        out = random.choice(_MOBILE_UA_POOL_ANDROID)
+        swapped_ios = True
+        note = note or "iOS CriOS UA → Android Chrome (Chromium honesty)"
+
+    os_key = _os_from_mobile_ua(out) or "android"
+    is_mobile = os_key in ("android", "ios") or any(
+        t in (out or "").lower() for t in ("mobile", "iphone", "ipad", "android")
+    )
+    return out, {
+        "swapped_ios": swapped_ios,
+        "os": os_key,
+        "is_mobile": bool(is_mobile),
+        "note": note,
+        "engine": "chromium",
+    }
+
+
+# ── Dual-engine (v2.7.9): iOS → Playwright WebKit, Android → Chromium ──
+_WEBKIT_AVAIL: Optional[bool] = None
+_WEBKIT_INSTALL_LOCK = asyncio.Lock()
+_WEBKIT_INSTALL_IN_PROGRESS = False
+
+
+def _ua_prefers_webkit(ua: str) -> bool:
+    """iPhone/iPad family (Safari, WKWebView, CriOS) prefer WebKit engine."""
+    ul = (ua or "").lower()
+    return ("iphone" in ul or "ipad" in ul) and "like mac os x" in ul
+
+
+def _webkit_runtime_available() -> bool:
+    """True if Playwright WebKit browser is installed (cached)."""
+    global _WEBKIT_AVAIL
+    if _WEBKIT_AVAIL is not None:
+        return bool(_WEBKIT_AVAIL)
+    try:
+        roots: List[Path] = []
+        seen: set[str] = set()
+
+        def _add(p: Path) -> None:
+            key = str(p)
+            if key in seen:
+                return
+            seen.add(key)
+            roots.append(p)
+
+        env_root = (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "").strip()
+        if env_root:
+            _add(Path(env_root))
+        _add(Path("/pw-browsers"))
+        _add(Path(r"C:\Program Files\Krexion\browser-engine"))
+        home = Path.home()
+        _add(home / "AppData" / "Local" / "ms-playwright")
+        _add(home / ".cache" / "ms-playwright")
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if local:
+            _add(Path(local) / "ms-playwright")
+        for root in roots:
+            try:
+                if not root.is_dir():
+                    continue
+                for child in root.glob("webkit-*"):
+                    if child.is_dir():
+                        _WEBKIT_AVAIL = True
+                        return True
+            except Exception:
+                continue
+        # Best-effort: Playwright sync executable_path (no browser launch).
+        try:
+            from playwright.sync_api import sync_playwright as _sp
+
+            with _sp() as _p:
+                exe = getattr(getattr(_p, "webkit", None), "executable_path", None)
+                if exe and Path(str(exe)).exists():
+                    _WEBKIT_AVAIL = True
+                    return True
+        except Exception:
+            pass
+        _WEBKIT_AVAIL = False
+        return False
+    except Exception:
+        _WEBKIT_AVAIL = False
+        return False
+
+
+async def _ensure_webkit_available() -> bool:
+    """Best-effort `playwright install webkit` if missing; return availability."""
+    global _WEBKIT_AVAIL, _WEBKIT_INSTALL_IN_PROGRESS
+    if _webkit_runtime_available():
+        return True
+    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+    async with _WEBKIT_INSTALL_LOCK:
+        # Re-check after lock (another coroutine may have finished install).
+        _WEBKIT_AVAIL = None
+        if _webkit_runtime_available():
+            return True
+        _WEBKIT_INSTALL_IN_PROGRESS = True
+        try:
+            logger.warning(
+                "Playwright WebKit missing — installing now (this may take ~60s)…"
+            )
+            try:
+                import sys as _sys
+
+                proc = await asyncio.create_subprocess_exec(
+                    _sys.executable,
+                    "-m",
+                    "playwright",
+                    "install",
+                    "webkit",
+                    env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browsers_root},
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    logger.error("Playwright WebKit install timed out after 5 min")
+                    return False
+                if proc.returncode != 0:
+                    logger.error(
+                        "Playwright WebKit install returned %s: %s",
+                        proc.returncode,
+                        (err or b"").decode(errors="ignore")[:300],
+                    )
+                    return False
+            except Exception as e:
+                logger.error("Playwright WebKit install failed: %s", e)
+                return False
+            _WEBKIT_AVAIL = None
+            ok = _webkit_runtime_available()
+            if ok:
+                logger.info("Playwright WebKit install: OK")
+            return ok
+        finally:
+            _WEBKIT_INSTALL_IN_PROGRESS = False
+
+
+def _normalize_mobile_ua_for_visit(ua: str) -> Tuple[str, Dict[str, Any]]:
+    """Pick engine + UA for a visit: iOS→WebKit when available, else Chromium.
+
+    If ``_ua_prefers_webkit(ua)`` and WebKit is installed:
+      keep UA as-is (minor strip), meta engine=webkit, os=ios, swapped_ios=False
+      note='iOS UA → Playwright WebKit engine'
+    Elif prefers WebKit but WebKit NOT available:
+      fall back to ``_normalize_mobile_ua_for_chromium`` (Android swap)
+      meta note mentions WebKit missing → Android fallback
+    Else:
+      Chromium / Android path, engine=chromium
+    """
+    original = (ua or "").strip()
+    if _ua_prefers_webkit(original) and _webkit_runtime_available():
+        return original, {
+            "swapped_ios": False,
+            "os": "ios",
+            "is_mobile": True,
+            "engine": "webkit",
+            "note": "iOS UA → Playwright WebKit engine",
+        }
+    if _ua_prefers_webkit(original) and not _webkit_runtime_available():
+        out, meta = _normalize_mobile_ua_for_chromium(original)
+        meta = dict(meta)
+        meta["engine"] = "chromium"
+        meta["note"] = (
+            "WebKit not installed — iOS UA → Android Chrome (Chromium fallback)"
+            if meta.get("swapped_ios")
+            else (
+                (meta.get("note") or "")
+                + "; WebKit missing → Android Chrome fallback"
+            ).strip("; ")
+        )
+        return out, meta
+    out, meta = _normalize_mobile_ua_for_chromium(original)
+    meta = dict(meta)
+    meta.setdefault("engine", "chromium")
+    return out, meta
+
+
 def _mobile_ua_for_inapp() -> str:
-    """Return a realistic MOBILE base UA (~70% Android, ~30% iOS —
-    matches real Facebook / Instagram / TikTok in-app user split).
-    Caller must NOT rely on this returning the same value twice."""
-    if random.random() < 0.70:
+    """Return a realistic MOBILE base UA for visits.
+
+    When Playwright WebKit is installed: ~40% iOS from `_MOBILE_UA_POOL_IOS`,
+    else Android. When WebKit is missing: Android Chrome only (unless
+    KREXION_ALLOW_IOS_SAFARI_UA=1 → ~20% iOS). Caller must NOT rely on this
+    returning the same value twice."""
+    if _webkit_runtime_available():
+        if random.random() < 0.40:
+            return random.choice(_MOBILE_UA_POOL_IOS)
         return random.choice(_MOBILE_UA_POOL_ANDROID)
-    return random.choice(_MOBILE_UA_POOL_IOS)
+    if _allow_ios_safari_ua() and random.random() < 0.20:
+        return random.choice(_MOBILE_UA_POOL_IOS)
+    return random.choice(_MOBILE_UA_POOL_ANDROID)
 
 
 def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_platform: str = "") -> List[str]:
@@ -281,10 +577,19 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
     if not user_agents:
         n = max(1, min(int(want_count or 20), 500))
         return [_mobile_ua_for_inapp() for _ in range(n)]
+    # v2.7.9 — Keep iOS/WebKit UAs when Playwright WebKit is installed;
+    # scrub only when WebKit is missing (Chromium cannot present them).
+    allow_ios = _allow_ios_safari_ua() or _webkit_runtime_available()
     out: List[str] = []
     for ua in user_agents:
         u = (ua or "").strip()
         if not u:
+            continue
+        if (
+            not allow_ios
+            and (_is_ios_webkit_ua(u) or (_is_ios_claiming_ua(u) and "crios/" in u.lower()))
+        ):
+            out.append(_mobile_ua_for_inapp())
             continue
         if _is_mob(u) and not _has_foreign_marker(u) and not _is_incomplete_tiktok_android(u):
             out.append(u)
@@ -863,12 +1168,10 @@ _BROWSER_LAUNCH_ARGS_BASE = [
     # picked up by Cloudflare BM v2 + Akamai BM. Re-enable.
     "--enable-quic",
     "--quic-version=h3",
-    "--origin-to-force-quic-on=*",
-    # 2026-02 Step 4 (P1 #8) — IPv6 enabled (Chromium defaults vary).
-    # Real users hit 50%+ IPv6 dual-stack — IPv4-only traffic is a tell
-    # for some EU anti-fraud detectors. Harmless when proxy/network is
-    # IPv4-only (Chromium silently falls back).
-    "--enable-features=AddressSpaceTraversal,EnableDualStackForChrome",
+    # v2.7.7 — do NOT force QUIC on every origin (removed force-all-origins
+    # flag); that is unnatural vs real Chrome negotiation. Keep enable-quic + h3 only.
+    # Prefer IPv4-proxy-consistent; avoid dual-stack vs IPv6-exit-reject clash.
+    "--enable-features=AddressSpaceTraversal",
     # 2026-01 Anti-detect: removed `--mute-audio` — real Chrome doesn't
     # launch with audio muted by default, and detectors comparing
     # AudioContext.state can flag the discrepancy. Audio output stays
@@ -923,6 +1226,16 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
                         or "headless-shell" in str(exe).lower()
                         or (engine or "").lower() == "headless-shell"
                     )
+                    if use_classic_headless:
+                        _allow_shell = (
+                            os.environ.get("KREXION_ALLOW_HEADLESS_SHELL") or ""
+                        ).strip().lower() in ("1", "true", "yes")
+                        if not _allow_shell:
+                            raise RuntimeError(
+                                "headless-shell variant is blocked for anti-detect. "
+                                "Install full Chromium (`playwright install chromium --no-shell`) "
+                                "or set KREXION_ALLOW_HEADLESS_SHELL=1."
+                            )
                     return await pw.chromium.launch(
                         headless=use_classic_headless,
                         executable_path=exe,
@@ -980,6 +1293,15 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
                 f"chromium-headless-shell (weaker stealth — run "
                 f"`playwright install chromium --no-shell`)"
             )
+    _allow_shell = (os.environ.get("KREXION_ALLOW_HEADLESS_SHELL") or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if not _allow_shell:
+        raise RuntimeError(
+            "Full Chromium is required for anti-detect RUT launches. "
+            "Install with `playwright install chromium --no-shell`, or set "
+            "KREXION_ALLOW_HEADLESS_SHELL=1 to allow weaker headless-shell fallback."
+        )
     logger.warning(
         "RUT browser engine: chromium-headless-shell fallback — "
         "full chromium not found (checked roots: %s)",
@@ -991,6 +1313,27 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
     )
     logger.info("RUT browser engine: chromium-headless-shell (legacy headless=True)")
     return browser
+
+
+async def _launch_webkit_browser(pw) -> Browser:
+    """Launch Playwright WebKit for iOS Safari / WKWebView visits.
+
+    WebKit ignores most Chromium CLI flags (AutomationControlled, etc.);
+    use a minimal launch. RUT jobs run headless=True — no real iPhone,
+    engine fidelity only.
+    """
+    logger.info("RUT browser engine: Playwright WebKit (iOS traffic)")
+    return await pw.webkit.launch(headless=True)
+
+
+async def _launch_engine_browser(
+    pw, *, engine: str = "chromium", variant: str = "auto"
+) -> Browser:
+    """Launch Chromium or WebKit based on ``engine``."""
+    eng = (engine or "chromium").strip().lower()
+    if eng == "webkit":
+        return await _launch_webkit_browser(pw)
+    return await _launch_anti_detect_browser(pw, variant=variant)
 
 
 from form_filler import (
@@ -2250,18 +2593,38 @@ def _build_client_hint_headers(fp: Dict[str, Any], ua: str) -> Dict[str, str]:
     }
 
 
-def _apply_contract_client_hints(headers: Dict[str, str], ua: str) -> Dict[str, str]:
-    """Reconcile low-entropy hints without discarding negotiated Chromium hints."""
+def _apply_contract_client_hints(
+    headers: Dict[str, str],
+    ua: str,
+    viewport: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Reconcile low-entropy hints; rebuild high-entropy via full_client_hints."""
     contract_hints = _build_client_hint_headers({}, ua)
     low_entropy = {"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+    high_entropy = {
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+        "sec-ch-dpr",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-wow64",
+        "sec-ch-ua-full-version",
+        "sec-ch-prefers-color-scheme",
+        "sec-ch-prefers-reduced-motion",
+        "sec-ch-viewport-width",
+    }
     if contract_hints:
-        # Chromium may add model/platform-version/architecture/full-version-list
-        # after Accept-CH. Preserve those negotiated high-entropy values and only
-        # replace the three low-entropy keys owned by the shared UA contract.
+        drop = low_entropy | high_entropy
         result = {
             key: value for key, value in (headers or {}).items()
-            if key.lower() not in low_entropy
+            if key.lower() not in drop
         }
+        try:
+            from anti_detect_v230 import full_client_hints as _fch
+            result.update(_fch(ua, viewport) or {})
+        except Exception:
+            pass
         result.update(contract_hints)
         return result
 
@@ -3036,6 +3399,10 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         )
     explicit_locale = locale_match.group(1).replace("_", "-") if locale_match else ""
 
+    canvas_seed = random.randint(1, 2**30)
+    is_chromium_ua = bool(re.search(r"(?:Chrome|CriOS|Chromium)/", ua_str or "", re.I))
+    history_length = 2 + (canvas_seed % 4)  # deterministic 2-5 from seed
+
     return {
         "os": os_key,
         "platform": platform,
@@ -3049,7 +3416,7 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         "webgl_vendor": webgl_vendor,
         "webgl_renderer": webgl_renderer,
         # Canvas noise seed — unique per visit so canvas fingerprint differs too
-        "canvas_seed": random.randint(1, 2**30),
+        "canvas_seed": canvas_seed,
         "label": f"{(ua.os.family + ' ' + ua.os.version_string) if ua else os_key}".strip() or ua_str[:40],
         # ── 2026-01 additions ──
         "chrome_version": chrome_major,
@@ -3074,9 +3441,17 @@ def _fingerprint_from_ua(ua_str: str) -> Dict[str, Any]:
         "connection_type": connection_type,
         "battery_level": battery_level,
         "battery_charging": battery_charging,
-        "fonts": _OS_FONTS.get(os_key, _OS_FONTS["windows"]),
+        # On Linux hosts, claiming Windows/macOS exclusive fonts (Segoe UI,
+        # Helvetica Neue, …) is a metrics mismatch — use the Linux set.
+        "fonts": (
+            _OS_FONTS["linux"]
+            if __import__("sys").platform.startswith("linux") and os_key in ("windows", "macos")
+            else _OS_FONTS.get(os_key, _OS_FONTS["windows"])
+        ),
         "explicit_locale": explicit_locale,
         "client_hints": client_hint_headers_for_ua(ua_str),
+        "is_chromium_ua": is_chromium_ua,
+        "history_length": history_length,
     }
 
 
@@ -3115,11 +3490,26 @@ async def _rut_apply_context_stealth(
     ctx_headers: Optional[Dict[str, str]] = None,
     fp_hash_override: Optional[int] = None,
     identity_label: str = "",
-) -> None:
-    """Full RUT stealth stack — shared by main, context-retry, tunnel-retry paths."""
-    await context.add_init_script(
-        _build_stealth_script(fp, geo, fp_hash_override=fp_hash_override)
-    )
+) -> bool:
+    """Full RUT stealth stack — shared by main, context-retry, tunnel-retry paths.
+
+    Returns True on success. On hard failure sets `context._krx_stealth_degraded`
+    and returns False (or re-raises for the initial stealth script build).
+    """
+    try:
+        await context.add_init_script(
+            _build_stealth_script(
+                fp, geo, fp_hash_override=fp_hash_override, skip_canvas_noise=True,
+            )
+        )
+    except Exception as _stealth_err:
+        try:
+            context._krx_stealth_degraded = True
+        except Exception:
+            pass
+        logger.warning(f"stealth script inject failed: {_stealth_err}")
+        raise
+
     try:
         from anti_detect_v230 import (
             align_webgl_to_ua_deterministic as _align_webgl,
@@ -3137,16 +3527,45 @@ async def _rut_apply_context_stealth(
             }
         if _wgl.get("vendor") and _wgl.get("renderer"):
             _seed = int(fp.get("canvas_seed") or random.randint(1, 2**30))
-            await context.add_init_script(_natural_canvas(_seed))
+            try:
+                await context.add_init_script(_natural_canvas(_seed))
+            except Exception as _nc_err:
+                # Fallback: re-enable baseline canvas noise in stealth script.
+                logger.warning(
+                    f"natural_canvas inject failed ({_nc_err}) — "
+                    f"falling back to stealth canvas noise"
+                )
+                try:
+                    await context.add_init_script(
+                        _build_stealth_script(
+                            fp, geo, fp_hash_override=fp_hash_override,
+                            skip_canvas_noise=False,
+                        )
+                    )
+                except Exception as _fb_err:
+                    try:
+                        context._krx_stealth_degraded = True
+                    except Exception:
+                        pass
+                    logger.warning(f"stealth canvas fallback also failed: {_fb_err}")
+                    return False
             await context.add_init_script(_webgl_align_js(_wgl))
     except Exception as _wgl_err:
         logger.debug(f"WebGL/canvas stealth inject failed: {_wgl_err}")
+        try:
+            context._krx_stealth_degraded = True
+        except Exception:
+            pass
+        return False
     try:
         from anti_detect_v230 import apply_v230_stealth as _v230_apply
+        _vp = dict(fp.get("viewport") or {"width": 1920, "height": 1080})
+        if fp.get("device_scale_factor") is not None:
+            _vp["device_scale_factor"] = fp["device_scale_factor"]
         _v230_r = await _v230_apply(
             context,
             ua=ua,
-            viewport=fp.get("viewport") or {"width": 1920, "height": 1080},
+            viewport=_vp,
             platform=platform or "",
         )
         _v_hdrs = _v230_r.get("headers") or {}
@@ -3156,6 +3575,7 @@ async def _rut_apply_context_stealth(
             await context.set_extra_http_headers(_cur)
     except Exception as _v230_err:
         logger.warning(f"v2.3.0 stealth apply failed (continuing): {_v230_err}")
+    return not bool(getattr(context, "_krx_stealth_degraded", False))
 
 
 _UNFILLED_MACRO_URL_RX = __import__("re").compile(r"\{\{[^}]+\}\}|%7[bB]%7[bB]")
@@ -4915,7 +5335,13 @@ async def _probe_proxy_target_reachable(
 # MaxMind minFraud / IPQualityScore / Anura / ArkoseLabs / FingerprintJS
 # / CreepJS / BotD probe. Per-visit unique noise so two visits from the
 # same OS+UA still get different audio/canvas/font fingerprints.
-def _build_stealth_script(fp: Dict[str, Any], geo: Dict[str, Any], *, fp_hash_override: Optional[int] = None) -> str:
+def _build_stealth_script(
+    fp: Dict[str, Any],
+    geo: Dict[str, Any],
+    *,
+    fp_hash_override: Optional[int] = None,
+    skip_canvas_noise: bool = False,
+) -> str:
     import json as _json
     explicit_locale = str(fp.get("explicit_locale") or "").strip()
     language_source = explicit_locale or geo["accept_language"]
@@ -4998,6 +5424,24 @@ def _build_stealth_script(fp: Dict[str, Any], geo: Dict[str, Any], *, fp_hash_ov
                 f"{fp.get('ua','')}|{fp.get('chrome_version','')}|{geo.get('timezone','')}"
             )) & 0xFFFFFFFF) or 0x9E3779B9
         ),
+        "connectionType": str(fp.get("connection_type") or "wifi"),
+        "isChromiumUa": bool(
+            fp.get("is_chromium_ua")
+            if "is_chromium_ua" in fp
+            else re.search(r"(?:Chrome|CriOS|Chromium)/", str(fp.get("ua") or ""), re.I)
+        ),
+        "skipCanvasNoise": bool(skip_canvas_noise),
+        "historyLength": max(
+            2,
+            min(
+                5,
+                int(
+                    fp.get("history_length")
+                    if fp.get("history_length") is not None
+                    else (2 + (int(fp.get("canvas_seed") or 0) % 4))
+                ),
+            ),
+        ),
     }
     config_js = "const __KX = " + _json.dumps(kx) + ";"
 
@@ -5010,7 +5454,7 @@ const safeDefine = (obj, prop, getter) => { try { Object.defineProperty(obj, pro
 const makeRng = (seed) => { let s = seed >>> 0 || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; };
 
 // ── navigator.* core props ──────────────────────────────────────
-safe(() => safeDefine(navigator, 'webdriver', () => false));
+safe(() => safeDefine(navigator, 'webdriver', () => undefined));
 safe(() => safeDefine(navigator, 'platform', () => __KX.platform));
 safe(() => safeDefine(navigator, 'vendor', () => __KX.vendor));
 safe(() => safeDefine(navigator, 'hardwareConcurrency', () => __KX.hardwareConcurrency));
@@ -5024,6 +5468,7 @@ safe(() => safeDefine(navigator, 'pdfViewerEnabled', () => true));
 
 // ── window.chrome stub ──────────────────────────────────────────
 safe(() => {
+  if (!__KX.isChromiumUa) return;
   if (!window.chrome) window.chrome = {};
   if (!window.chrome.runtime) {
     window.chrome.runtime = {
@@ -5069,8 +5514,6 @@ safe(() => {
       { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
       { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
       { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-      { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-      { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
     ];
     safeDefine(navigator, 'plugins', () => fakePlugins);
     safeDefine(navigator, 'mimeTypes', () => [
@@ -5100,6 +5543,7 @@ safe(() => {
 
 // ── Canvas fingerprint noise (per-visit seed) ──────────────────
 safe(() => {
+  if (__KX.skipCanvasNoise) return;
   const rng = makeRng(__KX.canvasSeed);
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function () {
@@ -5244,7 +5688,10 @@ safe(() => {
       getHighEntropyValues: function (hints) {
         return Promise.resolve({
           architecture: arch, bitness: '64', brands: brands,
-          fullVersionList: brands.map((b) => ({ brand: b.brand, version: cvFull })),
+          fullVersionList: brands.map((b) => ({
+            brand: b.brand,
+            version: (/Not|Brand/i.test(String(b.brand)) ? String(b.version) : cvFull),
+          })),
           mobile: __KX.clientHints.mobile, model: __KX.uaModel || '', platform: platformName,
           platformVersion: __KX.platformVersion || '15.0.0',
           uaFullVersion: cvFull, wow64: false,
@@ -5276,7 +5723,7 @@ safe(() => {
   const conn = {
     effectiveType: __KX.effectiveType,
     downlink: __KX.downlink, rtt: __KX.rtt, saveData: __KX.saveData,
-    onchange: null, type: __KX.effectiveType === '4g' ? 'cellular' : 'wifi',
+    onchange: null, type: __KX.connectionType || 'wifi',
     addEventListener: function () {}, removeEventListener: function () {},
   };
   safeDefine(navigator, 'connection', () => conn);
@@ -5451,7 +5898,7 @@ safe(() => {
 // ── window.history.length — realistic browsing depth ───────────
 safe(() => {
   if (window.history && window.history.length <= 1) {
-    safeDefine(window.history, 'length', () => 2);
+    safeDefine(window.history, 'length', () => __KX.historyLength || 2);
   }
 });
 
@@ -5759,7 +6206,7 @@ safe(() => {
   const reapply = (win) => {
     try {
       if (!win || !win.navigator) return;
-      Object.defineProperty(win.navigator, 'webdriver', { get: () => false, configurable: true });
+      Object.defineProperty(win.navigator, 'webdriver', { get: () => undefined, configurable: true });
     } catch (e) {}
   };
   const origAttach = HTMLIFrameElement.prototype.appendChild;
@@ -9611,22 +10058,34 @@ async def run_real_user_traffic_job(
         state_rr[state_code] = start_ptr
         return None
 
-    # ── Resilient shared-browser holder ─────────────────────────────
+    # ── Resilient dual shared-browser holder (Chromium + WebKit) ─────
     # Chromium occasionally crashes mid-job under heavy concurrency or
     # when a misbehaving proxy forces it to tear down. When that happens
     # every subsequent `browser.new_context(...)` throws
     # `TargetClosedError: Target page, context or browser has been closed`
     # and the whole job "fails" with 0 conversions. This holder wraps the
-    # shared browser so workers can lazily relaunch it behind an async
-    # lock if it ever drops offline.
-    _browser_holder: Dict[str, Any] = {"b": None, "pw": None}
+    # shared browsers so workers can lazily relaunch them behind an async
+    # lock if they ever drop offline. WebKit is launched lazily on first
+    # iOS visit.
+    _browser_holder: Dict[str, Any] = {
+        "chromium": None,
+        "webkit": None,
+        "pw": None,
+        "pw_cm": None,
+    }
     _browser_lock = asyncio.Lock()
 
-    async def _get_live_browser() -> Browser:
-        """Return a live Playwright Browser — relaunches on the fly if the
-        shared instance crashed / got disconnected. Safe to call from many
-        concurrent workers (serialised via _browser_lock)."""
-        b = _browser_holder.get("b")
+    async def _get_live_browser(engine: str = "chromium") -> Browser:
+        """Return a live Playwright Browser for ``engine`` (chromium|webkit).
+
+        Relaunches on the fly if the shared instance crashed / got
+        disconnected. Safe to call from many concurrent workers
+        (serialised via _browser_lock).
+        """
+        eng = (engine or "chromium").strip().lower()
+        if eng not in ("chromium", "webkit"):
+            eng = "chromium"
+        b = _browser_holder.get(eng)
         if b is not None:
             try:
                 if b.is_connected():
@@ -9635,7 +10094,7 @@ async def run_real_user_traffic_job(
                 pass
         # Browser missing or disconnected — relaunch under lock.
         async with _browser_lock:
-            b = _browser_holder.get("b")
+            b = _browser_holder.get(eng)
             if b is not None:
                 try:
                     if b.is_connected():
@@ -9649,19 +10108,41 @@ async def run_real_user_traffic_job(
                 pw = await pw_cm_local.__aenter__()
                 _browser_holder["pw"] = pw
                 _browser_holder["pw_cm"] = pw_cm_local
+            label = "WebKit" if eng == "webkit" else "Chromium"
             logger.warning(
-                f"RUT job {job_id}: shared Chromium unavailable — relaunching…"
+                f"RUT job {job_id}: shared {label} unavailable — relaunching…"
             )
             try:
-                push_live_step(job_id, 0, "engine", "info",
-                               "Chromium crashed — relaunching…")
+                push_live_step(
+                    job_id, 0, "engine", "info",
+                    f"{label} crashed — relaunching…",
+                )
             except Exception:
                 pass
-            new_b = await _launch_anti_detect_browser(pw, variant=browser_variant)
-            _browser_holder["b"] = new_b
+            if eng == "webkit":
+                try:
+                    ok = await _ensure_webkit_available()
+                except Exception:
+                    ok = False
+                if not ok:
+                    logger.warning(
+                        "RUT job %s: WebKit unavailable — falling back to Chromium",
+                        job_id,
+                    )
+                    eng = "chromium"
+                    new_b = await _launch_anti_detect_browser(
+                        pw, variant=browser_variant
+                    )
+                else:
+                    new_b = await _launch_webkit_browser(pw)
+            else:
+                new_b = await _launch_anti_detect_browser(pw, variant=browser_variant)
+            _browser_holder[eng] = new_b
             try:
-                push_live_step(job_id, 0, "engine", "ok",
-                               "Chromium relaunched — resuming visits")
+                push_live_step(
+                    job_id, 0, "engine", "ok",
+                    f"{'WebKit' if eng == 'webkit' else 'Chromium'} relaunched — resuming visits",
+                )
             except Exception:
                 pass
             return new_b
@@ -10221,14 +10702,54 @@ async def run_real_user_traffic_job(
         except Exception:
             pass
 
-        ua = pick_next_ua()
+        _pinned_ua = ""
+        _identity_doc = None
+        _identity_storage_state = None
+        _identity_fp_hash: Optional[int] = None
+        if identity_label and db is not None:
+            try:
+                _peek = await db.anti_detect_identities.find_one(
+                    {"owner_user_id": engine_user_id or "anon", "label": identity_label, "burnt": False},
+                    {"_id": 0, "id": 1, "ua": 1, "storage_state": 1},
+                )
+                # Reuse pinned UA even without storage_state (identity pin race fix).
+                if _peek and str(_peek.get("ua") or "").strip():
+                    _pinned_ua = str(_peek["ua"]).strip()
+            except Exception:
+                pass
+        ua = _pinned_ua if _pinned_ua else pick_next_ua()
+        _ua_norm_meta: Dict[str, Any] = {}
         try:
-            from anti_detect_v230 import align_ua_to_chromium as _align_chrome
-            _aligned = _align_chrome(ua)
-            if _aligned:
-                ua = _aligned
+            ua, _ua_norm_meta = _normalize_mobile_ua_for_visit(ua)
         except Exception:
-            pass
+            try:
+                ua = _coerce_ua_off_webkit_on_chromium(ua)
+                _ua_norm_meta = {"engine": "chromium", "swapped_ios": True}
+            except Exception:
+                _ua_norm_meta = {"engine": "chromium"}
+        _visit_engine = str(_ua_norm_meta.get("engine") or "chromium").lower()
+        if _visit_engine != "webkit":
+            try:
+                from anti_detect_v230 import align_ua_to_chromium as _align_chrome
+                _aligned = _align_chrome(ua)
+                if _aligned:
+                    ua = _aligned
+            except Exception:
+                pass
+        # Pin UA as soon as finalized (first writer wins) — before navigation.
+        if identity_label and db is not None and ua:
+            try:
+                from advanced_anti_detect import IdentityStore as _IdStore
+                _id_store_early = _IdStore(db)
+                _identity_doc = await _id_store_early.get_or_create(
+                    owner_user_id=engine_user_id or "anon",
+                    label=identity_label,
+                    max_age_days=30,
+                )
+                if _identity_doc:
+                    await _id_store_early.pin_ua(_identity_doc["id"], ua)
+            except Exception:
+                pass
         # Track UA strings used so the upload-consume hook removes only
         # those that were actually attempted, not the entire UA batch.
         try:
@@ -10237,6 +10758,8 @@ async def run_real_user_traffic_job(
                 _spawn_live(_live_remove_ua(ua))
         except Exception:
             pass
+        # Rebuild fingerprint AFTER coerce so os/viewport/WebGL match
+        # the final (possibly Android-swapped) UA.
         fp = _fingerprint_from_ua(ua)
         if identity_label:
             try:
@@ -10246,6 +10769,8 @@ async def run_real_user_traffic_job(
                 fp["webgl_renderer"] = _wgl["renderer"]
             except Exception:
                 pass
+        if _ua_norm_meta.get("swapped_ios") and _ua_norm_meta.get("os"):
+            fp["os"] = _ua_norm_meta["os"]
 
         entry["proxy"] = proxy.get("server", "")
         entry["os"] = fp["os"]
@@ -10257,6 +10782,12 @@ async def run_real_user_traffic_job(
         entry["hardware_concurrency"] = fp.get("hardware_concurrency", 0)
         entry["device_memory"] = fp.get("device_memory", 0)
         entry["device_scale_factor"] = fp.get("device_scale_factor", 0)
+        if _ua_norm_meta.get("swapped_ios"):
+            push_live_step(
+                job_id, i + 1, "setup", "info",
+                _ua_norm_meta.get("note")
+                or "iOS/WebKit UA → Android Chrome (Chromium honesty)",
+            )
         push_live_step(job_id, i + 1, "setup", "info",
                        f"Proxy {entry['proxy']} · {entry['device_name']} · {entry['viewport']}")
 
@@ -10774,21 +11305,29 @@ async def run_real_user_traffic_job(
         # identities per-user via the IdentityStore collection.
         # ── Step 5 (Big-5, Big-6): also load fp_hash for stable
         #     fingerprint across visits + reserve rate-limited slot.
-        _identity_doc = None
-        _identity_storage_state = None
-        _identity_fp_hash: Optional[int] = None
+        # Note: `_identity_doc` may already be set by the early pin_ua path.
         if identity_label and db is not None:
             try:
                 from advanced_anti_detect import IdentityStore as _IdStore
                 _id_store = _IdStore(db)
-                _identity_doc = await _id_store.get_or_create(
-                    owner_user_id=engine_user_id or "anon",
-                    label=identity_label,
-                    max_age_days=30,
-                )
+                if not _identity_doc:
+                    _identity_doc = await _id_store.get_or_create(
+                        owner_user_id=engine_user_id or "anon",
+                        label=identity_label,
+                        max_age_days=30,
+                    )
                 if _identity_doc:
                     _identity_storage_state = await _id_store.load_storage_state(_identity_doc["id"])
                     _identity_fp_hash = await _id_store.get_or_set_fp_hash(_identity_doc["id"])
+                    # Pin UA on first load when identity has no stored ua yet
+                    # (first-writer-wins filter inside pin_ua).
+                    if ua:
+                        try:
+                            await _id_store.pin_ua(_identity_doc["id"], ua)
+                            if not str(_identity_doc.get("ua") or "").strip():
+                                _identity_doc["ua"] = ua
+                        except Exception:
+                            pass
                     # Big-5: rate-limit coordination across jobs that
                     # share this identity. target_per_hour=0 (default)
                     # is a pass-through. Caller passes pacing_per_hour.
@@ -10877,11 +11416,14 @@ async def run_real_user_traffic_job(
             # all overridden per-context via init script). This drops RAM
             # usage 5-10x vs. per-visit Chromium launches and lets us safely
             # run 15+ concurrent visits without OOM.
-            # NOTE: `_get_live_browser()` transparently relaunches Chromium
-            # if it has crashed since the last visit — prevents the entire
-            # job from failing with `TargetClosedError` the moment one
-            # bad proxy or a Chromium bug kills the shared instance.
-            browser = await _get_live_browser()
+            # NOTE: `_get_live_browser(engine=…)` transparently relaunches
+            # Chromium or WebKit if it has crashed since the last visit —
+            # prevents the entire job from failing with `TargetClosedError`
+            # the moment one bad proxy or a browser bug kills the shared
+            # instance. Engine comes from UA normalize (iOS→webkit).
+            browser = await _get_live_browser(
+                engine=str(_ua_norm_meta.get("engine") or "chromium")
+            )
             try:
                 # Auto-detect Referer from the user-agent — TikTok UAs get a
                 # tiktok.com referer, FB in-app UAs get facebook.com, etc.
@@ -11379,7 +11921,12 @@ async def run_real_user_traffic_job(
                 # Chrome version + OS. MaxMind / IPQS / Anura cross-check
                 # these against the UA — a mismatch is a HARD bot signal.
                 try:
-                    _ctx_headers = _apply_contract_client_hints(_ctx_headers, ua)
+                    _ch_vp = dict(fp.get("viewport") or {})
+                    if fp.get("device_scale_factor") is not None:
+                        _ch_vp["device_scale_factor"] = fp["device_scale_factor"]
+                    _ctx_headers = _apply_contract_client_hints(
+                        _ctx_headers, ua, viewport=_ch_vp or None,
+                    )
                 except Exception:
                     pass
                 context = await browser.new_context(
@@ -11408,14 +11955,19 @@ async def run_real_user_traffic_job(
                 # last chance to relaunch, then retry the context.
                 msg = str(_nce)
                 if ("closed" in msg.lower()) or ("TargetClosed" in type(_nce).__name__):
-                    browser = await _get_live_browser()
+                    browser = await _get_live_browser(
+                        engine=str(_ua_norm_meta.get("engine") or "chromium")
+                    )
                     # v2.6.33 — FREEZE referer on context retry. Re-rolling
                     # platform pool would desync tracker URL (_kx_src) from
                     # the Referer the browser actually sends.
                     _ctx_headers_retry = dict(_ctx_headers)
                     try:
+                        _ch_vp_r = dict(fp.get("viewport") or {})
+                        if fp.get("device_scale_factor") is not None:
+                            _ch_vp_r["device_scale_factor"] = fp["device_scale_factor"]
                         _ctx_headers_retry = _apply_contract_client_hints(
-                            _ctx_headers_retry, ua
+                            _ctx_headers_retry, ua, viewport=_ch_vp_r or None,
                         )
                     except Exception:
                         pass
@@ -11449,6 +12001,22 @@ async def run_real_user_traffic_job(
                 fp_hash_override=_identity_fp_hash,
                 identity_label=identity_label or "",
             )
+            if getattr(context, "_krx_stealth_degraded", False):
+                push_live_step(
+                    job_id, i + 1, "stealth", "warn",
+                    "stealth_degraded — canvas/WebGL inject incomplete",
+                )
+                _fail_closed = (
+                    os.environ.get("KREXION_STEALTH_FAIL_CLOSED") or ""
+                ).strip().lower() in ("1", "true", "yes")
+                if _fail_closed:
+                    entry["status"] = "error"
+                    entry["error"] = "stealth_degraded"
+                    push_live_step(
+                        job_id, i + 1, "stealth", "failed",
+                        "Visit skipped (KREXION_STEALTH_FAIL_CLOSED=1)",
+                    )
+                    return await _record(job_id, entry, report, report_lock, db)
 
             # Defensive guard: block navigations to URLs that contain
             # unfilled tracker macros like `{{ccpa}}`, `{{sub}}`, etc.
@@ -12224,6 +12792,11 @@ async def run_real_user_traffic_job(
                                 fp_hash_override=_identity_fp_hash,
                                 identity_label=identity_label or "",
                             )
+                            if getattr(context, "_krx_stealth_degraded", False):
+                                push_live_step(
+                                    job_id, i + 1, "stealth", "warn",
+                                    "stealth_degraded after context rebuild",
+                                )
                             await context.route(
                                 "**/*",
                                 _make_macro_guard(
@@ -14228,6 +14801,7 @@ async def run_real_user_traffic_job(
                         from advanced_anti_detect import IdentityStore as _IdStore
                         _id_store = _IdStore(db)
                         await _id_store.save_storage_state(_identity_doc["id"], _state)
+                        await _id_store.pin_ua(_identity_doc["id"], ua)
                 except Exception as _save_err:  # noqa: BLE001
                     logger.debug(f"identity save_storage_state failed: {_save_err}")
             # Aggressive cleanup to prevent memory leaks
@@ -14441,16 +15015,17 @@ async def run_real_user_traffic_job(
                 except Exception:
                     pass
 
-    # ── Launch ONE shared Chromium browser for the WHOLE job ─────────
-    # All visits create their own isolated BrowserContext from this single
-    # browser. This is the standard anti-detection pattern (used by
+    # ── Launch shared browsers for the WHOLE job ─────────────────────
+    # Chromium launches eagerly; WebKit launches lazily on first iOS visit.
+    # All visits create their own isolated BrowserContext from the matching
+    # engine. This is the standard anti-detection pattern (used by
     # Multilogin/GoLogin/AdsPower under the hood) — every context has its
     # own cookies, storage, proxy, fingerprint and is undetectable from
     # the website's side. RAM cost drops 5-10x vs. per-visit launches,
     # which lets concurrency=15 run safely in the pod.
-    # NOTE: The browser + Playwright handle are stashed in `_browser_holder`
-    # so `_get_live_browser()` can transparently relaunch Chromium if it
-    # ever crashes mid-job (prevents the TargetClosedError death-spiral).
+    # NOTE: Browsers + Playwright handle are stashed in `_browser_holder`
+    # so `_get_live_browser(engine=…)` can transparently relaunch if
+    # either engine crashes mid-job (prevents the TargetClosedError death-spiral).
     pw_cm = async_playwright()
     pw = await pw_cm.__aenter__()
     _browser_holder["pw"] = pw
@@ -14469,9 +15044,25 @@ async def run_real_user_traffic_job(
             job_id, 0, "preflight", "ok",
             f"Full Chromium ready · --headless=new · exe={_fc}",
         )
+    # WebKit preflight — iOS visits need Playwright WebKit
+    try:
+        if _webkit_runtime_available():
+            push_live_step(
+                job_id, 0, "preflight", "ok",
+                "WebKit ready for iOS visits",
+            )
+        else:
+            push_live_step(
+                job_id, 0, "preflight", "warn",
+                "WebKit not installed — iOS UAs fall back to Android Chrome "
+                "(run playwright install webkit)",
+            )
+            asyncio.create_task(_ensure_webkit_available())
+    except Exception:
+        pass
     try:
         shared_browser = await _launch_anti_detect_browser(pw, variant=browser_variant)
-        _browser_holder["b"] = shared_browser
+        _browser_holder["chromium"] = shared_browser
     except Exception as e:
         try:
             await pw_cm.__aexit__(type(e), e, None)
@@ -14800,16 +15391,20 @@ async def run_real_user_traffic_job(
             # change the UI's TOTAL field, which stays at `total`).
             RUT_JOBS[job_id]["attempts_spawned"] = attempt_counter
 
-    # ── Close the shared browser & playwright runtime ────────────────
-    # Prefer the holder's current browser (may have been relaunched mid-job)
+    # ── Close shared browsers & playwright runtime ───────────────────
+    # Prefer the holder's current browsers (may have been relaunched mid-job)
     # over the original `shared_browser` variable.
-    final_browser = _browser_holder.get("b") or shared_browser
-    try:
-        if final_browser is not None:
-            await final_browser.close()
-            logger.info(f"Job {job_id}: Shared browser closed successfully")
-    except Exception as e:
-        logger.debug(f"shared browser close failed: {e}")
+    for _eng_key in ("chromium", "webkit"):
+        _b_close = _browser_holder.get(_eng_key)
+        if _eng_key == "chromium" and _b_close is None:
+            _b_close = shared_browser
+        try:
+            if _b_close is not None:
+                await _b_close.close()
+                logger.info(f"Job {job_id}: Shared {_eng_key} browser closed successfully")
+        except Exception as e:
+            logger.debug(f"shared {_eng_key} browser close failed: {e}")
+        _browser_holder[_eng_key] = None
     
     # Force cleanup
     import gc
@@ -14822,7 +15417,8 @@ async def run_real_user_traffic_job(
         await final_pw_cm.__aexit__(None, None, None)
     except Exception as e:
         logger.debug(f"playwright runtime exit failed: {e}")
-    _browser_holder["b"] = None
+    _browser_holder["chromium"] = None
+    _browser_holder["webkit"] = None
     _browser_holder["pw"] = None
     _browser_holder["pw_cm"] = None
 

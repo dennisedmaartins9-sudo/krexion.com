@@ -563,44 +563,39 @@ jobs:
           $size = (Get-Item $out).Length
           Write-Host "=== WebView2 bootstrapper ready: $out ($size bytes) ==="
 
-      - name: Bundle Playwright Chromium (required by heavy/RUT features)
+      - name: Bundle Playwright Chromium + WebKit (RUT Android/iOS engines)
         shell: powershell
         run: |
-          # Krexion's heavy features (Real-User-Traffic, conversion
-          # automation, click farms) all drive Playwright Chromium. The
-          # backend reads PLAYWRIGHT_BROWSERS_PATH at startup and
-          # expects to find chromium-headless-shell + chromium under
-          # that folder. If the folder is missing or empty the backend
-          # logs "Playwright chromium-headless-shell rev XXX missing"
-          # and every heavy job fails immediately on submission.
+          # Krexion heavy features drive Playwright:
+          #   • Chromium (+ headless-shell) — Android / desktop RUT
+          #   • WebKit — iOS Safari-honest visits (v2.7.9+ dual-engine)
+          # Backend reads PLAYWRIGHT_BROWSERS_PATH (= {app}\browser-engine
+          # after Inno install). Customer must NOT run `playwright install`
+          # manually — the EXE ships the full browser-engine folder.
           #
-          # On the dev pod the Playwright runtime auto-downloads at
-          # first use, but on a customer's Windows install the bundle
-          # we ship is the ONLY copy they get (no internet round-trip
-          # at runtime - that breaks behind corporate proxies and
-          # creates a 30-90s first-job stall).
-          #
-          # We invoke Playwright's own CLI on the runner to download
-          # the matching Chromium build into a temp folder, then move
-          # it under build/chromium-bundle/ which the Inno Setup script
-          # picks up via the `..\build\chromium-bundle\*` Source line.
+          # Output lands in build/chromium-bundle/ (legacy folder name);
+          # Inno copies it to DestDir {app}\browser-engine.
           $env:PLAYWRIGHT_BROWSERS_PATH = "$PWD\build\chromium-bundle"
           New-Item -ItemType Directory -Force -Path $env:PLAYWRIGHT_BROWSERS_PATH | Out-Null
           $py = Join-Path $PWD 'build\dist\krexion-backend.dist\krexion-core.exe'
-          if (-not (Test-Path $py)) { throw "krexion-core.exe missing; cannot install Playwright Chromium" }
-          Write-Host "Installing Playwright Chromium with bundled $py"
+          if (-not (Test-Path $py)) { throw "krexion-core.exe missing; cannot install Playwright browsers" }
+          Write-Host "Installing Playwright Chromium + WebKit with bundled $py"
           & $py -m pip install --upgrade pip
           & $py -m pip install playwright==1.49.1
-          # Both chromium (full) and chromium-headless-shell (smaller,
-          # used by the production RUT runner) - the runtime selects
-          # one based on the job kind, so we ship both.
-          & $py -m playwright install chromium chromium-headless-shell
+          # Ship all three: full chromium, headless-shell, and webkit.
+          & $py -m playwright install chromium chromium-headless-shell webkit
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "Playwright install returned exit $LASTEXITCODE - continuing build (chromium-bundle may be partial)"
           }
-          Write-Host "=== Chromium bundle contents (top level) ==="
+          Write-Host "=== browser-engine bundle contents (top level) ==="
           Get-ChildItem build/chromium-bundle -Directory -ErrorAction SilentlyContinue |
             Select-Object Name, FullName | Format-Table -AutoSize | Out-String -Width 200
+          $hasWebkit = @(Get-ChildItem build/chromium-bundle -Directory -Filter 'webkit-*' -ErrorAction SilentlyContinue).Count -gt 0
+          if (-not $hasWebkit) {
+            Write-Warning "webkit-* folder missing from bundle — iOS dual-engine will fall back to Android Chrome until install webkit succeeds"
+          } else {
+            Write-Host "WebKit present in bundle — iOS engine ready for EXE installs"
+          }
           $totalSize = (Get-ChildItem build/chromium-bundle -Recurse -File -ErrorAction SilentlyContinue |
                         Measure-Object -Property Length -Sum).Sum
           Write-Host "Total chromium-bundle size: $([math]::Round($totalSize / 1MB, 1)) MB"

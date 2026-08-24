@@ -169,6 +169,22 @@ class IdentityStore:
             }},
         )
 
+    async def pin_ua(self, identity_id: str, ua: str) -> None:
+        """Pin UA on first writer only (empty/missing ua) so races don't flip identity."""
+        if not identity_id or not (ua or "").strip():
+            return
+        await self.db.anti_detect_identities.update_one(
+            {
+                "id": identity_id,
+                "$or": [
+                    {"ua": {"$exists": False}},
+                    {"ua": None},
+                    {"ua": ""},
+                ],
+            },
+            {"$set": {"ua": str(ua).strip()}},
+        )
+
     async def load_storage_state(self, identity_id: str) -> Optional[dict]:
         doc = await self.db.anti_detect_identities.find_one(
             {"id": identity_id}, {"_id": 0, "storage_state": 1}

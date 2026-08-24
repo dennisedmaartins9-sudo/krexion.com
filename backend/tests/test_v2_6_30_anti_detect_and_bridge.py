@@ -6,7 +6,7 @@ from referrer_pro import is_non_chrome_inapp_ua
 
 TIKTOK_UA = (
     "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A.240905.015; wv) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.114 "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/136.0.7103.125 "
     "Mobile Safari/537.36 TikTok/45.8.2 musical_ly_2024508020 JsSdk/1.0 "
     "NetType/WIFI Channel/googleplay AppName/musical_ly app_version/45.8.2 "
     "ByteLocale/en ByteFullLocale/en Region/US "
@@ -15,10 +15,12 @@ TIKTOK_UA = (
 
 
 def test_full_client_hints_keeps_tiktok_browser_runtime():
-    assert is_non_chrome_inapp_ua(TIKTOK_UA) is False
+    # TikTok in-app is non-browser for CH branding — suppress Sec-CH-UA brands.
+    assert is_non_chrome_inapp_ua(TIKTOK_UA) is True
     hints = full_client_hints(TIKTOK_UA)
-    assert "Chromium" in hints.get("Sec-CH-UA", "")
+    assert hints.get("Sec-CH-UA") == ""
     assert hints.get("Sec-CH-UA-Mobile") == "?1"
+    assert hints.get("Sec-CH-UA-Platform") == '"Android"'
 
 
 def test_full_client_hints_chrome_still_emits_brands():

@@ -68,4 +68,10 @@ def test_update_profile_preserves_session_fields_in_source():
 def test_launch_duplicate_guard_in_source():
     src = _read_backend("browser_profile_module.py")
     assert "status_code=409" in src
-    assert '"running", "launching", "stopping"' in src
+    assert '"running", "launching", "stopping", "queued"' in src
+
+
+def test_stop_accepts_active_statuses():
+    src = _read_backend("browser_profile_module.py")
+    assert '"running", "launching", "stopping", "queued"' in src
+    assert '_mode in ("native", "local")' in src

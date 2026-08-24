@@ -66,6 +66,37 @@ _RUNNING_SESSIONS: Dict[str, Dict[str, Any]] = {}
 # Electron + cloud-edge deployments don't set it, so they continue to
 # spawn Chromium directly via `asyncio.create_task` exactly as before.
 _LAUNCH_QUEUE_COLLECTION = "browser_launch_queue"
+# If the tray helper never claims a queued launch, un-stick the profile card.
+_USER_SESSION_PICKUP_TIMEOUT_SEC = 60.0
+
+# Headed Profiles — same anti-detect Chromium flags as RUT
+# (`real_user_traffic._BROWSER_LAUNCH_ARGS_BASE`), minus headless-only
+# switches. Profiles stay HEADED; viewport stays profile-owned.
+_PROFILE_HEADED_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-features=AutomationControlled,UseDnsHttpsSvcb",
+    "--disable-blink-features=AutomationControlled",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--disable-translate",
+    "--disable-default-apps",
+    "--disable-component-update",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--metrics-recording-only",
+    "--enable-quic",
+    "--quic-version=h3",
+    # v2.7.7 — no force-all-origins QUIC flag; prefer IPv4-proxy-consistent
+    # (avoid dual-stack Chrome feature vs IPv6-exit-reject clash).
+    "--enable-features=AddressSpaceTraversal",
+    "--disable-infobars",
+]
 
 
 def _should_defer_to_user_session() -> bool:
@@ -142,12 +173,169 @@ async def _enqueue_for_user_session(
                 "profile_id": profile_id,
                 "session_id": session_id,
                 "status": "queued",
-                "message": "Waiting for user-session helper to pick up the launch...",
+                "message": "Waiting for Krexion tray (user session) to open Chromium…",
             })
         except Exception as _cb_err:  # noqa: BLE001
             logger.debug(f"queued-callback failed: {_cb_err}")
 
+    # Watchdog: if tray never claims within N seconds, fail closed with a
+    # clear error so the card does not stay on "launching/queued" forever.
+    try:
+        asyncio.create_task(
+            _watch_user_session_pickup(
+                session_id=session_id,
+                profile_id=profile_id,
+                user_id=str(profile_config.get("user_id") or ""),
+                on_session_update=on_session_update,
+            )
+        )
+    except Exception as _wd_err:  # noqa: BLE001
+        logger.debug(f"[profile-launch] pickup watchdog schedule failed: {_wd_err}")
+
     return {"ok": True, "session_id": session_id, "queued": True}
+
+
+async def _watch_user_session_pickup(
+    *,
+    session_id: str,
+    profile_id: str,
+    user_id: str = "",
+    on_session_update: Optional[Any] = None,
+    timeout_sec: float = _USER_SESSION_PICKUP_TIMEOUT_SEC,
+) -> None:
+    """Fail the launch if tray never claims the queue row in time."""
+    try:
+        await asyncio.sleep(max(5.0, float(timeout_sec or 60.0)))
+    except Exception:
+        return
+    try:
+        from server import db as _db  # type: ignore
+    except Exception:
+        return
+    try:
+        row = await _db[_LAUNCH_QUEUE_COLLECTION].find_one(
+            {"id": session_id},
+            {"status": 1, "_id": 0},
+        )
+        if not row or str(row.get("status") or "") != "queued":
+            return  # claimed / cancelled / finished
+        err = (
+            "Browser launch timed out — Krexion tray helper did not pick up the job. "
+            "Open the Krexion icon in the Windows system tray (or restart Krexion), "
+            "then click Launch again."
+        )
+        await _db[_LAUNCH_QUEUE_COLLECTION].update_one(
+            {"id": session_id, "status": "queued"},
+            {"$set": {
+                "status": "error",
+                "error_message": err,
+                "completed_at": _now_iso(),
+            }},
+        )
+        await _db.browser_profile_sessions.update_one(
+            {"id": session_id},
+            {"$set": {
+                "status": "error",
+                "error_message": err[:512],
+                "ended_at": _now_iso(),
+            }},
+        )
+        _prof_q: Dict[str, Any] = {
+            "status": "error",
+            "session_id": "",
+            "last_error": err[:512],
+        }
+        if user_id:
+            await _db.browser_profiles.update_one(
+                {"id": profile_id, "user_id": user_id},
+                {"$set": _prof_q},
+            )
+        else:
+            await _db.browser_profiles.update_one(
+                {"id": profile_id},
+                {"$set": _prof_q},
+            )
+        if on_session_update is not None:
+            try:
+                await on_session_update({
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "status": "error",
+                    "error_message": err,
+                })
+            except Exception:
+                pass
+        logger.warning(
+            f"[profile-launch] tray pickup timeout session_id={session_id[:8]} "
+            f"profile={profile_id[:8]}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[profile-launch] pickup watchdog failed: {exc}")
+
+
+async def expire_stale_user_session_launches(
+    motor_db: Any,
+    *,
+    older_than_sec: float = _USER_SESSION_PICKUP_TIMEOUT_SEC,
+) -> int:
+    """Mark long-queued launches as error (tray drain safety net)."""
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(15.0, float(older_than_sec or 60.0)))
+    cutoff_iso = cutoff.isoformat()
+    err = (
+        "Browser launch timed out — Krexion tray helper did not pick up the job. "
+        "Open the Krexion system-tray app, then click Launch again."
+    )
+    expired = 0
+    try:
+        async for doc in motor_db[_LAUNCH_QUEUE_COLLECTION].find({
+            "status": "queued",
+            "queued_at": {"$lt": cutoff_iso},
+        }):
+            sid = str(doc.get("id") or "")
+            pid = str(
+                (doc.get("profile_config") or {}).get("id")
+                or doc.get("profile_id")
+                or ""
+            )
+            uid = str((doc.get("profile_config") or {}).get("user_id") or "")
+            try:
+                await motor_db[_LAUNCH_QUEUE_COLLECTION].update_one(
+                    {"id": sid, "status": "queued"},
+                    {"$set": {
+                        "status": "error",
+                        "error_message": err,
+                        "completed_at": _now_iso(),
+                    }},
+                )
+                if sid:
+                    await motor_db.browser_profile_sessions.update_one(
+                        {"id": sid},
+                        {"$set": {
+                            "status": "error",
+                            "error_message": err[:512],
+                            "ended_at": _now_iso(),
+                        }},
+                    )
+                if pid:
+                    q = {"id": pid}
+                    if uid:
+                        q["user_id"] = uid
+                    await motor_db.browser_profiles.update_one(
+                        q,
+                        {"$set": {
+                            "status": "error",
+                            "session_id": "",
+                            "last_error": err[:512],
+                        }},
+                    )
+                expired += 1
+            except Exception:
+                continue
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[user-session] expire stale failed: {exc}")
+    return expired
 
 
 async def _launch_inline_for_fallback(*args, **kwargs) -> Dict[str, Any]:
@@ -202,6 +390,215 @@ def _resolve_geo_for_profile(profile_config: Dict[str, Any]) -> Dict[str, Any]:
         "lat": lat,
         "lon": lon,
     }
+
+
+def _pick_stable(seed: int, choices: List[Any]) -> Any:
+    if not choices:
+        return None
+    return choices[int(seed) % len(choices)]
+
+
+def _profile_screen_metrics(os_key: str, vw: int, vh: int, seed: int) -> Dict[str, Any]:
+    """Screen/outer deltas derived from the PROFILE viewport (not RUT random)."""
+    if os_key in ("android", "ios"):
+        return {
+            "screen_width": vw,
+            "screen_height": vh,
+            "avail_width": vw,
+            "avail_height": vh,
+            "outer_width_delta": 0,
+            "outer_height_delta": 0,
+            "color_depth": 24,
+            "max_touch_points": 5 if os_key == "ios" else int(_pick_stable(seed, [5, 10])),
+        }
+    if os_key == "macos":
+        tb = int(_pick_stable(seed, [22, 25, 28]))
+        oh = int(_pick_stable(seed >> 3, [74, 87, 105, 130]))
+        return {
+            "screen_width": max(1280, vw),
+            "screen_height": max(800, vh + tb),
+            "avail_width": max(1280, vw),
+            "avail_height": max(800, vh),
+            "outer_width_delta": 0,
+            "outer_height_delta": oh,
+            "color_depth": 30,
+            "max_touch_points": 0,
+        }
+    if os_key == "linux":
+        tb = int(_pick_stable(seed, [24, 40, 60]))
+        oh = int(_pick_stable(seed >> 3, [74, 100, 130]))
+        return {
+            "screen_width": max(1024, vw),
+            "screen_height": max(768, vh + tb),
+            "avail_width": max(1024, vw),
+            "avail_height": max(768, vh),
+            "outer_width_delta": 0,
+            "outer_height_delta": oh,
+            "color_depth": 24,
+            "max_touch_points": 0,
+        }
+    # windows / default
+    tb = int(_pick_stable(seed, [40, 48, 60, 80]))
+    oh = int(_pick_stable(seed >> 3, [74, 87, 117, 138]))
+    return {
+        "screen_width": max(1024, vw),
+        "screen_height": max(768, vh + tb),
+        "avail_width": max(1024, vw),
+        "avail_height": max(768, vh),
+        "outer_width_delta": 0,
+        "outer_height_delta": oh,
+        "color_depth": 24,
+        "max_touch_points": 0,
+    }
+
+
+def _build_profile_stealth_fp(
+    ua: str,
+    *,
+    profile_id: str,
+    viewport: Dict[str, Any],
+    dsf: float,
+    is_mobile: bool,
+    has_touch: bool,
+    profile_os: str = "",
+) -> Dict[str, Any]:
+    """Full RUT fingerprint for Profiles — keep profile viewport/mobile flags.
+
+    Uses `_sync_fingerprint_to_ua` so platform/vendor/HC/WebGL/fonts match
+    the UA, then overlays profile-owned viewport + deterministic seeds so
+    the same profile always looks like the same device across launches.
+    """
+    from anti_detect_v230 import _stable_hash as _stable_hash_fn
+    from real_user_traffic import _sync_fingerprint_to_ua
+
+    identity = str(profile_id or "profile")
+    fp = _sync_fingerprint_to_ua(ua or "", identity_label=identity)
+
+    vw = max(320, int((viewport or {}).get("width") or 1920))
+    vh = max(480, int((viewport or {}).get("height") or 1080))
+    fp["viewport"] = {"width": vw, "height": vh}
+    fp["device_scale_factor"] = float(dsf)
+    fp["is_mobile"] = bool(is_mobile)
+    fp["has_touch"] = bool(has_touch)
+    if profile_os:
+        fp["os"] = str(profile_os).lower().strip() or fp.get("os") or "windows"
+
+    os_key = str(fp.get("os") or "windows").lower()
+    screen = _profile_screen_metrics(os_key, vw, vh, _stable_hash_fn(f"{identity}:screen"))
+    fp.update(screen)
+    if has_touch and int(fp.get("max_touch_points") or 0) <= 0:
+        fp["max_touch_points"] = 5
+
+    # Stable per-profile noise seeds (RUT uses per-visit random).
+    fp["canvas_seed"] = (_stable_hash_fn(f"{identity}:canvas") % (2**30)) or 1
+    fp["audio_seed"] = (_stable_hash_fn(f"{identity}:audio") % (2**30)) or 1
+    fp["font_seed"] = (_stable_hash_fn(f"{identity}:font") % (2**30)) or 1
+    fp["history_length"] = 2 + (int(fp["canvas_seed"]) % 4)
+
+    # Desktop HC/DM: stabilize (mobile keeps UA-device-coupled values from RUT).
+    if os_key not in ("android", "ios"):
+        fp["hardware_concurrency"] = int(
+            _pick_stable(_stable_hash_fn(f"{identity}:hc"), [4, 8, 12, 16])
+        )
+        fp["device_memory"] = int(
+            _pick_stable(_stable_hash_fn(f"{identity}:dm"), [4, 8, 16, 32])
+        )
+
+    # Battery / network — deterministic snapshot per profile.
+    if os_key in ("android", "ios"):
+        bl = 0.18 + ((_stable_hash_fn(f"{identity}:bat") % 7400) / 10000.0)
+        fp["battery_level"] = round(min(0.92, max(0.18, bl)), 2)
+        fp["battery_charging"] = bool(_stable_hash_fn(f"{identity}:batc") % 100 < 35)
+        fp["effective_type"] = _pick_stable(
+            _stable_hash_fn(f"{identity}:net"), ["4g", "4g", "4g", "3g"]
+        )
+        fp["downlink"] = round(
+            2.5 + ((_stable_hash_fn(f"{identity}:dl") % 750) / 100.0), 1
+        )
+        fp["rtt"] = int(
+            _pick_stable(_stable_hash_fn(f"{identity}:rtt"), [50, 100, 150, 200, 300])
+        )
+        fp["connection_type"] = "cellular"
+    else:
+        bl = 0.45 + ((_stable_hash_fn(f"{identity}:bat") % 5300) / 10000.0)
+        fp["battery_level"] = round(min(0.98, max(0.45, bl)), 2)
+        fp["battery_charging"] = bool(_stable_hash_fn(f"{identity}:batc") % 100 < 70)
+        fp["effective_type"] = "4g"
+        fp["downlink"] = round(
+            5.0 + ((_stable_hash_fn(f"{identity}:dl") % 1500) / 100.0), 1
+        )
+        fp["rtt"] = int(
+            _pick_stable(_stable_hash_fn(f"{identity}:rtt"), [25, 50, 75, 100])
+        )
+        fp["connection_type"] = "wifi"
+
+    # Required keys for `_build_stealth_script` — never leave sparse.
+    for key, default in (
+        ("platform", "Win32"),
+        ("vendor", "Google Inc."),
+        ("hardware_concurrency", 8),
+        ("device_memory", 8),
+        ("webgl_vendor", "Google Inc."),
+        ("webgl_renderer", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)"),
+        ("canvas_seed", 1),
+    ):
+        if key not in fp or fp.get(key) in (None, ""):
+            fp[key] = default
+
+    return fp
+
+
+async def _align_profile_geo_from_proxy(
+    geo: Dict[str, Any],
+    proxy_arg: Optional[Dict[str, Any]],
+    ua: str,
+    profile_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """When a proxy is set, align locale/tz/lat/lon to the exit IP (RUT parity).
+
+    Probe always wins for timezone/locale/accept_language/lat/lon so the
+    browser fingerprint matches the exit IP (profile overrides are logged
+    when they conflict).
+    """
+    if not proxy_arg or not proxy_arg.get("server"):
+        return geo
+    try:
+        from real_user_traffic import _probe_proxy_geo
+        uid = str(profile_config.get("user_id") or "") or None
+        probed = await _probe_proxy_geo(proxy_arg, ua or "", user_id=uid)
+        if not probed.get("ok"):
+            return geo
+        out = dict(geo)
+        out["lat"] = float(probed.get("lat") if probed.get("lat") is not None else out["lat"])
+        out["lon"] = float(probed.get("lon") if probed.get("lon") is not None else out["lon"])
+        if probed.get("timezone"):
+            out["timezone"] = probed["timezone"]
+        if probed.get("locale"):
+            out["locale"] = probed["locale"]
+        if probed.get("accept_language"):
+            out["accept_language"] = probed["accept_language"]
+        # Warn if profile had conflicting explicit geo (probe still wins).
+        _prof_tz = str(profile_config.get("timezone") or "").strip()
+        _prof_loc = str(profile_config.get("locale") or "").strip()
+        if _prof_tz and out.get("timezone") and _prof_tz != out.get("timezone"):
+            logger.warning(
+                f"[profile-launch] profile timezone '{_prof_tz}' conflicts with "
+                f"proxy exit tz '{out.get('timezone')}' — using probe"
+            )
+        if _prof_loc and out.get("locale") and _prof_loc != out.get("locale"):
+            logger.warning(
+                f"[profile-launch] profile locale '{_prof_loc}' conflicts with "
+                f"proxy exit locale '{out.get('locale')}' — using probe"
+            )
+        logger.info(
+            f"[profile-launch] geo aligned to proxy exit "
+            f"ip={probed.get('exit_ip')} tz={out.get('timezone')} "
+            f"city={probed.get('city')}"
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[profile-launch] proxy geo align skipped: {exc}")
+        return geo
 
 
 def _coerce_profile_ua(ua: str, profile_config: Dict[str, Any]) -> str:
@@ -504,15 +901,47 @@ async def _launch_profile_session_inner(
     anti = profile_config.get("anti_detect") or {}
     master = bool(anti.get("master", True))
     identity_persist = bool(anti.get("identity_persist", True))
-    tls_prewarm = bool(anti.get("tls_prewarm", True)) and master
+    tls_prewarm = bool(anti.get("tls_prewarm", False)) and master
     behavioral_bio = bool(anti.get("behavioral_bio", True)) and master
     ip_warmup = bool(anti.get("ip_warmup", False)) and master
     paranoia_mode = bool(anti.get("paranoia_mode", False))
 
     ua = _coerce_profile_ua(ua, profile_config)
-    profile_os = profile_config.get("os") or _infer_os_from_ua(
-        ua, fallback=("ios" if is_mobile else "windows")
-    )
+    try:
+        from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
+        ua, _ua_meta = _norm_ua(ua)
+    except Exception:
+        _ua_meta = {}
+        try:
+            from real_user_traffic import _coerce_ua_off_webkit_on_chromium as _coerce_ios
+            ua = _coerce_ios(ua)
+        except Exception:
+            pass
+    _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
+    if _profile_engine != "webkit":
+        try:
+            from anti_detect_v230 import align_ua_to_chromium as _align_chrome
+            _aligned = _align_chrome(ua)
+            if _aligned:
+                ua = _aligned
+        except Exception:
+            pass
+    # v2.7.9 — Re-infer OS from final UA. WebKit path keeps ios; Chromium
+    # honesty may have swapped to Android when WebKit was missing.
+    inferred_os = _infer_os_from_ua(ua, fallback="")
+    if _ua_meta.get("os"):
+        profile_os = str(_ua_meta["os"])
+    elif inferred_os:
+        profile_os = inferred_os
+    else:
+        profile_os = profile_config.get("os") or (
+            "android" if is_mobile else "windows"
+        )
+    if profile_os in ("android", "ios") or _ua_meta.get("is_mobile"):
+        is_mobile = True
+        has_touch = True
+        if not profile_config.get("device_scale_factor"):
+            dsf = 3.0
     geo = _resolve_geo_for_profile(profile_config)
     locale = geo["locale"]
     timezone_id = geo["timezone"]
@@ -631,6 +1060,12 @@ async def _launch_profile_session_inner(
         proxy_diag["ok"] = False
         proxy_diag["error"] = "Proxy enabled but no server URL could be resolved (check ProxyJet credentials)"
 
+    # RUT parity: when proxy is live, align timezone/locale/geo to exit IP.
+    geo = await _align_profile_geo_from_proxy(geo, proxy_arg, ua, profile_config)
+    locale = geo["locale"]
+    timezone_id = geo["timezone"]
+    accept_lang = geo["accept_language"]
+
     async with async_playwright() as p:
         # Browser binary selection — prefer Chrome channel for realism,
         # fall back to bundled Chromium when not installed.
@@ -692,37 +1127,72 @@ async def _launch_profile_session_inner(
         launch_kwargs: Dict[str, Any] = {
             "headless": False,
             "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-default-browser-check",
-                "--no-first-run",
-                # Make the window non-obvious (no automation infobar)
-                "--disable-infobars",
-                # 2026-07 v2.2.6 — window title override.  Chromium
-                # picks this up as the initial main-frame title until
-                # the page's own <title> loads — the taskbar entry
-                # then reads "Krexion — <label>" instead of the bare
-                # site name during the split-second before first paint.
-                # Once the site loads, the page's real <title> takes
-                # over (v2.4.1 no longer force-prefixes it).
+                *_PROFILE_HEADED_LAUNCH_ARGS,
+                # Window title until first page paint; site title takes over after.
                 f"--window-name=Krexion \u2014 {_profile_label} ({_profile_first_letter})",
             ],
         }
         if _kx_user_data_dir:
             launch_kwargs["args"].append(f"--user-data-dir={_kx_user_data_dir}")
-        if proxy_arg:
+        # Chromium: proxy on launch. WebKit: prefer proxy on context (below).
+        if proxy_arg and _profile_engine != "webkit":
             launch_kwargs["proxy"] = proxy_arg
 
-        # Pick channel
-        channel: Optional[str] = None
-        variant = (anti.get("browser_variant") or "auto").lower()
-        if variant in ("chrome", "rotate"):
-            channel = "chrome"  # Falls back if not installed
-        try:
-            browser = await p.chromium.launch(channel=channel, **launch_kwargs) if channel else await p.chromium.launch(**launch_kwargs)
-        except Exception:
-            # Channel not present → fallback to bundled
-            browser = await p.chromium.launch(**launch_kwargs)
+        if _profile_engine == "webkit":
+            # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
+            wk_kwargs: Dict[str, Any] = {"headless": False}
+            try:
+                browser = await p.webkit.launch(**wk_kwargs)
+            except Exception as _wk_err:
+                logger.warning(
+                    "WebKit launch failed (%s) — falling back to Chromium",
+                    _wk_err,
+                )
+                _profile_engine = "chromium"
+                try:
+                    from real_user_traffic import (
+                        _normalize_mobile_ua_for_chromium as _norm_chr,
+                    )
+                    ua, _fb_meta = _norm_chr(ua)
+                    if _fb_meta.get("os"):
+                        profile_os = str(_fb_meta["os"])
+                    if _fb_meta.get("is_mobile"):
+                        is_mobile = True
+                        has_touch = True
+                    try:
+                        from anti_detect_v230 import align_ua_to_chromium as _align_chrome
+                        _aligned = _align_chrome(ua)
+                        if _aligned:
+                            ua = _aligned
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if proxy_arg:
+                    launch_kwargs["proxy"] = proxy_arg
+                channel = None
+                variant = (anti.get("browser_variant") or "auto").lower()
+                if variant in ("chrome", "rotate"):
+                    channel = "chrome"
+                try:
+                    browser = (
+                        await p.chromium.launch(channel=channel, **launch_kwargs)
+                        if channel
+                        else await p.chromium.launch(**launch_kwargs)
+                    )
+                except Exception:
+                    browser = await p.chromium.launch(**launch_kwargs)
+        else:
+            # Pick channel (Chromium only)
+            channel: Optional[str] = None
+            variant = (anti.get("browser_variant") or "auto").lower()
+            if variant in ("chrome", "rotate"):
+                channel = "chrome"  # Falls back if not installed
+            try:
+                browser = await p.chromium.launch(channel=channel, **launch_kwargs) if channel else await p.chromium.launch(**launch_kwargs)
+            except Exception:
+                # Channel not present → fallback to bundled
+                browser = await p.chromium.launch(**launch_kwargs)
 
         # 2026-07 v2.2.7 — Krexion taskbar icon override (Windows only).
         # 2026-01 v2.4.1 — Improved reliability: we now walk ALL Chromium
@@ -776,8 +1246,15 @@ async def _launch_profile_session_inner(
             "has_touch": has_touch,
             "locale": locale,
             "timezone_id": timezone_id,
+            "geolocation": {
+                "latitude": float(geo.get("lat") or 40.7128),
+                "longitude": float(geo.get("lon") or -74.0060),
+            },
+            "permissions": ["geolocation"],
             "extra_http_headers": {"Accept-Language": accept_lang},
         }
+        if _profile_engine == "webkit" and proxy_arg:
+            context_kwargs["proxy"] = proxy_arg
         if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
             context_kwargs["storage_state"] = storage_state
 
@@ -819,7 +1296,7 @@ async def _launch_profile_session_inner(
         _profile_ch_hints: Dict[str, str] = {}
         try:
             from real_user_traffic import _build_client_hint_headers as _bld_ch
-            _os_hint = profile_os or ("ios" if is_mobile else "windows")
+            _os_hint = profile_os or ("android" if is_mobile else "windows")
             _profile_ch_hints = _bld_ch(
                 {"os": _os_hint, "is_mobile": is_mobile},
                 ua,
@@ -830,83 +1307,45 @@ async def _launch_profile_session_inner(
         except Exception as _ch_err:
             logger.debug(f"profile client-hint build skipped: {_ch_err}")
 
-        # ── 2026-07 v2.3.0 — Apply next-level anti-detect stack ──
-        # 15 industry-standard enhancements: HTTP/2 fingerprint, Sec-Fetch-*,
-        # Full Client Hints, bot-vendor cohorts (PerimeterX/Kasada/Imperva/F5/
-        # Signal Sciences/Radware), mobile signals, WebGL exts, speech voices,
-        # battery fluctuation, privacy sandbox, extension emu, ad blocker
-        # realism, first-party sets, post-conversion behaviour.
-        # Non-blocking — a failure of the whole v2.3.0 stack still leaves
-        # the browser fully functional with the v2.2.x baseline stack.
-        try:
-            from anti_detect_v230 import apply_v230_stealth, full_client_hints, sec_fetch_headers
-            _v230_report = await apply_v230_stealth(
-                context, ua=ua, viewport=viewport, platform=""
-            )
-            # Merge v2.3.0 headers into the context's extra_http_headers
-            # (this replaces the earlier Accept-Language-only set with a
-            # full Chrome 128+ header suite).
-            _extra_hdrs = dict(context_kwargs.get("extra_http_headers") or {})
-            _extra_hdrs.update(_v230_report.get("headers") or {})
-            _extra_hdrs.update(_profile_ch_hints)
-            _extra_hdrs["Accept-Language"] = accept_lang
-            await context.set_extra_http_headers(_extra_hdrs)
-            logger.info(
-                f"[profile-launch] v2.3.0 anti-detect ON — "
-                f"js_ok={_v230_report.get('js_ok')} "
-                f"headers={len(_v230_report.get('headers') or {})}"
-            )
-        except Exception as _v230_err:
-            logger.debug(f"v2.3.0 anti-detect apply skipped: {_v230_err}")
-
         try:
             from referrer_pro import make_sec_ch_ua_strip_route_handler
             await context.route("**/*", make_sec_ch_ua_strip_route_handler())
         except Exception as _route_err:
             logger.debug(f"profile sec-ch-ua route strip skipped: {_route_err}")
 
+        _ctx_hdrs = dict(context_kwargs.get("extra_http_headers") or {})
+        _ctx_hdrs["Accept-Language"] = accept_lang
+
         if master:
             try:
-                # Reuse RUT's stealth builder so the SAME ~35 JS patches
-                # land here. Falls back to a minimal stub if the import
-                # ever fails (keeps the launcher usable in isolation).
-                from real_user_traffic import _build_stealth_script
-                from anti_detect_v230 import (
-                    align_webgl_to_ua_deterministic as _align_webgl,
-                    natural_canvas_js as _natural_canvas,
-                    webgl_align_js as _webgl_align_js,
-                    _stable_hash as _stable_hash_fn,
+                # v2.7.5 — Full RUT stealth parity (complete fp + same inject
+                # order as `_rut_apply_context_stealth`). Profile viewport /
+                # headed Chrome stay profile-owned; seeds are stable per id.
+                from anti_detect_v230 import _stable_hash as _stable_hash_fn
+                from real_user_traffic import _rut_apply_context_stealth
+
+                _stealth_fp = _build_profile_stealth_fp(
+                    ua,
+                    profile_id=profile_id or session_id,
+                    viewport=context_kwargs["viewport"],
+                    dsf=dsf,
+                    is_mobile=is_mobile,
+                    has_touch=has_touch,
+                    profile_os=str(profile_os or ""),
                 )
+                if _stealth_fp.get("webgl_vendor") and _stealth_fp.get("webgl_renderer"):
+                    _webgl_cfg = {
+                        "vendor": _stealth_fp["webgl_vendor"],
+                        "renderer": _stealth_fp["webgl_renderer"],
+                        "gpu_family": _stealth_fp.get("gpu_family", ""),
+                    }
+                    _fingerprint_hash = _compute_fingerprint_hash(
+                        _profile_ua,
+                        context_kwargs["viewport"],
+                        profile_id,
+                        _webgl_cfg,
+                    )
 
-                # 2026-07 — DETERMINISTIC WebGL GPU alignment.
-                # Compute the GPU descriptor from (UA, profile_id) so
-                # the SAME profile always reports the SAME GPU across
-                # sessions — mimics a real user who doesn't swap
-                # graphics cards. Different profiles get different
-                # GPUs drawn from the correct pool for the reported
-                # platform (macOS → Apple/Intel, Windows → NVIDIA/AMD/
-                # Intel, iOS → Apple GPU, etc.).
-                _profile_ua = str(context_kwargs.get("user_agent") or profile_config.get("user_agent") or "")
-                if _webgl_cfg is None:
-                    try:
-                        _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
-                    except Exception as _we:
-                        logger.debug(f"webgl deterministic alignment skipped: {_we}")
-
-                fp = {
-                    "viewport": context_kwargs["viewport"],
-                    "device_scale_factor": dsf,
-                    "is_mobile": is_mobile,
-                    "has_touch": has_touch,
-                    "os": profile_os or ("ios" if is_mobile else "windows"),
-                }
-                # Push aligned WebGL vendor/renderer into fp so the
-                # baseline stealth script's UNMASKED_VENDOR/RENDERER
-                # override reports these exact strings. This closes
-                # the "UA says Mac but WebGL says NVIDIA" detection.
-                if _webgl_cfg:
-                    fp["webgl_vendor"] = _webgl_cfg["vendor"]
-                    fp["webgl_renderer"] = _webgl_cfg["renderer"]
                 geo_stealth = {
                     "locale": locale,
                     "timezone": timezone_id,
@@ -914,41 +1353,64 @@ async def _launch_profile_session_inner(
                     "lat": geo["lat"],
                     "lon": geo["lon"],
                 }
-                stealth_js = _build_stealth_script(fp, geo_stealth)
-                await context.add_init_script(stealth_js)
+                await _rut_apply_context_stealth(
+                    context,
+                    fp=_stealth_fp,
+                    geo=geo_stealth,
+                    ua=ua,
+                    platform=str(_stealth_fp.get("platform") or ""),
+                    ctx_headers=_ctx_hdrs,
+                    fp_hash_override=_stable_hash_fn(str(profile_id or session_id)),
+                    identity_label=str(profile_id or session_id),
+                )
+                logger.info(
+                    f"[profile-launch] RUT-parity stealth ON — "
+                    f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
+                    f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]}"
+                )
 
                 if paranoia_mode:
                     await context.add_init_script(
                         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
                         "window.chrome = window.chrome || { runtime: {} };"
                     )
-
-                # 2026-07 — Natural canvas + WebGL alignment overrides.
-                # Injected AFTER the baseline so they override the
-                # simple XOR canvas noise and enforce the aligned GPU
-                # constants (MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, etc).
-                # Order matters: init scripts run in add-order and
-                # the last prototype override wins.
-                if _webgl_cfg:
-                    try:
-                        # Deterministic seed per profile — real users have
-                        # the same fingerprint every session.
-                        _canvas_seed = _stable_hash_fn(str(profile_id or session_id) + ":canvas")
-                        await context.add_init_script(_natural_canvas(_canvas_seed))
-                        await context.add_init_script(_webgl_align_js(_webgl_cfg))
-                        logger.debug(
-                            f"[profile-launch] natural canvas + webgl align injected "
-                            f"(gpu_family={_webgl_cfg.get('gpu_family')}, "
-                            f"renderer={_webgl_cfg.get('renderer', '')[:60]}...)"
-                        )
-                    except Exception as _oe:
-                        logger.debug(f"natural canvas/webgl align inject failed: {_oe}")
             except Exception as e:
                 logger.warning(f"anti-detect script injection failed: {e}")
-                # Minimal fallback — at least hide webdriver flag
+                try:
+                    context._krx_stealth_degraded = True
+                except Exception:
+                    pass
+                # Minimal fallback — at least hide webdriver flag + try v230
+                # (headed Profile soft-fails with warning; visit still opens)
+                try:
+                    from anti_detect_v230 import apply_v230_stealth
+                    _v230_report = await apply_v230_stealth(
+                        context, ua=ua, viewport=viewport, platform=""
+                    )
+                    _extra_hdrs = dict(_ctx_hdrs)
+                    _extra_hdrs.update(_v230_report.get("headers") or {})
+                    _extra_hdrs.update(_profile_ch_hints)
+                    _extra_hdrs["Accept-Language"] = accept_lang
+                    await context.set_extra_http_headers(_extra_hdrs)
+                except Exception:
+                    pass
                 await context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
                 )
+        else:
+            # Master anti-detect off — still apply v2.3.0 baseline when possible.
+            try:
+                from anti_detect_v230 import apply_v230_stealth
+                _v230_report = await apply_v230_stealth(
+                    context, ua=ua, viewport=viewport, platform=""
+                )
+                _extra_hdrs = dict(_ctx_hdrs)
+                _extra_hdrs.update(_v230_report.get("headers") or {})
+                _extra_hdrs.update(_profile_ch_hints)
+                _extra_hdrs["Accept-Language"] = accept_lang
+                await context.set_extra_http_headers(_extra_hdrs)
+            except Exception as _v230_err:
+                logger.debug(f"v2.3.0 anti-detect apply skipped: {_v230_err}")
 
         page = await context.new_page()
 
@@ -1428,6 +1890,14 @@ async def process_pending_user_session_launches(
     profile was launched from the cloud UI (krexion.com), so the
     customer's cloud view stays in sync.
     """
+    # 0. Expire launches the tray never claimed (stuck "queued" cards).
+    try:
+        n_expired = await expire_stale_user_session_launches(motor_db)
+        if n_expired:
+            logger.info(f"[user-session] expired {n_expired} stale queued launch(es)")
+    except Exception as _exp_err:  # noqa: BLE001
+        logger.debug(f"[user-session] expire stale skipped: {_exp_err}")
+
     # 1. Cancel queued launches that were stopped before the tray picked them up.
     try:
         async for _cancel_doc in motor_db[_LAUNCH_QUEUE_COLLECTION].find({
@@ -1616,4 +2086,7 @@ __all__ = [
     "request_stop",
     "list_running",
     "process_pending_user_session_launches",
+    "expire_stale_user_session_launches",
+    "_build_profile_stealth_fp",
+    "_PROFILE_HEADED_LAUNCH_ARGS",
 ]

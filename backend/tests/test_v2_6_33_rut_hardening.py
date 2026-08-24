@@ -67,7 +67,7 @@ def test_tunnel_retry_full_stealth_in_source():
     marker = "v2.6.33 — Re-probe geo on rotated proxy"
     assert marker in src
     idx = src.index(marker)
-    chunk = src[idx : idx + 3500]
+    chunk = src[idx : idx + 6500]
     assert "_rut_apply_context_stealth(" in chunk
     assert "force_referer=" in chunk
 

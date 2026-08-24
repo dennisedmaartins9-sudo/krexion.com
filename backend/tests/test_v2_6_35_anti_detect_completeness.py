@@ -41,7 +41,7 @@ def test_fire_pixel_prefire_and_navigate_helpers_exist():
 
 def test_rut_ad_chain_default_is_disabled():
     src = RUT_FILE.read_text(encoding="utf-8")
-    assert re.search(r"tls_prewarm:\s*bool\s*=\s*True", src)
+    assert re.search(r"tls_prewarm:\s*bool\s*=\s*False", src)
     assert re.search(r"ip_warmup_enabled:\s*bool\s*=\s*False", src)
     assert re.search(r"behavioral_bio_enabled:\s*bool\s*=\s*True", src)
     assert re.search(r"ad_chain_simulation_enabled:\s*bool\s*=\s*False", src)

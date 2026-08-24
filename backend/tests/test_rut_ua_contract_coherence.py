@@ -87,12 +87,13 @@ def test_no_hints_for_ios_crios_firefox_or_safari():
     assert builder({}, firefox) == {}
 
 
-def test_route_hint_reconciliation_preserves_chromium_high_entropy_only():
+def test_route_hint_reconciliation_rebuilds_high_entropy_via_full_client_hints():
     apply_hints = _load_rut_function(
         "_apply_contract_client_hints",
         {
             "Any": Any,
             "Dict": Dict,
+            "Optional": __import__("typing").Optional,
             "_build_client_hint_headers": lambda _fp, ua: {
                 {
                     "sec-ch-ua": "Sec-CH-UA",
@@ -107,22 +108,25 @@ def test_route_hint_reconciliation_preserves_chromium_high_entropy_only():
         "sec-ch-ua": '"Wrong";v="1"',
         "Sec-CH-UA-Mobile": "?0",
         "SEC-CH-UA-PLATFORM": '"Windows"',
-        "Sec-CH-UA-Model": '"Pixel 8"',
-        "Sec-CH-UA-Platform-Version": '"14.0.0"',
-        "Sec-CH-UA-Arch": '"arm"',
-        "Sec-CH-UA-Bitness": '"64"',
-        "Sec-CH-UA-Full-Version-List": '"Google Chrome";v="149.0.7827.114"',
+        "Sec-CH-UA-Model": '"StaleModel"',
+        "Sec-CH-UA-Platform-Version": '"99.0.0"',
+        "Sec-CH-UA-Arch": '"x86"',
+        "Sec-CH-UA-Bitness": '"32"',
+        "Sec-CH-UA-Full-Version-List": '"Google Chrome";v="1.0.0.0"',
         "X-Test": "keep",
     }
     chromium = apply_hints(negotiated, ANDROID)
+    # High-entropy rebuilt from UA via full_client_hints (not stale negotiated).
     assert chromium["Sec-CH-UA-Model"] == '"Pixel 8"'
     assert chromium["Sec-CH-UA-Platform-Version"] == '"14.0.0"'
     assert chromium["Sec-CH-UA-Arch"] == '"arm"'
     assert chromium["Sec-CH-UA-Bitness"] == '"64"'
     assert "149.0.7827.114" in chromium["Sec-CH-UA-Full-Version-List"]
+    # Low-entropy overlaid from UA contract.
     assert chromium["Sec-CH-UA-Mobile"] == "?1"
     assert chromium["Sec-CH-UA-Platform"] == '"Android"'
     assert not any(key in chromium for key in ("sec-ch-ua", "SEC-CH-UA-PLATFORM"))
+    assert chromium["X-Test"] == "keep"
 
     webkit = apply_hints(negotiated, IOS)
     assert webkit == {"X-Test": "keep"}
@@ -248,7 +252,7 @@ def test_mobile_fingerprint_preserves_instagram_resolution_and_dpr():
             "_sanitize_swiftshader_webgl": lambda _os, vendor, renderer: (
                 vendor, renderer
             ),
-            "_OS_FONTS": {"android": [], "windows": []},
+            "_OS_FONTS": {"android": [], "windows": [], "linux": [], "macos": []},
             "client_hint_headers_for_ua": client_hint_headers_for_ua,
         },
     )
@@ -311,10 +315,14 @@ def test_context_accept_language_is_shared_by_every_outbound_request_path():
     tree = ast.parse(source)
     outbound_values = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not (9950 <= node.lineno <= 12000):
+        if not isinstance(node, ast.Call):
             continue
         for keyword in node.keywords:
-            if keyword.arg == "accept_language":
+            if keyword.arg != "accept_language":
+                continue
+            # Only the visit outbound paths that must share context AL
+            # (ignore helper defaults / other modules' kwargs).
+            if isinstance(keyword.value, ast.Name) and keyword.value.id == "_context_accept_language":
                 outbound_values.append(keyword.value)
 
     assert len(outbound_values) == 2

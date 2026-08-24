@@ -524,7 +524,13 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
         model = '"iPhone"' if "iphone" in ua_low else '"iPad"'; mobile = "?1"
     elif "android" in ua_low:
         platform = '"Android"'; platform_ver = '"14.0.0"'; arch = '"arm"'; bitness = '"64"'
-        model = '"SM-S928B"'; mobile = "?1"
+        _model_m = re.search(r"Android[^;]*;\s*([^);]+)", ua or "")
+        if _model_m:
+            _model_raw = re.split(r"\s+Build/", _model_m.group(1).strip(), maxsplit=1)[0].strip()
+            model = f'"{_model_raw}"' if _model_raw else '""'
+        else:
+            model = '""'
+        mobile = "?1"
     elif "mac os" in ua_low or "macintosh" in ua_low:
         platform = '"macOS"'; platform_ver = '"15.1.0"'; arch = '"arm"'; bitness = '"64"'
         model = '""'; mobile = "?0"
@@ -540,6 +546,20 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
     ua_short = f'{grease_brand};v={grease_ver}, "Chromium";v="{major_ver}", "Google Chrome";v="{major_ver}"'
     ua_full  = f'{grease_brand};v={grease_ver}, "Chromium";v="{full_ver}", "Google Chrome";v="{full_ver}"'
 
+    # DPR: prefer viewport device_scale_factor; else mobile→2/3, desktop→1.
+    _dsf = viewport.get("device_scale_factor") if isinstance(viewport, dict) else None
+    if _dsf is not None:
+        try:
+            dpr = str(float(_dsf)).rstrip("0").rstrip(".") if "." in str(float(_dsf)) else str(int(float(_dsf)))
+            if dpr == "":
+                dpr = "1"
+        except Exception:
+            dpr = "3" if mobile == "?1" else "1"
+    elif mobile == "?1":
+        dpr = "3"
+    else:
+        dpr = "1"
+
     return {
         "Sec-CH-UA": ua_short,
         "Sec-CH-UA-Mobile": mobile,
@@ -550,10 +570,10 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
         "Sec-CH-UA-Arch": f'"{arch.strip(chr(34))}"',
         "Sec-CH-UA-Bitness": bitness,
         "Sec-CH-UA-WoW64": "?0",
-        "Sec-CH-Prefers-Color-Scheme": random.choice(['"light"', '"dark"']),
+        "Sec-CH-Prefers-Color-Scheme": '"light"',
         "Sec-CH-Prefers-Reduced-Motion": '"no-preference"',
         "Sec-CH-Viewport-Width": str(int(viewport.get("width", 1920))),
-        "Sec-CH-DPR": random.choice(["1", "1.25", "1.5", "2"]),
+        "Sec-CH-DPR": dpr,
     }
 
 
@@ -561,29 +581,42 @@ def full_client_hints(ua: str, viewport: Optional[Dict[str, int]] = None) -> Dic
 # 8. CHROMIUM BINARY VERSION ↔ UA STRING DRIFT CHECK
 # ══════════════════════════════════════════════════════════════════════
 def align_ua_to_chromium(ua: str, actual_chromium_ver: Optional[int] = None) -> str:
-    """Rewrite the Chrome version in `ua` to match `actual_chromium_ver`
-    (or auto-detect if omitted).  Prevents the "UA says Chrome 133 but
-    binary is 128" drift signal.  If actual version can't be detected,
-    returns UA unchanged (safe no-op)."""
+    """Rewrite the Chrome/CriOS major in `ua` to match `actual_chromium_ver`
+    (or auto-detect if omitted). Always match binary major when drift > 0.
+    If actual version can't be detected, returns UA unchanged (safe no-op)."""
     if not ua:
         return ua
     if actual_chromium_ver is None:
         actual_chromium_ver = detect_installed_chromium_major()
     if not actual_chromium_ver:
         return ua
-    m = re.search(r"Chrome/(\d+)", ua)
-    if not m:
-        return ua
-    declared = int(m.group(1))
-    # Allow +/- 3 major version drift (natural for real users who don't
-    # auto-update instantly).  Only rewrite if outside that band.
-    if abs(declared - actual_chromium_ver) <= 3:
-        return ua
-    return re.sub(
-        r"(Chrome/)\d+(\.\d+\.\d+\.\d+)",
-        lambda m2: f"{m2.group(1)}{actual_chromium_ver}{m2.group(2)}",
-        ua, count=1,
-    )
+
+    def _rewrite_token(token: str, text: str) -> str:
+        m = re.search(rf"{token}/(\d+)", text)
+        if not m:
+            return text
+        declared = int(m.group(1))
+        if abs(declared - actual_chromium_ver) == 0:
+            return text
+        # Prefer full x.y.z.w rewrite; fall back to major-only token.
+        rewritten = re.sub(
+            rf"({token}/)\d+(\.\d+\.\d+\.\d+)",
+            lambda m2: f"{m2.group(1)}{actual_chromium_ver}{m2.group(2)}",
+            text,
+            count=1,
+        )
+        if rewritten != text:
+            return rewritten
+        return re.sub(
+            rf"({token}/)\d+",
+            rf"\g<1>{actual_chromium_ver}",
+            text,
+            count=1,
+        )
+
+    out = _rewrite_token("Chrome", ua)
+    out = _rewrite_token("CriOS", out)
+    return out
 
 
 def detect_installed_chromium_major() -> Optional[int]:
@@ -1318,10 +1351,15 @@ def natural_canvas_js(seed: int) -> str:
 # Values sourced from browserleaks.com/webgl real-fleet aggregates.
 _GPU_POOL_WINDOWS = [
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
+    ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (Intel)",  "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
+    ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
     ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)", 16384, 30, 4096, 8),
 ]
@@ -1339,8 +1377,10 @@ _GPU_POOL_LINUX = [
     ("Google Inc. (AMD)",    "ANGLE (AMD, AMD Radeon Graphics (renoir, LLVM 15.0.7, DRM 3.49, 6.1.0-16-amd64), OpenGL 4.6)", 16384, 30, 4096, 8),
 ]
 _GPU_POOL_ANDROID = [
+    ("Google Inc. (Qualcomm)", "ANGLE (Qualcomm, Adreno (TM) 660, OpenGL ES 3.2)", 16384, 15, 256, 8),
     ("Google Inc. (Qualcomm)", "ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)", 16384, 15, 256, 8),
     ("Google Inc. (Qualcomm)", "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)", 16384, 15, 256, 8),
+    ("Google Inc. (ARM)",      "ANGLE (ARM, Mali-G68 MP5, OpenGL ES 3.2)", 8192, 15, 256, 8),
     ("Google Inc. (ARM)",      "ANGLE (ARM, Mali-G78 MP14, OpenGL ES 3.2)", 8192, 15, 256, 8),
     ("Google Inc. (ARM)",      "ANGLE (ARM, Mali-G710 MP7, OpenGL ES 3.2)", 8192, 15, 256, 8),
 ]
@@ -1494,6 +1534,7 @@ async def apply_v230_stealth(
     ua: str = "",
     viewport: Optional[Dict[str, int]] = None,
     platform: str = "",
+    sec_fetch_kind: str = "typed_url",
 ) -> Dict[str, Any]:
     """One-call orchestrator that wires every v2.3.0 JS feature into a
     Playwright browser context AND returns the header dict the caller
@@ -1503,7 +1544,7 @@ async def apply_v230_stealth(
     try:
         # Set extra HTTP headers (Sec-Fetch-* + Full Client Hints)
         headers = {}
-        headers.update(sec_fetch_headers("ad_click"))
+        headers.update(sec_fetch_headers(sec_fetch_kind or "typed_url"))
         headers.update(full_client_hints(ua, viewport))
         report["headers"] = headers
         report["http2_settings"] = http2_settings_for_ua(ua)

@@ -285,6 +285,23 @@ async def ensure_chromium_installed() -> Optional[str]:
         return None
 
 
+async def ensure_webkit_installed() -> Optional[str]:
+    """Ensure Playwright WebKit is present (iOS dual-engine). Native EXE
+    should already ship it under browser-engine; this is a safety net."""
+    try:
+        from real_user_traffic import (
+            _ensure_webkit_available,
+            _webkit_runtime_available,
+        )
+        if _webkit_runtime_available():
+            return "ready"
+        ok = await _ensure_webkit_available()
+        return "ready" if ok else None
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"webkit ensure skipped: {e}")
+        return None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public bootstrap entry point
 # ──────────────────────────────────────────────────────────────────────
@@ -298,7 +315,7 @@ async def bootstrap_browsers_async() -> dict:
 
     Customer experience:
       Customer downloads Krexion → app starts → backend warms up →
-      THIS function fires in background → Brave/Chromium download
+      THIS function fires in background → Brave/Chromium/WebKit download
       kicks off → ~2-3 min later browser_variants.list_available_variants()
       starts returning ["chromium", "brave", ...] → UI Phase 3 panel's
       "Browser Binary" dropdown auto-populates additional options →
@@ -314,14 +331,16 @@ async def bootstrap_browsers_async() -> dict:
         "browsers_dir": str(_krexion_browsers_dir()),
         "brave": None,
         "chromium": None,
+        "webkit": None,
         "errors": [],
     }
-    # Run both in parallel — independent
+    # Run in parallel — independent
     try:
         brave_task = asyncio.create_task(ensure_brave_installed())
         chrom_task = asyncio.create_task(ensure_chromium_installed())
-        brave_path, chrom_path = await asyncio.gather(
-            brave_task, chrom_task, return_exceptions=True,
+        wk_task = asyncio.create_task(ensure_webkit_installed())
+        brave_path, chrom_path, wk_path = await asyncio.gather(
+            brave_task, chrom_task, wk_task, return_exceptions=True,
         )
         if isinstance(brave_path, Exception):
             out["errors"].append(f"brave: {brave_path}")
@@ -331,6 +350,10 @@ async def bootstrap_browsers_async() -> dict:
             out["errors"].append(f"chromium: {chrom_path}")
         else:
             out["chromium"] = chrom_path
+        if isinstance(wk_path, Exception):
+            out["errors"].append(f"webkit: {wk_path}")
+        else:
+            out["webkit"] = wk_path
     except Exception as e:  # noqa: BLE001
         out["errors"].append(f"bootstrap: {e}")
     logger.info(f"browser bootstrap done: {out}")
@@ -341,4 +364,5 @@ __all__ = [
     "bootstrap_browsers_async",
     "ensure_brave_installed",
     "ensure_chromium_installed",
+    "ensure_webkit_installed",
 ]

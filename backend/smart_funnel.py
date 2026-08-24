@@ -1560,9 +1560,13 @@ async def _human_page_click(page, x: float, y: float, *, fast: Optional[bool] = 
     jx = x + random.uniform(-2.5, 2.5)
     jy = y + random.uniform(-2.5, 2.5)
     try:
-        await page.mouse.move(jx, jy, steps=random.randint(10, 18))
+        from advanced_anti_detect import BehavioralProfile
+        await BehavioralProfile.move_mouse_human(page, None, (jx, jy))
     except Exception:
-        await page.mouse.move(jx, jy)
+        try:
+            await page.mouse.move(jx, jy, steps=random.randint(10, 18))
+        except Exception:
+            await page.mouse.move(jx, jy)
     await asyncio.sleep(random.uniform(0.05, 0.12))
     await page.mouse.down()
     await asyncio.sleep(random.uniform(0.04, 0.1))

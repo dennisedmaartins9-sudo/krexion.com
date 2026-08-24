@@ -11,7 +11,7 @@
 ;   • bin\krexion-core.exe            — Krexion-branded core engine binary
 ;   • bin\krexion-service.exe         — Windows service wrapper (renamed NSSM)
 ;   • database\                       — Embedded local database engine
-;   • browser-engine\                 — Bundled Chromium for anti-detect
+;   • browser-engine\                 — Bundled Chromium + WebKit (Android/iOS)
 ;   • frontend\                       — Production React build
 ;   • krexion-tray.exe                — System tray app (optional)
 ;
@@ -98,7 +98,8 @@ Source: "..\build\nssm-portable\nssm.exe"; DestDir: "{app}\bin"; DestName: "{#Ap
 ; Local database engine (MongoDB Portable, folder renamed to `database`)
 Source: "..\build\mongo-portable\*"; DestDir: "{app}\database"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Browser engine (Playwright Chromium, folder renamed to `browser-engine`)
+; Browser engine (Playwright Chromium + WebKit → `browser-engine`)
+; WebKit enables iOS Safari-honest dual-engine without manual `playwright install`.
 Source: "..\build\chromium-bundle\*"; DestDir: "{app}\browser-engine"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; Frontend production build — required

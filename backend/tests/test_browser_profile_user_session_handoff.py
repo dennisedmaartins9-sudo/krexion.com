@@ -122,14 +122,27 @@ def test_enqueue_inserts_record_and_notifies():
     """The enqueue helper must write a complete queue record AND call
     the on_session_update callback with status='queued' so the frontend
     flips off the 'launching...' state immediately."""
+    import types
+
     fake_collection = AsyncMock()
     fake_collection.insert_one = AsyncMock()
     fake_db = MagicMock()
     fake_db.__getitem__.return_value = fake_collection
 
     callback = AsyncMock()
+    fake_server = types.ModuleType("server")
+    fake_server.db = fake_db
 
-    with patch("server.db", fake_db, create=True):
+    created = []
+
+    def _capture_task(coro):
+        created.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        return MagicMock()
+
+    with patch.dict(sys.modules, {"server": fake_server}), \
+         patch.object(bpl.asyncio, "create_task", side_effect=_capture_task):
         result = asyncio.run(bpl._enqueue_for_user_session(
             profile_config={"id": "profile-xyz", "name": "Test"},
             session_id="session-abc",
@@ -154,6 +167,7 @@ def test_enqueue_inserts_record_and_notifies():
 
     assert result["queued"] is True
     assert result["ok"] is True
+    assert len(created) >= 1  # tray pickup watchdog scheduled
 
 
 # ── process_pending_user_session_launches() ─────────────────────────

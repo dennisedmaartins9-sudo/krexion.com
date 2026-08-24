@@ -451,7 +451,10 @@ export default function BrowserProfilesPage() {
         <div className="mb-6 p-3 rounded-lg bg-amber-950/20 border border-amber-700/40 text-xs text-amber-200 flex items-start gap-2">
           <Shield className="w-4 h-4 mt-0.5 text-amber-300" />
           <div>
-            <span className="font-semibold">How it works:</span> Configure profile here in the cloud. Click <span className="text-amber-300">Launch</span> → your Krexion desktop app picks up the job → opens a HEADED Chromium with all anti-detect injected + cookies/localStorage seeded from previous sessions. Manual browsing fully anonymous, looks like a real user. Storage state syncs back here so you can resume across devices.
+            <span className="font-semibold">How it works:</span> Create a profile, then click{" "}
+            <span className="text-amber-300">Launch</span>. On Local Engine / Native, Chromium opens on this PC
+            (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
+            app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
           </div>
         </div>
 
@@ -522,9 +525,14 @@ export default function BrowserProfilesPage() {
                   {statusMap[p.id]?.message && (
                     <div className="mt-2 text-[10px] text-amber-300/80 italic">{statusMap[p.id].message}</div>
                   )}
-                  {p.status === "error" && p.last_error && (
+                  {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
                     <div className="mt-2 text-[10px] text-red-300/90 italic break-words" data-testid={`bp-last-error-${p.id}`}>
                       ⚠ {p.last_error}
+                    </div>
+                  )}
+                  {p.status === "queued" && !p.last_error && (
+                    <div className="mt-2 text-[10px] text-amber-300/80 italic">
+                      Waiting for Krexion tray to open Chromium… Keep the tray app running.
                     </div>
                   )}
                 </CardContent>
@@ -608,7 +616,7 @@ export default function BrowserProfilesPage() {
                           is_mobile: mob,
                           has_touch: mob,
                           device_scale_factor: mob ? 3 : 1,
-                          os: mob ? "ios" : "windows",
+                          os: mob ? "android" : "windows",
                           viewport: newViewport,
                         });
                         // Sync UA platform to match device by default
@@ -620,6 +628,11 @@ export default function BrowserProfilesPage() {
                       <option value="desktop">Desktop</option>
                       <option value="mobile">Mobile</option>
                     </select>
+                    {form.device_type === "mobile" && (
+                      <p className="text-[11px] text-zinc-500 mt-1">
+                        iOS uses WebKit bundled in Krexion Setup (no manual install); Android uses Chromium. If WebKit is missing from an old install, backend installs it in the background or falls back to Android Chrome.
+                      </p>
+                    )}
                   </div>
                   <div className="col-span-2">
                     <Label className="text-zinc-300 text-xs">Start URL</Label>

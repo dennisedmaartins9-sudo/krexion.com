@@ -126,28 +126,33 @@ if (-not (Test-Path "$nssmPortable\nssm.exe")) {
 }
 Ok "NSSM: $nssmPortable\nssm.exe"
 
-# ── Step 4: Download Playwright Chromium ────────────────────────────
-Step 4 9 "Downloading Playwright Chromium (anti-detect browser)"
+# ── Step 4: Download Playwright Chromium + WebKit ───────────────────
+Step 4 9 "Downloading Playwright Chromium + WebKit (Android + iOS engines)"
 if (-not $SkipChromium) {
     $chromiumBundle = Join-Path $BuildDir "chromium-bundle"
-    if (-not (Test-Path "$chromiumBundle\chromium-*\chrome-win\chrome.exe")) {
+    $needChromium = -not (Test-Path "$chromiumBundle\chromium-*\chrome-win\chrome.exe")
+    $needWebkit = -not (Test-Path "$chromiumBundle\webkit-*")
+    if ($needChromium -or $needWebkit) {
         $env:PLAYWRIGHT_BROWSERS_PATH = $chromiumBundle
         # The build-backend already pip-installed playwright into the embedded
         # python. We need to run `playwright install` from THAT install.
         $embedPython = Join-Path $TargetDir "python.exe"
+        $browsers = @()
+        if ($needChromium) { $browsers += @("chromium", "chromium-headless-shell") }
+        if ($needWebkit) { $browsers += "webkit" }
+        if ($browsers.Count -eq 0) { $browsers = @("chromium", "chromium-headless-shell", "webkit") }
+        Info ("Installing Playwright browsers: " + ($browsers -join ", "))
         if (Test-Path $embedPython) {
-            Info "Installing Chromium via embedded Python..."
-            & $embedPython -m playwright install chromium --no-shell
+            & $embedPython -m playwright install @browsers
         }
         else {
-            # Fallback: system playwright
-            python -m playwright install chromium --no-shell
+            python -m playwright install @browsers
         }
     }
-    Ok "Chromium bundle: $chromiumBundle"
+    Ok "Browser-engine bundle (Chromium + WebKit): $chromiumBundle"
 }
 else {
-    Warn "Skipped Chromium download (per -SkipChromium)"
+    Warn "Skipped Chromium/WebKit download (per -SkipChromium)"
 }
 
 # ── Step 5: Build React frontend ─────────────────────────────────────

@@ -41,8 +41,8 @@ REGION = {
     "code": "US", "country": "United States", "byte_locale": "en",
     "posix_locale": "en_US", "lang_tag": "en-US",
 }
-WEBVIEW = "151.0.7922.83"
-DESKTOP_CHROME = "151.0.7922.109"
+WEBVIEW = "136.0.7103.125"
+DESKTOP_CHROME = "136.0.7103.113"
 
 
 def _templates():
@@ -195,7 +195,7 @@ def test_required_marker_shapes_and_reduced_chrome():
     assert "GoogleApp/17.36.15" in _generate("gsearch", "android")
     chrome = _generate("chrome", "android")
     assert "Android 10; K" in chrome
-    assert "Chrome/151.0.0.0" in chrome
+    assert "Chrome/136.0.0.0" in chrome
     assert "Pixel" not in chrome and "Build/" not in chrome
 
 

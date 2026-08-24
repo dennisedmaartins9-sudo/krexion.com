@@ -1,3 +1,95 @@
+# v2.7.10 — 2026-08 — WebKit ships inside Krexion Setup EXE (no manual install)
+#
+# - Native Windows release CI + Build-Krexion-Windows.ps1 now run
+#   `playwright install chromium chromium-headless-shell webkit` into
+#   build/chromium-bundle → Inno DestDir `{app}\browser-engine`.
+# - PLAYWRIGHT_BROWSERS_PATH already points at browser-engine (unchanged).
+# - Startup safety net: `_ensure_playwright_webkit` + bootstrap ensure_webkit
+#   for older partial installs (background, no user CLI).
+# - UI note: WebKit bundled with Setup; no manual playwright install.
+#
+# v2.7.9 — 2026-08 — Dual-engine browser launch (iOS→WebKit, Android→Chromium)
+#
+# - RUT + Browser Profiles: iOS Safari/WKWebView/CriOS UAs use Playwright
+#   WebKit when installed; Android (and desktop) stay on Chromium.
+# - `_normalize_mobile_ua_for_visit`: keep iOS UA + engine=webkit when WebKit
+#   is available; only coerce to Android Chrome if WebKit is missing.
+# - Dual shared browsers in RUT jobs (`chromium` + lazy `webkit`); align_ua
+#   to Chromium only on the Chromium path.
+# - In-app pool: ~40% iOS when WebKit ready; scrub iOS bases only when not.
+# - Profiles: headed WebKit launch (no channel=chrome); create stores iOS UA
+#   as requested — launch path decides engine / fallback.
+# - Frontend note updated. WebKit ships in Krexion Setup EXE (v2.7.10+);
+#   no manual `playwright install webkit` for customers.
+#
+# v2.7.8 — 2026-08 — Mobile Chromium honesty (iOS/WebKit → Android)
+#
+# - Central `_normalize_mobile_ua_for_chromium` + `_is_ios_webkit_ua`:
+#   Safari AND WKWebView-without-Chrome coerced to Android Chrome/136;
+#   CriOS-on-iPhone also swapped unless KREXION_ALLOW_IOS_SAFARI_UA=1.
+# - RUT visit path: normalize → rebuild fingerprint → live step when swapped.
+# - In-app preset pool: scrub iOS/WebKit operator UAs → Android bases.
+# - Android mobile UA pool ~50/50 Chrome app (no wv) + WebView (wv).
+# - Browser Profiles create/update/advanced_create: coerce UA, infer os from
+#   final UA, default mobile platform android (ios→android unless allow).
+# - Profile launcher: re-infer os/is_mobile/has_touch after coerce; rebuild
+#   stealth fp with corrected os (no stale ios).
+# - Profile mobile fallback UAs: mix app + wv Chrome/136.
+# - UA generator: `_clamp_chrome_versions` after fetch/load (max installed
+#   Chromium major or 136).
+# - Frontend: one-line note that iOS Safari UAs auto-convert on Chromium.
+# - Linux host font shrink still windows/macos only — android fonts unchanged.
+# - referrer_pro coerce already branches FB4A/Android TikTok on Android UA.
+#
+# v2.7.7 — 2026-08 — Remaining anti-detect fixes (UA/136 + Chromium honesty)
+#
+# - UA pools aligned to Chrome/136 (RUT fallbacks, Android mobile pool, TLS
+#   fallbacks, server _CHROME_VERSIONS / WebView, sample UAs, profile mobile).
+# - align_ua_to_chromium: always rewrite when major drift > 0; also CriOS/.
+# - iOS Safari-on-Chromium: coerce pure Safari → Android Chrome unless
+#   KREXION_ALLOW_IOS_SAFARI_UA=1; mobile pick prefers Android.
+# - Client hints: _apply_contract_client_hints(viewport=…) + DPR from fp.
+# - Identity pin race: reuse pinned UA without storage_state; early pin_ua;
+#   first-writer-wins filter on empty ua.
+# - Stealth degrade flag + natural_canvas→baseline canvas fallback; optional
+#   KREXION_STEALTH_FAIL_CLOSED (default off); Profiles soft-fail headed.
+# - Headless-shell variant gated by KREXION_ALLOW_HEADLESS_SHELL.
+# - iframe webdriver getter → undefined; drop force-all-origins QUIC flag;
+#   drop EnableDualStackForChrome (IPv4-proxy-consistent).
+# - smart_funnel clicks use BehavioralProfile bezier when not fast.
+# - Linux host: avoid claiming Windows/macOS-only fonts in fingerprint.
+#
+# v2.7.6 — 2026-08 — Anti-detect hardening (RUT + Browser Profiles)
+#
+# - Identity UA pin: reuse pinned UA when storage_state exists; pin_ua on save/first load.
+# - Stealth JS: webdriver→undefined, connection.type from fp, Chrome-only PDF plugins,
+#   chrome stub gated on Chromium UA, skipCanvasNoise (RUT uses natural_canvas only),
+#   history.length 2-5, fullVersionList grease keeps short version.
+# - Headless-shell fail-closed unless KREXION_ALLOW_HEADLESS_SHELL=1/true/yes.
+# - TLS: chrome133a/chrome136 targets; modern Chrome fallback → chrome136.
+# - Client hints: Android model from UA; DPR from viewport (no random); rebuild
+#   high-entropy via full_client_hints; sec_fetch_kind default typed_url.
+# - Profiles: tls_prewarm default False; align_ua_to_chromium; probe geo always wins;
+#   fallback UAs Chrome/136.x (iOS Safari unchanged). GPU pools expanded.
+#
+# v2.7.5 — 2026-08 — Browser Profiles: RUT-parity anti-detect (keep headed + viewport)
+#
+# - Complete RUT fingerprint via _build_profile_stealth_fp (platform/vendor/HC/
+#   memory/fonts/audio/WebGL) — fixes sparse-fp KeyError that skipped full stealth.
+# - Same inject path as RUT: _rut_apply_context_stealth + v2.3.0 + natural canvas.
+# - Stable per-profile canvas/audio/font seeds (not per-visit random).
+# - Headed launch args match RUT base (WebRTC policy, QUIC, AutomationControlled).
+# - Proxy exit-IP geo align for timezone/locale/lat/lon; Playwright geolocation on.
+# - Intentionally DIFFERENT from RUT: headed Chrome GUI + profile-owned viewport.
+#
+# v2.7.4 — 2026-08 — Browser Profiles: perfect local launch (no stuck "launching")
+#
+# - Local Engine mode `local` now launches in-process like `native` (no orphan cloud bridge).
+# - Failures reset profile to error/idle with last_error (never leave card on launching).
+# - NSSM Session-0 queue: tray pickup watchdog (60s) + expire_stale on drain loop.
+# - Distinct status "queued" while waiting for tray; UI shows last_error / tray hint.
+# - Stop/409 guards include queued. No push until user asks.
+#
 # v2.7.3 — 2026-08 — Flat team IP ledger (no-duplicate, less VPS load)
 #
 # - New permanent collection team_offer_ip_ledger (scope_key + offer_key + ip).

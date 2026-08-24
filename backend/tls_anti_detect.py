@@ -77,11 +77,11 @@ except Exception as _import_err:  # pragma: no cover
 import random as _random_fb
 _FALLBACK_UAS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
 )
 
 
@@ -102,6 +102,7 @@ def is_available() -> bool:
 # curl_cffi supports the following impersonation targets (v0.7+):
 #   chrome99, chrome100, chrome101, chrome104, chrome107, chrome110,
 #   chrome116, chrome119, chrome120, chrome123, chrome124, chrome131,
+#   chrome133a, chrome136,
 #   chrome133a, chrome136, edge99, edge101, safari15_3, safari15_5,
 #   safari17_0, safari17_2_ios, safari18_0, safari18_0_ios
 # We pick the closest match to the visiting UA so the TLS handshake
@@ -116,7 +117,7 @@ _IOS_RE = _re.compile(r"iPhone OS (\d+)_|CPU iPhone OS (\d+)_", _re.IGNORECASE)
 # impersonation targets. Newer ones (chrome136, chrome133a) work but
 # we keep a small set to avoid surprises when curl_cffi adds/removes
 # tags between minor versions.
-_CHROME_TARGETS = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124, 131]
+_CHROME_TARGETS = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124, 131, 133, 136]
 
 
 def _pick_chrome_target(version: int) -> str:
@@ -125,17 +126,21 @@ def _pick_chrome_target(version: int) -> str:
     for t in _CHROME_TARGETS:
         if t <= version and t > best:
             best = t
+    if best >= 136:
+        return "chrome136"
+    if best >= 133:
+        return "chrome133a"
     return f"chrome{best}"
 
 
 def impersonate_for_ua(ua: str) -> str:
     """Return the curl_cffi impersonation tag matching the given UA.
 
-    Falls back to 'chrome131' for anything we can't classify so the
+    Falls back to 'chrome136' for anything we can't classify so the
     handshake still looks like a recent real browser.
     """
     if not ua:
-        return "chrome131"
+        return "chrome136"
     ua_l = ua.lower()
 
     # Edge (Chromium-based, but curl_cffi has dedicated edge tags)
@@ -177,7 +182,7 @@ def impersonate_for_ua(ua: str) -> str:
     if m:
         return _pick_chrome_target(int(m.group(1)))
 
-    return "chrome131"
+    return "chrome136"
 
 
 def _async_session_kwargs(
@@ -188,7 +193,7 @@ def _async_session_kwargs(
 ) -> Dict[str, Any]:
     """Build curl_cffi AsyncSession kwargs with TLS + HTTP/2 alignment."""
     kwargs: Dict[str, Any] = {
-        "impersonate": impersonate_for_ua(ua) if ua else "chrome131",
+        "impersonate": impersonate_for_ua(ua) if ua else "chrome136",
         "timeout": timeout,
         "verify": verify,
     }
@@ -360,7 +365,7 @@ async def prewarm_target(
             "status": 200,
             "cookies": [ {name, value, domain, path, ...}, ... ],   # ready for context.add_cookies(...)
             "final_url": "https://...",                              # after redirects
-            "impersonate": "chrome131",
+            "impersonate": "chrome136",
             "used": True,
         }
 
@@ -379,7 +384,7 @@ async def prewarm_target(
         return None
 
     proxy_uri = _build_proxy_uri(proxy) if proxy else None
-    impersonate = impersonate_for_ua(ua) if ua else "chrome131"
+    impersonate = impersonate_for_ua(ua) if ua else "chrome136"
 
     req_headers = {
         "User-Agent": ua or _fallback_ua(),
@@ -574,7 +579,7 @@ async def head_or_get_status(
     if not _CURL_CFFI_AVAILABLE or _AsyncSession is None:
         return None
     proxy_uri = _build_proxy_uri(proxy) if proxy else None
-    impersonate = impersonate_for_ua(ua) if ua else "chrome131"
+    impersonate = impersonate_for_ua(ua) if ua else "chrome136"
 
     req_headers = {
         "User-Agent": ua or _fallback_ua(),

@@ -70,8 +70,14 @@ def test_apply_inapp_preset_replaces_third_party_browsers():
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             if node.target.id in wanted_constants:
                 nodes.append(node)
+    # v2.7.9 — extracted helpers call module-level dual-engine guards;
+    # stub them so this AST-isolated exec stays self-contained.
     namespace = {
         "random": random, "Dict": Dict, "List": List, "Tuple": Tuple,
+        "_allow_ios_safari_ua": lambda: False,
+        "_webkit_runtime_available": lambda: False,
+        "_is_ios_webkit_ua": lambda _u: False,
+        "_is_ios_claiming_ua": lambda _u: False,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(RUT_FILE), "exec"), namespace)
     rut = SimpleNamespace(**namespace)
