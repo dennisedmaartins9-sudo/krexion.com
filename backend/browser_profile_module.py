@@ -57,7 +57,7 @@ import secrets
 import string
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -123,6 +123,185 @@ _VIEWPORTS_MOBILE = [
     {"width": 360, "height": 780},   # Galaxy S22
     {"width": 412, "height": 915},   # Pixel 7
 ]
+
+# v2.7.12 — Device catalog for mix create + smart naming.
+# Each entry drives viewport/DPR + human-readable auto-name slug.
+_DEVICE_CATALOG: List[Dict[str, Any]] = [
+    # iOS
+    {"id": "iphone16promax", "slug": "iPhone16ProMax", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 16 Pro Max", "viewport": {"width": 440, "height": 956}, "dpr": 3.0},
+    {"id": "iphone16pro", "slug": "iPhone16Pro", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 16 Pro", "viewport": {"width": 402, "height": 874}, "dpr": 3.0},
+    {"id": "iphone15", "slug": "iPhone15", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 15", "viewport": {"width": 390, "height": 844}, "dpr": 3.0},
+    {"id": "iphone14pro", "slug": "iPhone14Pro", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 14 Pro", "viewport": {"width": 393, "height": 852}, "dpr": 3.0},
+    {"id": "iphone13", "slug": "iPhone13", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 13", "viewport": {"width": 390, "height": 844}, "dpr": 3.0},
+    {"id": "iphonese", "slug": "iPhoneSE", "platform": "ios", "brand": "iphone",
+     "label": "iPhone SE", "viewport": {"width": 375, "height": 667}, "dpr": 2.0},
+    {"id": "ipadpro11", "slug": "iPadPro11", "platform": "ios", "brand": "ipad",
+     "label": "iPad Pro 11", "viewport": {"width": 834, "height": 1194}, "dpr": 2.0},
+    # Android
+    {"id": "pixel9", "slug": "Pixel9", "platform": "android", "brand": "google",
+     "label": "Pixel 9", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
+    {"id": "pixel8", "slug": "Pixel8", "platform": "android", "brand": "google",
+     "label": "Pixel 8", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
+    {"id": "pixel7", "slug": "Pixel7", "platform": "android", "brand": "google",
+     "label": "Pixel 7", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
+    {"id": "galaxys24", "slug": "GalaxyS24", "platform": "android", "brand": "samsung",
+     "label": "Galaxy S24", "viewport": {"width": 360, "height": 780}, "dpr": 3.0},
+    {"id": "galaxys23", "slug": "GalaxyS23", "platform": "android", "brand": "samsung",
+     "label": "Galaxy S23", "viewport": {"width": 360, "height": 780}, "dpr": 3.0},
+    {"id": "galaxya55", "slug": "GalaxyA55", "platform": "android", "brand": "samsung",
+     "label": "Galaxy A55", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
+    {"id": "oneplus12", "slug": "OnePlus12", "platform": "android", "brand": "oneplus",
+     "label": "OnePlus 12", "viewport": {"width": 412, "height": 919}, "dpr": 3.5},
+    {"id": "xiaomi14", "slug": "Xiaomi14", "platform": "android", "brand": "xiaomi",
+     "label": "Xiaomi 14", "viewport": {"width": 393, "height": 873}, "dpr": 2.75},
+    # Desktop
+    {"id": "win11chrome", "slug": "Win11-Chrome", "platform": "desktop", "brand": "windows",
+     "label": "Windows 11 Chrome", "viewport": {"width": 1920, "height": 1080}, "dpr": 1.0},
+    {"id": "win11fhd", "slug": "Win11-1536", "platform": "desktop", "brand": "windows",
+     "label": "Windows 11 1536", "viewport": {"width": 1536, "height": 864}, "dpr": 1.25},
+    {"id": "win11hd", "slug": "Win11-1366", "platform": "desktop", "brand": "windows",
+     "label": "Windows 11 1366", "viewport": {"width": 1366, "height": 768}, "dpr": 1.0},
+    {"id": "macchrome", "slug": "Mac-Chrome", "platform": "desktop", "brand": "mac",
+     "label": "macOS Chrome", "viewport": {"width": 1440, "height": 900}, "dpr": 2.0},
+    {"id": "macretina", "slug": "Mac-Retina", "platform": "desktop", "brand": "mac",
+     "label": "macOS Retina", "viewport": {"width": 1680, "height": 1050}, "dpr": 2.0},
+]
+
+
+def _devices_for_platform(platform: str) -> List[Dict[str, Any]]:
+    plat = (platform or "").lower().strip()
+    return [d for d in _DEVICE_CATALOG if d["platform"] == plat]
+
+
+def _find_device(device_id: str) -> Optional[Dict[str, Any]]:
+    key = (device_id or "").strip().lower()
+    if not key:
+        return None
+    for d in _DEVICE_CATALOG:
+        if d["id"] == key or d["slug"].lower() == key:
+            return d
+    return None
+
+
+def _split_mix_counts(
+    total: int,
+    ios_pct: float,
+    android_pct: float,
+    desktop_pct: float,
+) -> Optional[List[Tuple[str, int]]]:
+    """Return [(platform, n), ...] or None when mix disabled (all zero)."""
+    total = max(1, int(total))
+    ios_pct = max(0.0, float(ios_pct or 0))
+    android_pct = max(0.0, float(android_pct or 0))
+    desktop_pct = max(0.0, float(desktop_pct or 0))
+    s = ios_pct + android_pct + desktop_pct
+    if s <= 0:
+        return None
+    ios_pct, android_pct, desktop_pct = (
+        ios_pct / s * 100.0,
+        android_pct / s * 100.0,
+        desktop_pct / s * 100.0,
+    )
+    n_ios = int(round(total * ios_pct / 100.0))
+    n_android = int(round(total * android_pct / 100.0))
+    n_desktop = total - n_ios - n_android
+    # Fix rare overshoot from rounding.
+    while n_desktop < 0 and (n_ios > 0 or n_android > 0):
+        if n_ios >= n_android and n_ios > 0:
+            n_ios -= 1
+        elif n_android > 0:
+            n_android -= 1
+        n_desktop = total - n_ios - n_android
+    while n_ios + n_android + n_desktop > total:
+        if n_desktop > 0:
+            n_desktop -= 1
+        elif n_android > 0:
+            n_android -= 1
+        elif n_ios > 0:
+            n_ios -= 1
+        else:
+            break
+    while n_ios + n_android + n_desktop < total:
+        n_desktop += 1
+    out: List[Tuple[str, int]] = []
+    if n_ios:
+        out.append(("ios", n_ios))
+    if n_android:
+        out.append(("android", n_android))
+    if n_desktop:
+        out.append(("desktop", n_desktop))
+    return out or [("desktop", total)]
+
+
+def _auto_name_device(country: str, device_slug: str) -> str:
+    """Smart unique name: Krexion-iPhone15-US-0825-A7K3."""
+    cc = (country or "us").upper()[:3]
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "", (device_slug or "Device"))[:28] or "Device"
+    ts = datetime.now().strftime("%m%d")
+    suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    return f"Krexion-{slug}-{cc}-{ts}-{suffix}"
+
+
+def _pick_device(
+    platform: str,
+    *,
+    device_mode: str = "random",
+    device_id: str = "",
+    used_ids: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Pick a catalog device for this platform; prefer unused ids in-batch."""
+    used_ids = used_ids if used_ids is not None else set()
+    specific = _find_device(device_id) if (device_mode or "").lower() == "specific" else None
+    if specific and specific["platform"] == platform:
+        used_ids.add(specific["id"])
+        return specific
+    pool = _devices_for_platform(platform)
+    if not pool:
+        # Synthetic fallback
+        if platform == "ios":
+            return {
+                "id": "iphone15", "slug": "iPhone15", "platform": "ios", "brand": "iphone",
+                "label": "iPhone 15", "viewport": {"width": 390, "height": 844}, "dpr": 3.0,
+            }
+        if platform == "android":
+            return {
+                "id": "pixel8", "slug": "Pixel8", "platform": "android", "brand": "google",
+                "label": "Pixel 8", "viewport": {"width": 412, "height": 915}, "dpr": 2.625,
+            }
+        return {
+            "id": "win11chrome", "slug": "Win11-Chrome", "platform": "desktop", "brand": "windows",
+            "label": "Windows 11 Chrome", "viewport": {"width": 1920, "height": 1080}, "dpr": 1.0,
+        }
+    unused = [d for d in pool if d["id"] not in used_ids]
+    choice = random.choice(unused or pool)
+    used_ids.add(choice["id"])
+    return choice
+
+
+def _viewport_for_device(
+    device: Dict[str, Any],
+    *,
+    resolution_mode: str = "match_device",
+    width: int = 0,
+    height: int = 0,
+) -> Dict[str, int]:
+    mode = (resolution_mode or "match_device").lower().strip()
+    if mode == "exact" and width > 0 and height > 0:
+        return {"width": int(width), "height": int(height)}
+    if mode == "random":
+        plat = device.get("platform") or "desktop"
+        return _gen_random_viewport(is_mobile=(plat in ("ios", "android")))
+    vp = device.get("viewport") or {}
+    w = int(vp.get("width") or 0)
+    h = int(vp.get("height") or 0)
+    if w > 0 and h > 0:
+        return {"width": w, "height": h}
+    return _gen_random_viewport(is_mobile=(device.get("platform") in ("ios", "android")))
 
 _FALLBACK_UAS_DESKTOP = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
@@ -505,9 +684,23 @@ class AdvancedCreateBody(BaseModel):
     viewport_width: int = 0   # 0 → device-default
     viewport_height: int = 0  # 0 → device-default
     anti_detect_on: bool = True
+    # v2.7.12 — Platform mix (%). Sum normalized; all-zero → legacy device_type.
+    mix_ios_pct: float = Field(default=0, ge=0, le=100)
+    mix_android_pct: float = Field(default=0, ge=0, le=100)
+    mix_desktop_pct: float = Field(default=0, ge=0, le=100)
+    # Device picker: random | specific
+    device_mode: str = "random"
+    device_id: str = ""
+    # Resolution: match_device | random | exact
+    resolution_mode: str = "match_device"
     # Sub-configs
     ua: AdvUACfg = Field(default_factory=AdvUACfg)
     proxy: AdvProxyCfg = Field(default_factory=AdvProxyCfg)
+
+
+class BulkIdsBody(BaseModel):
+    profile_ids: List[str] = Field(default_factory=list)
+    max_concurrent: int = Field(default=5, ge=1, le=20)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -655,6 +848,26 @@ async def create_profile(request: Request, body: ProfileBody):
     doc = _profile_doc(uid, body)
     await _DB.browser_profiles.insert_one(doc)
     return {"profile": _public_view(doc), "id": doc["id"]}
+
+
+@router.get("/device-catalog")
+async def device_catalog(request: Request):
+    """Device list for create-form dropdown — must be before /{profile_id}."""
+    await _resolve_user(request)
+    return {
+        "devices": [
+            {
+                "id": d["id"],
+                "slug": d["slug"],
+                "label": d["label"],
+                "platform": d["platform"],
+                "brand": d.get("brand") or "",
+                "viewport": d.get("viewport") or {},
+                "dpr": d.get("dpr") or 1,
+            }
+            for d in _DEVICE_CATALOG
+        ]
+    }
 
 
 @router.get("/{profile_id}")
@@ -1131,72 +1344,41 @@ async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_f
     return {"profile": _public_view(doc), "id": doc["id"]}
 
 
-# ── 2026-01: Advanced create — UA generator + ProxyJet integration ───
-# One endpoint that powers the new "New Browser Profile" form. Takes
-# the same options as the standalone UA Generator + Proxy Generator
-# pages and produces N profiles (count=1..200), each with:
-#   • A UNIQUE realistic UA (generated through the live UA generator)
-#   • A UNIQUE proxy (when proxy.mode=="proxyjet")
-#   • An auto-generated unique name (when name_prefix blank)
-#   • Anti-Detect master toggle on by default
-# This is what customers actually use day-to-day — replaces hand-
-# crafting each profile with name + UA + proxy.
-@router.post("/advanced-create")
-async def advanced_create(request: Request, body: AdvancedCreateBody):
-    user = await _resolve_user(request)
-    uid = _resolve_user_or_401(user)
-
-    count = max(1, min(int(body.count or 1), 200))
-    device_type = (body.device_type or "desktop").lower()
-    is_mobile = device_type == "mobile"
-    country = (body.country or "us").lower()
-
-    # ── 1. Generate UAs ────────────────────────────────────────────
-    # Call the live UA generator (same one /ua-generator uses) so the
-    # UAs are realistic 2026 strings — never the small 4-7 fallback
-    # pool baked in this module. Falls back to the local random
-    # generator if the binding isn't wired (degraded mode, e.g. unit
-    # tests).
+# ── 2026-01 / v2.7.12: Advanced create — mix % + device catalog ──────
+# Produces N profiles with optional iOS/Android/Desktop mix, smart
+# device naming, and resolution modes. ProxyJet / provider / manual
+# proxy paths unchanged.
+async def _generate_uas_batch(
+    user: dict,
+    *,
+    count: int,
+    platform: str,
+    app: str,
+    brand: Optional[str],
+    region: str,
+    is_mobile: bool,
+) -> List[str]:
+    """Generate `count` UAs for one platform; fall back to local pools."""
     uas: List[str] = []
+    if count <= 0:
+        return uas
     if _UA_GEN is not None:
         try:
-            # Build a UAGenerateRequest-compatible payload. We import
-            # the model lazily so this module doesn't hard-depend on
-            # server.py at import time.
             from server import UAGenerateRequest  # type: ignore
-            # v2.7.9 — Allow ios platform when WebKit is installed; else
-            # map ios→android for Chromium-honest mobile profiles.
             _ua_platform = _honest_ua_platform_for_profiles(
-                body.ua.platform or "",
+                platform or "",
                 is_mobile=is_mobile,
             )
             ua_payload = UAGenerateRequest(
-                app=body.ua.app or "browser",
+                app=app or "browser",
                 platform=_ua_platform,
-                brand=body.ua.brand,
-                device_id=body.ua.device_id,
-                app_version=body.ua.app_version,
-                os_version=body.ua.os_version,
-                region=body.ua.region or country.upper(),
-                resolution=body.ua.resolution,
-                apps=body.ua.apps,
-                platforms=body.ua.platforms,
-                device_ids=body.ua.device_ids,
-                app_versions=body.ua.app_versions,
-                os_versions=body.ua.os_versions,
-                regions=body.ua.regions,
-                resolutions=body.ua.resolutions,
+                brand=brand,
+                region=region,
                 count=count,
                 format="json",
             )
             ua_resp = await _UA_GEN(ua_payload, user)
-            # Server returns {"count": N, "results": [{"user_agent": ..., ...}, ...]}
-            # (older payloads may use "user_agents")
-            raw = (
-                ua_resp.get("results")
-                or ua_resp.get("user_agents")
-                or []
-            )
+            raw = ua_resp.get("results") or ua_resp.get("user_agents") or []
             for item in raw:
                 if isinstance(item, dict):
                     u = item.get("user_agent") or item.get("ua") or ""
@@ -1206,18 +1388,75 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     uas.append(u)
         except Exception as e:
             logger.warning(f"advanced_create: UA generator call failed ({e}); using fallback pool")
-
     while len(uas) < count:
         uas.append(_gen_random_ua(is_mobile))
-    uas = uas[:count]
-    # v2.7.9 — Normalize residual UAs (keep iOS when preferred; launch decides).
-    _coerced_uas: List[str] = []
-    for _u in uas:
-        _cu, _ = _normalize_profile_ua_honesty(_u)
-        _coerced_uas.append(_cu)
-    uas = _coerced_uas
+    coerced: List[str] = []
+    for u in uas[:count]:
+        cu, _ = _normalize_profile_ua_honesty(u)
+        coerced.append(cu)
+    return coerced
 
-    # ── 2. Generate proxies (if requested) ─────────────────────────
+
+@router.post("/advanced-create")
+async def advanced_create(request: Request, body: AdvancedCreateBody):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+
+    count = max(1, min(int(body.count or 1), 200))
+    country = (body.country or "us").lower()
+    resolution_mode = (body.resolution_mode or "match_device").lower().strip()
+    device_mode = (body.device_mode or "random").lower().strip()
+    specific_id = (body.device_id or "").strip()
+
+    # Specific device forces 100% of that platform.
+    specific_dev = _find_device(specific_id) if device_mode == "specific" and specific_id else None
+    if specific_dev:
+        plat = specific_dev["platform"]
+        mix_plan = [(plat, count)]
+    else:
+        mix_plan = _split_mix_counts(
+            count,
+            body.mix_ios_pct,
+            body.mix_android_pct,
+            body.mix_desktop_pct,
+        )
+        if mix_plan is None:
+            # Legacy: single device_type / ua.platform
+            legacy_plat = (body.ua.platform or "").lower().strip()
+            if legacy_plat in ("ios", "android", "desktop"):
+                mix_plan = [(legacy_plat, count)]
+            else:
+                dt = (body.device_type or "desktop").lower()
+                mix_plan = [("android" if dt == "mobile" else "desktop", count)]
+
+    # Expand to per-slot platform list
+    platform_slots: List[str] = []
+    for plat, n in mix_plan:
+        platform_slots.extend([plat] * int(n))
+    platform_slots = platform_slots[:count]
+    while len(platform_slots) < count:
+        platform_slots.append("desktop")
+
+    # Generate UAs per platform group (keeps generator coherent).
+    uas_by_plat: Dict[str, List[str]] = {}
+    ua_cursors: Dict[str, int] = {}
+    for plat, n in mix_plan:
+        is_mob = plat in ("ios", "android")
+        brand = body.ua.brand
+        if specific_dev and specific_dev.get("brand"):
+            brand = specific_dev["brand"]
+        uas_by_plat[plat] = await _generate_uas_batch(
+            user,
+            count=n,
+            platform=plat,
+            app=body.ua.app or "browser",
+            brand=brand,
+            region=body.ua.region or country.upper(),
+            is_mobile=is_mob,
+        )
+        ua_cursors[plat] = 0
+
+    # ── Proxies (unchanged ProxyJet / provider / manual) ───────────
     proxy_lines: List[str] = []
     proxy_mode = (body.proxy.mode or "none").lower()
     if proxy_mode == "proxyjet":
@@ -1255,23 +1494,90 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 ),
             )
 
-    # ── 3. Build profile docs ──────────────────────────────────────
+    def _parse_proxy_line_to_cfg(line: str) -> ProxyConfig:
+        server = ""
+        username = ""
+        password = ""
+        try:
+            if "://" in line:
+                proto, rest = line.split("://", 1)
+                if "@" in rest:
+                    creds, hostpart = rest.rsplit("@", 1)
+                    username, _, password = creds.partition(":")
+                    server = f"{proto}://{hostpart}"
+                else:
+                    colon_parts = rest.split(":")
+                    if len(colon_parts) >= 4:
+                        host, port, username = (
+                            colon_parts[0], colon_parts[1], colon_parts[2]
+                        )
+                        password = ":".join(colon_parts[3:])
+                        server = f"{proto}://{host}:{port}"
+                    elif len(colon_parts) == 2:
+                        server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
+                    elif len(colon_parts) == 1:
+                        server = line
+                    else:
+                        server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
+            elif "@" in line:
+                creds, hostport = line.rsplit("@", 1)
+                username, _, password = creds.partition(":")
+                server = f"http://{hostport}"
+            else:
+                parts = line.split(":")
+                if len(parts) >= 4:
+                    host, port, username = parts[0], parts[1], parts[2]
+                    password = ":".join(parts[3:])
+                    server = f"http://{host}:{port}"
+                elif len(parts) >= 2:
+                    server = f"http://{parts[0]}:{parts[1]}"
+        except Exception as _pe:
+            logger.warning(f"advanced_create: proxy line parse failed: {_pe}")
+            server = line
+        return ProxyConfig(
+            enabled=True,
+            server=server,
+            username=username,
+            password=password,
+            use_proxyjet=True,
+            proxyjet_country=(body.proxy.country or "").upper() or "US",
+            proxyjet_state=(body.proxy.state or "").upper(),
+        )
+
     pad = max(2, len(str(count)))
     docs: List[Dict[str, Any]] = []
-    for i in range(count):
-        # Name: prefix + index, or auto-unique when prefix is blank
+    used_device_ids: Set[str] = set()
+    seen_ua: Set[str] = set()
+
+    for i, plat in enumerate(platform_slots):
+        is_mobile = plat in ("ios", "android")
+        device = _pick_device(
+            plat,
+            device_mode=device_mode,
+            device_id=specific_id,
+            used_ids=used_device_ids,
+        )
+        # UA for this slot
+        idx = ua_cursors.get(plat, 0)
+        pool = uas_by_plat.get(plat) or []
+        ua = pool[idx] if idx < len(pool) else _gen_random_ua(is_mobile)
+        ua_cursors[plat] = idx + 1
+        # Soft uniqueness: reshuffle fallback if duplicate in-batch
+        if ua in seen_ua:
+            for _ in range(5):
+                alt = _gen_random_ua(is_mobile)
+                if alt not in seen_ua:
+                    ua = alt
+                    break
+        seen_ua.add(ua)
+
         if (body.name_prefix or "").strip():
             name = f"{body.name_prefix.strip()} {str(i + 1).zfill(pad)}"
         else:
-            name = _auto_name(country, device_type)
+            name = _auto_name_device(country, str(device.get("slug") or plat))
 
-        # Proxy attachment for this profile
         proxy_cfg = ProxyConfig()
         if proxy_mode == "provider" and body.proxy.provider_id:
-            # v2.4.0 — Multi-provider proxy dropdown. Persist the
-            # provider_id so `/{profile_id}/launch` resolves a fresh
-            # proxy at launch time (per-launch rotation is desirable
-            # for rotating gateway / api endpoint kinds).
             proxy_cfg = ProxyConfig(
                 enabled=True,
                 provider_id=body.proxy.provider_id,
@@ -1284,104 +1590,29 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 password=body.proxy.password or "",
             )
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
-            line = proxy_lines[i].strip()
-            # 2026-06 — Robust proxy-line parser. ProxyJet (and
-            # `build_proxy_string` in proxyjet_module.py) returns lines
-            # in the `user:pass@host:port` shape — NOT
-            # `host:port:user:password`. The old parser called
-            # `line.split(":")` which produced 3 parts for the @-form
-            # (user, pass@host, port) and matched the
-            # `len(parts) >= 2` branch — dropping the real port and
-            # baking the creds into the server URL. Chromium then
-            # silently defaulted to port 80, ProxyJet doesn't listen
-            # there, and every profile launch errored with
-            # "Proxy could not be reached" within 10 seconds.
-            #
-            # We now handle ALL four shapes the codebase has ever
-            # emitted, with `@` detection taking precedence over
-            # colon-counting so the canonical ProxyJet line parses
-            # correctly. The port is ALWAYS preserved.
-            server = ""
-            username = ""
-            password = ""
-            try:
-                if "://" in line:
-                    # Already a URL — keep proto, strip embedded creds.
-                    proto, rest = line.split("://", 1)
-                    if "@" in rest:
-                        creds, hostpart = rest.rsplit("@", 1)
-                        username, _, password = creds.partition(":")
-                        server = f"{proto}://{hostpart}"
-                    else:
-                        # 2026-07 v2.2.2 fix — Handle scheme + 4-part
-                        # colon form (BestGo / GeoNode / rotating
-                        # residentials): `http://host:port:user:pass`
-                        # The old branch fell through here, storing
-                        # the malformed URL verbatim in `server`.
-                        # Chromium then tried to resolve "http" as
-                        # the hostname (getaddrinfo ENOTFOUND http)
-                        # and the customer saw the "Proxy could not
-                        # be reached" page on every profile launch.
-                        colon_parts = rest.split(":")
-                        if len(colon_parts) >= 4:
-                            host, port, username = (
-                                colon_parts[0], colon_parts[1], colon_parts[2]
-                            )
-                            password = ":".join(colon_parts[3:])
-                            server = f"{proto}://{host}:{port}"
-                        elif len(colon_parts) == 2:
-                            server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
-                        elif len(colon_parts) == 1:
-                            # scheme://host with no port — keep as-is.
-                            server = line
-                        else:
-                            # 3 colon parts is ambiguous but safest is
-                            # to keep host:port and drop the extras
-                            # rather than pass a malformed URL down.
-                            server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
-                elif "@" in line:
-                    # ProxyJet canonical form: user:pass@host:port
-                    creds, hostport = line.rsplit("@", 1)
-                    username, _, password = creds.partition(":")
-                    server = f"http://{hostport}"
-                else:
-                    # Legacy colon-separated form: host:port:user:password
-                    parts = line.split(":")
-                    if len(parts) >= 4:
-                        host, port, username = parts[0], parts[1], parts[2]
-                        password = ":".join(parts[3:])
-                        server = f"http://{host}:{port}"
-                    elif len(parts) >= 2:
-                        server = f"http://{parts[0]}:{parts[1]}"
-            except Exception as _pe:
-                logger.warning(f"advanced_create: proxy line parse failed for line[0:20]={line[:20]!r}: {_pe}")
-                server = line  # last-resort: store raw, launcher will normalize again
-            proxy_cfg = ProxyConfig(
-                enabled=True,
-                server=server,
-                username=username,
-                password=password,
-                use_proxyjet=True,
-                proxyjet_country=(body.proxy.country or "").upper() or "US",
-                proxyjet_state=(body.proxy.state or "").upper(),
-            )
+            proxy_cfg = _parse_proxy_line_to_cfg(proxy_lines[i].strip())
 
-        # Viewport: use override if provided, else device default
-        viewport = {"width": body.viewport_width or 0,
-                    "height": body.viewport_height or 0}
-        if not viewport["width"] or not viewport["height"]:
-            viewport = _gen_random_viewport(is_mobile)
+        viewport = _viewport_for_device(
+            device,
+            resolution_mode=resolution_mode,
+            width=body.viewport_width or 0,
+            height=body.viewport_height or 0,
+        )
+        dpr = float(device.get("dpr") or (3.0 if is_mobile else 1.0))
+        os_fallback = "ios" if plat == "ios" else ("android" if plat == "android" else "windows")
+        if plat == "desktop" and (device.get("brand") or "") == "mac":
+            os_fallback = "macos"
 
         pb = ProfileBody(
             name=name,
             country=country,
-            device_type=device_type,
+            device_type="mobile" if is_mobile else "desktop",
             is_mobile=is_mobile,
             has_touch=is_mobile,
-            device_scale_factor=3.0 if is_mobile else 1.0,
-            user_agent=uas[i],
+            device_scale_factor=dpr,
+            user_agent=ua,
             viewport=viewport,
-            os=_infer_os_from_ua(uas[i], is_mobile=is_mobile),
+            os=_infer_os_from_ua(ua, is_mobile=is_mobile, fallback=os_fallback),
             start_url=body.start_url or "https://www.google.com/",
             notes=body.notes or "",
             proxy=proxy_cfg,
@@ -1393,7 +1624,11 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 identity_persist=bool(body.anti_detect_on),
             ),
         )
-        docs.append(_profile_doc(uid, pb))
+        doc = _profile_doc(uid, pb)
+        doc["device_model"] = str(device.get("slug") or "")
+        doc["device_label"] = str(device.get("label") or "")
+        doc["device_catalog_id"] = str(device.get("id") or "")
+        docs.append(doc)
 
     if docs:
         await _DB.browser_profiles.insert_many(docs)
@@ -1403,10 +1638,133 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
         "proxies_allocated": len(proxy_lines) if proxy_mode == "proxyjet" else 0,
+        "mix": {plat: n for plat, n in (mix_plan or [])},
     }
 
 
+@router.post("/bulk-delete")
+async def bulk_delete(request: Request, body: BulkIdsBody):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()][:200]
+    if not ids:
+        raise HTTPException(status_code=400, detail="profile_ids required")
+    # Skip actively launching/running unless client sends only idle — we allow
+    # delete of non-running; running ones are skipped with reason.
+    deleted: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    for pid in ids:
+        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid}, {"status": 1})
+        if not doc:
+            skipped.append({"id": pid, "reason": "not_found"})
+            continue
+        st = str(doc.get("status") or "idle")
+        if st in ("running", "launching", "queued", "stopping"):
+            skipped.append({"id": pid, "reason": f"busy:{st}"})
+            continue
+        await _DB.browser_profiles.delete_one({"id": pid, "user_id": uid})
+        await _DB.browser_profile_sessions.delete_many({"profile_id": pid, "user_id": uid})
+        deleted.append(pid)
+    return {"deleted": deleted, "skipped": skipped, "deleted_count": len(deleted)}
 
+
+@router.post("/bulk-stop")
+async def bulk_stop(request: Request, body: BulkIdsBody):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()][:200]
+    results = []
+    for pid in ids:
+        # Reuse stop endpoint logic via internal HTTP-less call pattern:
+        try:
+            fake_body = {}
+            # Inline minimal stop: mark stop_requested / update status
+            doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
+            if not doc:
+                results.append({"id": pid, "ok": False, "reason": "not_found"})
+                continue
+            st = str(doc.get("status") or "idle")
+            if st not in ("running", "launching", "queued", "stopping"):
+                results.append({"id": pid, "ok": False, "reason": f"not_active:{st}"})
+                continue
+            # Call existing stop handler by constructing a Request is hard;
+            # duplicate the essential bits from stop_profile.
+            from starlette.requests import Request as _Req  # noqa: F401
+            # Prefer importing stop by invoking the route function with a shim —
+            # simplest: set status stopping and queue stop flag.
+            sid = str(doc.get("session_id") or "")
+            await _DB.browser_profiles.update_one(
+                {"id": pid, "user_id": uid},
+                {"$set": {"status": "stopping"}},
+            )
+            if sid:
+                try:
+                    await _DB.browser_launch_queue.update_one(
+                        {"id": sid},
+                        {"$set": {"stop_requested": True}},
+                    )
+                except Exception:
+                    pass
+                try:
+                    from browser_profile_launcher import request_stop
+                    await request_stop(sid)
+                except Exception:
+                    pass
+            results.append({"id": pid, "ok": True, "status": "stopping"})
+        except Exception as e:
+            results.append({"id": pid, "ok": False, "reason": str(e)[:120]})
+    return {"results": results, "stopped": sum(1 for r in results if r.get("ok"))}
+
+
+@router.post("/bulk-launch")
+async def bulk_launch(request: Request, body: BulkIdsBody):
+    """Launch up to max_concurrent idle profiles (rest skipped with reason)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()][:50]
+    max_c = max(1, min(int(body.max_concurrent or 5), 20))
+    if not ids:
+        raise HTTPException(status_code=400, detail="profile_ids required")
+
+    launched: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, str]] = []
+
+    for pid in ids:
+        if len(launched) >= max_c:
+            skipped.append({"id": pid, "reason": "concurrent_cap"})
+            continue
+        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
+        if not doc:
+            skipped.append({"id": pid, "reason": "not_found"})
+            continue
+        st = str(doc.get("status") or "idle")
+        if st in ("running", "launching", "queued", "stopping"):
+            skipped.append({"id": pid, "reason": f"busy:{st}"})
+            continue
+        # Delegate to existing launch endpoint implementation
+        try:
+            # Build a minimal internal call by reusing launch_profile
+            result = await launch_profile(
+                request,
+                pid,
+                start_url=doc.get("start_url") or None,
+            )
+            launched.append({"id": pid, "ok": True, **{k: result.get(k) for k in ("session_id", "desktop_available", "message") if isinstance(result, dict)}})
+        except HTTPException as he:
+            skipped.append({"id": pid, "reason": str(he.detail)[:160]})
+        except Exception as e:
+            skipped.append({"id": pid, "reason": str(e)[:160]})
+
+    return {
+        "launched": launched,
+        "skipped": skipped,
+        "launched_count": len(launched),
+        "max_concurrent": max_c,
+    }
+
+
+# LEGACY advanced_create body retained below was replaced above (v2.7.12).
+# ── session-update bridge ────────────────────────────────────────────
 @router.post("/_bridge/session-update")
 async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(...)):
     user = await _resolve_user(request)
@@ -1439,9 +1797,6 @@ async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(..
             update["last_session_duration_sec"] = float(body["duration_sec"])
         except Exception:
             pass
-    # v2.1.59: persist error_message so the card chip / detail line can
-    # surface WHY a launch failed instead of leaving the operator
-    # guessing. Cleared on the next successful "running" update.
     err_msg = body.get("error_message")
     if status == "error" and err_msg:
         update["last_error"] = str(err_msg)[:512]

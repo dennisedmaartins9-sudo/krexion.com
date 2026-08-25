@@ -157,6 +157,14 @@ export default function BrowserProfilesPage() {
   });
   const [advAntiDetect, setAdvAntiDetect] = useState(true);
   const [advCreating, setAdvCreating] = useState(false);
+  // v2.7.12 — Mix % + device/resolution + multi-select
+  const [advMix, setAdvMix] = useState({ ios: 0, android: 0, desktop: 100 });
+  const [advDeviceMode, setAdvDeviceMode] = useState("random"); // random | specific
+  const [advDeviceId, setAdvDeviceId] = useState("");
+  const [advResolutionMode, setAdvResolutionMode] = useState("match_device"); // match_device | random | exact
+  const [deviceCatalog, setDeviceCatalog] = useState([]);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   const authHeaders = useMemo(() => {
     const t = localStorage.getItem("token");
@@ -179,7 +187,37 @@ export default function BrowserProfilesPage() {
 
   useEffect(() => {
     fetchProfiles();
+    (async () => {
+      try {
+        const r = await fetch(`${API}/device-catalog`, { headers: authHeaders });
+        if (!r.ok) return;
+        const d = await r.json();
+        setDeviceCatalog(d.devices || []);
+      } catch (_) { /* catalog optional */ }
+    })();
   }, []);
+
+  const selectedCount = selectedIds.size;
+  const toggleSelect = (id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const selectAllVisible = () => {
+    setSelectedIds(new Set(profiles.map((p) => p.id)));
+  };
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const normalizeMix = (m) => {
+    const ios = Math.max(0, Math.min(100, Number(m.ios) || 0));
+    const android = Math.max(0, Math.min(100, Number(m.android) || 0));
+    const desktop = Math.max(0, Math.min(100, Number(m.desktop) || 0));
+    const sum = ios + android + desktop;
+    return { ios, android, desktop, sum };
+  };
 
   // v2.6.32 — Poll while any profile is mid-launch so cloud-bridged cards update.
   useEffect(() => {
@@ -237,18 +275,37 @@ export default function BrowserProfilesPage() {
   const handleAdvancedCreate = async () => {
     if (advCreating) return;
     const count = Math.max(1, Math.min(parseInt(advCount) || 1, 200));
+    const mix = normalizeMix(advMix);
+    if (advDeviceMode !== "specific" && mix.sum <= 0) {
+      toast.error("Set at least one mix % (iOS / Android / Desktop)");
+      return;
+    }
+    if (advDeviceMode === "specific" && !advDeviceId) {
+      toast.error("Pick a specific device, or switch Device mode to Random");
+      return;
+    }
+    if (advResolutionMode === "exact" && (!(form.viewport?.width > 0) || !(form.viewport?.height > 0))) {
+      toast.error("Exact resolution needs width and height");
+      return;
+    }
     setAdvCreating(true);
     try {
       const payload = {
         count,
         name_prefix: (advNamePrefix || "").trim(),
         country: (form.country || "us").toLowerCase(),
-        device_type: form.device_type || "desktop",
+        device_type: mix.desktop >= mix.android && mix.desktop >= mix.ios ? "desktop" : "mobile",
         start_url: form.start_url || "https://www.google.com/",
         notes: form.notes || "",
-        viewport_width: form.viewport?.width || 0,
-        viewport_height: form.viewport?.height || 0,
+        viewport_width: advResolutionMode === "exact" ? (form.viewport?.width || 0) : 0,
+        viewport_height: advResolutionMode === "exact" ? (form.viewport?.height || 0) : 0,
         anti_detect_on: !!advAntiDetect,
+        mix_ios_pct: mix.ios,
+        mix_android_pct: mix.android,
+        mix_desktop_pct: mix.desktop,
+        device_mode: advDeviceMode,
+        device_id: advDeviceId || "",
+        resolution_mode: advResolutionMode,
         ua: {
           app: advUA.app || "browser",
           platform: advUA.platform || "any",
@@ -292,19 +349,85 @@ export default function BrowserProfilesPage() {
       }
       const d = await r.json();
       const n = d.created || 0;
+      const mixLabel = d.mix
+        ? ` (iOS ${d.mix.ios || 0} · Android ${d.mix.android || 0} · Desktop ${d.mix.desktop || 0})`
+        : "";
       toast.success(
         n === 1
           ? `Profile "${d.profiles?.[0]?.name || ""}" created`
-          : `${n} unique profiles created (UA: ${d.ua_source}, proxies: ${d.proxies_allocated || 0})`,
+          : `${n} unique profiles created${mixLabel}`,
       );
       setShowCreate(false); setEditingId(null); setForm(DEFAULT_NEW);
-      // Reset advanced fields to defaults for next open
       setAdvCount(1); setAdvNamePrefix("");
+      setAdvMix({ ios: 0, android: 0, desktop: 100 });
+      setAdvDeviceMode("random"); setAdvDeviceId("");
+      setAdvResolutionMode("match_device");
       fetchProfiles();
     } catch (e) {
       toast.error(`Create failed: ${e.message}`);
     } finally {
       setAdvCreating(false);
+    }
+  };
+
+  const handleBulkLaunch = async () => {
+    if (!selectedCount || bulkBusy) return;
+    setBulkBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-launch`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ profile_ids: [...selectedIds], max_concurrent: 5 }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Launched ${d.launched_count || 0}` + (d.skipped?.length ? ` · skipped ${d.skipped.length}` : ""));
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Bulk launch failed: ${e.message}`);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const handleBulkStop = async () => {
+    if (!selectedCount || bulkBusy) return;
+    setBulkBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-stop`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ profile_ids: [...selectedIds] }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Stop sent to ${d.stopped || 0} profile(s)`);
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Bulk stop failed: ${e.message}`);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    if (!selectedCount || bulkBusy) return;
+    if (!window.confirm(`Delete ${selectedCount} selected profile(s)? Storage state will be lost.`)) return;
+    setBulkBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-delete`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ profile_ids: [...selectedIds] }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Deleted ${d.deleted_count || 0}` + (d.skipped?.length ? ` · skipped ${d.skipped.length} (busy)` : ""));
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Bulk delete failed: ${e.message}`);
+    } finally {
+      setBulkBusy(false);
     }
   };
 
@@ -455,8 +578,34 @@ export default function BrowserProfilesPage() {
             <span className="text-amber-300">Launch</span>. On Local Engine / Native, Chromium opens on this PC
             (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
             app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
+            Select multiple cards for bulk Launch / Stop / Delete.
           </div>
         </div>
+
+        {profiles.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
+            <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" onClick={selectAllVisible} data-testid="bp-select-all">
+              Select all
+            </Button>
+            <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" onClick={clearSelection} data-testid="bp-clear-selection">
+              Clear
+            </Button>
+            <span className="text-xs text-zinc-400">{selectedCount} selected</span>
+            <div className="flex-1" />
+            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkLaunch}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
+              <Play className="w-3 h-3 mr-1" /> Launch
+            </Button>
+            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkStop}
+              className="bg-amber-700 hover:bg-amber-800 text-white h-7 text-xs" data-testid="bp-bulk-stop">
+              <StopCircle className="w-3 h-3 mr-1" /> Stop
+            </Button>
+            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkDelete}
+              variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs" data-testid="bp-bulk-delete">
+              <Trash2 className="w-3 h-3 mr-1" /> Delete
+            </Button>
+          </div>
+        )}
 
         {/* Profile list */}
         {profiles.length === 0 ? (
@@ -469,16 +618,30 @@ export default function BrowserProfilesPage() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {profiles.map((p) => (
-              <Card key={p.id} className="bg-zinc-900/60 border-zinc-800 hover:border-fuchsia-700/40 transition" data-testid={`bp-card-${p.id}`}>
+              <Card key={p.id} className={`bg-zinc-900/60 border-zinc-800 hover:border-fuchsia-700/40 transition ${selectedIds.has(p.id) ? "ring-1 ring-fuchsia-500/50 border-fuchsia-700/50" : ""}`} data-testid={`bp-card-${p.id}`}>
                 <CardHeader className="pb-3">
-                  <div className="flex items-start justify-between">
+                  <div className="flex items-start justify-between gap-2">
+                    <label className="mt-1 flex-shrink-0 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 accent-fuchsia-500"
+                        checked={selectedIds.has(p.id)}
+                        onChange={() => toggleSelect(p.id)}
+                        data-testid={`bp-select-${p.id}`}
+                      />
+                    </label>
                     <div className="flex-1 min-w-0">
                       <CardTitle className="text-base text-zinc-100 truncate">{p.name}</CardTitle>
                       <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                         <Badge variant="outline" className="text-[10px] bg-zinc-900 border-zinc-700 text-zinc-300">
                           {p.device_type === "mobile" ? <Smartphone className="w-3 h-3 mr-0.5" /> : <Monitor className="w-3 h-3 mr-0.5" />}
-                          {p.device_type}
+                          {p.os || p.device_type}
                         </Badge>
+                        {p.device_model && (
+                          <Badge variant="outline" className="text-[10px] bg-zinc-900 border-zinc-700 text-cyan-300">
+                            {p.device_model}
+                          </Badge>
+                        )}
                         <Badge variant="outline" className="text-[10px] bg-zinc-900 border-zinc-700 text-zinc-300">{(p.country || "?").toUpperCase()}</Badge>
                         {p.anti_detect?.master && (
                           <Badge variant="outline" className="text-[10px] bg-fuchsia-950/40 border-fuchsia-700/60 text-fuchsia-300">
@@ -591,25 +754,15 @@ export default function BrowserProfilesPage() {
                       {COUNTRY_OPTIONS.map((c) => <option key={c} value={c.toLowerCase()}>{c}</option>)}
                     </select>
                   </div>
+                  {editingId ? (
                   <div>
                     <Label className="text-zinc-300 text-xs">Device Type</Label>
                     <select data-testid="bp-form-device" value={form.device_type}
                       onChange={(e) => {
                         const mob = e.target.value === "mobile";
-                        // 2026-06 — Customer ask: viewport should
-                        // AUTO-MATCH the device type. Previously
-                        // switching to mobile left viewport at the
-                        // desktop 1920×1080 default, which made the
-                        // headed browser render mobile sites in
-                        // desktop layout (broken anti-detect signal —
-                        // a Samsung UA with a 1920px window is a dead
-                        // giveaway to any fingerprint script). We now
-                        // set sensible per-device defaults the user
-                        // can still override below if they need
-                        // something specific.
                         const newViewport = mob
-                          ? { width: 412, height: 914 }   // Pixel 5 / iPhone 14 Pro Max bucket
-                          : { width: 1920, height: 1080 }; // common desktop
+                          ? { width: 412, height: 914 }
+                          : { width: 1920, height: 1080 };
                         setForm({
                           ...form,
                           device_type: e.target.value,
@@ -619,26 +772,118 @@ export default function BrowserProfilesPage() {
                           os: mob ? "android" : "windows",
                           viewport: newViewport,
                         });
-                        // Sync UA platform to match device by default
-                        if (!editingId) {
-                          setAdvUA((u) => ({ ...u, platform: mob ? "android" : "desktop" }));
-                        }
                       }}
                       className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
                       <option value="desktop">Desktop</option>
                       <option value="mobile">Mobile</option>
                     </select>
-                    {form.device_type === "mobile" && (
-                      <p className="text-[11px] text-zinc-500 mt-1">
-                        iOS uses WebKit bundled in Krexion Setup (no manual install); Android uses Chromium. If WebKit is missing from an old install, backend installs it in the background or falls back to Android Chrome.
-                      </p>
-                    )}
                   </div>
+                  ) : (
+                  <div>
+                    <Label className="text-zinc-300 text-xs">Start URL</Label>
+                    <Input data-testid="bp-form-starturl-top" value={form.start_url} onChange={(e) => setForm({ ...form, start_url: e.target.value })}
+                      className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                  </div>
+                  )}
+                  {editingId && (
                   <div className="col-span-2">
                     <Label className="text-zinc-300 text-xs">Start URL</Label>
                     <Input data-testid="bp-form-starturl" value={form.start_url} onChange={(e) => setForm({ ...form, start_url: e.target.value })}
                       className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                   </div>
+                  )}
+                  {!editingId && (
+                    <div className="col-span-2 p-3 rounded-lg border border-emerald-500/30 bg-emerald-950/10 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-emerald-300 text-sm font-semibold">Platform mix %</span>
+                        <span className="text-[10px] text-zinc-500">
+                          Sum {normalizeMix(advMix).sum}% (auto-normalized) · names like Krexion-iPhone15-US-…
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-3">
+                        {[
+                          ["ios", "iOS"],
+                          ["android", "Android"],
+                          ["desktop", "Desktop"],
+                        ].map(([key, label]) => (
+                          <div key={key}>
+                            <Label className="text-zinc-300 text-xs">{label}</Label>
+                            <Input
+                              data-testid={`bp-mix-${key}`}
+                              type="number" min={0} max={100}
+                              value={advMix[key]}
+                              onChange={(e) => setAdvMix({ ...advMix, [key]: Math.max(0, Math.min(100, parseInt(e.target.value) || 0)) })}
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button type="button" size="sm" variant="outline" className="h-7 text-[10px] border-zinc-700"
+                          onClick={() => setAdvMix({ ios: 40, android: 40, desktop: 20 })}>40/40/20</Button>
+                        <Button type="button" size="sm" variant="outline" className="h-7 text-[10px] border-zinc-700"
+                          onClick={() => setAdvMix({ ios: 50, android: 50, desktop: 0 })}>50/50 mobile</Button>
+                        <Button type="button" size="sm" variant="outline" className="h-7 text-[10px] border-zinc-700"
+                          onClick={() => setAdvMix({ ios: 0, android: 0, desktop: 100 })}>100% desktop</Button>
+                        <Button type="button" size="sm" variant="outline" className="h-7 text-[10px] border-zinc-700"
+                          onClick={() => setAdvMix({ ios: 0, android: 100, desktop: 0 })}>100% Android</Button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <Label className="text-zinc-300 text-xs">Device</Label>
+                          <select data-testid="bp-device-mode" value={advDeviceMode}
+                            onChange={(e) => setAdvDeviceMode(e.target.value)}
+                            className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
+                            <option value="random">Random unique models</option>
+                            <option value="specific">Specific device</option>
+                          </select>
+                        </div>
+                        <div>
+                          <Label className="text-zinc-300 text-xs">Resolution</Label>
+                          <select data-testid="bp-resolution-mode" value={advResolutionMode}
+                            onChange={(e) => setAdvResolutionMode(e.target.value)}
+                            className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
+                            <option value="match_device">Match device</option>
+                            <option value="random">Random per profile</option>
+                            <option value="exact">Exact W×H</option>
+                          </select>
+                        </div>
+                      </div>
+                      {advDeviceMode === "specific" && (
+                        <div>
+                          <Label className="text-zinc-300 text-xs">Specific device</Label>
+                          <select data-testid="bp-device-id" value={advDeviceId}
+                            onChange={(e) => setAdvDeviceId(e.target.value)}
+                            className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
+                            <option value="">Pick a device…</option>
+                            {deviceCatalog.map((d) => (
+                              <option key={d.id} value={d.id}>{d.label} ({d.platform})</option>
+                            ))}
+                          </select>
+                          <p className="text-[10px] text-zinc-500 mt-1">Specific device forces 100% that platform for the whole batch.</p>
+                        </div>
+                      )}
+                      {advResolutionMode === "exact" && (
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <Label className="text-zinc-300 text-xs">Width</Label>
+                            <Input type="number" value={form.viewport.width}
+                              onChange={(e) => setForm({ ...form, viewport: { ...form.viewport, width: parseInt(e.target.value) || 0 } })}
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                          </div>
+                          <div>
+                            <Label className="text-zinc-300 text-xs">Height</Label>
+                            <Input type="number" value={form.viewport.height}
+                              onChange={(e) => setForm({ ...form, viewport: { ...form.viewport, height: parseInt(e.target.value) || 0 } })}
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                          </div>
+                        </div>
+                      )}
+                      <p className="text-[11px] text-zinc-500">
+                        iOS → WebKit (bundled in Setup). Android / Desktop → Chromium. Each profile gets a unique UA + device model.
+                      </p>
+                    </div>
+                  )}
                   {editingId && (
                     <div className="col-span-2">
                       <Label className="text-zinc-300 text-xs">User Agent <span className="text-zinc-500">(leave blank = auto-generate)</span></Label>
@@ -646,18 +891,22 @@ export default function BrowserProfilesPage() {
                         className="bg-zinc-900 border-zinc-700 text-zinc-100 font-mono text-xs" placeholder="Auto" />
                     </div>
                   )}
+                  {editingId && (
+                  <>
                   <div>
-                    <Label className="text-zinc-300 text-xs">Viewport Width <span className="text-zinc-500">(0 = device default)</span></Label>
+                    <Label className="text-zinc-300 text-xs">Viewport Width</Label>
                     <Input type="number" value={form.viewport.width}
                       onChange={(e) => setForm({ ...form, viewport: { ...form.viewport, width: parseInt(e.target.value) || 0 } })}
                       className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                   </div>
                   <div>
-                    <Label className="text-zinc-300 text-xs">Viewport Height <span className="text-zinc-500">(0 = device default)</span></Label>
+                    <Label className="text-zinc-300 text-xs">Viewport Height</Label>
                     <Input type="number" value={form.viewport.height}
                       onChange={(e) => setForm({ ...form, viewport: { ...form.viewport, height: parseInt(e.target.value) || 0 } })}
                       className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                   </div>
+                  </>
+                  )}
                   <div className="col-span-2">
                     <Label className="text-zinc-300 text-xs">Notes</Label>
                     <Textarea data-testid="bp-form-notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })}

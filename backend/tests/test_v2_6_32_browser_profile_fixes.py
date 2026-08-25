@@ -48,10 +48,11 @@ def test_compute_fingerprint_hash_stable():
     assert len(h1) == 32
 
 
-def test_launch_kwargs_include_user_data_dir_in_source():
+def test_launch_does_not_pass_user_data_dir_cli_arg():
+    """v2.7.11 — Playwright rejects --user-data-dir on browser_type.launch()."""
     src = _read_backend("browser_profile_launcher.py")
-    assert '--user-data-dir=' in src
-    assert '_kx_user_data_dir' in src
+    assert 'args"].append(f"--user-data-dir=' not in src
+    assert "launch_persistent_context" in src or "Do NOT pass `--user-data-dir=`" in src
 
 
 def test_queue_claim_filters_stop_requested_in_source():

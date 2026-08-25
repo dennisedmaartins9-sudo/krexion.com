@@ -1076,24 +1076,16 @@ async def _launch_profile_session_inner(
         # is a bundled resource inside chrome.exe / chromium.exe so we
         # can NOT change it at runtime without shipping a custom binary
         # (that's a native-installer-level task tracked separately).
-        # BUT we CAN light up Chromium's OWN native profile badge
-        # (colored circle with the profile letter in the top-right
-        # corner) by passing `--user-data-dir` pointing at a folder
-        # named after this Krexion profile.  We also set the window
-        # title prefix so the taskbar entry reads "Krexion".
+        # Krexion identity lives on the Windows taskbar (WM_SETICON +
+        # AppUserModelID) and a short window-name prefix. Per-tab
+        # favicon/title stay site-owned (v2.4.1 customer ask).
         #
-        # 2026-01 v2.4.1 — REVERTED per-tab favicon + per-tab title
-        # override.  Customer feedback:
-        #   "jitne tab kholte sab pr krexion ka logo a raha hai ye
-        #    esa ni hona chahye balke jese orignal hota hai wese
-        #    hona chahye"
-        # We now leave EACH TAB's favicon + title exactly as the site
-        # itself sets them (so myip.com shows the myip.com favicon,
-        # not a Krexion K).  The Krexion identity now lives EXCLUSIVELY
-        # on the Windows taskbar (via WM_SETICON + AppUserModelID) and
-        # on Chromium's own profile-badge chip in the top-right of the
-        # main window — both of which are correct places to brand the
-        # browser instance without touching per-tab UI.
+        # v2.7.11 — Do NOT pass `--user-data-dir=` as a Chromium CLI arg
+        # to `browser_type.launch()`. Modern Playwright rejects that and
+        # aborts with: "Pass user_data_dir parameter to
+        # launch_persistent_context(...) instead". Profiles persist via
+        # Playwright `storage_state` on the context (below), not via a
+        # Chrome user-data folder on launch().
         _profile_label = (
             profile_config.get("name")
             or profile_config.get("id")
@@ -1113,17 +1105,6 @@ async def _launch_profile_session_inner(
                 _ctypes_pre.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_pre_appid)
         except Exception:
             pass
-        try:
-            import tempfile as _tf
-            _kx_user_data_root = os.environ.get(
-                "KREXION_PROFILE_DATA_ROOT",
-                os.path.join(_tf.gettempdir(), "krexion_browser_profiles"),
-            )
-            _safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(_profile_label))[:60] or "Profile"
-            _kx_user_data_dir = os.path.join(_kx_user_data_root, _safe_label)
-            os.makedirs(_kx_user_data_dir, exist_ok=True)
-        except Exception:
-            _kx_user_data_dir = ""
         launch_kwargs: Dict[str, Any] = {
             "headless": False,
             "args": [
@@ -1132,8 +1113,6 @@ async def _launch_profile_session_inner(
                 f"--window-name=Krexion \u2014 {_profile_label} ({_profile_first_letter})",
             ],
         }
-        if _kx_user_data_dir:
-            launch_kwargs["args"].append(f"--user-data-dir={_kx_user_data_dir}")
         # Chromium: proxy on launch. WebKit: prefer proxy on context (below).
         if proxy_arg and _profile_engine != "webkit":
             launch_kwargs["proxy"] = proxy_arg
@@ -1194,49 +1173,43 @@ async def _launch_profile_session_inner(
                 # Channel not present → fallback to bundled
                 browser = await p.chromium.launch(**launch_kwargs)
 
-        # 2026-07 v2.2.7 — Krexion taskbar icon override (Windows only).
-        # 2026-01 v2.4.1 — Improved reliability: we now walk ALL Chromium
-        # descendants of the Playwright driver PID via psutil (Chromium
-        # spawns 5-10 helper processes; only the main "browser" process
-        # owns the visible top-level window we need to WM_SETICON, and
-        # Playwright's `_impl_obj._process.pid` often points to the
-        # Node driver — NOT the Chromium browser process).
-        # AppUserModelID was already set pre-launch (above); the loop
-        # below just decorates every visible window it can find.
-        try:
-            _driver_pid = None
+        # 2026-07 / v2.7.11 — Krexion taskbar brand (Windows).
+        # WM_SETICON alone is not enough on Win10/11 — Chrome keeps its
+        # own AppUserModelID. `krexion_window_icon` sets RelaunchIconResource
+        # + AppUserModelID on each HWND and keeps re-applying.
+        def _brand_krexion_taskbar() -> None:
             try:
-                _proc = getattr(getattr(browser, "_impl_obj", browser), "_process", None)
-                if _proc is not None:
-                    _driver_pid = getattr(_proc, "pid", None)
-            except Exception:
                 _driver_pid = None
-            # Build the PID set: driver + all descendants (walk on-demand
-            # inside the loop so newly-spawned Chromium helpers are
-            # picked up as tabs open).
-            _target_pids: List[int] = []
-            if _driver_pid:
-                _target_pids.append(int(_driver_pid))
                 try:
-                    import psutil as _psu
-                    for _child in _psu.Process(int(_driver_pid)).children(recursive=True):
-                        try:
-                            _target_pids.append(int(_child.pid))
-                        except Exception:
-                            pass
+                    _proc = getattr(getattr(browser, "_impl_obj", browser), "_process", None)
+                    if _proc is not None:
+                        _driver_pid = getattr(_proc, "pid", None)
                 except Exception:
-                    # psutil missing or process gone — driver PID alone
-                    # is still useful for the first WM_SETICON pass.
-                    pass
-            if _target_pids:
-                from krexion_window_icon import apply_krexion_icon_to_pids
-                apply_krexion_icon_to_pids(
-                    _target_pids,
-                    profile_label=str(_profile_label)[:60] or "Profile",
-                    parent_pid=int(_driver_pid) if _driver_pid else None,
-                )
-        except Exception as _icon_err:
-            logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
+                    _driver_pid = None
+                _target_pids: List[int] = []
+                if _driver_pid:
+                    _target_pids.append(int(_driver_pid))
+                    try:
+                        import psutil as _psu
+                        for _child in _psu.Process(int(_driver_pid)).children(recursive=True):
+                            try:
+                                _target_pids.append(int(_child.pid))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if _target_pids:
+                    from krexion_window_icon import apply_krexion_icon_to_pids
+                    apply_krexion_icon_to_pids(
+                        _target_pids,
+                        profile_label=str(_profile_label)[:60] or "Profile",
+                        parent_pid=int(_driver_pid) if _driver_pid else None,
+                        poll_seconds=90.0,
+                    )
+            except Exception as _icon_err:
+                logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
+
+        _brand_krexion_taskbar()
 
         context_kwargs: Dict[str, Any] = {
             "user_agent": ua,
@@ -1279,17 +1252,8 @@ async def _launch_profile_session_inner(
         #     "jitne tab kholte sab pr krexion ka logo a raha hai ye
         #      esa ni hona chahye balke jese orignal hota hai wese
         #      hona chahye"
-        # Krexion branding now lives ONLY on:
-        #     1. The Windows taskbar entry (WM_SETICON above swaps the
-        #        Chrome logo for the Krexion K-badge on the taskbar +
-        #        alt-tab + title-bar chip).
-        #     2. Chromium's own profile badge (colored circle with the
-        #        profile's first-letter in the top-right corner —
-        #        rendered by Chromium when `--user-data-dir` points
-        #        at a per-profile folder, done above).
-        # Each tab now displays its site's REAL favicon and title,
-        # matching how a stock Chrome install behaves — professional
-        # and correct.
+        # Krexion branding on Windows taskbar (WM_SETICON above).
+        # Each tab keeps the site's real favicon and title.
 
         # v2.6.30 — RUT-grade client hints before v2.3.0 merge (TikTok/FB-iOS
         # Sec-CH-UA suppression must not be overwritten by Chrome brands).
@@ -1413,6 +1377,13 @@ async def _launch_profile_session_inner(
                 logger.debug(f"v2.3.0 anti-detect apply skipped: {_v230_err}")
 
         page = await context.new_page()
+        # HWND exists after first page — re-brand taskbar (Chrome often
+        # paints its own icon between launch() and first navigation).
+        try:
+            await asyncio.sleep(0.5)
+            _brand_krexion_taskbar()
+        except Exception:
+            pass
 
         # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
         if tls_prewarm:
@@ -1992,7 +1963,11 @@ async def process_pending_user_session_launches(
                 if status == "running":
                     await motor_db.browser_profiles.update_one(
                         {"id": profile_id},
-                        {"$set": {"status": "running", "session_id": sid}},
+                        {"$set": {
+                            "status": "running",
+                            "session_id": sid,
+                            "last_error": "",
+                        }},
                     )
                 elif status == "queued":
                     await motor_db.browser_profiles.update_one(
@@ -2005,12 +1980,15 @@ async def process_pending_user_session_launches(
                         {"$set": {"status": "stopping", "session_id": sid}},
                     )
                 elif status in ("stopped", "closed", "error"):
+                    _prof_set: Dict[str, Any] = {
+                        "status": "idle" if status in ("stopped", "closed") else "error",
+                        "session_id": "",
+                    }
+                    if status == "error" and body.get("error_message"):
+                        _prof_set["last_error"] = str(body.get("error_message"))[:512]
                     await motor_db.browser_profiles.update_one(
                         {"id": profile_id},
-                        {"$set": {
-                            "status": "idle" if status in ("stopped", "closed") else "error",
-                            "session_id": "",
-                        }},
+                        {"$set": _prof_set},
                     )
                 if body.get("storage_state") and isinstance(body["storage_state"], dict):
                     await motor_db.browser_profiles.update_one(

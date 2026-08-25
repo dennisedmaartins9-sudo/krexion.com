@@ -1,3 +1,27 @@
+# v2.7.12 — 2026-08 — Browser Profiles: mix %, devices, bulk select
+#
+# - Create: iOS/Android/Desktop mix %, random/specific device catalog,
+#   resolution modes (match device / random / exact), smart auto-names
+#   (Krexion-iPhone15-US-… / Pixel8-… / Win11-Chrome-…).
+# - List: multi-select checkboxes + bulk Launch / Stop / Delete.
+# - APIs: GET /device-catalog, POST /bulk-launch|bulk-stop|bulk-delete;
+#   advanced-create accepts mix_*_pct, device_mode, resolution_mode.
+#
+# v2.7.11 — 2026-08 — Profile launch crash + Krexion taskbar logo
+#
+# - Root cause: headed Profile launch appended `--user-data-dir=...` to
+#   `chromium.launch(args=...)`. Modern Playwright rejects that CLI flag
+#   and aborts before any window opens ("Pass user_data_dir to
+#   launch_persistent_context"). Native tray claimed the queue then failed
+#   silently on the card (error badge, no Chromium).
+# - Fix: stop passing `--user-data-dir` on launch(); cookies/storage still
+#   via Playwright `storage_state`. Tray session mirror now writes
+#   `last_error` so the profile card shows the real failure text.
+# - Taskbar brand: `krexion_window_icon` now sets AppUserModelID +
+#   RelaunchIconResource (real krexion.ico) via SHGetPropertyStoreForWindow,
+#   plus Start Menu shortcut + repeated WM_SETICON — so Chrome logo is
+#   replaced by Krexion on the Windows taskbar.
+#
 # v2.7.10 — 2026-08 — WebKit ships inside Krexion Setup EXE (no manual install)
 #
 # - Native Windows release CI + Build-Krexion-Windows.ps1 now run
