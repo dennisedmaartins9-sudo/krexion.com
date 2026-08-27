@@ -27244,6 +27244,37 @@ async def _krexion_customer_startup_tasks():
     except Exception as _imp_e:
         logger.debug(f"License hardening hook skipped: {_imp_e}")
 
+    # v2.7.22 — Native UI auto-sync when bundled frontend is stale.
+    try:
+        _fe_mode = (os.environ.get("KREXION_MODE") or "local").lower()
+        if _fe_mode == "native":
+            import asyncio as _aio_ui
+
+            async def _auto_sync_native_frontend():
+                await _aio_ui.sleep(8)
+                try:
+                    from frontend_bundle import frontend_sync_status, sync_frontend_from_cloud
+
+                    status = frontend_sync_status()
+                    if not status.get("frontend_sync_needed"):
+                        return
+                    logger.warning(
+                        "[frontend-sync] stale native UI detected "
+                        f"(backend={status.get('backend_version')}, "
+                        f"frontend={status.get('frontend_version')}) — syncing from cloud"
+                    )
+                    result = await _aio_ui.to_thread(sync_frontend_from_cloud)
+                    if result.get("ok"):
+                        logger.info("[frontend-sync] native UI refreshed from cloud")
+                    else:
+                        logger.warning(f"[frontend-sync] auto-sync failed: {result}")
+                except Exception as _ui_sync_e:  # noqa: BLE001
+                    logger.warning(f"[frontend-sync] auto-sync hook error: {_ui_sync_e}")
+
+            _aio_ui.create_task(_auto_sync_native_frontend())
+    except Exception as _fe_hook_e:  # noqa: BLE001
+        logger.debug(f"native frontend sync hook skipped: {_fe_hook_e}")
+
 
 
 # ─── Local UI static mount — RE-ENABLED in v2.1.76 ───────────────────
@@ -27326,7 +27357,14 @@ if not IS_CLOUD:
                 # SPA catch-all — hand off to React Router
                 _idx = _fe_dir / "index.html"
                 if _idx.exists():
-                    return _StaticFileResp(str(_idx))
+                    # v2.7.22 — never cache SPA shell on native installs.
+                    # PyWebView / Edge can keep an old index.html that
+                    # points at stale hashed JS after upgrades.
+                    _resp = _StaticFileResp(str(_idx))
+                    _resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+                    _resp.headers["Pragma"] = "no-cache"
+                    _resp.headers["Expires"] = "0"
+                    return _resp
                 raise HTTPException(status_code=404, detail="Frontend build not found")
 
             logger.info(f"[frontend] Local UI serving from {_fe_dir} (KREXION_MODE={KREXION_MODE})")

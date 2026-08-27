@@ -587,6 +587,12 @@ begin
   Exec(ExpandConstant('{cmd}'),
        '/C taskkill /F /IM krexion-core.exe /T',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // v2.7.22 — wipe stale frontend bundle before copying the new one.
+  // Without this, locked/untracked files from a prior install can leave
+  // the customer on an old React build even when backend VERSION updated.
+  Exec(ExpandConstant('{cmd}'),
+       '/C if exist "' + ExpandConstant('{app}') + '\frontend" rmdir /S /Q "' + ExpandConstant('{app}') + '\frontend"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   // Give the OS 3 s to release file handles before [Files] starts.
   Exec(ExpandConstant('{cmd}'),
        '/C timeout /t 3 /nobreak',

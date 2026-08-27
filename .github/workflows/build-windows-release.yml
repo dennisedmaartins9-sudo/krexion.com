@@ -297,6 +297,8 @@ jobs:
           yarn install --frozen-lockfile
           echo "REACT_APP_BACKEND_URL=http://127.0.0.1:8001" > .env.production
           yarn build
+          cd ..
+          python scripts/stamp-frontend-build.py
 
       - name: Upload frontend artifact
         # Installer job downloads this via GitHub API (no actions/cache
@@ -421,11 +423,24 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          if ((Test-Path "frontend/build/index.html") -or (Test-Path "build/frontend-build/index.html")) {
-            Write-Host "Frontend already available from cache or artifact - skipping local rebuild"
+          $expectedVer = (Get-Content backend/VERSION -Raw).Trim()
+          $stampPath = "frontend/build/build-version.json"
+          $frontendFresh = $false
+          if (Test-Path $stampPath) {
+            try {
+              $stamp = Get-Content $stampPath -Raw | ConvertFrom-Json
+              if ($stamp.version -eq $expectedVer) {
+                $frontendFresh = $true
+              }
+            } catch {
+              Write-Host "Could not parse $stampPath — will rebuild frontend"
+            }
+          }
+          if ($frontendFresh -and ((Test-Path "frontend/build/index.html") -or (Test-Path "build/frontend-build/index.html"))) {
+            Write-Host "Frontend already stamped for v$expectedVer — skipping local rebuild"
             exit 0
           }
-          Write-Host "Frontend missing from cache AND artifact - rebuilding locally..."
+          Write-Host "Frontend missing or stale for v$expectedVer — rebuilding locally..."
           cd frontend
           yarn install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { throw "yarn install failed with exit $LASTEXITCODE" }
@@ -448,6 +463,8 @@ jobs:
           if (-not (Test-Path "build/index.html")) {
             throw "craco build reported success but build/index.html is missing"
           }
+          cd ..
+          python scripts/stamp-frontend-build.py
           Write-Host "Local frontend build complete."
 
       - name: Verify build outputs available
@@ -466,6 +483,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
             Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
           }
+          python scripts/stamp-frontend-build.py --dir build/frontend-build
           Write-Host "backend OK: $backendOk"
           Write-Host "frontend OK: $frontendOk"
           if (-not $backendOk) { throw "Backend build artifact missing from BOTH cache and artifact." }

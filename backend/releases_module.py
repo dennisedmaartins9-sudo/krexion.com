@@ -553,10 +553,43 @@ def _build_customer_endpoints(get_user_dep):
         """Public — returns the running version of this install."""
         # 2026-01: DB-aware so the displayed version survives static
         # VERSION-file resets caused by container restarts / git pulls.
-        return {
-            "version": await _displayed_current_version(),
-            "mode": (os.environ.get("KREXION_MODE") or "local").lower(),
+        mode = (os.environ.get("KREXION_MODE") or "local").lower()
+        if mode == "native":
+            backend_version = current_version()
+        else:
+            backend_version = await _displayed_current_version()
+        payload = {
+            "version": backend_version,
+            "mode": mode,
         }
+        try:
+            from frontend_bundle import frontend_sync_status
+
+            sync = frontend_sync_status()
+            payload["frontend_version"] = sync.get("frontend_version")
+            payload["frontend_sync_needed"] = bool(sync.get("frontend_sync_needed"))
+        except Exception:  # noqa: BLE001
+            pass
+        return payload
+
+    @router.post("/api/system/sync-frontend")
+    async def sync_frontend_bundle():
+        """Native-only — replace stale bundled UI from the cloud CDN zip."""
+        mode = (os.environ.get("KREXION_MODE") or "local").lower()
+        if mode != "native":
+            raise HTTPException(404, "Frontend sync is only available on native installs")
+
+        import asyncio
+        from frontend_bundle import frontend_sync_status, sync_frontend_from_cloud
+
+        status = frontend_sync_status()
+        if not status.get("frontend_sync_needed"):
+            return {"ok": True, "already_current": True, "version": status.get("backend_version")}
+
+        result = await asyncio.to_thread(sync_frontend_from_cloud)
+        if not result.get("ok"):
+            raise HTTPException(502, result)
+        return result
 
     # v1.0.11 fix: filter that excludes orphan release records (those
     # without a real GitHub Releases .exe URL). Pre-1.0.11 the cloud DB
