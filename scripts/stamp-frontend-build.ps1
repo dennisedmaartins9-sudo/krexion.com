@@ -72,7 +72,15 @@ function Invoke-KrexionStamp {
 Push-Location $Root
 try {
     if ($Dir) {
-        $buildDir = (Resolve-Path -LiteralPath $Dir).Path
+        if ([System.IO.Path]::IsPathRooted($Dir)) {
+            $buildDir = $Dir
+        } else {
+            $buildDir = Join-Path $Root $Dir
+        }
+        if (-not (Test-Path $buildDir)) {
+            throw "Frontend build directory not found: $buildDir"
+        }
+        $buildDir = (Get-Item -LiteralPath $buildDir).FullName
     } else {
         $buildDir = Join-Path $Root 'frontend/build'
     }

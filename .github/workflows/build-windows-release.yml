@@ -464,25 +464,44 @@ jobs:
 
       - name: Verify build outputs available
         shell: powershell
+        working-directory: ${{ github.workspace }}
         run: |
-          # v1.0.21 — the real native entry-point produced by
-          # build/build-backend.py is `krexion-core.exe` (renamed
-          # python.exe — see build-backend.py:494). Previous version
-          # of this check looked for `krexion-backend.exe` which never
-          # existed in the output, so this gate failed on every run.
+          $ErrorActionPreference = 'Stop'
           $backendOk = Test-Path "build/dist/krexion-backend.dist/krexion-core.exe"
-          $frontendOk = (Test-Path "build/frontend-build/index.html") -or (Test-Path "frontend/build/index.html")
-          # Frontend cache restored to frontend/build (cache's original path)
-          # but artifact download went to build/frontend-build. Normalize.
-          if (-not (Test-Path "build/frontend-build/index.html") -and (Test-Path "frontend/build/index.html")) {
-            New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
-            Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
-          }
-          & ./scripts/stamp-frontend-build.ps1 -Dir "build/frontend-build"
-          Write-Host "backend OK: $backendOk"
-          Write-Host "frontend OK: $frontendOk"
           if (-not $backendOk) { throw "Backend build artifact missing from BOTH cache and artifact." }
-          if (-not $frontendOk) { throw "Frontend build artifact missing from BOTH cache and artifact." }
+          if (-not (Test-Path "frontend/build/index.html")) { throw "Frontend build artifact missing from BOTH cache and artifact." }
+
+          # Always refresh installer-facing bundle from the ubuntu artifact.
+          # Self-hosted runner can keep a stale build/frontend-build folder
+          # between runs which previously made verify/stamp fail instantly.
+          if (Test-Path "build/frontend-build") {
+            Remove-Item -Recurse -Force "build/frontend-build"
+          }
+          New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
+          Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
+
+          $expected = (Get-Content backend/VERSION -Raw).Trim().TrimStart('v','V')
+          $stampFile = "build/frontend-build/build-version.json"
+          $needsStamp = $true
+          if (Test-Path $stampFile) {
+            try {
+              $got = ((Get-Content $stampFile -Raw | ConvertFrom-Json).version).ToString().Trim().TrimStart('v','V')
+              if ($got -eq $expected) { $needsStamp = $false }
+            } catch {
+              $needsStamp = $true
+            }
+          }
+          if ($needsStamp) {
+            & ./scripts/stamp-frontend-build.ps1 -Dir "build/frontend-build"
+          } else {
+            Write-Host "Frontend bundle already stamped for v$expected"
+          }
+
+          if (-not (Test-Path "build/frontend-build/index.html")) {
+            throw "Normalized frontend bundle missing index.html"
+          }
+          Write-Host "backend OK: $backendOk"
+          Write-Host "frontend OK: true"
 
       - name: Download MongoDB Portable
         shell: powershell
