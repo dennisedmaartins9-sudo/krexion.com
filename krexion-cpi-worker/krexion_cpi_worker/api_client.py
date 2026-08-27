@@ -49,14 +49,20 @@ class APIClient:
         return r.json()
 
     async def heartbeat(self, device_id: str, status: str = "online",
-                         needs_action: Optional[str] = None) -> None:
+                         needs_action: Optional[Any] = None,
+                         clear_needs_action: bool = False) -> Dict[str, Any]:
         try:
-            await self._req("POST", f"/api/cpi/devices/{device_id}/heartbeat", json={
-                "status": status,
-                "needs_action": needs_action,
-            })
+            body: Dict[str, Any] = {"status": status}
+            if clear_needs_action:
+                body["clear_needs_action"] = True
+                body["ack_action"] = True
+            elif needs_action is not None:
+                body["needs_action"] = needs_action
+            r = await self._req("POST", f"/api/cpi/devices/{device_id}/heartbeat", json=body)
+            return r.json() if r.content else {"ok": True}
         except Exception as e:  # noqa: BLE001
             logger.warning(f"heartbeat failed for {device_id}: {e}")
+            return {"ok": False, "error": str(e)[:160]}
 
     async def list_devices(self) -> List[Dict[str, Any]]:
         r = await self._req("GET", "/api/cpi/devices")
@@ -94,3 +100,21 @@ class APIClient:
     async def auth_check(self) -> Dict[str, Any]:
         r = await self._req("GET", "/api/auth/me")
         return r.json()
+
+    async def worker_commands(self) -> Dict[str, Any]:
+        try:
+            r = await self._req("GET", "/api/cpi/worker/commands")
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"worker_commands: {e}")
+            return {"commands": []}
+
+    async def ack_worker_command(self, command_id: str, ok: bool = True,
+                                  result: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            await self._req("POST", f"/api/cpi/worker/commands/{command_id}/ack", json={
+                "ok": ok,
+                "result": result or {},
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ack_worker_command: {e}")

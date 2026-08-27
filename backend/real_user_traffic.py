@@ -3490,6 +3490,10 @@ async def _rut_apply_context_stealth(
     ctx_headers: Optional[Dict[str, str]] = None,
     fp_hash_override: Optional[int] = None,
     identity_label: str = "",
+    skip_natural_canvas: bool = False,
+    skip_webgl_align: bool = False,
+    fingerprint_win: bool = True,
+    cloak_quiet: bool = False,
 ) -> bool:
     """Full RUT stealth stack — shared by main, context-retry, tunnel-retry paths.
 
@@ -3517,38 +3521,51 @@ async def _rut_apply_context_stealth(
             webgl_align_js as _webgl_align_js,
         )
         _wgl: Dict[str, Any] = {}
-        if identity_label:
-            _wgl = _align_webgl(ua, identity_label)
-        elif fp.get("webgl_vendor") and fp.get("webgl_renderer"):
-            _wgl = {
-                "vendor": fp["webgl_vendor"],
-                "renderer": fp["webgl_renderer"],
-                "gpu_family": fp.get("gpu_family", ""),
-            }
-        if _wgl.get("vendor") and _wgl.get("renderer"):
-            _seed = int(fp.get("canvas_seed") or random.randint(1, 2**30))
-            try:
-                await context.add_init_script(_natural_canvas(_seed))
-            except Exception as _nc_err:
-                # Fallback: re-enable baseline canvas noise in stealth script.
-                logger.warning(
-                    f"natural_canvas inject failed ({_nc_err}) — "
-                    f"falling back to stealth canvas noise"
-                )
+        if not skip_webgl_align:
+            if identity_label:
+                _wgl = _align_webgl(ua, identity_label)
+            elif fp.get("webgl_vendor") and fp.get("webgl_renderer"):
+                _wgl = {
+                    "vendor": fp["webgl_vendor"],
+                    "renderer": fp["webgl_renderer"],
+                    "gpu_family": fp.get("gpu_family", ""),
+                }
+        # Canvas noise / natural canvas
+        # Legacy RUT: natural canvas only when WebGL cfg present.
+        # Profile modes may skip WebGL align while still wanting canvas noise.
+        # v2.7.20 — Cloak quiet: skip natural canvas (C++ kernel owns it)
+        if cloak_quiet:
+            skip_natural_canvas = True
+        if not skip_natural_canvas and (
+            bool(_wgl.get("vendor") and _wgl.get("renderer")) or skip_webgl_align
+        ):
+            if "canvas_seed" in fp and fp.get("canvas_seed") is not None:
+                _seed = int(fp.get("canvas_seed") or 0)
+            else:
+                _seed = random.randint(1, 2**30)
+            if _seed > 0:
                 try:
-                    await context.add_init_script(
-                        _build_stealth_script(
-                            fp, geo, fp_hash_override=fp_hash_override,
-                            skip_canvas_noise=False,
-                        )
+                    await context.add_init_script(_natural_canvas(_seed))
+                except Exception as _nc_err:
+                    logger.warning(
+                        f"natural_canvas inject failed ({_nc_err}) — "
+                        f"falling back to stealth canvas noise"
                     )
-                except Exception as _fb_err:
                     try:
-                        context._krx_stealth_degraded = True
-                    except Exception:
-                        pass
-                    logger.warning(f"stealth canvas fallback also failed: {_fb_err}")
-                    return False
+                        await context.add_init_script(
+                            _build_stealth_script(
+                                fp, geo, fp_hash_override=fp_hash_override,
+                                skip_canvas_noise=False,
+                            )
+                        )
+                    except Exception as _fb_err:
+                        try:
+                            context._krx_stealth_degraded = True
+                        except Exception:
+                            pass
+                        logger.warning(f"stealth canvas fallback also failed: {_fb_err}")
+                        return False
+        if _wgl.get("vendor") and _wgl.get("renderer"):
             await context.add_init_script(_webgl_align_js(_wgl))
     except Exception as _wgl_err:
         logger.debug(f"WebGL/canvas stealth inject failed: {_wgl_err}")
@@ -3575,6 +3592,23 @@ async def _rut_apply_context_stealth(
             await context.set_extra_http_headers(_cur)
     except Exception as _v230_err:
         logger.warning(f"v2.3.0 stealth apply failed (continuing): {_v230_err}")
+
+    # v2.7.20 — CreepJS-class Fingerprint WIN pack (iframe/Worker/OffscreenCanvas/chrome)
+    if fingerprint_win:
+        try:
+            from fingerprint_win import build_fingerprint_win_js
+
+            _fh = int(fp_hash_override) if fp_hash_override is not None else 0
+            await context.add_init_script(
+                build_fingerprint_win_js(
+                    fp,
+                    cloak_mode=bool(cloak_quiet),
+                    fp_hash=_fh,
+                )
+            )
+        except Exception as _fw_err:
+            logger.debug(f"fingerprint_win inject skipped: {_fw_err}")
+
     return not bool(getattr(context, "_krx_stealth_degraded", False))
 
 

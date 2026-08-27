@@ -40,6 +40,16 @@ android:
   # Leave blank to skip.
   frida_server_path: ""
 
+  # ── Krexion Android Engine (silent — customer never installs 3rd-party apps)
+  auto_runtime: true
+  prefer_emulator: true
+  emulator_endpoints:
+    - "127.0.0.1:5555"
+    - "127.0.0.1:5557"
+    - "127.0.0.1:5559"
+  cloud_adb_endpoints: []
+  runtime_brand: "Krexion Android"
+
 ios:
   # Set to true only when you have an iPhone connected. Android-only users leave false.
   enabled: false

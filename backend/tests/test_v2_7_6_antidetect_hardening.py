@@ -93,9 +93,9 @@ def test_tls_targets_include_136():
     assert impersonate_for_ua(ua) == "chrome136"
 
 
-def test_profile_tls_prewarm_default_false_in_source():
+def test_profile_tls_prewarm_default_true_in_source():
     src = _read("browser_profile_launcher.py")
-    assert 'anti.get("tls_prewarm", False)' in src
+    assert 'anti.get("tls_prewarm", True)' in src
 
 
 def test_rut_apply_context_stealth_skips_canvas_noise():

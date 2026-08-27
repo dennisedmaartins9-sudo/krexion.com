@@ -461,17 +461,21 @@ def _build_profile_stealth_fp(
     is_mobile: bool,
     has_touch: bool,
     profile_os: str = "",
+    fingerprint_salt: str = "",
 ) -> Dict[str, Any]:
     """Full RUT fingerprint for Profiles — keep profile viewport/mobile flags.
 
     Uses `_sync_fingerprint_to_ua` so platform/vendor/HC/WebGL/fonts match
     the UA, then overlays profile-owned viewport + deterministic seeds so
     the same profile always looks like the same device across launches.
+    Optional fingerprint_salt (from refresh API) rotates canvas/HC seeds
+    without changing profile_id.
     """
     from anti_detect_v230 import _stable_hash as _stable_hash_fn
     from real_user_traffic import _sync_fingerprint_to_ua
 
-    identity = str(profile_id or "profile")
+    _salt = str(fingerprint_salt or "").strip()
+    identity = f"{profile_id}:{_salt}" if _salt else str(profile_id or "profile")
     fp = _sync_fingerprint_to_ua(ua or "", identity_label=identity)
 
     vw = max(320, int((viewport or {}).get("width") or 1920))
@@ -561,6 +565,9 @@ async def _align_profile_geo_from_proxy(
     when they conflict).
     """
     if not proxy_arg or not proxy_arg.get("server"):
+        return geo
+    # v2.7.13 — allow locked profile timezone/locale when geo_follow_proxy=False
+    if profile_config.get("geo_follow_proxy") is False:
         return geo
     try:
         from real_user_traffic import _probe_proxy_geo
@@ -845,10 +852,21 @@ async def _launch_session_inline(
             logger.debug(f"[profile-launch] chromium pre-check skipped: {_ge}")
 
         started_at = time.time()
+        # Taskbar slot = open-profile number badge (1, 2, 3…) on Krexion icon.
+        _used_slots = {
+            int(s.get("taskbar_slot") or 0)
+            for s in _RUNNING_SESSIONS.values()
+            if isinstance(s, dict)
+        }
+        _taskbar_slot = next(
+            (i for i in range(1, 100) if i not in _used_slots),
+            max(1, len(_RUNNING_SESSIONS) + 1),
+        )
         _RUNNING_SESSIONS[session_id] = {
             "profile_id": profile_id,
             "started_at": started_at,
             "stop_requested": False,
+            "taskbar_slot": _taskbar_slot,
         }
 
         try:
@@ -901,10 +919,42 @@ async def _launch_profile_session_inner(
     anti = profile_config.get("anti_detect") or {}
     master = bool(anti.get("master", True))
     identity_persist = bool(anti.get("identity_persist", True))
-    tls_prewarm = bool(anti.get("tls_prewarm", False)) and master
+    tls_prewarm = bool(anti.get("tls_prewarm", True)) and master
     behavioral_bio = bool(anti.get("behavioral_bio", True)) and master
     ip_warmup = bool(anti.get("ip_warmup", False)) and master
     paranoia_mode = bool(anti.get("paranoia_mode", False))
+    # v2.7.16 — Octo-class kernel (CloakBrowser C++ / Patchright / Firefox)
+    try:
+        from krexion_browser_kernel import resolve_launch_plan as _resolve_kernel_plan
+        _kernel_plan = _resolve_kernel_plan(anti)
+    except Exception as _kp_err:
+        logger.debug(f"[profile-launch] kernel plan fallback: {_kp_err}")
+        _kernel_plan = {
+            "engine": "chromium",
+            "driver": "playwright",
+            "executable_path": "",
+            "stealth_args": [],
+            "kernel_label": "playwright-chromium",
+            "reduce_js_fingerprint_noise": False,
+            "preference": "auto",
+        }
+    # When C++ kernel already patches canvas/WebGL, prefer JS modes → real
+    # (CreepJS quiet path). fingerprint_win_prefer_real also coerces leftover
+    # "noise" defaults so Stealth kernel + pack don't fight each other.
+    _prefer_real = bool(anti.get("fingerprint_win_prefer_real", True))
+    if _kernel_plan.get("reduce_js_fingerprint_noise"):
+        for _mk in ("canvas_mode", "webgl_mode", "audio_mode", "font_mode"):
+            _cur = str(anti.get(_mk) or "").lower().strip()
+            if not _cur or (_prefer_real and _cur == "noise"):
+                anti[_mk] = "real"
+    canvas_mode = str(anti.get("canvas_mode") or "noise").lower().strip()
+    webgl_mode = str(anti.get("webgl_mode") or "noise").lower().strip()
+    audio_mode = str(anti.get("audio_mode") or "noise").lower().strip()
+    font_mode = str(anti.get("font_mode") or "noise").lower().strip()
+    webrtc_mode = str(anti.get("webrtc_mode") or "proxy").lower().strip()
+    proxy_check_on_launch = bool(anti.get("proxy_check_on_launch", True))
+    proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail", False))
+    use_persistent_context = bool(anti.get("use_persistent_context", False))
 
     ua = _coerce_profile_ua(ua, profile_config)
     try:
@@ -1066,6 +1116,15 @@ async def _launch_profile_session_inner(
     timezone_id = geo["timezone"]
     accept_lang = geo["accept_language"]
 
+    # v2.7.16 — Patchright driver when plan says so
+    try:
+        from krexion_browser_kernel import get_async_playwright_factory as _gaf
+        async_playwright = _gaf(_kernel_plan)
+    except Exception:
+        pass
+    if str(_kernel_plan.get("engine") or "") == "firefox":
+        _profile_engine = "firefox"
+
     async with async_playwright() as p:
         # Browser binary selection — prefer Chrome channel for realism,
         # fall back to bundled Chromium when not installed.
@@ -1093,32 +1152,94 @@ async def _launch_profile_session_inner(
             or "Profile"
         )
         _profile_first_letter = (str(_profile_label)[:1] or "K").upper()
-        # v2.4.1 — Register AppUserModelID BEFORE spawning Chromium so
-        # Windows' shell groups the incoming child under a dedicated
-        # "Krexion" taskbar entry from the very first frame paint,
-        # instead of the generic "Google Chrome" entry (which is how
-        # v2.2.7 was leaking the Chrome logo).
+        _taskbar_slot = int(
+            ((_RUNNING_SESSIONS.get(session_id) or {}).get("taskbar_slot")) or 1
+        )
+        # v2.7.15 — WebRTC launch flags from webrtc_mode (default proxy = current)
+        _WEBRTC_FORCE = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        _launch_args = [a for a in _PROFILE_HEADED_LAUNCH_ARGS if a != _WEBRTC_FORCE]
+        if webrtc_mode == "disabled":
+            _launch_args.append("--disable-webrtc")
+            _launch_args.append(_WEBRTC_FORCE)
+        elif webrtc_mode == "real":
+            pass  # omit force-webrtc — allow real WebRTC
+        else:
+            # proxy (default): keep non-proxied UDP disabled
+            _launch_args.append(_WEBRTC_FORCE)
+        # v2.7.13 — AppUserModelID per slot so each open profile gets its
+        # own numbered Krexion taskbar button (not one shared Chrome icon).
         try:
             if sys.platform.startswith("win"):
                 import ctypes as _ctypes_pre
-                _pre_appid = f"Krexion.BrowserProfile.{str(_profile_label)[:60] or 'Profile'}"
+                _pre_appid = f"Krexion.BrowserProfile.{_taskbar_slot}"
                 _ctypes_pre.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_pre_appid)
         except Exception:
             pass
         launch_kwargs: Dict[str, Any] = {
             "headless": False,
             "args": [
-                *_PROFILE_HEADED_LAUNCH_ARGS,
+                *_launch_args,
                 # Window title until first page paint; site title takes over after.
-                f"--window-name=Krexion \u2014 {_profile_label} ({_profile_first_letter})",
+                f"--window-name=Krexion \u2014 {_profile_label} ({_taskbar_slot})",
             ],
         }
+        # Merge CloakBrowser default stealth CLI args (dedupe)
+        for _sa in (_kernel_plan.get("stealth_args") or []):
+            if _sa and _sa not in launch_kwargs["args"]:
+                launch_kwargs["args"].append(_sa)
+        if _kernel_plan.get("executable_path"):
+            launch_kwargs["executable_path"] = _kernel_plan["executable_path"]
+        logger.info(
+            f"[profile-launch] kernel={_kernel_plan.get('kernel_label')} "
+            f"driver={_kernel_plan.get('driver')} exe={bool(_kernel_plan.get('executable_path'))}"
+        )
+
+        async def _krx_launch_chromium() -> Any:
+            """Launch Chromium via Cloak exe path / channel / stock."""
+            from krexion_browser_kernel import launch_chromium_with_plan as _lcp
+            _plan = dict(_kernel_plan)
+            variant = (anti.get("browser_variant") or "auto").lower()
+            _force_sys = (
+                os.environ.get("KREXION_PROFILE_USE_SYSTEM_CHROME", "").strip() == "1"
+                or variant == "chrome"
+                or _plan.get("preference") == "chrome"
+            )
+            if _force_sys and not _plan.get("executable_path"):
+                _plan["channel"] = "chrome"
+                _plan["kernel_label"] = "system-chrome"
+            try:
+                return await _lcp(p, launch_kwargs, _plan)
+            except Exception as _lex:
+                logger.warning(f"[profile-launch] kernel launch failed ({_lex}); stock chromium")
+                _kw = dict(launch_kwargs)
+                _kw.pop("executable_path", None)
+                return await p.chromium.launch(**_kw)
+        # v2.7.13 — Local API CDP: optional remote debugging for Playwright connect
+        _cdp_port: Optional[int] = None
+        _want_cdp = bool(
+            profile_config.get("local_api_cdp")
+            or os.environ.get("KREXION_PROFILE_CDP", "").strip() == "1"
+            or (os.environ.get("KREXION_MODE") or "").lower().strip() in ("native", "local")
+        )
+        if _want_cdp and _profile_engine != "webkit":
+            try:
+                import socket as _sock
+
+                with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as _s:
+                    _s.bind(("127.0.0.1", 0))
+                    _cdp_port = int(_s.getsockname()[1])
+                launch_kwargs["args"].append(f"--remote-debugging-port={_cdp_port}")
+                launch_kwargs["args"].append("--remote-debugging-address=127.0.0.1")
+            except Exception as _cdp_bind_err:
+                logger.debug(f"[profile-launch] CDP port bind skipped: {_cdp_bind_err}")
+                _cdp_port = None
         # Chromium: proxy on launch. WebKit: prefer proxy on context (below).
         if proxy_arg and _profile_engine != "webkit":
             launch_kwargs["proxy"] = proxy_arg
 
         if _profile_engine == "webkit":
             # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
+            _persistent_mode = False
             wk_kwargs: Dict[str, Any] = {"headless": False}
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
@@ -1149,34 +1270,99 @@ async def _launch_profile_session_inner(
                     pass
                 if proxy_arg:
                     launch_kwargs["proxy"] = proxy_arg
-                channel = None
-                variant = (anti.get("browser_variant") or "auto").lower()
-                if variant in ("chrome", "rotate"):
-                    channel = "chrome"
-                try:
-                    browser = (
-                        await p.chromium.launch(channel=channel, **launch_kwargs)
-                        if channel
-                        else await p.chromium.launch(**launch_kwargs)
-                    )
-                except Exception:
-                    browser = await p.chromium.launch(**launch_kwargs)
+                browser = await _krx_launch_chromium()
+        elif _profile_engine == "firefox":
+            _persistent_mode = False
+            ff_kwargs: Dict[str, Any] = {"headless": False}
+            if proxy_arg:
+                ff_kwargs["proxy"] = proxy_arg
+            try:
+                browser = await p.firefox.launch(**ff_kwargs)
+                logger.info("[profile-launch] Firefox engine ON")
+            except Exception as _ff_err:
+                logger.warning(f"Firefox launch failed ({_ff_err}) — Chromium fallback")
+                _profile_engine = "chromium"
+                if proxy_arg:
+                    launch_kwargs["proxy"] = proxy_arg
+                browser = await _krx_launch_chromium()
         else:
-            # Pick channel (Chromium only)
+            # Prefer CloakBrowser C++ kernel (Octo-class) when available.
             channel: Optional[str] = None
             variant = (anti.get("browser_variant") or "auto").lower()
-            if variant in ("chrome", "rotate"):
-                channel = "chrome"  # Falls back if not installed
-            try:
-                browser = await p.chromium.launch(channel=channel, **launch_kwargs) if channel else await p.chromium.launch(**launch_kwargs)
-            except Exception:
-                # Channel not present → fallback to bundled
-                browser = await p.chromium.launch(**launch_kwargs)
+            _force_sys_chrome = (
+                os.environ.get("KREXION_PROFILE_USE_SYSTEM_CHROME", "").strip() == "1"
+                or variant == "chrome"
+            )
+            if _force_sys_chrome:
+                channel = "chrome"
+            # v2.7.15 — Optional persistent context (native/local WIN/Linux only)
+            _krx_mode = (os.environ.get("KREXION_MODE") or "").lower()
+            _want_persist = (
+                use_persistent_context
+                and _profile_engine not in ("webkit", "firefox")
+                and (sys.platform.startswith("win") or sys.platform.startswith("linux"))
+                and _krx_mode in ("native", "local", "desktop")
+                and not bool(_kernel_plan.get("executable_path"))
+            )
+            _persistent_mode = False
+            browser = None  # type: ignore
+            if _want_persist:
+                try:
+                    if sys.platform.startswith("win"):
+                        _base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+                        _udir = os.path.join(_base, "Krexion", "profile_data", str(profile_id or session_id))
+                    else:
+                        _base = os.path.expanduser("~/.local/share/Krexion")
+                        _udir = os.path.join(_base, "profile_data", str(profile_id or session_id))
+                    os.makedirs(_udir, exist_ok=True)
+                    _pk: Dict[str, Any] = {
+                        "user_data_dir": _udir,
+                        "headless": False,
+                        "args": list(launch_kwargs.get("args") or []),
+                        "user_agent": ua,
+                        "viewport": {
+                            "width": int(viewport.get("width", 1920)),
+                            "height": int(viewport.get("height", 1080)),
+                        },
+                        "device_scale_factor": dsf,
+                        "is_mobile": is_mobile,
+                        "has_touch": has_touch,
+                        "locale": locale,
+                        "timezone_id": timezone_id,
+                        "geolocation": {
+                            "latitude": float(geo.get("lat") or 40.7128),
+                            "longitude": float(geo.get("lon") or -74.0060),
+                        },
+                        "permissions": ["geolocation"],
+                        "extra_http_headers": {"Accept-Language": accept_lang},
+                    }
+                    if proxy_arg:
+                        _pk["proxy"] = proxy_arg
+                    if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
+                        _pk["storage_state"] = storage_state
+                    if channel:
+                        _pk["channel"] = channel
+                    if launch_kwargs.get("executable_path"):
+                        _pk["executable_path"] = launch_kwargs["executable_path"]
+                    context = await p.chromium.launch_persistent_context(**_pk)
+                    browser = context.browser
+                    _persistent_mode = True
+                    logger.info(
+                        f"[profile-launch] persistent context ON dir={_udir} "
+                        f"session={session_id[:8]}"
+                    )
+                except Exception as _persist_err:
+                    logger.warning(
+                        f"[profile-launch] persistent context failed ({_persist_err}); "
+                        f"falling back to ephemeral launch"
+                    )
+                    _persistent_mode = False
+                    browser = None
+            if not _persistent_mode:
+                browser = await _krx_launch_chromium()
 
         # 2026-07 / v2.7.11 — Krexion taskbar brand (Windows).
-        # WM_SETICON alone is not enough on Win10/11 — Chrome keeps its
-        # own AppUserModelID. `krexion_window_icon` sets RelaunchIconResource
-        # + AppUserModelID on each HWND and keeps re-applying.
+        # v2.7.13 — Numbered badge = open-profile slot (top-left).
         def _brand_krexion_taskbar() -> None:
             try:
                 _driver_pid = None
@@ -1205,11 +1391,41 @@ async def _launch_profile_session_inner(
                         profile_label=str(_profile_label)[:60] or "Profile",
                         parent_pid=int(_driver_pid) if _driver_pid else None,
                         poll_seconds=90.0,
+                        profile_slot=int(_taskbar_slot),
                     )
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
 
         _brand_krexion_taskbar()
+
+        # Publish CDP websocket for Local API automation clients
+        _cdp_ws = ""
+        _debugger_addr = ""
+        if _cdp_port:
+            _debugger_addr = f"127.0.0.1:{_cdp_port}"
+            try:
+                import httpx as _httpx_cdp
+
+                for _ in range(15):
+                    try:
+                        _vr = _httpx_cdp.get(
+                            f"http://{_debugger_addr}/json/version",
+                            timeout=1.5,
+                        )
+                        if _vr.status_code == 200:
+                            _cdp_ws = str((_vr.json() or {}).get("webSocketDebuggerUrl") or "")
+                            if _cdp_ws:
+                                break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.4)
+            except Exception as _cdp_err:
+                logger.debug(f"[profile-launch] CDP discover skipped: {_cdp_err}")
+            if not _cdp_ws:
+                _cdp_ws = f"http://{_debugger_addr}"
+            if session_id in _RUNNING_SESSIONS:
+                _RUNNING_SESSIONS[session_id]["cdp_ws"] = _cdp_ws
+                _RUNNING_SESSIONS[session_id]["debugger_address"] = _debugger_addr
 
         context_kwargs: Dict[str, Any] = {
             "user_agent": ua,
@@ -1231,15 +1447,25 @@ async def _launch_profile_session_inner(
         if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
             context_kwargs["storage_state"] = storage_state
 
-        context = await browser.new_context(**context_kwargs)
+        if not _persistent_mode:
+            context = await browser.new_context(**context_kwargs)
 
         _webgl_cfg: Optional[Dict[str, Any]] = None
         _profile_ua = str(context_kwargs.get("user_agent") or ua)
         try:
             from anti_detect_v230 import align_webgl_to_ua_deterministic as _align_webgl
-            _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
+            if webgl_mode != "real":
+                _webgl_cfg = _align_webgl(_profile_ua, profile_id or session_id)
+            else:
+                _webgl_cfg = None
         except Exception:
             _webgl_cfg = None
+        if webgl_mode == "off":
+            _webgl_cfg = {
+                "vendor": "Google Inc.",
+                "renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)",
+                "gpu_family": "generic",
+            }
         _fingerprint_hash = _compute_fingerprint_hash(_profile_ua, context_kwargs["viewport"], profile_id, _webgl_cfg)
 
         # v2.4.1 — Per-tab Krexion favicon + title-prefix injection has
@@ -1296,7 +1522,45 @@ async def _launch_profile_session_inner(
                     is_mobile=is_mobile,
                     has_touch=has_touch,
                     profile_os=str(profile_os or ""),
+                    fingerprint_salt=str(profile_config.get("fingerprint_salt") or ""),
                 )
+                # v2.7.15 — Apply canvas/webgl/audio/font modes onto fp
+                # v2.7.20 — Cloak quiet when Stealth kernel or all modes real/off
+                try:
+                    from fingerprint_win import should_use_quiet_mode as _quiet_fn
+                    _cloak_quiet = _quiet_fn(
+                        reduce_js_fingerprint_noise=bool(
+                            _kernel_plan.get("reduce_js_fingerprint_noise")
+                        ),
+                        canvas_mode=canvas_mode,
+                        webgl_mode=webgl_mode,
+                        audio_mode=audio_mode,
+                        font_mode=font_mode,
+                    )
+                except Exception:
+                    _cloak_quiet = bool(_kernel_plan.get("reduce_js_fingerprint_noise"))
+                _skip_natural_canvas = canvas_mode in ("off", "real")
+                _skip_webgl_align = webgl_mode == "real"
+                _fp_salt = str(profile_config.get("fingerprint_salt") or "")
+                _stealth_identity = (
+                    f"{profile_id}:{_fp_salt}" if _fp_salt else str(profile_id or session_id)
+                )
+                if canvas_mode in ("off", "real"):
+                    _stealth_fp["canvas_seed"] = 0
+                if audio_mode in ("off", "real"):
+                    _stealth_fp["audio_seed"] = 0
+                if font_mode in ("off", "real"):
+                    _stealth_fp["font_seed"] = 0
+                if webgl_mode == "real":
+                    _stealth_fp["webgl_vendor"] = ""
+                    _stealth_fp["webgl_renderer"] = ""
+                    _stealth_identity = ""
+                elif webgl_mode == "off":
+                    _stealth_fp["webgl_vendor"] = "Google Inc."
+                    _stealth_fp["webgl_renderer"] = (
+                        "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)"
+                    )
+                    _stealth_identity = ""  # use generic fp values, don't UA-align
                 if _stealth_fp.get("webgl_vendor") and _stealth_fp.get("webgl_renderer"):
                     _webgl_cfg = {
                         "vendor": _stealth_fp["webgl_vendor"],
@@ -1324,13 +1588,20 @@ async def _launch_profile_session_inner(
                     ua=ua,
                     platform=str(_stealth_fp.get("platform") or ""),
                     ctx_headers=_ctx_hdrs,
-                    fp_hash_override=_stable_hash_fn(str(profile_id or session_id)),
-                    identity_label=str(profile_id or session_id),
+                    fp_hash_override=_stable_hash_fn(str(profile_id or session_id) + (f":{_fp_salt}" if _fp_salt else "")),
+                    identity_label=_stealth_identity,
+                    skip_natural_canvas=_skip_natural_canvas,
+                    skip_webgl_align=_skip_webgl_align,
+                    fingerprint_win=bool(anti.get("fingerprint_win", True)),
+                    cloak_quiet=_cloak_quiet,
                 )
                 logger.info(
                     f"[profile-launch] RUT-parity stealth ON — "
                     f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
-                    f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]}"
+                    f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]} "
+                    f"canvas={canvas_mode} webrtc={webrtc_mode} "
+                    f"fp_win={bool(anti.get('fingerprint_win', True))} "
+                    f"cloak_quiet={_cloak_quiet}"
                 )
 
                 if paranoia_mode:
@@ -1386,6 +1657,7 @@ async def _launch_profile_session_inner(
             pass
 
         # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
+        _last_tls_prewarm_ok = None
         if tls_prewarm:
             try:
                 from tls_anti_detect import prewarm_target as _prewarm_target
@@ -1397,9 +1669,11 @@ async def _launch_profile_session_inner(
                     accept_language=accept_lang,
                     sec_fetch_kind="ad_click",
                 )
+                _last_tls_prewarm_ok = bool(_pw_res and _pw_res.get("ok"))
                 if _pw_res and _pw_res.get("ok") and _pw_res.get("cookies"):
                     await context.add_cookies(_pw_res["cookies"])
             except Exception as _pw_err:
+                _last_tls_prewarm_ok = False
                 logger.debug(f"[profile-launch] tls prewarm skipped: {_pw_err}")
 
         # v2.6.34 — IP warm-up before first navigation (RUT parity, opt-in).
@@ -1444,7 +1718,8 @@ async def _launch_profile_session_inner(
         # surface a meaningful diagnostic page if it fails. The user
         # then sees WHY the browser can't reach the target site and
         # can pick a different proxy / disable it / contact support.
-        if proxy_arg is not None:
+        # v2.7.15 — gated by anti.proxy_check_on_launch (default True).
+        if proxy_arg is not None and proxy_check_on_launch:
             try:
                 import urllib.parse as _urlparse
                 _parsed = _urlparse.urlparse(proxy_arg.get("server") or "")
@@ -1558,6 +1833,46 @@ async def _launch_profile_session_inner(
                 logger.warning(
                     f"[profile-launch] proxy health probe outer failed: {proxy_diag['error']}"
                 )
+
+        # v2.7.15 — Hard-abort when proxy check failed and block_on_fail is set
+        if (
+            proxy_arg is not None
+            and proxy_check_on_launch
+            and proxy_check_block_on_fail
+            and proxy_diag.get("ok") is False
+        ):
+            _abort_msg = str(proxy_diag.get("error") or "proxy check failed")[:300]
+            logger.warning(
+                f"[profile-launch] proxy_check_block_on_fail — aborting: {_abort_msg}"
+            )
+            if on_session_update:
+                try:
+                    await on_session_update({
+                        "profile_id": profile_id,
+                        "session_id": session_id,
+                        "status": "error",
+                        "error_message": f"Proxy check failed: {_abort_msg}",
+                        "last_proxy_check": proxy_diag,
+                        "last_tls_prewarm_ok": _last_tls_prewarm_ok,
+                    })
+                except Exception:
+                    pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None:
+                    await browser.close()
+            except Exception:
+                pass
+            _RUNNING_SESSIONS.pop(session_id, None)
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "error": f"Proxy check failed: {_abort_msg}",
+                "proxy_diag": proxy_diag,
+            }
 
         # If proxy was REQUESTED but FAILED the probe, show a
         # diagnostic landing page INSTEAD of trying to load the real
@@ -1740,6 +2055,11 @@ async def _launch_profile_session_inner(
                     "session_id": session_id,
                     "status": "running",
                     "fingerprint_hash": _fingerprint_hash,
+                    "cdp_ws": _cdp_ws or "",
+                    "debugger_address": _debugger_addr or "",
+                    "last_tls_prewarm_ok": _last_tls_prewarm_ok,
+                    "last_proxy_check": proxy_diag if proxy_diag.get("requested") else {},
+                    "browser_kernel": str(_kernel_plan.get("kernel_label") or ""),
                 })
             except Exception:
                 pass
@@ -1753,7 +2073,12 @@ async def _launch_profile_session_inner(
         def _on_disconnected():
             closed_event.set()
 
-        browser.on("disconnected", lambda *_: _on_disconnected())
+        _br_for_events = browser if browser is not None else getattr(context, "browser", None)
+        if _br_for_events is not None:
+            _br_for_events.on("disconnected", lambda *_: _on_disconnected())
+        else:
+            # Persistent context without browser handle — poll context pages
+            pass
 
         while not closed_event.is_set():
             try:
@@ -1766,10 +2091,20 @@ async def _launch_profile_session_inner(
                     except Exception:
                         pass
                     try:
-                        await browser.close()
+                        if browser is not None and not _persistent_mode:
+                            await browser.close()
                     except Exception:
                         pass
                     break
+                # Persistent without disconnect hook: detect empty pages
+                if _br_for_events is None:
+                    try:
+                        if not context.pages:
+                            closed_event.set()
+                            break
+                    except Exception:
+                        closed_event.set()
+                        break
                 # Periodic storage_state flush (crash recovery when identity_persist ON)
                 if identity_persist and (time.time() - _last_storage_flush) >= 120.0:
                     _last_storage_flush = time.time()
@@ -1789,13 +2124,19 @@ async def _launch_profile_session_inner(
         # ── Save storage_state + push to cloud ────────────────────────
         new_storage: Dict[str, Any] = {}
         try:
-            if not browser.is_connected():
-                # Browser already closed — can't query storage. Skip.
+            _still = True
+            try:
+                if browser is not None and hasattr(browser, "is_connected"):
+                    _still = bool(browser.is_connected())
+            except Exception:
+                _still = True
+            if not _still:
                 pass
             else:
                 new_storage = await context.storage_state()
                 await context.close()
-                await browser.close()
+                if browser is not None and not _persistent_mode:
+                    await browser.close()
         except Exception as e:
             logger.warning(f"storage_state export failed: {e}")
 
@@ -2059,12 +2400,143 @@ async def process_pending_user_session_launches(
     return 1
 
 
+async def warm_profile_cookies(
+    profile_config: Dict[str, Any],
+    urls: Optional[List[str]] = None,
+    max_urls: int = 5,
+) -> Dict[str, Any]:
+    """Best-effort cookie warm: brief Chromium visits with stealth, return storage_state.
+
+    Default URLs: google + youtube + wikipedia. Max 5 URLs, 15s timeout each.
+    """
+    default_urls = [
+        "https://www.google.com/",
+        "https://www.youtube.com/",
+        "https://www.wikipedia.org/",
+    ]
+    targets: List[str] = []
+    for u in (urls or default_urls):
+        s = str(u or "").strip()
+        if s and s not in targets:
+            targets.append(s)
+        if len(targets) >= max(1, min(int(max_urls or 5), 10)):
+            break
+    if not targets:
+        targets = default_urls[: max(1, min(int(max_urls or 5), 10))]
+
+    visited: List[str] = []
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        return {"ok": False, "error": f"playwright unavailable: {e}", "visited": []}
+
+    ua = str(profile_config.get("user_agent") or "") or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    )
+    viewport = profile_config.get("viewport") or {"width": 1920, "height": 1080}
+    anti = profile_config.get("anti_detect") or {}
+    master = bool(anti.get("master", True))
+    profile_id = str(profile_config.get("id") or "warm")
+    storage_state = profile_config.get("storage_state") or None
+    proxy_cfg = profile_config.get("proxy") or {}
+    proxy_arg = None
+    if (proxy_cfg.get("enabled") or proxy_cfg.get("use_proxyjet")) and proxy_cfg.get("server"):
+        raw = str(proxy_cfg["server"]).strip()
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        proxy_arg = {"server": raw}
+        if proxy_cfg.get("username"):
+            proxy_arg["username"] = str(proxy_cfg["username"])
+        if proxy_cfg.get("password"):
+            proxy_arg["password"] = str(proxy_cfg["password"])
+
+    headless = str(os.environ.get("KREXION_COOKIE_ROBOT_HEADED", "")).strip() != "1"
+    try:
+        async with async_playwright() as p:
+            launch_kwargs: Dict[str, Any] = {
+                "headless": headless,
+                "args": list(_PROFILE_HEADED_LAUNCH_ARGS),
+            }
+            if proxy_arg:
+                launch_kwargs["proxy"] = proxy_arg
+            browser = await p.chromium.launch(**launch_kwargs)
+            ctx_kwargs: Dict[str, Any] = {
+                "user_agent": ua,
+                "viewport": {
+                    "width": int(viewport.get("width") or 1920),
+                    "height": int(viewport.get("height") or 1080),
+                },
+                "locale": str(profile_config.get("locale") or "en-US"),
+                "timezone_id": str(profile_config.get("timezone") or "America/New_York"),
+            }
+            if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
+                ctx_kwargs["storage_state"] = storage_state
+            context = await browser.new_context(**ctx_kwargs)
+            if master:
+                try:
+                    from anti_detect_v230 import _stable_hash as _stable_hash_fn
+                    from real_user_traffic import _rut_apply_context_stealth
+                    _fp = _build_profile_stealth_fp(
+                        ua,
+                        profile_id=profile_id,
+                        viewport=ctx_kwargs["viewport"],
+                        dsf=float(profile_config.get("device_scale_factor") or 1.0),
+                        is_mobile=bool(profile_config.get("is_mobile")),
+                        has_touch=bool(profile_config.get("has_touch")),
+                        profile_os=str(profile_config.get("os") or "windows"),
+                        fingerprint_salt=str(profile_config.get("fingerprint_salt") or ""),
+                    )
+                    geo = {
+                        "locale": ctx_kwargs["locale"],
+                        "timezone": ctx_kwargs["timezone_id"],
+                        "accept_language": str(profile_config.get("accept_language") or "en-US,en;q=0.9"),
+                        "lat": 40.7128,
+                        "lon": -74.0060,
+                    }
+                    await _rut_apply_context_stealth(
+                        context,
+                        fp=_fp,
+                        geo=geo,
+                        ua=ua,
+                        platform=str(_fp.get("platform") or ""),
+                        ctx_headers={"Accept-Language": geo["accept_language"]},
+                        fp_hash_override=_stable_hash_fn(
+                            profile_id + (f":{profile_config.get('fingerprint_salt') or ''}")
+                        ),
+                        identity_label=profile_id,
+                        fingerprint_win=bool((profile_config.get("anti_detect") or {}).get("fingerprint_win", True)),
+                        cloak_quiet=False,
+                    )
+                except Exception as _st_err:
+                    logger.debug(f"[cookie-robot] stealth skipped: {_st_err}")
+            page = await context.new_page()
+            for url in targets:
+                try:
+                    await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                    visited.append(url)
+                    await asyncio.sleep(0.8)
+                except Exception as _nav_err:
+                    logger.debug(f"[cookie-robot] visit failed {url}: {_nav_err}")
+            ss = await context.storage_state()
+            await context.close()
+            await browser.close()
+            return {"ok": True, "storage_state": ss, "visited": visited}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:240]}",
+            "visited": visited,
+        }
+
+
 __all__ = [
     "launch_profile_session",
     "request_stop",
     "list_running",
     "process_pending_user_session_launches",
     "expire_stale_user_session_launches",
+    "warm_profile_cookies",
     "_build_profile_stealth_fp",
     "_PROFILE_HEADED_LAUNCH_ARGS",
 ]

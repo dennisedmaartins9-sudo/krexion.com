@@ -33,6 +33,25 @@ class AndroidConfig:
     use_magisk_props: bool = True
     use_frida: bool = True
     frida_server_path: str = ""
+    # v2.7.18 — no physical phone: auto adb connect to local emulators / cloud ADB
+    prefer_emulator: bool = True
+    emulator_endpoints: List[str] = field(default_factory=lambda: [
+        "127.0.0.1:5555",
+        "127.0.0.1:5557",
+        "127.0.0.1:5559",
+        "127.0.0.1:5561",
+        "127.0.0.1:5563",
+        "127.0.0.1:5565",
+        "127.0.0.1:5567",
+        "127.0.0.1:5569",
+    ])
+    # Remote Krexion Cloud Android ADB tunnels (host:port) — synced from backend devices
+    cloud_adb_endpoints: List[str] = field(default_factory=list)
+    # v2.7.19 — silent Krexion Android Engine (customer never installs 3rd-party emulators)
+    auto_runtime: bool = True
+    runtime_brand: str = "Krexion Android"
+    # v2.7.21 — default farm size when auto-provisioning
+    farm_instances: int = 1
 
 
 @dataclass

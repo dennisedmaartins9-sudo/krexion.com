@@ -28,6 +28,27 @@ class ADB:
             return 124, "", "timeout"
         return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
+    async def connect(self, endpoint: str, timeout: int = 20) -> bool:
+        """adb connect host:port — for emulators / cloud ARM ADB tunnels."""
+        ep = (endpoint or "").strip()
+        if not ep:
+            return False
+        rc, out, err = await self._run(["connect", ep], timeout=timeout)
+        text = f"{out}\n{err}".lower()
+        ok = rc == 0 and ("connected" in text or "already connected" in text)
+        if not ok:
+            logger.warning(f"adb connect {ep} failed: {(out or err).strip()[:200]}")
+        return ok
+
+    async def disconnect(self, endpoint: str) -> None:
+        ep = (endpoint or "").strip()
+        if not ep:
+            return
+        try:
+            await self._run(["disconnect", ep], timeout=15)
+        except Exception:
+            pass
+
     async def devices(self) -> List[Dict[str, str]]:
         """Return list of {serial, state} for all attached devices."""
         rc, out, err = await self._run(["devices", "-l"])

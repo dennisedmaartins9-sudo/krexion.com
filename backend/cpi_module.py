@@ -297,11 +297,39 @@ class CPIInstallAttempt(BaseModel):
 
 class CPIDeviceRegister(BaseModel):
     device_id: str                # worker-generated stable ID (e.g., adb serial / iOS UDID)
-    device_type: str              # "android_real" | "android_genymotion" | "ios_real"
+    device_type: str              # android_real | android_emulator | android_cloud | ios_real | …
     label: Optional[str] = None
     model: Optional[str] = None
     os_version: Optional[str] = None
     worker_token: Optional[str] = None  # worker authenticates to backend with this
+
+
+class CPIDeviceActionBody(BaseModel):
+    """Queue an action for the home-PC worker (open_url / install_apk)."""
+    type: str = Field(..., max_length=32)  # open_url | install_apk
+    url: str = Field(default="", max_length=1024)
+    apk_url: str = Field(default="", max_length=1024)
+    package_name: str = Field(default="", max_length=200)
+
+
+class CPICloudPhoneProvisionBody(BaseModel):
+    """Register a partner ARM cloud phone ADB tunnel (no USB phone)."""
+    label: str = Field(default="Cloud Phone", max_length=120)
+    adb_endpoint: str = Field(..., min_length=3, max_length=120)  # host:port
+    provider: str = Field(default="partner", max_length=40)  # partner|geelark|redfinger|custom
+    external_id: str = Field(default="", max_length=120)
+    notes: str = Field(default="", max_length=500)
+
+
+class CPIAndroidEnableBody(BaseModel):
+    """One-click Krexion Android farm enable."""
+    instances: int = Field(default=1, ge=1, le=8)
+
+
+class CPIApkLibraryBody(BaseModel):
+    apk_url: str = Field(..., min_length=8, max_length=1024)
+    label: str = Field(default="", max_length=120)
+    package_name: str = Field(default="", max_length=200)
 
 
 class CPIDevice(BaseModel):
@@ -317,7 +345,9 @@ class CPIDevice(BaseModel):
     last_install_at: Optional[str] = None
     total_installs: int = 0
     successful_installs: int = 0
-    needs_action: Optional[str] = None  # "2fa_pending" | "apple_id_locked" etc.
+    needs_action: Optional[Any] = None  # dict action or legacy string
+    adb_endpoint: Optional[str] = None
+    cloud_provider: Optional[str] = None
     created_at: str
 
 
@@ -607,14 +637,30 @@ async def device_heartbeat(device_id: str, request: Request, payload: Dict[str, 
     update = {"last_heartbeat": _iso_now()}
     if "status" in payload:
         update["status"] = payload["status"]
-    if "needs_action" in payload:
+    # Worker may ACK a prior open_url / needs_action
+    clear_action = bool(payload.get("clear_needs_action") or payload.get("ack_action"))
+    if "needs_action" in payload and payload.get("needs_action") is None:
+        clear_action = True
+    if clear_action:
+        update["needs_action"] = None
+    elif "needs_action" in payload:
         update["needs_action"] = payload["needs_action"]
     res = await db.cpi_devices.update_one(
         {"id": device_id, "user_id": user["id"]}, {"$set": update}
     )
     if res.matched_count == 0:
+        # also try by hardware device_id
+        res = await db.cpi_devices.update_one(
+            {"device_id": device_id, "user_id": user["id"]}, {"$set": update}
+        )
+    if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Device not found")
-    return {"ok": True}
+    doc = await db.cpi_devices.find_one(
+        {"$or": [{"id": device_id}, {"device_id": device_id}], "user_id": user["id"]},
+        {"_id": 0},
+    )
+    pending = (doc or {}).get("needs_action")
+    return {"ok": True, "needs_action": pending}
 
 
 @cpi_router.get("/devices", response_model=List[CPIDevice])
@@ -636,6 +682,350 @@ async def delete_device(device_id: str, request: Request):
     user = await _require_cpi_user(request)
     db = _get_db_for_user(user)
     await db.cpi_devices.delete_one({"id": device_id, "user_id": user["id"]})
+    return {"ok": True}
+
+
+@cpi_router.post("/devices/{device_id}/action")
+async def queue_device_action(device_id: str, request: Request, body: CPIDeviceActionBody):
+    """Queue open_url / install_apk for the CPI worker (no USB required if emulator/cloud online)."""
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    device = await db.cpi_devices.find_one(
+        {"$or": [{"id": device_id}, {"device_id": device_id}], "user_id": user["id"]},
+        {"_id": 0},
+    )
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    atype = (body.type or "").strip().lower()
+    if atype not in ("open_url", "install_apk", "install"):
+        raise HTTPException(status_code=400, detail="type must be open_url or install_apk")
+    action: Dict[str, Any] = {"type": atype, "queued_at": _iso_now()}
+    if atype == "open_url":
+        url = (body.url or "").strip()
+        if not url.startswith("http"):
+            raise HTTPException(status_code=400, detail="url must be http(s)")
+        action["url"] = url[:1024]
+    else:
+        apk = (body.apk_url or body.url or "").strip()
+        if not apk.startswith("http"):
+            raise HTTPException(status_code=400, detail="apk_url required")
+        action["apk_url"] = apk[:1024]
+        if body.package_name:
+            action["package_name"] = body.package_name.strip()[:200]
+        # Remember APK in library for next Install
+        try:
+            now = _iso_now()
+            existing = await db.cpi_apk_library.find_one(
+                {"user_id": user["id"], "apk_url": action["apk_url"]}, {"_id": 0}
+            )
+            if existing:
+                await db.cpi_apk_library.update_one(
+                    {"id": existing["id"]},
+                    {"$set": {"last_used_at": now, "use_count": int(existing.get("use_count") or 0) + 1}},
+                )
+            else:
+                await db.cpi_apk_library.insert_one({
+                    "id": _new_id(),
+                    "user_id": user["id"],
+                    "apk_url": action["apk_url"],
+                    "label": action["apk_url"].rsplit("/", 1)[-1][:120],
+                    "package_name": action.get("package_name") or "",
+                    "use_count": 1,
+                    "created_at": now,
+                    "last_used_at": now,
+                })
+        except Exception as e:
+            logger.debug(f"apk library upsert skipped: {e}")
+    await db.cpi_devices.update_one(
+        {"id": device["id"]},
+        {"$set": {"needs_action": action, "updated_at": _iso_now()}},
+    )
+    return {"ok": True, "device_id": device["id"], "needs_action": action}
+
+
+@cpi_router.post("/cloud-phone/provision")
+async def provision_cloud_phone(request: Request, body: CPICloudPhoneProvisionBody):
+    """Register Krexion Cloud Android ADB endpoint (admin/advanced — white-labeled)."""
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    ep = (body.adb_endpoint or "").strip()
+    if ":" not in ep or not ep.split(":")[-1].isdigit():
+        raise HTTPException(status_code=400, detail="Invalid Krexion Cloud Android endpoint")
+    device_key = f"cloud:{ep}"
+    existing = await db.cpi_devices.find_one(
+        {"user_id": user["id"], "device_id": device_key}, {"_id": 0}
+    )
+    label = (body.label or "Krexion Cloud Android").strip()[:120]
+    if existing:
+        await db.cpi_devices.update_one(
+            {"id": existing["id"]},
+            {"$set": {
+                "label": label,
+                "adb_endpoint": ep,
+                "cloud_provider": "krexion",
+                "external_id": (body.external_id or "")[:120],
+                "notes": (body.notes or "")[:500],
+                "device_type": "android_cloud",
+                "updated_at": _iso_now(),
+            }},
+        )
+        existing.update({"adb_endpoint": ep, "label": label, "device_type": "android_cloud"})
+        return {"ok": True, "device": existing, "message": "Krexion Cloud Android updated — worker will connect automatically"}
+    doc = {
+        "id": _new_id(),
+        "user_id": user["id"],
+        "device_id": device_key,
+        "device_type": "android_cloud",
+        "label": label,
+        "model": "Krexion Cloud Android",
+        "os_version": "Android",
+        "status": "offline",
+        "last_heartbeat": None,
+        "last_install_at": None,
+        "total_installs": 0,
+        "successful_installs": 0,
+        "needs_action": None,
+        "adb_endpoint": ep,
+        "cloud_provider": "krexion",
+        "external_id": (body.external_id or "")[:120],
+        "notes": (body.notes or "")[:500],
+        "created_at": _iso_now(),
+    }
+    await db.cpi_devices.insert_one(doc)
+    doc.pop("_id", None)
+    # Also queue ensure so worker picks up cloud_adb from device list via command
+    await db.cpi_worker_commands.insert_one({
+        "id": _new_id(),
+        "user_id": user["id"],
+        "type": "ensure_android",
+        "status": "queued",
+        "created_at": _iso_now(),
+        "result": {},
+        "adb_endpoint": ep,
+    })
+    return {
+        "ok": True,
+        "device": doc,
+        "message": "Krexion Cloud Android registered. Keep CPI Worker running.",
+    }
+
+
+@cpi_router.get("/cloud-phone/guide")
+async def cloud_phone_guide(request: Request):
+    """Customer-facing guide — Krexion branding only (no third-party names)."""
+    await _require_cpi_user(request)
+    return {
+        "paths": [
+            {
+                "id": "krexion_android",
+                "title": "Krexion Android Farm (recommended)",
+                "steps": [
+                    "Click Enable Krexion Android — choose 1–8 phones for a farm",
+                    "Keep Krexion CPI Worker running on this PC",
+                    "Krexion Android Engine downloads and starts automatically",
+                    "Use Browse / Install APK, or bind phones from Browser Profiles",
+                ],
+            },
+            {
+                "id": "krexion_cloud",
+                "title": "Krexion Cloud Android",
+                "steps": [
+                    "Add Cloud Android endpoint on the Devices page (host:port)",
+                    "Worker connects automatically — no USB phone required",
+                ],
+            },
+        ],
+        "note": "Everything runs as Krexion. No third-party emulator apps to install.",
+    }
+
+
+@cpi_router.post("/android/enable")
+async def enable_krexion_android(
+    request: Request,
+    body: CPIAndroidEnableBody = Body(default_factory=CPIAndroidEnableBody),
+):
+    """One-click: queue silent Krexion Android Engine farm on the worker."""
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    instances = max(1, min(8, int(getattr(body, "instances", 1) or 1)))
+    cmd = {
+        "id": _new_id(),
+        "user_id": user["id"],
+        "type": "ensure_android",
+        "status": "queued",
+        "created_at": _iso_now(),
+        "result": {},
+        "instances": instances,
+    }
+    await db.cpi_worker_commands.insert_one(cmd)
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "cpi_android_auto": True,
+            "cpi_android_instances": instances,
+            "updated_at": _iso_now(),
+        }},
+    )
+    cmd.pop("_id", None)
+    msg = (
+        "Krexion Android is starting on your PC worker."
+        if instances <= 1
+        else f"Krexion Android farm ({instances} phones) is starting on your PC worker."
+    )
+    return {
+        "ok": True,
+        "command": cmd,
+        "instances": instances,
+        "message": msg + " This page will show devices when ready.",
+    }
+
+
+@cpi_router.get("/android/status")
+async def krexion_android_status(request: Request):
+    """Aggregate device + last command result for the UI spinner."""
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    devices = [
+        d async for d in db.cpi_devices.find(
+            {"user_id": user["id"], "device_type": {"$regex": "^android_"}},
+            {"_id": 0},
+        )
+    ]
+    online = [d for d in devices if d.get("status") in ("online", "busy")]
+    last_cmd = await db.cpi_worker_commands.find_one(
+        {"user_id": user["id"], "type": "ensure_android"},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+    farm_target = int((last_cmd or {}).get("instances") or user.get("cpi_android_instances") or 1)
+    return {
+        "brand": "Krexion Android",
+        "ready": len(online) > 0,
+        "online_count": len(online),
+        "device_count": len(devices),
+        "farm_target": farm_target,
+        "farm_ready": len(online) >= farm_target,
+        "instances": [
+            {
+                "id": d.get("id"),
+                "label": d.get("label") or d.get("model") or "Krexion Android",
+                "status": d.get("status"),
+                "device_type": d.get("device_type"),
+                "adb_endpoint": d.get("adb_endpoint") or "",
+            }
+            for d in devices
+        ],
+        "last_command": last_cmd,
+        "message": (
+            f"Krexion Android farm ready ({len(online)} online)"
+            if online
+            else "Waiting for Krexion CPI Worker — click Enable Krexion Android if needed"
+        ),
+    }
+
+
+@cpi_router.get("/android/catalog")
+async def android_device_catalog(request: Request):
+    """Hardware profiles for Krexion Android farm (AVD skins — white-label)."""
+    await _require_cpi_user(request)
+    return {
+        "brand": "Krexion Android",
+        "profiles": [
+            {"id": "pixel_7", "label": "Krexion Phone 7", "api": 34, "abi": "x86_64", "ram_mb": 2048},
+            {"id": "pixel_6a", "label": "Krexion Phone 6a", "api": 34, "abi": "x86_64", "ram_mb": 2048},
+            {"id": "galaxy_s23", "label": "Krexion Phone S", "api": 34, "abi": "x86_64", "ram_mb": 3072},
+            {"id": "compact", "label": "Krexion Phone Compact", "api": 34, "abi": "x86_64", "ram_mb": 1536},
+        ],
+        "max_instances": 8,
+        "note": "Farm runs silently as Krexion Android on your PC worker.",
+    }
+
+
+@cpi_router.get("/apk-library")
+async def list_apk_library(request: Request):
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    rows = [
+        r async for r in db.cpi_apk_library.find(
+            {"user_id": user["id"]}, {"_id": 0}
+        ).sort("last_used_at", -1).limit(40)
+    ]
+    return {"items": rows}
+
+
+@cpi_router.post("/apk-library")
+async def upsert_apk_library(request: Request, body: CPIApkLibraryBody):
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    url = (body.apk_url or "").strip()
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="apk_url must be http(s)")
+    now = _iso_now()
+    existing = await db.cpi_apk_library.find_one(
+        {"user_id": user["id"], "apk_url": url[:1024]}, {"_id": 0}
+    )
+    if existing:
+        await db.cpi_apk_library.update_one(
+            {"id": existing["id"]},
+            {"$set": {
+                "label": (body.label or existing.get("label") or "")[:120],
+                "package_name": (body.package_name or existing.get("package_name") or "")[:200],
+                "last_used_at": now,
+                "use_count": int(existing.get("use_count") or 0) + 1,
+            }},
+        )
+        existing.update({"last_used_at": now})
+        return {"ok": True, "item": existing}
+    doc = {
+        "id": _new_id(),
+        "user_id": user["id"],
+        "apk_url": url[:1024],
+        "label": (body.label or url.rsplit("/", 1)[-1])[:120],
+        "package_name": (body.package_name or "")[:200],
+        "use_count": 1,
+        "created_at": now,
+        "last_used_at": now,
+    }
+    await db.cpi_apk_library.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "item": doc}
+
+
+@cpi_router.delete("/apk-library/{item_id}")
+async def delete_apk_library_item(item_id: str, request: Request):
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    await db.cpi_apk_library.delete_one({"id": item_id, "user_id": user["id"]})
+    return {"ok": True}
+
+
+@cpi_router.get("/worker/commands")
+async def list_worker_commands(request: Request):
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    cur = db.cpi_worker_commands.find(
+        {"user_id": user["id"], "status": "queued"},
+        {"_id": 0},
+    ).sort("created_at", 1).limit(10)
+    return {"commands": [c async for c in cur]}
+
+
+@cpi_router.post("/worker/commands/{command_id}/ack")
+async def ack_worker_command(command_id: str, request: Request, body: Dict[str, Any] = Body(default={})):
+    user = await _require_cpi_user(request)
+    db = _get_db_for_user(user)
+    ok = bool((body or {}).get("ok", True))
+    result = (body or {}).get("result") if isinstance((body or {}).get("result"), dict) else {}
+    res = await db.cpi_worker_commands.update_one(
+        {"id": command_id, "user_id": user["id"]},
+        {"$set": {
+            "status": "done" if ok else "error",
+            "result": result,
+            "acked_at": _iso_now(),
+        }},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Command not found")
     return {"ok": True}
 
 
@@ -921,7 +1311,16 @@ async def worker_poll(request: Request, payload: Dict[str, Any] = Body(default={
     install instructions."""
     user = await _require_cpi_user(request)
     db = _get_db_for_user(user)
-    available_types = payload.get("device_types") or ["android_real", "android_genymotion", "ios_real"]
+    available_types = payload.get("device_types") or [
+        "android_real",
+        "android_genymotion",
+        "android_emulator",
+        "android_ldplayer",
+        "android_bluestacks",
+        "android_cloud",
+        "android_krexion",
+        "ios_real",
+    ]
     device_id_db = payload.get("device_id")  # optional: lock to this device
 
     # Find a running job that has queued attempts

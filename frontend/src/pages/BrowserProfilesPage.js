@@ -15,11 +15,16 @@ import {
   StopCircle,
   Copy,
   Download,
+  Upload,
   Globe,
   Smartphone,
   Monitor,
   Shield,
   RefreshCw,
+  Search,
+  Folder,
+  Link,
+  Cookie,
 } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api/browser-profiles`;
@@ -83,6 +88,9 @@ const DEFAULT_NEW = {
   accept_language: "en-US,en;q=0.9",
   start_url: "https://www.google.com/",
   tags: [],
+  folder: "",
+  geo_follow_proxy: true,
+  quick_links: [],
   proxy: {
     enabled: false,
     server: "",
@@ -102,6 +110,18 @@ const DEFAULT_NEW = {
     browser_variant: "rotate",
     identity_persist: true,
     paranoia_mode: false,
+    // v2.7.15 — WIN antidetect bundle (match backend AntiDetectConfig defaults)
+    canvas_mode: "noise",
+    webgl_mode: "noise",
+    audio_mode: "noise",
+    font_mode: "noise",
+    webrtc_mode: "proxy",
+    use_persistent_context: false,
+    proxy_check_on_launch: true,
+    proxy_check_block_on_fail: false,
+    browser_kernel: "auto",
+    fingerprint_win: true,
+    fingerprint_win_prefer_real: true,
   },
   referrer: {
     enabled: false,
@@ -117,6 +137,35 @@ const DEFAULT_NEW = {
     brand: "",
   },
 };
+
+/** Relative or ISO timestamp for storage_state sync chip */
+function formatSyncedAt(iso) {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso).slice(0, 19);
+    const sec = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (sec < 60) return "just now";
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+    if (sec < 604800) return `${Math.floor(sec / 86400)}d ago`;
+    return d.toISOString().slice(0, 16).replace("T", " ");
+  } catch {
+    return String(iso).slice(0, 19);
+  }
+}
+
+const FP_MODE_OPTIONS = [
+  { value: "off", label: "off" },
+  { value: "noise", label: "noise" },
+  { value: "real", label: "real" },
+];
+
+const WEBRTC_MODE_OPTIONS = [
+  { value: "disabled", label: "disabled" },
+  { value: "proxy", label: "proxy" },
+  { value: "real", label: "real" },
+];
 
 export default function BrowserProfilesPage() {
   const [profiles, setProfiles] = useState([]);
@@ -135,7 +184,7 @@ export default function BrowserProfilesPage() {
   const [advNamePrefix, setAdvNamePrefix] = useState("");
   const [advUA, setAdvUA] = useState({
     app: "browser",      // browser | instagram | facebook | tiktok | ...
-    platform: "desktop", // any | android | ios | desktop
+    platform: "any",     // any | android | ios | desktop
     brand: "",           // optional
     region: "US",
   });
@@ -166,18 +215,66 @@ export default function BrowserProfilesPage() {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
 
+  // v2.7.13 — Agency UX: folders / tags / cookies / share / launch-URL
+  const [filterQ, setFilterQ] = useState("");
+  const [filterTag, setFilterTag] = useState("");
+  const [filterFolder, setFilterFolder] = useState(""); // "" | "unsorted" | name
+  const [folders, setFolders] = useState([]); // [{name,count}]
+  const [foldersUnsorted, setFoldersUnsorted] = useState(0);
+  const [proxyBusy, setProxyBusy] = useState(null); // profile id
+  const [cookieDialog, setCookieDialog] = useState({ id: null, text: "", open: false });
+  const [shareDialog, setShareDialog] = useState({
+    id: null, email: "", includeCookies: false, mode: "acl", role: "editor",
+  });
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [activeSyncId, setActiveSyncId] = useState("");
+  const [cloudPhoneDialog, setCloudPhoneDialog] = useState({
+    id: null, provider: "cpi", partnerUrl: "", deviceId: "", label: "", devices: [], loadingDevices: false,
+  });
+  const [launchUrlPrompt, setLaunchUrlPrompt] = useState({ id: null, url: "" });
+  const [advTags, setAdvTags] = useState("");
+  const [advFolder, setAdvFolder] = useState("");
+  const [advTimezone, setAdvTimezone] = useState("");
+  const [advLocale, setAdvLocale] = useState("");
+  const [advGeoFollow, setAdvGeoFollow] = useState(true);
+  const [advReferrerEnabled, setAdvReferrerEnabled] = useState(false);
+  const [advQuickLinks, setAdvQuickLinks] = useState("");
+  const [advProxyLines, setAdvProxyLines] = useState("");
+  const [showFpAdvanced, setShowFpAdvanced] = useState(false);
+  const [bulkMoveFolder, setBulkMoveFolder] = useState("");
+  // v2.7.15 — fingerprint coherence panel + local API docs
+  const [fpModal, setFpModal] = useState({ open: false, id: null, loading: false, data: null, error: null });
+  const [docsModal, setDocsModal] = useState({ open: false, loading: false, data: null, error: null });
+  const [cookieRobotBusy, setCookieRobotBusy] = useState(null);
+
   const authHeaders = useMemo(() => {
     const t = localStorage.getItem("token");
     return { Authorization: `Bearer ${t}`, "Content-Type": "application/json" };
   }, []);
 
+  const fetchFolders = async () => {
+    try {
+      const r = await fetch(`${API}/folders`, { headers: authHeaders });
+      if (!r.ok) return;
+      const d = await r.json();
+      setFolders(d.folders || []);
+      setFoldersUnsorted(d.unsorted || 0);
+    } catch (_) { /* folders optional */ }
+  };
+
   const fetchProfiles = async () => {
     setLoading(true);
     try {
-      const r = await fetch(`${API}/`, { headers: authHeaders });
+      const params = new URLSearchParams();
+      if (filterQ.trim()) params.set("q", filterQ.trim());
+      if (filterTag.trim()) params.set("tag", filterTag.trim());
+      if (filterFolder) params.set("folder", filterFolder);
+      const qs = params.toString();
+      const r = await fetch(`${API}/${qs ? `?${qs}` : ""}`, { headers: authHeaders });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setProfiles(d.profiles || []);
+      fetchFolders();
     } catch (e) {
       toast.error(`Failed to load profiles: ${e.message}`);
     } finally {
@@ -186,7 +283,6 @@ export default function BrowserProfilesPage() {
   };
 
   useEffect(() => {
-    fetchProfiles();
     (async () => {
       try {
         const r = await fetch(`${API}/device-catalog`, { headers: authHeaders });
@@ -196,6 +292,11 @@ export default function BrowserProfilesPage() {
       } catch (_) { /* catalog optional */ }
     })();
   }, []);
+
+  // Re-fetch when filters change (also runs on mount)
+  useEffect(() => {
+    fetchProfiles();
+  }, [filterQ, filterTag, filterFolder]);
 
   const selectedCount = selectedIds.size;
   const toggleSelect = (id) => {
@@ -300,6 +401,15 @@ export default function BrowserProfilesPage() {
         viewport_width: advResolutionMode === "exact" ? (form.viewport?.width || 0) : 0,
         viewport_height: advResolutionMode === "exact" ? (form.viewport?.height || 0) : 0,
         anti_detect_on: !!advAntiDetect,
+        ...(advAntiDetect
+          ? {
+              anti_detect: {
+                ...form.anti_detect,
+                master: true,
+                tls_prewarm: form.anti_detect?.tls_prewarm !== false,
+              },
+            }
+          : {}),
         mix_ios_pct: mix.ios,
         mix_android_pct: mix.android,
         mix_desktop_pct: mix.desktop,
@@ -328,15 +438,37 @@ export default function BrowserProfilesPage() {
             };
           }
           if (advProxy.mode === "manual") {
-            return {
+            const lines = (advProxyLines || "")
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean);
+            const base = {
               mode: "manual",
               server: advProxy.server || "",
               username: advProxy.username || "",
               password: advProxy.password || "",
             };
+            if (lines.length) base.lines = lines;
+            return base;
           }
           return { mode: "none" };
         })(),
+        tags: (advTags || "").split(",").map((t) => t.trim()).filter(Boolean).slice(0, 20),
+        folder: (advFolder || "").trim().slice(0, 80),
+        timezone: (advTimezone || "").trim() || (form.timezone || ""),
+        locale: (advLocale || "").trim() || (form.locale || ""),
+        geo_follow_proxy: !!advGeoFollow,
+        referrer: {
+          enabled: !!advReferrerEnabled,
+          ...(advReferrerEnabled && form.referrer?.search_keywords
+            ? { search_keywords: form.referrer.search_keywords, pro_mode: true }
+            : {}),
+        },
+        quick_links: (advQuickLinks || "")
+          .split(/\r?\n/)
+          .map((u) => u.trim())
+          .filter(Boolean)
+          .slice(0, 12),
       };
       const r = await fetch(`${API}/advanced-create`, {
         method: "POST", headers: authHeaders, body: JSON.stringify(payload),
@@ -362,6 +494,9 @@ export default function BrowserProfilesPage() {
       setAdvMix({ ios: 0, android: 0, desktop: 100 });
       setAdvDeviceMode("random"); setAdvDeviceId("");
       setAdvResolutionMode("match_device");
+      setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
+      setAdvGeoFollow(true); setAdvReferrerEnabled(false);
+      setAdvQuickLinks(""); setAdvProxyLines("");
       fetchProfiles();
     } catch (e) {
       toast.error(`Create failed: ${e.message}`);
@@ -456,11 +591,15 @@ export default function BrowserProfilesPage() {
       setForm({
         ...DEFAULT_NEW,
         ...p,
+        folder: p.folder || "",
+        geo_follow_proxy: p.geo_follow_proxy !== false,
+        quick_links: Array.isArray(p.quick_links) ? p.quick_links : [],
+        fingerprint_short: p.fingerprint_short || "",
         proxy: { ...DEFAULT_NEW.proxy, ...(p.proxy || {}) },
         anti_detect: { ...DEFAULT_NEW.anti_detect, ...(p.anti_detect || {}) },
         referrer: { ...DEFAULT_NEW.referrer, ...(p.referrer || {}) },
       });
-      setEditingId(id); setShowCreate(true);
+      setEditingId(id); setShowCreate(true); setShowFpAdvanced(false);
     } catch (e) { toast.error(`Load profile failed: ${e.message}`); }
   };
 
@@ -474,11 +613,371 @@ export default function BrowserProfilesPage() {
   };
 
   const handleClone = async (id) => {
+    const includeCookies = window.confirm("Clone with cookies / storage state?");
     try {
-      const r = await fetch(`${API}/${id}/clone`, { method: "POST", headers: authHeaders });
+      const r = await fetch(`${API}/${id}/clone`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ include_cookies: includeCookies }),
+      });
       if (!r.ok) throw new Error(await r.text());
-      toast.success("Profile cloned"); fetchProfiles();
+      toast.success(includeCookies ? "Profile cloned (with cookies)" : "Profile cloned");
+      fetchProfiles();
     } catch (e) { toast.error(`Clone failed: ${e.message}`); }
+  };
+
+  const handleBulkMove = async () => {
+    if (!selectedCount || bulkBusy) return;
+    const folder = (bulkMoveFolder || "").trim();
+    setBulkBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-move`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ profile_ids: [...selectedIds], folder }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Moved ${d.moved || 0} to ${folder || "(unsorted)"}`);
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Bulk move failed: ${e.message}`);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const handleImportFile = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : (Array.isArray(parsed?.profiles) ? parsed.profiles : null);
+      if (!list || !list.length) {
+        toast.error("JSON must be an array or { profiles: [...] }");
+        return;
+      }
+      const includeCookies = window.confirm("Import cookies/storage_state when present?");
+      const r = await fetch(`${API}/import`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ profiles: list, include_cookies: includeCookies }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Imported ${d.created || 0} profile(s)`);
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Import failed: ${e.message}`);
+    }
+  };
+
+  const handleProxyCheck = async (id) => {
+    if (proxyBusy) return;
+    setProxyBusy(id);
+    try {
+      const r = await fetch(`${API}/${id}/check-proxy`, { method: "POST", headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      const ip = d.ip || d.exit_ip || d.public_ip || "";
+      const ok = d.ok !== false && !d.error;
+      toast[ok ? "success" : "error"](
+        ok
+          ? `Proxy OK${ip ? `: ${ip}` : ""}${d.country ? ` (${d.country})` : ""}`
+          : `Proxy check failed: ${d.error || d.message || "unknown"}`,
+      );
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Proxy check failed: ${e.message}`);
+    } finally {
+      setProxyBusy(null);
+    }
+  };
+
+  const openFingerprintModal = async (id) => {
+    setFpModal({ open: true, id, loading: true, data: null, error: null });
+    try {
+      const r = await fetch(`${API}/${id}/fingerprint`, { headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setFpModal({ open: true, id, loading: false, data: d, error: null });
+    } catch (e) {
+      setFpModal({ open: true, id, loading: false, data: null, error: e.message || "Failed" });
+    }
+  };
+
+  const handleFingerprintRefresh = async () => {
+    const id = fpModal.id;
+    if (!id) return;
+    if (!window.confirm("Rotate fingerprint salt? Next launch gets a new CreepJS-class identity (cookies kept).")) return;
+    try {
+      const r = await fetch(`${API}/${id}/fingerprint/refresh`, {
+        method: "POST", headers: authHeaders, body: "{}",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(d.message || "Fingerprint rotated — relaunch to apply");
+      await openFingerprintModal(id);
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Fingerprint refresh failed: ${e.message}`);
+    }
+  };
+
+  const handleCookieRobot = async (id) => {
+    if (cookieRobotBusy) return;
+    if (!window.confirm("Run Cookie Robot? Short stealth visits will warm cookies (desktop/native only).")) return;
+    setCookieRobotBusy(id);
+    try {
+      const r = await fetch(`${API}/${id}/cookie-robot`, {
+        method: "POST", headers: authHeaders, body: JSON.stringify({}),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        let msg = t;
+        try { msg = JSON.parse(t).detail || t; } catch {}
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      const d = await r.json();
+      toast.success(
+        d.ok !== false
+          ? `Cookie robot done${d.cookie_count != null ? ` (${d.cookie_count} cookies)` : ""}`
+          : `Cookie robot: ${d.error || "finished"}`,
+      );
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Cookie robot failed: ${e.message}`);
+    } finally {
+      setCookieRobotBusy(null);
+    }
+  };
+
+  const openLocalApiDocs = async () => {
+    setDocsModal({ open: true, loading: true, data: null, error: null });
+    try {
+      const r = await fetch(`${API}/local/docs`, { headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setDocsModal({ open: true, loading: false, data: d, error: null });
+    } catch (e) {
+      setDocsModal({ open: true, loading: false, data: null, error: e.message || "Failed" });
+    }
+  };
+
+  const openCookieDialog = async (id) => {
+    try {
+      const r = await fetch(`${API}/${id}/cookies`, { headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setCookieDialog({
+        id,
+        text: JSON.stringify(d.storage_state || { cookies: [], origins: [] }, null, 2),
+        open: true,
+      });
+    } catch (e) {
+      toast.error(`Load cookies failed: ${e.message}`);
+    }
+  };
+
+  const handleCookieSave = async () => {
+    const { id, text } = cookieDialog;
+    if (!id) return;
+    try {
+      let parsed;
+      try { parsed = JSON.parse(text); } catch {
+        toast.error("Cookies JSON invalid");
+        return;
+      }
+      const body = Array.isArray(parsed)
+        ? { cookies: parsed }
+        : (parsed.cookies || parsed.origins
+          ? { storage_state: parsed }
+          : { storage_state: parsed });
+      const r = await fetch(`${API}/${id}/cookies`, {
+        method: "PUT", headers: authHeaders, body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Cookies saved (${d.cookie_count ?? "?"} cookies)`);
+      setCookieDialog({ id: null, text: "", open: false });
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Save cookies failed: ${e.message}`);
+    }
+  };
+
+  const handleCookieClear = async () => {
+    const { id } = cookieDialog;
+    if (!id) return;
+    if (!window.confirm("Clear all cookies for this profile?")) return;
+    try {
+      const r = await fetch(`${API}/${id}/cookies`, { method: "DELETE", headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("Cookies cleared");
+      setCookieDialog({ id: null, text: "", open: false });
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Clear cookies failed: ${e.message}`);
+    }
+  };
+
+  const handleShare = async () => {
+    const { id, email, includeCookies, mode, role } = shareDialog;
+    if (!id || !(email || "").trim()) {
+      toast.error("Target email required");
+      return;
+    }
+    try {
+      if (mode === "clone") {
+        const r = await fetch(`${API}/${id}/share`, {
+          method: "POST", headers: authHeaders,
+          body: JSON.stringify({
+            target_email: email.trim(),
+            include_cookies: !!includeCookies,
+          }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        toast.success(`Cloned profile to ${email.trim()}`);
+      } else {
+        const r = await fetch(`${API}/${id}/acl`, {
+          method: "POST", headers: authHeaders,
+          body: JSON.stringify({
+            target_email: email.trim(),
+            role: role || "editor",
+          }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        toast.success(`ACL ${role || "editor"} granted to ${email.trim()}`);
+        fetchProfiles();
+      }
+      setShareDialog({ id: null, email: "", includeCookies: false, mode: "acl", role: "editor" });
+    } catch (e) {
+      toast.error(`Share failed: ${e.message}`);
+    }
+  };
+
+  const handleStartSync = async () => {
+    const ids = [...selectedIds];
+    if (ids.length < 2) {
+      toast.error("Select 2+ running profiles (first = master)");
+      return;
+    }
+    setSyncBusy(true);
+    try {
+      const r = await fetch(`${API}/sync/start`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({
+          master_id: ids[0],
+          slave_ids: ids.slice(1),
+          modes: ["navigate", "click", "type", "scroll"],
+          jitter: true,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setActiveSyncId(d.sync_id || "");
+      toast.success(`Synchronizer ON — master ${String(ids[0]).slice(0, 8)}…`);
+    } catch (e) {
+      toast.error(`Sync failed: ${e.message}`);
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const handleStopSync = async () => {
+    if (!activeSyncId) return;
+    setSyncBusy(true);
+    try {
+      const r = await fetch(`${API}/sync/${activeSyncId}/stop`, {
+        method: "POST", headers: authHeaders,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setActiveSyncId("");
+      toast.success("Synchronizer stopped");
+    } catch (e) {
+      toast.error(`Stop sync failed: ${e.message}`);
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const openCloudPhoneDialog = async (profileId, existing) => {
+    const cp = existing?.cloud_phone || {};
+    setCloudPhoneDialog({
+      id: profileId,
+      provider: cp.provider || "cpi",
+      partnerUrl: cp.partner_url || "",
+      deviceId: cp.device_id || "",
+      label: cp.label || "",
+      devices: [],
+      loadingDevices: true,
+    });
+    try {
+      const base = (process.env.REACT_APP_BACKEND_URL || "").replace(/\/$/, "");
+      const r = await fetch(`${base}/api/cpi/devices`, { headers: authHeaders });
+      if (r.ok) {
+        const list = await r.json();
+        const android = (Array.isArray(list) ? list : []).filter((d) =>
+          String(d.device_type || "").startsWith("android_")
+        );
+        setCloudPhoneDialog((prev) => ({
+          ...prev,
+          devices: android,
+          loadingDevices: false,
+          deviceId: prev.deviceId || (android.find((d) => d.status === "online") || android[0] || {}).id || "",
+        }));
+      } else {
+        setCloudPhoneDialog((prev) => ({ ...prev, loadingDevices: false }));
+      }
+    } catch {
+      setCloudPhoneDialog((prev) => ({ ...prev, loadingDevices: false }));
+    }
+  };
+
+  const handleCloudPhoneSave = async (mode = "bind") => {
+    const { id, provider, partnerUrl, deviceId, label } = cloudPhoneDialog;
+    if (!id) return;
+    try {
+      if (mode === "open" || (provider === "cpi" && mode === "open")) {
+        const r = await fetch(`${API}/${id}/open-on-device`, {
+          method: "POST", headers: authHeaders,
+          body: JSON.stringify({ device_id: deviceId || "", auto_fallback: true }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        toast.success(
+          d.auto_picked
+            ? `Opened on ${d.device_label || "Krexion Android"} (auto)`
+            : "Queued open URL on Krexion Android",
+        );
+      } else {
+        const r = await fetch(`${API}/${id}/cloud-phone`, {
+          method: "POST", headers: authHeaders,
+          body: JSON.stringify({
+            provider,
+            partner_url: partnerUrl || "",
+            device_id: deviceId || "",
+            label: label || "",
+          }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        toast.success(provider === "none" ? "Cloud phone cleared" : "Cloud phone bound");
+      }
+      setCloudPhoneDialog({
+        id: null, provider: "cpi", partnerUrl: "", deviceId: "", label: "", devices: [], loadingDevices: false,
+      });
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Cloud phone failed: ${e.message}`);
+    }
+  };
+
+  const handleLaunchUrlConfirm = () => {
+    const { id, url } = launchUrlPrompt;
+    if (!id) return;
+    const u = (url || "").trim();
+    setLaunchUrlPrompt({ id: null, url: "" });
+    handleLaunch(id, u || undefined);
   };
 
   const handleLaunch = async (id, startUrl) => {
@@ -536,7 +1035,8 @@ export default function BrowserProfilesPage() {
               🌐 Browser Profiles
             </h1>
             <p className="text-zinc-400 text-sm mt-1">
-              AdsPower / GoLogin-style manual browsing profiles. Each profile uses the FULL Krexion anti-detect stack — same anti-detect engine that powers Real User Traffic.
+              Krexion Browser Profiles — each profile uses the full Krexion anti-detect stack
+              (same engine that powers Real User Traffic).
             </p>
           </div>
           <div className="flex gap-2">
@@ -556,13 +1056,35 @@ export default function BrowserProfilesPage() {
             </Button>
             <Button
               data-testid="bp-open-create"
-              onClick={() => { setEditingId(null); setForm(DEFAULT_NEW); setShowCreate(true); }}
+              onClick={() => {
+                setEditingId(null); setForm(DEFAULT_NEW); setShowCreate(true);
+                setShowFpAdvanced(false);
+                setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
+                setAdvGeoFollow(true); setAdvReferrerEnabled(false);
+                setAdvQuickLinks(""); setAdvProxyLines("");
+              }}
               variant="outline" className="border-zinc-700 text-zinc-300"
             >
               <Plus className="w-4 h-4 mr-1" /> Custom Profile
             </Button>
+            <label data-testid="bp-import" className="inline-flex items-center gap-1 px-3 py-2 rounded-md border border-zinc-700 text-zinc-300 text-sm cursor-pointer hover:bg-zinc-900">
+              <Upload className="w-4 h-4" /> Import
+              <input
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  handleImportFile(f);
+                }}
+              />
+            </label>
             <Button data-testid="bp-export" onClick={handleExport} variant="outline" className="border-zinc-700 text-zinc-300">
               <Download className="w-4 h-4 mr-1" /> Export
+            </Button>
+            <Button data-testid="bp-local-api-docs" onClick={openLocalApiDocs} variant="outline" className="border-zinc-700 text-zinc-300">
+              Local API docs
             </Button>
             <Button data-testid="bp-refresh" onClick={fetchProfiles} variant="outline" className="border-zinc-700 text-zinc-300">
               <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
@@ -582,6 +1104,41 @@ export default function BrowserProfilesPage() {
           </div>
         </div>
 
+        {/* Filters toolbar */}
+        <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
+          <div className="relative flex-1 min-w-[160px] max-w-xs">
+            <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500" />
+            <Input
+              data-testid="bp-search"
+              value={filterQ}
+              onChange={(e) => setFilterQ(e.target.value)}
+              placeholder="Search name, notes, tags…"
+              className="bg-zinc-950 border-zinc-700 text-zinc-100 h-8 text-xs pl-8"
+            />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Folder className="w-3.5 h-3.5 text-zinc-500" />
+            <select
+              data-testid="bp-filter-folder"
+              value={filterFolder}
+              onChange={(e) => setFilterFolder(e.target.value)}
+              className="bg-zinc-950 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs h-8"
+            >
+              <option value="">All folders</option>
+              <option value="unsorted">Unsorted ({foldersUnsorted})</option>
+              {folders.map((f) => (
+                <option key={f.name} value={f.name}>{f.name} ({f.count})</option>
+              ))}
+            </select>
+          </div>
+          <Input
+            value={filterTag}
+            onChange={(e) => setFilterTag(e.target.value)}
+            placeholder="Filter tag"
+            className="bg-zinc-950 border-zinc-700 text-zinc-100 h-8 text-xs w-32"
+          />
+        </div>
+
         {profiles.length > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
             <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" onClick={selectAllVisible} data-testid="bp-select-all">
@@ -592,10 +1149,39 @@ export default function BrowserProfilesPage() {
             </Button>
             <span className="text-xs text-zinc-400">{selectedCount} selected</span>
             <div className="flex-1" />
+            {selectedCount > 0 && (
+              <div className="flex items-center gap-1.5">
+                <Input
+                  value={bulkMoveFolder}
+                  onChange={(e) => setBulkMoveFolder(e.target.value)}
+                  placeholder="Folder name"
+                  list="bp-folder-suggestions"
+                  className="bg-zinc-950 border-zinc-700 text-zinc-100 h-7 text-xs w-36"
+                />
+                <datalist id="bp-folder-suggestions">
+                  {folders.map((f) => <option key={f.name} value={f.name} />)}
+                </datalist>
+                <Button size="sm" disabled={bulkBusy} onClick={handleBulkMove}
+                  variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" data-testid="bp-bulk-move">
+                  <Folder className="w-3 h-3 mr-1" /> Move
+                </Button>
+              </div>
+            )}
             <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
               <Play className="w-3 h-3 mr-1" /> Launch
             </Button>
+            <Button size="sm" disabled={selectedCount < 2 || syncBusy} onClick={handleStartSync}
+              className="bg-sky-700 hover:bg-sky-800 text-white h-7 text-xs" data-testid="bp-sync-start"
+              title="First selected = master; others = slaves (must be running with CDP)">
+              Sync
+            </Button>
+            {activeSyncId ? (
+              <Button size="sm" disabled={syncBusy} onClick={handleStopSync}
+                variant="outline" className="border-sky-800 text-sky-300 h-7 text-xs" data-testid="bp-sync-stop">
+                Stop Sync
+              </Button>
+            ) : null}
             <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkStop}
               className="bg-amber-700 hover:bg-amber-800 text-white h-7 text-xs" data-testid="bp-bulk-stop">
               <StopCircle className="w-3 h-3 mr-1" /> Stop
@@ -656,15 +1242,80 @@ export default function BrowserProfilesPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="pt-0 pb-3">
+                  <div className="flex flex-wrap gap-1 mb-2">
+                    {p.folder ? (
+                      <Badge variant="outline" className="text-[10px] bg-zinc-900 border-zinc-700 text-violet-300">
+                        <Folder className="w-3 h-3 mr-0.5" />{p.folder}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="text-[10px] bg-zinc-900 border-zinc-700 text-zinc-500">unsorted</Badge>
+                    )}
+                    {(p.tags || []).map((t) => (
+                      <Badge key={t} variant="outline" className="text-[10px] bg-fuchsia-950/30 border-fuchsia-800/50 text-fuchsia-300">{t}</Badge>
+                    ))}
+                  </div>
                   <div className="text-[11px] text-zinc-500 truncate mb-2" title={p.user_agent}>
                     {(p.user_agent || "").slice(0, 60)}…
                   </div>
-                  <div className="text-[11px] text-zinc-500 mb-3">
+                  <div className="text-[11px] text-zinc-500 mb-1">
                     {p.viewport?.width}×{p.viewport?.height} · {p.locale} · {p.total_launches || 0} launches
-                    {p.storage_state_stats?.cookie_count > 0 && (
-                      <span className="text-emerald-400 ml-1">· {p.storage_state_stats.cookie_count} cookies</span>
+                    {(p.storage_state_stats?.cookie_count > 0 || p.storage_state_stats?.has_cookies) && (
+                      <span className="text-emerald-400 ml-1">
+                        · <Cookie className="w-3 h-3 inline" /> {p.storage_state_stats.cookie_count || 0} cookies
+                      </span>
                     )}
                   </div>
+                  {(p.fingerprint_short
+                    || p.storage_state_stats?.synced_at
+                    || p.last_tls_prewarm_ok != null
+                    || (p.last_proxy_check && Object.keys(p.last_proxy_check).length > 0)) && (
+                    <div className="text-[10px] text-zinc-500 mb-2 font-mono flex flex-wrap items-center gap-x-2 gap-y-1">
+                      {p.fingerprint_short && <span>fp:{p.fingerprint_short}</span>}
+                      {p.storage_state_stats?.synced_at && (
+                        <span className="text-emerald-400/90" title={String(p.storage_state_stats.synced_at)}>
+                          Synced: {formatSyncedAt(p.storage_state_stats.synced_at)}
+                        </span>
+                      )}
+                      {p.last_tls_prewarm_ok != null && p.last_tls_prewarm_ok !== "" && (
+                        <Badge
+                          variant="outline"
+                          className={`text-[9px] px-1 py-0 h-4 ${
+                            p.last_tls_prewarm_ok === true || p.last_tls_prewarm_ok === "ok" || p.last_tls_prewarm_ok === 1
+                              ? "border-emerald-700/60 text-emerald-300"
+                              : "border-amber-700/60 text-amber-300"
+                          }`}
+                        >
+                          tls:{String(p.last_tls_prewarm_ok === true ? "ok" : p.last_tls_prewarm_ok)}
+                        </Badge>
+                      )}
+                      {p.last_proxy_check?.ip || p.last_proxy_check?.exit_ip ? (
+                        <span className={p.last_proxy_check.ok === false ? "text-red-400" : "text-cyan-400"}>
+                          proxy:{p.last_proxy_check.ip || p.last_proxy_check.exit_ip}
+                          {p.last_proxy_check.country ? ` (${p.last_proxy_check.country})` : ""}
+                        </span>
+                      ) : p.last_proxy_check?.error ? (
+                        <span className="text-red-400">proxy:fail</span>
+                      ) : null}
+                    </div>
+                  )}
+                  {Array.isArray(p.quick_links) && p.quick_links.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-2">
+                      {p.quick_links.slice(0, 6).map((url) => (
+                        <Button
+                          key={url}
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="border-zinc-700 text-cyan-300 h-6 text-[10px] px-1.5"
+                          onClick={() => handleLaunch(p.id, url)}
+                          title={url}
+                        >
+                          <Link className="w-3 h-3 mr-0.5" />
+                          {(() => { try { return new URL(url).hostname; } catch { return url.slice(0, 18); } })()}
+                        </Button>
+                      ))}
+                    </div>
+                  )}
                   <div className="flex flex-wrap gap-1">
                     {["running", "launching", "stopping", "queued"].includes(p.status) ? (
                       <Button data-testid={`bp-stop-${p.id}`} onClick={() => handleStop(p.id)} size="sm" className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
@@ -675,6 +1326,71 @@ export default function BrowserProfilesPage() {
                         <Play className="w-3 h-3 mr-1" /> Launch
                       </Button>
                     )}
+                    <Button
+                      data-testid={`bp-launch-url-${p.id}`}
+                      onClick={() => setLaunchUrlPrompt({ id: p.id, url: p.start_url || "https://" })}
+                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                      disabled={["running", "launching", "stopping", "queued"].includes(p.status)}
+                    >
+                      <Link className="w-3 h-3 mr-1" /> URL
+                    </Button>
+                    <Button
+                      data-testid={`bp-fingerprint-${p.id}`}
+                      onClick={() => openFingerprintModal(p.id)}
+                      variant="outline" size="sm" className="border-fuchsia-800/60 text-fuchsia-300 h-7 text-xs"
+                    >
+                      Fingerprint
+                    </Button>
+                    <Button
+                      data-testid={`bp-cookie-robot-${p.id}`}
+                      onClick={() => handleCookieRobot(p.id)}
+                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                      disabled={cookieRobotBusy === p.id}
+                    >
+                      {cookieRobotBusy === p.id ? "…" : "Cookie Robot"}
+                    </Button>
+                    <Button
+                      data-testid={`bp-rpa-${p.id}`}
+                      onClick={() => {
+                        window.location.href = `/rpa-studio?browser_profile_id=${encodeURIComponent(p.id)}&name=${encodeURIComponent(p.name || "")}`;
+                      }}
+                      variant="outline" size="sm" className="border-zinc-700 text-cyan-300 h-7 text-xs"
+                      title="Open RPA Studio with this profile id"
+                    >
+                      RPA
+                    </Button>
+                    <Button
+                      data-testid={`bp-proxy-check-${p.id}`}
+                      onClick={() => handleProxyCheck(p.id)}
+                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                      disabled={proxyBusy === p.id}
+                    >
+                      {proxyBusy === p.id ? "…" : "Proxy"}
+                    </Button>
+                    <Button
+                      data-testid={`bp-cookies-${p.id}`}
+                      onClick={() => openCookieDialog(p.id)}
+                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                    >
+                      <Cookie className="w-3 h-3" />
+                    </Button>
+                    <Button
+                      data-testid={`bp-share-${p.id}`}
+                      onClick={() => setShareDialog({
+                        id: p.id, email: "", includeCookies: false, mode: "acl", role: "editor",
+                      })}
+                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                    >
+                      Share
+                    </Button>
+                    <Button
+                      data-testid={`bp-cloud-phone-${p.id}`}
+                      onClick={() => openCloudPhoneDialog(p.id, p)}
+                      variant="outline" size="sm" className="border-zinc-700 text-emerald-300 h-7 text-xs"
+                      title="Cloud phone / Krexion Android"
+                    >
+                      <Smartphone className="w-3 h-3" />
+                    </Button>
                     <Button data-testid={`bp-edit-${p.id}`} onClick={() => handleEdit(p.id)} variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs">
                       Edit
                     </Button>
@@ -949,6 +1665,9 @@ export default function BrowserProfilesPage() {
                           <option value="ios">iOS</option>
                           <option value="desktop">Desktop</option>
                         </select>
+                        <p className="text-[10px] text-amber-400/90 mt-1">
+                          Platform mix ON → OS auto (ignore Operating System)
+                        </p>
                       </div>
                       <div>
                         <Label className="text-zinc-300 text-xs">Region / Country</Label>
@@ -983,6 +1702,66 @@ export default function BrowserProfilesPage() {
                   </div>
                 )}
 
+                {/* Agency fields — create mode */}
+                {!editingId && (
+                  <div className="p-3 rounded-lg border border-violet-500/30 bg-violet-950/10 space-y-3">
+                    <span className="text-violet-300 text-sm font-semibold">Folder · Tags · Geo · Links</span>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Folder</Label>
+                        <Input value={advFolder} onChange={(e) => setAdvFolder(e.target.value)}
+                          list="bp-folder-suggestions"
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" placeholder="e.g. Clients / US Ads" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Tags <span className="text-zinc-500">(csv)</span></Label>
+                        <Input value={advTags} onChange={(e) => setAdvTags(e.target.value)}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" placeholder="warmup, client-a" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Timezone</Label>
+                        <Input value={advTimezone} onChange={(e) => setAdvTimezone(e.target.value)}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" placeholder="America/New_York (blank = default)" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Locale</Label>
+                        <Input value={advLocale} onChange={(e) => setAdvLocale(e.target.value)}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" placeholder="en-US (blank = default)" />
+                      </div>
+                    </div>
+                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                      <input type="checkbox" checked={advGeoFollow}
+                        onChange={(e) => setAdvGeoFollow(e.target.checked)}
+                        className="w-4 h-4 rounded accent-fuchsia-500" />
+                      geo_follow_proxy — timezone/locale follow proxy IP
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                      <input type="checkbox" checked={advReferrerEnabled}
+                        onChange={(e) => setAdvReferrerEnabled(e.target.checked)}
+                        className="w-4 h-4 rounded accent-fuchsia-500" />
+                      Referrer Pro enabled
+                    </label>
+                    {advReferrerEnabled && (
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Referrer keywords</Label>
+                        <Input value={form.referrer?.search_keywords || ""}
+                          onChange={(e) => setForm({
+                            ...form,
+                            referrer: { ...form.referrer, enabled: true, search_keywords: e.target.value },
+                          })}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100"
+                          placeholder="search keywords for referrer chain" />
+                      </div>
+                    )}
+                    <div>
+                      <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>
+                      <Textarea value={advQuickLinks} onChange={(e) => setAdvQuickLinks(e.target.value)}
+                        rows={2} className="bg-zinc-900 border-zinc-700 text-zinc-100 font-mono text-xs"
+                        placeholder={"https://mail.google.com\nhttps://facebook.com"} />
+                    </div>
+                  </div>
+                )}
+
                 {/* Anti-Detect */}
                 <div className="p-3 rounded-lg border border-fuchsia-500/30 bg-fuchsia-950/10">
                   <label className="flex items-center justify-between cursor-pointer">
@@ -1010,7 +1789,272 @@ export default function BrowserProfilesPage() {
                         className="w-5 h-5 rounded accent-fuchsia-500" />
                     )}
                   </label>
+                  {(editingId || advAntiDetect) && (
+                    <div className="mt-3">
+                      <button
+                        type="button"
+                        className="text-[11px] text-fuchsia-300/90 hover:text-fuchsia-200 underline"
+                        onClick={() => setShowFpAdvanced((v) => !v)}
+                      >
+                        {showFpAdvanced ? "Hide" : "Show"} advanced anti-detect
+                      </button>
+                      {showFpAdvanced && (
+                        <div className="mt-2 space-y-3 text-xs text-zinc-300 border-t border-fuchsia-500/20 pt-2">
+                          {editingId && (
+                            <>
+                              <label className="flex items-center gap-2">
+                                <input type="checkbox" className="accent-fuchsia-500" checked={!!form.anti_detect.master}
+                                  onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, master: e.target.checked } })} />
+                                master
+                              </label>
+                              <label className="flex items-center gap-2">
+                                <input type="checkbox" className="accent-fuchsia-500" checked={!!form.anti_detect.behavioral_bio}
+                                  onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, behavioral_bio: e.target.checked } })} />
+                                behavioral_bio
+                              </label>
+                              <label className="flex items-center gap-2">
+                                <input type="checkbox" className="accent-fuchsia-500" checked={!!form.anti_detect.paranoia_mode}
+                                  onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, paranoia_mode: e.target.checked } })} />
+                                paranoia_mode
+                              </label>
+                            </>
+                          )}
+                          <div className="grid grid-cols-2 gap-2">
+                            {[
+                              ["canvas_mode", "Canvas", "noise = slight spoof; real = pass-through; off = no inject"],
+                              ["webgl_mode", "WebGL", "Align GPU vendor/renderer noise with UA"],
+                              ["audio_mode", "Audio", "AudioContext fingerprint noise"],
+                              ["font_mode", "Fonts", "Font enumeration noise"],
+                            ].map(([key, label, help]) => (
+                              <div key={key}>
+                                <Label className="text-zinc-400 text-[10px]">{label}</Label>
+                                <select
+                                  value={form.anti_detect?.[key] || "noise"}
+                                  onChange={(e) => setForm({
+                                    ...form,
+                                    anti_detect: { ...form.anti_detect, [key]: e.target.value },
+                                  })}
+                                  className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
+                                >
+                                  {FP_MODE_OPTIONS.map((o) => (
+                                    <option key={o.value} value={o.value}>{o.label}</option>
+                                  ))}
+                                </select>
+                                <p className="text-[9px] text-zinc-500 mt-0.5">{help}</p>
+                              </div>
+                            ))}
+                            <div className="col-span-2">
+                              <Label className="text-zinc-400 text-[10px]">Browser kernel</Label>
+                              <select
+                                data-testid="bp-browser-kernel"
+                                value={form.anti_detect?.browser_kernel || "auto"}
+                                onChange={(e) => setForm({
+                                  ...form,
+                                  anti_detect: { ...form.anti_detect, browser_kernel: e.target.value },
+                                })}
+                                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
+                              >
+                                <option value="auto">Krexion Stealth (auto)</option>
+                                <option value="cloak">Krexion Stealth Chromium</option>
+                                <option value="patchright">Krexion Hardened Chromium</option>
+                                <option value="playwright">Krexion Standard Chromium</option>
+                                <option value="firefox">Krexion Firefox</option>
+                                <option value="chrome">System Chrome (not recommended)</option>
+                              </select>
+                              <p className="text-[9px] text-zinc-500 mt-0.5">
+                                Auto selects the strongest Krexion stealth kernel available on this PC
+                              </p>
+                            </div>
+                            <label className="col-span-2 flex items-start gap-2">
+                              <input
+                                type="checkbox"
+                                className="accent-fuchsia-500 mt-0.5"
+                                data-testid="bp-fingerprint-win"
+                                checked={form.anti_detect?.fingerprint_win !== false}
+                                onChange={(e) => setForm({
+                                  ...form,
+                                  anti_detect: { ...form.anti_detect, fingerprint_win: e.target.checked },
+                                })}
+                              />
+                              <span>
+                                Fingerprint WIN pack (CreepJS-class)
+                                <span className="block text-[9px] text-zinc-500">
+                                  iframe / Worker / OffscreenCanvas / chrome.runtime coherence — recommended ON
+                                </span>
+                              </span>
+                            </label>
+                            <label className="col-span-2 flex items-start gap-2">
+                              <input
+                                type="checkbox"
+                                className="accent-fuchsia-500 mt-0.5"
+                                checked={form.anti_detect?.fingerprint_win_prefer_real !== false}
+                                onChange={(e) => setForm({
+                                  ...form,
+                                  anti_detect: {
+                                    ...form.anti_detect,
+                                    fingerprint_win_prefer_real: e.target.checked,
+                                  },
+                                })}
+                              />
+                              <span>
+                                Prefer real canvas/WebGL under Stealth kernel
+                                <span className="block text-[9px] text-zinc-500">
+                                  Quiet path: C++ kernel owns FP, less JS noise (CreepJS safer)
+                                </span>
+                              </span>
+                            </label>
+                            <div className="col-span-2">
+                              <Label className="text-zinc-400 text-[10px]">WebRTC</Label>
+                              <select
+                                value={form.anti_detect?.webrtc_mode || "proxy"}
+                                onChange={(e) => setForm({
+                                  ...form,
+                                  anti_detect: { ...form.anti_detect, webrtc_mode: e.target.value },
+                                })}
+                                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
+                              >
+                                {WEBRTC_MODE_OPTIONS.map((o) => (
+                                  <option key={o.value} value={o.value}>{o.label}</option>
+                                ))}
+                              </select>
+                              <p className="text-[9px] text-zinc-500 mt-0.5">
+                                proxy = leak via proxy IP; disabled = block; real = system WebRTC
+                              </p>
+                            </div>
+                          </div>
+                          <label className="flex items-start gap-2">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.tls_prewarm}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, tls_prewarm: e.target.checked } })} />
+                            <span>
+                              tls_prewarm
+                              <span className="block text-[9px] text-zinc-500">Warm TLS session to start URL before browse</span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.use_persistent_context}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, use_persistent_context: e.target.checked } })} />
+                            <span>
+                              use_persistent_context
+                              <span className="block text-[9px] text-zinc-500">Disk profile dir instead of ephemeral + storage_state</span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.proxy_check_on_launch}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, proxy_check_on_launch: e.target.checked } })} />
+                            <span>
+                              proxy_check_on_launch
+                              <span className="block text-[9px] text-zinc-500">Verify exit IP when launching</span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.proxy_check_block_on_fail}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, proxy_check_block_on_fail: e.target.checked } })} />
+                            <span>
+                              proxy_check_block_on_fail
+                              <span className="block text-[9px] text-zinc-500">Abort launch if proxy check fails</span>
+                            </span>
+                          </label>
+                          {editingId && (
+                            <p className="text-[10px] text-zinc-500 font-mono">
+                              fingerprint: {form.fingerprint_short || "(none yet — set after first launch)"}
+                            </p>
+                          )}
+                          {!editingId && (
+                            <p className="text-[10px] text-zinc-500">
+                              Modes are sent with advanced-create (backend AntiDetectConfig). Defaults match WIN bundle.
+                            </p>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
+
+                {/* Edit-mode agency fields */}
+                {editingId && (
+                  <div className="p-3 rounded-lg border border-violet-500/30 bg-violet-950/10 space-y-3">
+                    <span className="text-violet-300 text-sm font-semibold">Folder · Tags · Geo · Referrer · Links</span>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Folder</Label>
+                        <Input value={form.folder || ""}
+                          onChange={(e) => setForm({ ...form, folder: e.target.value })}
+                          list="bp-folder-suggestions"
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Tags <span className="text-zinc-500">(csv)</span></Label>
+                        <Input
+                          value={Array.isArray(form.tags) ? form.tags.join(", ") : (form.tags || "")}
+                          onChange={(e) => setForm({
+                            ...form,
+                            tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean),
+                          })}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Timezone</Label>
+                        <Input value={form.timezone || ""}
+                          onChange={(e) => setForm({ ...form, timezone: e.target.value })}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                      </div>
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Locale</Label>
+                        <Input value={form.locale || ""}
+                          onChange={(e) => setForm({ ...form, locale: e.target.value })}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                      </div>
+                    </div>
+                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                      <input type="checkbox" checked={form.geo_follow_proxy !== false}
+                        onChange={(e) => setForm({ ...form, geo_follow_proxy: e.target.checked })}
+                        className="w-4 h-4 rounded accent-fuchsia-500" />
+                      geo_follow_proxy
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                      <input type="checkbox" checked={!!form.referrer?.enabled}
+                        onChange={(e) => setForm({
+                          ...form,
+                          referrer: { ...form.referrer, enabled: e.target.checked },
+                        })}
+                        className="w-4 h-4 rounded accent-fuchsia-500" />
+                      Referrer Pro enabled
+                    </label>
+                    {form.referrer?.enabled && (
+                      <div>
+                        <Label className="text-zinc-300 text-xs">Referrer keywords</Label>
+                        <Input value={form.referrer?.search_keywords || ""}
+                          onChange={(e) => setForm({
+                            ...form,
+                            referrer: { ...form.referrer, search_keywords: e.target.value },
+                          })}
+                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
+                      </div>
+                    )}
+                    <div>
+                      <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>
+                      <Textarea
+                        value={Array.isArray(form.quick_links) ? form.quick_links.join("\n") : ""}
+                        onChange={(e) => setForm({
+                          ...form,
+                          quick_links: e.target.value.split(/\r?\n/).map((u) => u.trim()).filter(Boolean).slice(0, 12),
+                        })}
+                        rows={2}
+                        className="bg-zinc-900 border-zinc-700 text-zinc-100 font-mono text-xs"
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <Button type="button" size="sm" variant="outline" className="h-7 text-xs border-zinc-700 text-zinc-300"
+                        onClick={() => openCookieDialog(editingId)}>
+                        <Cookie className="w-3 h-3 mr-1" /> Manage cookies
+                      </Button>
+                      <Button type="button" size="sm" variant="outline" className="h-7 text-xs border-zinc-700 text-zinc-300"
+                        onClick={() => handleProxyCheck(editingId)} disabled={proxyBusy === editingId}>
+                        Check proxy
+                      </Button>
+                    </div>
+                  </div>
+                )}
 
                 {/* Proxy — create vs edit modes use different controls */}
                 {!editingId ? (
@@ -1106,6 +2150,22 @@ export default function BrowserProfilesPage() {
                         <div className="p-2.5 rounded-md bg-zinc-900/60 border border-zinc-800 text-[11px] text-zinc-400">
                           <span className="text-zinc-200 font-semibold">💡 Works with any proxy provider</span> — BrightData, SmartProxy, Oxylabs, IPRoyal, Nimble, Rayobyte, GeoNode, BestGo, DataImpulse, etc.
                           Paste the proxy string OR fill the fields below.
+                        </div>
+
+                        <div>
+                          <Label className="text-zinc-300 text-[11px] mb-1 block">
+                            Unique proxies <span className="text-zinc-500">(one line per profile — preferred for bulk)</span>
+                          </Label>
+                          <Textarea
+                            value={advProxyLines}
+                            onChange={(e) => setAdvProxyLines(e.target.value)}
+                            rows={4}
+                            className="bg-zinc-900 border-zinc-700 text-zinc-100 font-mono text-xs"
+                            placeholder={"http://user:pass@host:port\nhost:port:user:pass"}
+                          />
+                          <p className="text-[10px] text-zinc-500 mt-1">
+                            When lines are set, each profile gets the next unique proxy. Single server below is still supported as fallback.
+                          </p>
                         </div>
 
                         {/* Paste-and-parse — accepts all 5 common formats */}
@@ -1291,7 +2351,11 @@ export default function BrowserProfilesPage() {
                             ✓ {advProxy.server}{advProxy.username ? `  (auth: ${advProxy.username})` : ""}
                           </div>
                         )}
-                        <p className="text-[10px] text-zinc-500">Same proxy applied to every profile in this batch.</p>
+                        <p className="text-[10px] text-zinc-500">
+                          {advProxyLines.trim()
+                            ? "Unique proxy lines above take priority (one per profile)."
+                            : "Same proxy applied to every profile in this batch (or paste unique lines above)."}
+                        </p>
                       </div>
                     )}
                   </div>
@@ -1351,6 +2415,345 @@ export default function BrowserProfilesPage() {
                         ? "Creating…"
                         : (advCount > 1 ? `Create ${advCount} Profiles` : "Create Profile"))}
                 </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Cookie dialog */}
+        {cookieDialog.open && (
+          <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setCookieDialog({ id: null, text: "", open: false })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-2xl w-full max-h-[85vh] overflow-hidden flex flex-col"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                  <Cookie className="w-4 h-4 text-emerald-400" /> Cookies / storage_state
+                </h3>
+                <Button size="sm" variant="outline" className="h-7 text-xs border-zinc-700"
+                  onClick={() => setCookieDialog({ id: null, text: "", open: false })}>Close</Button>
+              </div>
+              <div className="p-4 flex-1 overflow-y-auto">
+                <Textarea
+                  value={cookieDialog.text}
+                  onChange={(e) => setCookieDialog({ ...cookieDialog, text: e.target.value })}
+                  rows={16}
+                  className="bg-zinc-900 border-zinc-700 text-zinc-100 font-mono text-[11px]"
+                />
+                <p className="text-[10px] text-zinc-500 mt-2">
+                  Paste Playwright storage_state JSON, or a cookies array. Export is already loaded.
+                </p>
+              </div>
+              <div className="p-3 border-t border-zinc-800 flex justify-end gap-2">
+                <Button size="sm" variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs"
+                  onClick={handleCookieClear}>Clear</Button>
+                <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                  onClick={handleCookieSave}>Import / Save</Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Share / ACL dialog */}
+        {shareDialog.id && (
+          <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setShareDialog({ id: null, email: "", includeCookies: false, mode: "acl", role: "editor" })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
+              onClick={(e) => e.stopPropagation()}>
+              <h3 className="text-sm font-semibold text-zinc-100 mb-3">Team share</h3>
+              <Label className="text-zinc-300 text-xs">Mode</Label>
+              <select
+                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded-md h-9 text-xs mb-3 px-2"
+                value={shareDialog.mode || "acl"}
+                onChange={(e) => setShareDialog({ ...shareDialog, mode: e.target.value })}
+                data-testid="bp-share-mode"
+              >
+                <option value="acl">Live ACL (same profile)</option>
+                <option value="clone">Clone into their account</option>
+              </select>
+              <Label className="text-zinc-300 text-xs">Target email</Label>
+              <Input
+                value={shareDialog.email}
+                onChange={(e) => setShareDialog({ ...shareDialog, email: e.target.value })}
+                className="bg-zinc-900 border-zinc-700 text-zinc-100 mb-3"
+                placeholder="teammate@company.com"
+              />
+              {shareDialog.mode !== "clone" ? (
+                <>
+                  <Label className="text-zinc-300 text-xs">Role</Label>
+                  <select
+                    className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded-md h-9 text-xs mb-4 px-2"
+                    value={shareDialog.role || "editor"}
+                    onChange={(e) => setShareDialog({ ...shareDialog, role: e.target.value })}
+                    data-testid="bp-share-role"
+                  >
+                    <option value="viewer">Viewer</option>
+                    <option value="editor">Editor</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </>
+              ) : (
+                <label className="flex items-center gap-2 text-xs text-zinc-300 mb-4 cursor-pointer">
+                  <input type="checkbox" className="accent-fuchsia-500"
+                    checked={shareDialog.includeCookies}
+                    onChange={(e) => setShareDialog({ ...shareDialog, includeCookies: e.target.checked })} />
+                  Include cookies / storage state
+                </label>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setShareDialog({ id: null, email: "", includeCookies: false, mode: "acl", role: "editor" })}>Cancel</Button>
+                <Button size="sm" className="bg-fuchsia-600 hover:bg-fuchsia-700 text-white h-7 text-xs"
+                  onClick={handleShare} data-testid="bp-share-confirm">Share</Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Cloud phone / Krexion Android dialog */}
+        {cloudPhoneDialog.id && (
+          <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setCloudPhoneDialog({
+              id: null, provider: "cpi", partnerUrl: "", deviceId: "", label: "", devices: [], loadingDevices: false,
+            })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
+              onClick={(e) => e.stopPropagation()}>
+              <h3 className="text-sm font-semibold text-zinc-100 mb-3">Krexion Android / Cloud phone</h3>
+              <Label className="text-zinc-300 text-xs">Provider</Label>
+              <select
+                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded-md h-9 text-xs mb-3 px-2"
+                value={cloudPhoneDialog.provider}
+                onChange={(e) => setCloudPhoneDialog({ ...cloudPhoneDialog, provider: e.target.value })}
+                data-testid="bp-cloud-phone-provider"
+              >
+                <option value="cpi">Krexion Android (this PC farm)</option>
+                <option value="partner">Krexion Cloud Android (URL)</option>
+                <option value="none">Clear</option>
+              </select>
+              {cloudPhoneDialog.provider === "partner" && (
+                <>
+                  <Label className="text-zinc-300 text-xs">Console URL</Label>
+                  <Input
+                    value={cloudPhoneDialog.partnerUrl}
+                    onChange={(e) => setCloudPhoneDialog({ ...cloudPhoneDialog, partnerUrl: e.target.value })}
+                    className="bg-zinc-900 border-zinc-700 text-zinc-100 mb-3"
+                    placeholder="https://…"
+                  />
+                </>
+              )}
+              {cloudPhoneDialog.provider === "cpi" && (
+                <>
+                  <Label className="text-zinc-300 text-xs">Krexion Android device</Label>
+                  {cloudPhoneDialog.loadingDevices ? (
+                    <p className="text-[10px] text-zinc-500 mb-3">Loading devices…</p>
+                  ) : (
+                    <select
+                      className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded-md h-9 text-xs mb-3 px-2"
+                      value={cloudPhoneDialog.deviceId}
+                      onChange={(e) => setCloudPhoneDialog({ ...cloudPhoneDialog, deviceId: e.target.value })}
+                      data-testid="bp-cloud-phone-device"
+                    >
+                      <option value="">Auto (first online)</option>
+                      {(cloudPhoneDialog.devices || []).map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {(d.label || d.model || "Android")} · {d.status}
+                          {d.device_type === "android_cloud" ? " · cloud" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {(cloudPhoneDialog.devices || []).length === 0 && !cloudPhoneDialog.loadingDevices && (
+                    <p className="text-[10px] text-amber-400 mb-3">
+                      No devices yet — Enable Krexion Android on CPI → Devices first.
+                    </p>
+                  )}
+                </>
+              )}
+              <div className="flex justify-end gap-2 flex-wrap">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setCloudPhoneDialog({
+                    id: null, provider: "cpi", partnerUrl: "", deviceId: "", label: "", devices: [], loadingDevices: false,
+                  })}>Cancel</Button>
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-200 h-7 text-xs"
+                  onClick={() => handleCloudPhoneSave("bind")} data-testid="bp-cloud-phone-save">Bind</Button>
+                {cloudPhoneDialog.provider === "cpi" && (
+                  <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                    onClick={() => handleCloudPhoneSave("open")} data-testid="bp-cloud-phone-open">
+                    Open now
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Launch URL prompt */}
+        {launchUrlPrompt.id && (
+          <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setLaunchUrlPrompt({ id: null, url: "" })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
+              onClick={(e) => e.stopPropagation()}>
+              <h3 className="text-sm font-semibold text-zinc-100 mb-3 flex items-center gap-2">
+                <Link className="w-4 h-4 text-cyan-400" /> Launch with URL
+              </h3>
+              <Input
+                value={launchUrlPrompt.url}
+                onChange={(e) => setLaunchUrlPrompt({ ...launchUrlPrompt, url: e.target.value })}
+                className="bg-zinc-900 border-zinc-700 text-zinc-100 mb-4"
+                placeholder="https://…"
+                autoFocus
+                onKeyDown={(e) => { if (e.key === "Enter") handleLaunchUrlConfirm(); }}
+              />
+              <div className="flex justify-end gap-2">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setLaunchUrlPrompt({ id: null, url: "" })}>Cancel</Button>
+                <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                  onClick={handleLaunchUrlConfirm}>Launch</Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* v2.7.15 — Fingerprint coherence panel */}
+        {fpModal.open && (
+          <div
+            className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            data-testid="bp-fp-modal"
+            onClick={() => setFpModal({ open: false, id: null, loading: false, data: null, error: null })}
+          >
+            <div
+              className="bg-zinc-950 border border-fuchsia-800/40 rounded-xl max-w-lg w-full max-h-[85vh] overflow-hidden flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="p-4 border-b border-zinc-800 flex items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-fuchsia-300 flex items-center gap-2">
+                  <Shield className="w-4 h-4" /> Fingerprint / coherence
+                </h3>
+                <div className="flex gap-2">
+                  {fpModal.id && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs border-fuchsia-800/60 text-fuchsia-200"
+                      data-testid="bp-fp-refresh"
+                      onClick={handleFingerprintRefresh}
+                    >
+                      Refresh FP
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs border-zinc-700"
+                    onClick={() => setFpModal({ open: false, id: null, loading: false, data: null, error: null })}
+                  >
+                    Close
+                  </Button>
+                </div>
+              </div>
+              <div className="p-4 flex-1 overflow-y-auto text-xs">
+                {fpModal.loading && <p className="text-zinc-400">Loading…</p>}
+                {fpModal.error && <p className="text-red-400">{fpModal.error}</p>}
+                {fpModal.data && (() => {
+                  const d = fpModal.data;
+                  const prev = d.preview || {};
+                  const anti = d.anti_detect || {};
+                  const lpc = d.last_proxy_check || {};
+                  const card = profiles.find((x) => x.id === fpModal.id) || {};
+                  const warnings = [];
+                  const proxyCc = String(lpc.country || "").toLowerCase().slice(0, 2);
+                  const profileCc = String(card.country || prev.country || "").toLowerCase().slice(0, 2);
+                  if (proxyCc && profileCc && proxyCc !== profileCc) {
+                    warnings.push(`Proxy exit country (${proxyCc}) ≠ profile country (${profileCc})`);
+                  }
+                  const rows = [
+                    ["UA", (prev.user_agent || "").slice(0, 120)],
+                    ["OS", prev.os || ""],
+                    ["Timezone", prev.timezone || ""],
+                    ["Locale", prev.locale || ""],
+                    ["WebGL", [prev.webgl_vendor, prev.webgl_renderer].filter(Boolean).join(" / ") || "—"],
+                    ["canvas_mode", anti.canvas_mode || ""],
+                    ["webrtc_mode", anti.webrtc_mode || ""],
+                    ["fp_win", anti.fingerprint_win == null ? "true" : String(anti.fingerprint_win)],
+                    ["Proxy exit", lpc.ip || lpc.exit_ip || (lpc.error ? `fail: ${lpc.error}` : "—")],
+                    ["geo_follow", String(prev.geo_follow_proxy ?? "")],
+                    ["fp short", d.fingerprint_short || ""],
+                    ["fp salt", prev.fingerprint_salt || "—"],
+                    ["TLS prewarm", d.last_tls_prewarm_ok == null ? "—" : String(d.last_tls_prewarm_ok)],
+                  ];
+                  return (
+                    <>
+                      {warnings.length > 0 && (
+                        <div className="mb-3 p-2 rounded border border-amber-700/50 bg-amber-950/30 text-amber-200 space-y-1">
+                          {warnings.map((w) => (
+                            <div key={w}>⚠ {w}</div>
+                          ))}
+                        </div>
+                      )}
+                      <table className="w-full text-left border-collapse">
+                        <tbody>
+                          {rows.map(([k, v]) => (
+                            <tr key={k} className="border-b border-zinc-800/80">
+                              <td className="py-1.5 pr-3 text-zinc-500 whitespace-nowrap align-top w-28">{k}</td>
+                              <td className="py-1.5 text-zinc-200 font-mono break-all">{v || "—"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* v2.7.15 — Local API docs (migration map) */}
+        {docsModal.open && (
+          <div
+            className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setDocsModal({ open: false, loading: false, data: null, error: null })}
+          >
+            <div
+              className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-2xl w-full max-h-[85vh] overflow-hidden flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-zinc-100">Local API docs</h3>
+                <div className="flex gap-2">
+                  {docsModal.data && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs border-zinc-700"
+                      onClick={() => {
+                        const blob = new Blob([JSON.stringify(docsModal.data, null, 2)], { type: "application/json" });
+                        const url = URL.createObjectURL(blob);
+                        window.open(url, "_blank");
+                        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+                      }}
+                    >
+                      Open blob
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs border-zinc-700"
+                    onClick={() => setDocsModal({ open: false, loading: false, data: null, error: null })}
+                  >
+                    Close
+                  </Button>
+                </div>
+              </div>
+              <div className="p-4 flex-1 overflow-y-auto">
+                {docsModal.loading && <p className="text-zinc-400 text-xs">Loading…</p>}
+                {docsModal.error && <p className="text-red-400 text-xs">{docsModal.error}</p>}
+                {docsModal.data && (
+                  <pre className="text-[11px] text-zinc-300 font-mono whitespace-pre-wrap break-all">
+                    {JSON.stringify(docsModal.data, null, 2)}
+                  </pre>
+                )}
               </div>
             </div>
           </div>

@@ -121,6 +121,9 @@ pexpect==4.9.0
 pillow==10.4.0
 platformdirs==4.9.6
 playwright==1.49.1
+# v2.7.16 — Octo-class C++ stealth Chromium + CDP stealth driver (optional soft-fallback)
+cloakbrowser>=0.5.0
+patchright>=1.49.0
 pluggy==1.6.0
 plumbum==1.10.0
 prompt_toolkit==3.0.52

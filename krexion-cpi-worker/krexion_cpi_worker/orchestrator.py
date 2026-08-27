@@ -65,15 +65,111 @@ class Orchestrator:
             return
 
         await self._discover_and_register()
+        if not self.slots and getattr(self.cfg.android, "auto_runtime", True):
+            logger.info("No devices — starting Krexion Android Engine (silent auto-runtime)")
+            await self._ensure_krexion_android()
+            await self._discover_and_register()
         if not self.slots:
-            logger.warning("No devices found. Connect phones via USB and restart.")
+            logger.warning(
+                "Krexion Android not ready yet. Worker will keep retrying auto-runtime."
+            )
 
         # Main loops
         await asyncio.gather(
             self._heartbeat_loop(),
             self._discovery_loop(),
             self._dispatch_loop(),
+            self._commands_loop(),
         )
+
+    async def _ensure_krexion_android(self, instances: int = 1) -> None:
+        try:
+            from .krexion_android_runtime import ensure_krexion_android
+
+            want = max(1, min(8, int(instances or getattr(self.cfg.android, "farm_instances", 1) or 1)))
+            result = await ensure_krexion_android(
+                adb_path=self.cfg.android.adb_path,
+                instances=want,
+            )
+            logger.info(
+                f"Krexion Android Engine: {result.get('status')} — {result.get('message')} "
+                f"(instances={result.get('instances') or want})"
+            )
+            await self._sync_cloud_adb_endpoints()
+            if hasattr(self.android_engine, "ensure_emulator_connections"):
+                await self.android_engine.ensure_emulator_connections()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Krexion Android Engine failed: {e}")
+
+    async def _sync_cloud_adb_endpoints(self) -> None:
+        """Pull adb_endpoint from backend cloud devices into worker config."""
+        try:
+            devices = await self.api.list_devices()
+            if not isinstance(devices, list):
+                return
+            eps: List[str] = []
+            for d in devices:
+                if not isinstance(d, dict):
+                    continue
+                ep = str(d.get("adb_endpoint") or "").strip()
+                dtype = str(d.get("device_type") or "")
+                if ep and ":" in ep and (dtype.startswith("android_") or d.get("device_id", "").startswith("cloud:")):
+                    if ep not in eps:
+                        eps.append(ep)
+            if not eps:
+                return
+            existing = list(self.cfg.android.cloud_adb_endpoints or [])
+            merged = existing[:]
+            for ep in eps:
+                if ep not in merged:
+                    merged.append(ep)
+            self.cfg.android.cloud_adb_endpoints = merged
+            logger.info(f"Synced {len(eps)} Krexion Cloud Android ADB endpoint(s)")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"cloud ADB sync skipped: {e}")
+
+    async def _commands_loop(self):
+        """Poll backend for one-click Enable Krexion Android / force recreate."""
+        while not self._stop.is_set():
+            try:
+                await self._sync_cloud_adb_endpoints()
+                cmds = await self.api.worker_commands()
+                for cmd in cmds.get("commands") or []:
+                    ctype = str((cmd or {}).get("type") or "")
+                    cid = str((cmd or {}).get("id") or "")
+                    # Honor per-command cloud ADB endpoint (from provision)
+                    ep = str((cmd or {}).get("adb_endpoint") or "").strip()
+                    if ep and ":" in ep:
+                        cloud = list(self.cfg.android.cloud_adb_endpoints or [])
+                        if ep not in cloud:
+                            cloud.append(ep)
+                            self.cfg.android.cloud_adb_endpoints = cloud
+                        if hasattr(self.android_engine, "ensure_emulator_connections"):
+                            await self.android_engine.ensure_emulator_connections()
+                    if ctype in ("ensure_android", "enable_krexion_android"):
+                        inst = int((cmd or {}).get("instances") or 1)
+                        await self._ensure_krexion_android(instances=inst)
+                        await self._discover_and_register()
+                        if cid:
+                            from .krexion_android_runtime import read_status
+                            await self.api.ack_worker_command(
+                                cid, ok=True, result=read_status()
+                            )
+                    elif ctype == "connect_cloud_adb":
+                        if hasattr(self.android_engine, "ensure_emulator_connections"):
+                            await self.android_engine.ensure_emulator_connections()
+                        await self._discover_and_register()
+                        if cid:
+                            await self.api.ack_worker_command(cid, ok=True)
+                    elif ctype == "runtime_status":
+                        from .krexion_android_runtime import read_status
+                        if cid:
+                            await self.api.ack_worker_command(
+                                cid, ok=True, result=read_status()
+                            )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"commands loop: {e}")
+            await asyncio.sleep(max(8, int(self.cfg.api.poll_interval_seconds)))
 
     # ── Discovery & registration ───────────────────────────
     async def _discover_and_register(self):
@@ -121,38 +217,94 @@ class Orchestrator:
         while not self._stop.is_set():
             for slot in list(self.slots.values()):
                 status = "busy" if slot.busy else "online"
-                if slot.backend_id:
-                    await self.api.heartbeat(slot.backend_id, status=status)
+                if not slot.backend_id:
+                    continue
+                resp = await self.api.heartbeat(slot.backend_id, status=status)
+                pending = (resp or {}).get("needs_action")
+                if pending and not slot.busy:
+                    await self._handle_needs_action(slot, pending)
             await asyncio.sleep(self.cfg.api.heartbeat_interval_seconds)
+
+    async def _handle_needs_action(self, slot: DeviceSlot, action: Any) -> None:
+        """Execute queued open_url / install_apk from Browser Profiles / CPI UI."""
+        if isinstance(action, str):
+            # Legacy string flags (2fa_pending etc.) — not executable
+            logger.info(f"needs_action flag on {slot.serial}: {action}")
+            return
+        if not isinstance(action, dict):
+            return
+        atype = str(action.get("type") or "").strip().lower()
+        if atype not in ("open_url", "install_apk", "install"):
+            logger.info(f"Ignoring needs_action type={atype} on {slot.serial}")
+            return
+        slot.busy = True
+        try:
+            if slot.engine_kind != "android":
+                logger.warning(f"needs_action {atype} not supported on iOS yet")
+                return
+            result = await self.android_engine.execute_action(slot.serial, action)
+            logger.info(f"needs_action {atype} on {slot.serial}: {result}")
+            # ACK so backend clears the queue
+            if slot.backend_id:
+                await self.api.heartbeat(
+                    slot.backend_id,
+                    status="online",
+                    clear_needs_action=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"needs_action failed on {slot.serial}: {e}")
+        finally:
+            slot.busy = False
 
     # ── Job dispatch ───────────────────────────────────────
     async def _dispatch_loop(self):
         while not self._stop.is_set():
             try:
-                # Find an idle device
+                # v2.7.21 — claim work for EVERY idle slot (parallel farm)
                 idle = [s for s in self.slots.values() if not s.busy]
                 if not idle:
                     await asyncio.sleep(self.cfg.api.poll_interval_seconds)
                     continue
 
-                slot = idle[0]
-                payload = await self.api.poll(
-                    device_types=[slot.device_type],
-                    device_id=slot.backend_id,
-                )
-                if not payload.get("has_work"):
+                claimed_any = False
+                for slot in idle:
+                    if slot.busy:
+                        continue
+                    dtype = slot.device_type
+                    types = [dtype]
+                    if dtype.startswith("android_"):
+                        types = list({
+                            dtype,
+                            "android_real",
+                            "android_genymotion",
+                            "android_emulator",
+                            "android_ldplayer",
+                            "android_bluestacks",
+                            "android_cloud",
+                            "android_krexion",
+                        })
+                    payload = await self.api.poll(
+                        device_types=types,
+                        device_id=slot.backend_id,
+                    )
+                    if not payload.get("has_work"):
+                        continue
+
+                    claimed_any = True
+                    attempt = payload["attempt"]
+                    job = payload["job"]
+                    offer = payload["offer"]
+                    slot.busy = True
+                    slot.task = asyncio.create_task(
+                        self._execute_one(slot, attempt, job, offer),
+                        name=f"install-{attempt['id']}",
+                    )
+
+                if not claimed_any:
                     await asyncio.sleep(self.cfg.api.poll_interval_seconds)
-                    continue
-
-                attempt = payload["attempt"]
-                job = payload["job"]
-                offer = payload["offer"]
-                slot.busy = True
-                slot.task = asyncio.create_task(
-                    self._execute_one(slot, attempt, job, offer),
-                    name=f"install-{attempt['id']}",
-                )
-
+                else:
+                    # Brief yield so heartbeats can run while tasks execute
+                    await asyncio.sleep(0.5)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"dispatch loop: {e}")
                 await asyncio.sleep(self.cfg.api.poll_interval_seconds)
@@ -212,10 +364,18 @@ async def run_doctor(cfg: Config) -> int:
 
     if cfg.android.enabled:
         adb = ADB(cfg.android.adb_path)
+        try:
+            from .android_engine import AndroidEngine
+            eng = AndroidEngine(cfg.android)
+            await eng.ensure_emulator_connections()
+        except Exception:
+            pass
         devs = await adb.devices()
         print(f"  • Android devices via adb: {len(devs)}")
         for d in devs:
-            print(f"      {d['serial']} ({d.get('model')}) state={d['state']}")
+            print(f"      {d.get('serial')} ({d.get('model') or d.get('state')}) state={d.get('state')}")
+        cloud = list(cfg.android.cloud_adb_endpoints or [])
+        print(f"  • Cloud ADB endpoints configured: {len(cloud)}")
     else:
         print("  • Android engine disabled in config")
 

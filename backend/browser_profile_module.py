@@ -523,14 +523,26 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
     elif status == "stopping":
         prof_update = {"status": "stopping", "session_id": sid}
     elif status in ("stopped", "closed", "error"):
-        prof_update = {"status": "idle" if status in ("stopped", "closed") else "error", "session_id": ""}
+        prof_update = {
+            "status": "idle" if status in ("stopped", "closed") else "error",
+            "session_id": "",
+            "cdp_ws": "",
+            "debugger_address": "",
+        }
         if status == "error" and body.get("error_message"):
             prof_update["last_error"] = str(body.get("error_message"))[:512]
     elif status == "launching":
         prof_update = {"status": "launching", "session_id": sid}
+    # v2.7.17 — persist CDP so Synchronizer / Local API can attach
+    if body.get("cdp_ws"):
+        prof_update["cdp_ws"] = str(body.get("cdp_ws"))[:512]
+    if body.get("debugger_address"):
+        prof_update["debugger_address"] = str(body.get("debugger_address"))[:128]
+    if body.get("browser_kernel"):
+        prof_update["browser_kernel"] = str(body.get("browser_kernel"))[:64]
     if prof_update:
         await _DB.browser_profiles.update_one(
-            {"id": profile_id, "user_id": uid},
+            {"id": profile_id},
             {"$set": prof_update},
         )
 
@@ -562,6 +574,21 @@ class AntiDetectConfig(BaseModel):
     browser_variant: str = "rotate" # auto/rotate/chromium/brave/headless-shell
     identity_persist: bool = True   # Carry cookies+localStorage across launches
     paranoia_mode: bool = False     # Maximum anti-detect (slower)
+    # v2.7.15 — WIN antidetect bundle (defaults = current strong stealth)
+    canvas_mode: str = "noise"      # off | noise | real
+    webgl_mode: str = "noise"       # off | noise | real
+    audio_mode: str = "noise"       # off | noise | real
+    font_mode: str = "noise"        # off | noise | real
+    webrtc_mode: str = "proxy"      # disabled | proxy | real
+    use_persistent_context: bool = False
+    proxy_check_on_launch: bool = True
+    proxy_check_block_on_fail: bool = False
+    # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
+    browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
+    # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
+    fingerprint_win: bool = True
+    # When True + Stealth kernel: prefer real modes (less JS noise)
+    fingerprint_win_prefer_real: bool = True
 
 
 class ReferrerProConfig(BaseModel):
@@ -604,6 +631,10 @@ class ProfileBody(BaseModel):
     referrer: ReferrerProConfig = Field(default_factory=ReferrerProConfig)
     tags: List[str] = Field(default_factory=list)
     start_url: str = Field(default="https://www.google.com/", max_length=512)
+    # v2.7.13 — folders / geo / quick links (AdsPower-style agency UX)
+    folder: str = Field(default="", max_length=80)
+    geo_follow_proxy: bool = True
+    quick_links: List[str] = Field(default_factory=list)
 
 
 class BulkCreateBody(BaseModel):
@@ -647,7 +678,7 @@ class AdvProxyCfg(BaseModel):
     `mode`:
         "none"     → no proxy attached
         "manual"   → use the literal `server`/`username`/`password`
-                     (same proxy applied to every profile)
+                     OR `lines` (one unique proxy per profile)
         "proxyjet" → call ProxyJet generator and assign each profile a
                      UNIQUE exit-IP from the result. Count = number of
                      profiles being created.
@@ -660,6 +691,8 @@ class AdvProxyCfg(BaseModel):
     server: str = ""
     username: str = ""
     password: str = ""
+    # v2.7.13 — multiline paste: one proxy line per profile (unique IPs)
+    lines: Optional[List[str]] = None
     # ProxyJet on-demand
     country: Optional[str] = None
     state: Optional[str] = None
@@ -684,6 +717,8 @@ class AdvancedCreateBody(BaseModel):
     viewport_width: int = 0   # 0 → device-default
     viewport_height: int = 0  # 0 → device-default
     anti_detect_on: bool = True
+    # v2.7.15 — optional full anti_detect overrides (merged over anti_detect_on defaults)
+    anti_detect: Optional[AntiDetectConfig] = None
     # v2.7.12 — Platform mix (%). Sum normalized; all-zero → legacy device_type.
     mix_ios_pct: float = Field(default=0, ge=0, le=100)
     mix_android_pct: float = Field(default=0, ge=0, le=100)
@@ -693,14 +728,172 @@ class AdvancedCreateBody(BaseModel):
     device_id: str = ""
     # Resolution: match_device | random | exact
     resolution_mode: str = "match_device"
+    # v2.7.13 — agency fields on create
+    tags: List[str] = Field(default_factory=list)
+    folder: str = Field(default="", max_length=80)
+    timezone: str = Field(default="", max_length=64)
+    locale: str = Field(default="", max_length=24)
+    geo_follow_proxy: bool = True
+    referrer: ReferrerProConfig = Field(default_factory=ReferrerProConfig)
+    quick_links: List[str] = Field(default_factory=list)
     # Sub-configs
     ua: AdvUACfg = Field(default_factory=AdvUACfg)
     proxy: AdvProxyCfg = Field(default_factory=AdvProxyCfg)
 
 
+class CookieImportBody(BaseModel):
+    """Accept Playwright storage_state, cookie list, or Netscape text."""
+    storage_state: Optional[Dict[str, Any]] = None
+    cookies: Optional[List[Dict[str, Any]]] = None
+    netscape: Optional[str] = None
+    merge: bool = False  # False = replace cookies (origins kept unless clear_origins)
+
+
+class CookieRobotBody(BaseModel):
+    """Warm profile cookies via short stealth visits (local/native only)."""
+    urls: Optional[List[str]] = None
+    max_urls: int = Field(default=5, ge=1, le=10)
+
+
+class ImportProfilesBody(BaseModel):
+    profiles: List[Dict[str, Any]] = Field(default_factory=list)
+    include_cookies: bool = False
+
+
+class BulkMoveBody(BaseModel):
+    profile_ids: List[str] = Field(default_factory=list)
+    folder: str = Field(default="", max_length=80)
+
+
+class ShareProfileBody(BaseModel):
+    """Light team share: clone profile into another Krexion account by email."""
+    target_email: str = Field(..., min_length=3, max_length=200)
+    include_cookies: bool = False
+
+
+class AclGrantBody(BaseModel):
+    """Live team ACL (viewer | editor | admin) — does not clone the profile."""
+    target_email: str = Field(..., min_length=3, max_length=200)
+    role: str = Field(default="editor", max_length=16)  # viewer|editor|admin
+
+
+class AclRevokeBody(BaseModel):
+    target_email: str = Field(default="", max_length=200)
+    user_id: str = Field(default="", max_length=80)
+
+
+class SyncStartBody(BaseModel):
+    master_id: str = Field(..., min_length=8, max_length=80)
+    slave_ids: List[str] = Field(default_factory=list)
+    modes: List[str] = Field(default_factory=lambda: ["navigate", "click", "type", "scroll"])
+    jitter: bool = True
+
+
+class CloudPhoneBindBody(BaseModel):
+    provider: str = Field(default="partner", max_length=32)  # partner|cpi|none
+    partner_url: str = Field(default="", max_length=512)
+    external_id: str = Field(default="", max_length=120)
+    device_id: str = Field(default="", max_length=80)  # CPI device mongo id
+    label: str = Field(default="", max_length=120)
+
+
+class OpenOnDeviceBody(BaseModel):
+    device_id: str = Field(default="", max_length=80)  # empty = auto-pick online Android
+    url: str = Field(default="", max_length=1024)
+    auto_fallback: bool = True
+
+
+class CloneOptsBody(BaseModel):
+    include_cookies: bool = False
+
+
 class BulkIdsBody(BaseModel):
     profile_ids: List[str] = Field(default_factory=list)
     max_concurrent: int = Field(default=5, ge=1, le=20)
+
+
+_ROLE_RANK = {"viewer": 1, "editor": 2, "admin": 3, "owner": 4}
+
+
+def _normalize_role(role: str) -> str:
+    r = (role or "viewer").strip().lower()
+    return r if r in ("viewer", "editor", "admin") else "viewer"
+
+
+def _acl_entries(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = doc.get("acl") or []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        out.append({
+            "user_id": str(e.get("user_id") or ""),
+            "email": str(e.get("email") or "").lower()[:200],
+            "role": _normalize_role(str(e.get("role") or "viewer")),
+            "added_at": str(e.get("added_at") or ""),
+        })
+    return out
+
+
+def _role_for_user(doc: Dict[str, Any], uid: str) -> str:
+    if str(doc.get("user_id") or "") == str(uid):
+        return "owner"
+    for e in _acl_entries(doc):
+        if e.get("user_id") == str(uid):
+            return e.get("role") or "viewer"
+    return ""
+
+
+def _has_min_role(doc: Dict[str, Any], uid: str, min_role: str) -> bool:
+    got = _role_for_user(doc, uid)
+    if not got:
+        return False
+    return _ROLE_RANK.get(got, 0) >= _ROLE_RANK.get(min_role, 99)
+
+
+def _owned_or_shared_filter(uid: str) -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"user_id": uid},
+            {"acl.user_id": uid},
+        ]
+    }
+
+
+async def _get_profile_for_user(
+    profile_id: str,
+    uid: str,
+    *,
+    min_role: str = "viewer",
+) -> Dict[str, Any]:
+    doc = await _DB.browser_profiles.find_one({
+        "id": profile_id,
+        "$or": [{"user_id": uid}, {"acl.user_id": uid}],
+    })
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if not _has_min_role(doc, uid, min_role):
+        raise HTTPException(status_code=403, detail=f"Requires {min_role} access")
+    return doc
+
+
+def _adv_anti_detect_cfg(body: AdvancedCreateBody) -> AntiDetectConfig:
+    """Build AntiDetectConfig for advanced_create — tls_prewarm True when on."""
+    on = bool(body.anti_detect_on)
+    if body.anti_detect is not None:
+        raw = body.anti_detect.dict() if hasattr(body.anti_detect, "dict") else dict(body.anti_detect or {})
+        raw["master"] = on
+        fields = getattr(AntiDetectConfig, "model_fields", None) or getattr(AntiDetectConfig, "__fields__", {})
+        return AntiDetectConfig(**{k: v for k, v in raw.items() if k in fields})
+    return AntiDetectConfig(
+        master=on,
+        tls_prewarm=on,
+        behavioral_bio=on,
+        browser_variant="rotate" if on else "auto",
+        identity_persist=on,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -774,8 +967,15 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "proxy": body.proxy.dict() if hasattr(body.proxy, "dict") else dict(body.proxy or {}),
         "anti_detect": body.anti_detect.dict() if hasattr(body.anti_detect, "dict") else dict(body.anti_detect or {}),
         "referrer": body.referrer.dict() if hasattr(body.referrer, "dict") else dict(body.referrer or {}),
-        "tags": body.tags or [],
+        "tags": [str(t).strip()[:40] for t in (body.tags or []) if str(t).strip()][:20],
         "start_url": body.start_url,
+        "folder": (body.folder or "").strip()[:80],
+        "geo_follow_proxy": bool(body.geo_follow_proxy),
+        "quick_links": [
+            str(u).strip()[:512]
+            for u in (body.quick_links or [])
+            if str(u).strip()
+        ][:12],
         "storage_state": {},   # cookies + localStorage persisted by desktop client
         "fingerprint_hash": "",  # set by desktop client on first launch
         "session_id": "",        # active session_id when launched
@@ -783,6 +983,10 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "last_launched_at": "",
         "last_session_duration_sec": 0,
         "total_launches": 0,
+        "storage_synced_at": "",
+        "last_proxy_check": {},
+        "last_tls_prewarm_ok": None,
+        "cdp_ws": "",
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
@@ -798,9 +1002,181 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
         "has_cookies": bool(ss.get("cookies")),
         "cookie_count": len(ss.get("cookies") or []),
         "origin_count": len(ss.get("origins") or []),
+        "synced_at": d.get("storage_synced_at") or "",
     }
     d.pop("storage_state", None)
+    d["folder"] = (d.get("folder") or "").strip()
+    d["geo_follow_proxy"] = bool(d.get("geo_follow_proxy", True))
+    d["quick_links"] = d.get("quick_links") or []
+    fh = str(d.get("fingerprint_hash") or "")
+    d["fingerprint_short"] = fh[:12] if fh else ""
+    d["last_proxy_check"] = d.get("last_proxy_check") or {}
+    if "last_tls_prewarm_ok" not in d:
+        d["last_tls_prewarm_ok"] = None
+    # CDP endpoint only for local automation clients (still useful in UI copy)
+    if not d.get("cdp_ws"):
+        d.pop("cdp_ws", None)
+    d["acl"] = _acl_entries(d)
+    d["cloud_phone"] = d.get("cloud_phone") if isinstance(d.get("cloud_phone"), dict) else {}
+    d["browser_kernel_label"] = str(d.get("browser_kernel") or "")
     return d
+
+
+def _public_view_for(doc: Dict[str, Any], uid: str) -> Dict[str, Any]:
+    d = _public_view(doc)
+    d["my_role"] = _role_for_user(doc, uid) or "viewer"
+    d["is_shared"] = str(doc.get("user_id") or "") != str(uid)
+    return d
+
+
+def _enforce_local_api_key(request: Request) -> None:
+    """When KREXION_LOCAL_API_KEY is set, require matching header/Bearer (JWT still required)."""
+    key = (os.environ.get("KREXION_LOCAL_API_KEY") or "").strip()
+    if not key:
+        return
+    hdr = (request.headers.get("X-Krexion-Local-Key") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if hdr != key and bearer != key:
+        raise HTTPException(status_code=401, detail="Invalid or missing local API key")
+
+
+def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
+    """Parse Netscape / curl cookie file into Playwright cookie dicts."""
+    out: List[Dict[str, Any]] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            parts = line.split()
+        if len(parts) < 7:
+            continue
+        domain, _flag, path, secure, expires, name, value = parts[:7]
+        try:
+            exp = int(float(expires))
+        except Exception:
+            exp = -1
+        ck: Dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "domain": domain.lstrip("."),
+            "path": path or "/",
+            "secure": str(secure).upper() in ("TRUE", "1", "YES"),
+            "httpOnly": False,
+        }
+        if exp > 0:
+            ck["expires"] = exp
+        out.append(ck)
+    return out
+
+
+def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in cookies or []:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        if not name:
+            continue
+        item = {
+            "name": name,
+            "value": str(c.get("value") if c.get("value") is not None else ""),
+            "domain": str(c.get("domain") or "").lstrip(".") or "localhost",
+            "path": str(c.get("path") or "/"),
+            "secure": bool(c.get("secure", False)),
+            "httpOnly": bool(c.get("httpOnly") or c.get("http_only") or False),
+        }
+        if c.get("expires") is not None:
+            try:
+                item["expires"] = float(c["expires"])
+            except Exception:
+                pass
+        if c.get("sameSite"):
+            item["sameSite"] = c["sameSite"]
+        out.append(item)
+    return out
+
+
+async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any]:
+    """Exit-IP + optional fraud score for Proxy Check UI."""
+    import httpx
+
+    proxy = doc.get("proxy") or {}
+    result: Dict[str, Any] = {
+        "ok": False,
+        "checked_at": _now_iso(),
+        "proxy_enabled": bool(proxy.get("enabled") or proxy.get("provider_id") or proxy.get("use_proxyjet")),
+        "exit_ip": "",
+        "country": "",
+        "timezone": "",
+        "fraud_score": None,
+        "error": "",
+    }
+    server = (proxy.get("server") or "").strip()
+    # Resolve provider_id → live line when possible
+    if not server and proxy.get("provider_id"):
+        try:
+            from proxy_provider_module import resolve_provider_proxy_line  # type: ignore
+            server = await resolve_provider_proxy_line(user, proxy.get("provider_id")) or ""
+        except Exception:
+            try:
+                from proxy_provider_module import allocate_proxy_for_user  # type: ignore
+                allocated = await allocate_proxy_for_user(user, provider_id=proxy.get("provider_id"))
+                if isinstance(allocated, dict):
+                    server = allocated.get("server") or allocated.get("proxy") or ""
+                elif isinstance(allocated, str):
+                    server = allocated
+            except Exception as e:
+                result["error"] = f"provider_resolve_failed: {e}"
+                return result
+    if not server:
+        result["error"] = "no_proxy_configured"
+        return result
+
+    username = proxy.get("username") or ""
+    password = proxy.get("password") or ""
+    proxy_url = server
+    if username and "://" in server and "@" not in server:
+        scheme, rest = server.split("://", 1)
+        from urllib.parse import quote
+        proxy_url = f"{scheme}://{quote(str(username))}:{quote(str(password))}@{rest}"
+
+    try:
+        async with httpx.AsyncClient(proxies=proxy_url, timeout=20.0, follow_redirects=True) as client:
+            r = await client.get("https://api.ipify.org?format=json")
+            r.raise_for_status()
+            result["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()
+        if result["exit_ip"]:
+            result["ok"] = True
+            try:
+                from fraud_provider_module import check_ip_for_user  # type: ignore
+                fr = await check_ip_for_user(user, result["exit_ip"])
+                if isinstance(fr, dict):
+                    result["fraud_score"] = fr.get("fraud_score") or fr.get("score")
+                    result["country"] = fr.get("country") or fr.get("country_code") or ""
+                    result["raw_fraud"] = {
+                        k: fr.get(k)
+                        for k in ("provider", "is_proxy", "is_vpn", "risk")
+                        if k in fr
+                    }
+            except Exception:
+                pass
+            # Lightweight geo fallback
+            if not result["country"]:
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as c2:
+                        gr = await c2.get(f"https://ipapi.co/{result['exit_ip']}/json/")
+                        if gr.status_code == 200:
+                            gj = gr.json() or {}
+                            result["country"] = gj.get("country_code") or gj.get("country") or ""
+                            result["timezone"] = gj.get("timezone") or ""
+                except Exception:
+                    pass
+    except Exception as e:
+        result["error"] = str(e)[:240]
+    return result
 
 
 async def _resolve_user(request: Request) -> dict:
@@ -828,16 +1204,42 @@ async def list_profiles(
     request: Request,
     limit: int = Query(default=200, ge=1, le=1000),
     tag: Optional[str] = None,
+    folder: Optional[str] = None,
+    q: Optional[str] = None,
 ):
-    """List ALL profiles for the current user."""
+    """List owned + ACL-shared profiles for the current user."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    q: Dict[str, Any] = {"user_id": uid}
+    filt: Dict[str, Any] = {
+        "$or": [{"user_id": uid}, {"acl.user_id": uid}],
+    }
     if tag:
-        q["tags"] = tag
-    cur = _DB.browser_profiles.find(q).sort("updated_at", -1).limit(limit)
+        filt["tags"] = tag
+    if folder is not None and str(folder).strip() != "":
+        if str(folder).strip().lower() in ("__", "none", "(none)", "unsorted"):
+            filt["$and"] = [
+                {"$or": [
+                    {"folder": {"$exists": False}},
+                    {"folder": ""},
+                    {"folder": None},
+                ]},
+            ]
+        else:
+            filt["folder"] = str(folder).strip()[:80]
+    cur = _DB.browser_profiles.find(filt).sort("updated_at", -1).limit(limit)
     docs = await cur.to_list(length=limit)
-    return {"profiles": [_public_view(d) for d in docs], "count": len(docs)}
+    needle = (q or "").strip().lower()
+    if needle:
+        docs = [
+            d for d in docs
+            if needle in str(d.get("name") or "").lower()
+            or needle in str(d.get("notes") or "").lower()
+            or needle in str(d.get("folder") or "").lower()
+            or any(needle in str(t).lower() for t in (d.get("tags") or []))
+            or needle in str(d.get("user_agent") or "").lower()
+            or needle in str(d.get("start_url") or "").lower()
+        ]
+    return {"profiles": [_public_view_for(d, uid) for d in docs], "count": len(docs)}
 
 
 @router.post("/")
@@ -870,15 +1272,856 @@ async def device_catalog(request: Request):
     }
 
 
+@router.get("/folders")
+async def list_folders(request: Request):
+    """Distinct folder names for sidebar filter."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    folders: Dict[str, int] = {}
+    unsorted = 0
+    cur = _DB.browser_profiles.find({"user_id": uid}, {"folder": 1})
+    async for doc in cur:
+        f = (doc.get("folder") or "").strip()
+        if not f:
+            unsorted += 1
+        else:
+            folders[f] = folders.get(f, 0) + 1
+    items = [{"name": k, "count": v} for k, v in sorted(folders.items(), key=lambda x: x[0].lower())]
+    return {"folders": items, "unsorted": unsorted}
+
+
+@router.post("/bulk-move")
+async def bulk_move(request: Request, body: BulkMoveBody):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()][:200]
+    folder = (body.folder or "").strip()[:80]
+    if not ids:
+        raise HTTPException(status_code=400, detail="profile_ids required")
+    res = await _DB.browser_profiles.update_many(
+        {"user_id": uid, "id": {"$in": ids}},
+        {"$set": {"folder": folder, "updated_at": _now_iso()}},
+    )
+    return {"moved": int(res.modified_count or 0), "folder": folder}
+
+
+@router.post("/import")
+async def import_profiles(request: Request, body: ImportProfilesBody):
+    """Re-import profiles from Export JSON (config; optional cookies)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    raw_list = body.profiles or []
+    if not raw_list and isinstance(getattr(body, "__dict__", None), dict):
+        pass
+    created = []
+    for raw in raw_list[:200]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            tags = raw.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            pb = ProfileBody(
+                name=str(raw.get("name") or "").strip() or "",
+                notes=str(raw.get("notes") or "")[:2000],
+                country=str(raw.get("country") or "us").lower()[:8],
+                language=str(raw.get("language") or "en-US"),
+                timezone=str(raw.get("timezone") or "America/New_York"),
+                device_type=str(raw.get("device_type") or "desktop"),
+                os=str(raw.get("os") or "windows"),
+                user_agent=str(raw.get("user_agent") or "")[:600],
+                viewport=raw.get("viewport") if isinstance(raw.get("viewport"), dict) else {"width": 1920, "height": 1080},
+                is_mobile=bool(raw.get("is_mobile")),
+                has_touch=bool(raw.get("has_touch") or raw.get("is_mobile")),
+                device_scale_factor=float(raw.get("device_scale_factor") or 1.0),
+                locale=str(raw.get("locale") or "en-US"),
+                accept_language=str(raw.get("accept_language") or "en-US,en;q=0.9"),
+                start_url=str(raw.get("start_url") or "https://www.google.com/")[:512],
+                tags=[str(t) for t in tags][:20],
+                folder=str(raw.get("folder") or "")[:80],
+                geo_follow_proxy=bool(raw.get("geo_follow_proxy", True)),
+                quick_links=[str(u) for u in (raw.get("quick_links") or [])][:12],
+            )
+            # Proxy / anti / referrer best-effort
+            if isinstance(raw.get("proxy"), dict):
+                try:
+                    _fields = getattr(ProxyConfig, "model_fields", None) or getattr(ProxyConfig, "__fields__", {})
+                    pb.proxy = ProxyConfig(**{k: v for k, v in raw["proxy"].items() if k in _fields})
+                except Exception:
+                    pass
+            if isinstance(raw.get("anti_detect"), dict):
+                try:
+                    _fields = getattr(AntiDetectConfig, "model_fields", None) or getattr(AntiDetectConfig, "__fields__", {})
+                    pb.anti_detect = AntiDetectConfig(**{k: v for k, v in raw["anti_detect"].items() if k in _fields})
+                except Exception:
+                    pass
+            if isinstance(raw.get("referrer"), dict):
+                try:
+                    _fields = getattr(ReferrerProConfig, "model_fields", None) or getattr(ReferrerProConfig, "__fields__", {})
+                    pb.referrer = ReferrerProConfig(**{k: v for k, v in raw["referrer"].items() if k in _fields})
+                except Exception:
+                    pass
+            doc = _profile_doc(uid, pb)
+            if body.include_cookies and isinstance(raw.get("storage_state"), dict):
+                doc["storage_state"] = raw["storage_state"]
+                doc["storage_synced_at"] = _now_iso()
+            await _DB.browser_profiles.insert_one(doc)
+            created.append(_public_view(doc))
+        except Exception as e:
+            logger.warning(f"import profile skipped: {e}")
+    return {"created": len(created), "profiles": created}
+
+
+@router.get("/local/info")
+async def local_api_info(request: Request):
+    """AdsPower-style Local API discovery for automation clients."""
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    mode = (os.environ.get("KREXION_MODE") or "").lower()
+    local = mode in ("native", "local", "desktop")
+    return {
+        "ok": True,
+        "local_mode": local,
+        "base_path": "/api/browser-profiles/local",
+        "endpoints": {
+            "start": "POST /api/browser-profiles/local/start",
+            "status": "GET /api/browser-profiles/local/status/{profile_id}",
+            "stop": "POST /api/browser-profiles/local/stop",
+            "list": "GET /api/browser-profiles/local/profiles",
+            "cookies_get": "GET /api/browser-profiles/local/profiles/{id}/cookies",
+            "cookies_put": "PUT /api/browser-profiles/local/profiles/{id}/cookies",
+            "docs": "GET /api/browser-profiles/local/docs",
+            "kernel": "GET /api/browser-profiles/local/kernel",
+        },
+        "notes": (
+            "Start returns cdp_ws when enable_cdp=true and Chromium launches on this machine. "
+            "Connect Playwright via chromium.connect_over_cdp(cdp_ws). "
+            "Kernel auto = CloakBrowser C++ Chromium when installed (Octo-class), else Patchright, else Playwright. "
+            "When KREXION_LOCAL_API_KEY is set, also send X-Krexion-Local-Key or Authorization Bearer."
+        ),
+    }
+
+
+@router.get("/local/kernel")
+async def local_kernel_status(request: Request):
+    """Report CloakBrowser / Patchright / Playwright kernel availability."""
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    try:
+        from krexion_browser_kernel import cloak_info, patchright_available, resolve_launch_plan
+        plan = resolve_launch_plan({"browser_kernel": "auto"})
+        return {
+            "ok": True,
+            "cloak": cloak_info(),
+            "patchright": patchright_available(),
+            "auto_plan": plan,
+            "env_KREXION_BROWSER_KERNEL": (os.environ.get("KREXION_BROWSER_KERNEL") or "auto"),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:240]}
+
+
+@router.get("/local/docs")
+async def local_api_docs(request: Request, format: str = Query(default="json")):
+    """AdsPower / Octo → Krexion Local API migration map (markdown or json)."""
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    mapping = [
+        {"vendor": "AdsPower start", "krexion": "POST /api/browser-profiles/local/start"},
+        {"vendor": "AdsPower status", "krexion": "GET /api/browser-profiles/local/status/{id}"},
+        {"vendor": "AdsPower stop", "krexion": "POST /api/browser-profiles/local/stop"},
+        {"vendor": "AdsPower list", "krexion": "GET /api/browser-profiles/local/profiles"},
+        {"vendor": "AdsPower cookies", "krexion": "GET/PUT /api/browser-profiles/local/profiles/{id}/cookies"},
+        {"vendor": "Octo :58888 start + debug_port", "krexion": "POST /local/start {enable_cdp:true} → cdp_ws"},
+        {"vendor": "Octo Octium kernel", "krexion": "anti_detect.browser_kernel=auto|cloak (CloakBrowser C++)"},
+        {"vendor": "Octo noise toggles", "krexion": "canvas_mode / webgl_mode / audio_mode / font_mode"},
+        {"vendor": "GoLogin / MoreLogin CDP", "krexion": "same Local start + connect_over_cdp"},
+        {"vendor": "AdsPower Synchronizer", "krexion": "POST /api/browser-profiles/sync/start {master_id, slave_ids}"},
+        {"vendor": "Team ACL / share", "krexion": "POST /{id}/acl + POST /{id}/share (clone)"},
+        {"vendor": "MoreLogin Cloud Phone", "krexion": "POST /{id}/cloud-phone + /open-on-device (CPI)"},
+        # back-compat keys
+        {"adspower": "start", "krexion": "POST /api/browser-profiles/local/start"},
+        {"adspower": "status", "krexion": "GET /api/browser-profiles/local/status/{id}"},
+        {"adspower": "stop", "krexion": "POST /api/browser-profiles/local/stop"},
+        {"adspower": "list", "krexion": "GET /api/browser-profiles/local/profiles"},
+        {"adspower": "cookies", "krexion": "GET/PUT /api/browser-profiles/local/profiles/{id}/cookies"},
+    ]
+    if str(format or "json").lower() in ("md", "markdown", "text"):
+        lines = [
+            "# Krexion Local API — AdsPower / Octo / GoLogin migration map",
+            "",
+            "| Vendor | Krexion |",
+            "|----------|---------|",
+        ]
+        for row in mapping:
+            label = row.get("vendor") or row.get("adspower") or ""
+            lines.append(f"| {label} | `{row['krexion']}` |")
+        lines.extend([
+            "",
+            "Auth: JWT (Bearer) always. If `KREXION_LOCAL_API_KEY` is set, also send",
+            "`X-Krexion-Local-Key` or `Authorization: Bearer <key>`.",
+            "",
+            "Kernel: `anti_detect.browser_kernel=auto` prefers CloakBrowser C++ Chromium",
+            "(Octo Octium-class), then Patchright, then Playwright.",
+            "",
+        ])
+        return {"ok": True, "format": "markdown", "markdown": "\n".join(lines), "map": mapping}
+    return {"ok": True, "format": "json", "map": mapping}
+
+
+@router.get("/local/profiles")
+async def local_api_list_profiles(
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    return await list_profiles(request, limit=limit)
+
+
+@router.get("/local/profiles/{profile_id}/cookies")
+async def local_api_export_cookies(request: Request, profile_id: str):
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    return await export_cookies(request, profile_id)
+
+
+@router.put("/local/profiles/{profile_id}/cookies")
+async def local_api_import_cookies(request: Request, profile_id: str, body: CookieImportBody):
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    return await import_cookies(request, profile_id, body)
+
+
+@router.post("/local/start")
+async def local_api_start(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+):
+    """Local automation: launch profile and optionally expose CDP websocket."""
+    user = await _resolve_user(request)
+    _enforce_local_api_key(request)
+    uid = _resolve_user_or_401(user)
+    profile_id = str((body or {}).get("profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="profile_id required")
+    enable_cdp = bool((body or {}).get("enable_cdp", True))
+    start_url = (body or {}).get("start_url")
+    # Stash CDP preference on doc for launcher
+    if enable_cdp:
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": {"local_api_cdp": True, "updated_at": _now_iso()}},
+        )
+    # Reuse launch_profile
+    return await launch_profile(request, profile_id, start_url=start_url)
+
+
+@router.get("/local/status/{profile_id}")
+async def local_api_status(request: Request, profile_id: str):
+    user = await _resolve_user(request)
+    _enforce_local_api_key(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {
+        "ok": True,
+        "profile_id": profile_id,
+        "status": doc.get("status") or "idle",
+        "session_id": doc.get("session_id") or "",
+        "cdp_ws": doc.get("cdp_ws") or "",
+        "debugger_address": doc.get("debugger_address") or "",
+    }
+
+
+@router.post("/local/stop")
+async def local_api_stop(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    await _resolve_user(request)
+    _enforce_local_api_key(request)
+    profile_id = str((body or {}).get("profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="profile_id required")
+    return await stop_profile(request, profile_id)
+
+
+# ── v2.7.17 — Multi-window Synchronizer ───────────────────────────────
+@router.post("/sync/start")
+async def sync_start(request: Request, body: SyncStartBody):
+    """Start AdsPower-class multi-window sync (master → slaves via CDP)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    master = await _get_profile_for_user(body.master_id, uid, min_role="editor")
+    if (master.get("status") or "") != "running":
+        raise HTTPException(status_code=400, detail="Master profile must be running")
+    from browser_profile_sync import resolve_cdp_for_profile, start_sync
+
+    master_cdp = resolve_cdp_for_profile(body.master_id, master)
+    if not master_cdp:
+        raise HTTPException(
+            status_code=400,
+            detail="Master has no CDP endpoint — re-launch on local/native Krexion",
+        )
+    slave_cdps: Dict[str, str] = {}
+    for sid in body.slave_ids or []:
+        sdoc = await _get_profile_for_user(sid, uid, min_role="editor")
+        if (sdoc.get("status") or "") != "running":
+            raise HTTPException(status_code=400, detail=f"Slave {sid} must be running")
+        cdp = resolve_cdp_for_profile(sid, sdoc)
+        if not cdp:
+            raise HTTPException(status_code=400, detail=f"Slave {sid} missing CDP — re-launch")
+        slave_cdps[sid] = cdp
+    try:
+        result = await start_sync(
+            user_id=uid,
+            master_id=body.master_id,
+            slave_ids=list(body.slave_ids or []),
+            modes=list(body.modes or []),
+            jitter=bool(body.jitter),
+            master_cdp=master_cdp,
+            slave_cdps=slave_cdps,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning(f"sync start failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync start failed: {e}")
+    return result
+
+
+@router.get("/sync/status")
+async def sync_status_list(request: Request):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_sync import list_syncs_for_user
+
+    return {"syncs": list_syncs_for_user(uid)}
+
+
+@router.get("/sync/{sync_id}")
+async def sync_status_one(request: Request, sync_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_sync import status_sync, _SYNC_GROUPS
+
+    st = status_sync(sync_id)
+    g = _SYNC_GROUPS.get(sync_id) or {}
+    if not st.get("ok") or g.get("user_id") != uid:
+        raise HTTPException(status_code=404, detail="Sync not found")
+    return st
+
+
+@router.post("/sync/{sync_id}/stop")
+async def sync_stop(request: Request, sync_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_sync import stop_sync
+
+    return await stop_sync(sync_id, user_id=uid)
+
+
+@router.get("/cloud-phone/providers")
+async def cloud_phone_providers(request: Request):
+    """Partner + CPI BYO device options (ARM farm = partner URL)."""
+    await _resolve_user(request)
+    return {
+        "providers": [
+            {
+                "id": "cpi",
+                "name": "Krexion CPI device (BYO Android)",
+                "kind": "byo_adb",
+                "description": "Open profile URL on an online CPI worker Android via ADB am start",
+            },
+            {
+                "id": "partner",
+                "name": "Cloud Phone partner (Geelark / ARM farm)",
+                "kind": "partner_url",
+                "description": "Bind an external cloud-phone console URL / device id",
+            },
+            {
+                "id": "none",
+                "name": "None",
+                "kind": "none",
+                "description": "Clear cloud-phone binding",
+            },
+        ]
+    }
+
+
 @router.get("/{profile_id}")
 async def get_profile(request: Request, profile_id: str):
-    """Get one profile."""
+    """Get one profile (owned or ACL-shared)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    return {"profile": _public_view_for(doc, uid)}
+
+
+@router.get("/{profile_id}/acl")
+async def get_profile_acl(request: Request, profile_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    return {
+        "profile_id": profile_id,
+        "owner_user_id": doc.get("user_id"),
+        "acl": _acl_entries(doc),
+        "my_role": _role_for_user(doc, uid),
+    }
+
+
+@router.post("/{profile_id}/acl")
+async def grant_profile_acl(request: Request, profile_id: str, body: AclGrantBody):
+    """Grant live team access (viewer|editor|admin) without cloning."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="admin")
+    email = (body.target_email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid target_email required")
+    target = await _DB.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if not target or not target.get("id"):
+        raise HTTPException(status_code=404, detail="Target user not found")
+    target_uid = target["id"]
+    if target_uid == doc.get("user_id"):
+        raise HTTPException(status_code=400, detail="Cannot ACL-grant the owner")
+    role = _normalize_role(body.role)
+    entries = [e for e in _acl_entries(doc) if e.get("user_id") != target_uid]
+    entries.append({
+        "user_id": target_uid,
+        "email": email,
+        "role": role,
+        "added_at": _now_iso(),
+    })
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id},
+        {"$set": {"acl": entries, "updated_at": _now_iso()}},
+    )
+    return {"ok": True, "acl": entries}
+
+
+@router.delete("/{profile_id}/acl")
+async def revoke_profile_acl(request: Request, profile_id: str, body: AclRevokeBody = Body(...)):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    await _get_profile_for_user(profile_id, uid, min_role="admin")
+    email = (body.target_email or "").strip().lower()
+    tid = (body.user_id or "").strip()
+    doc = await _DB.browser_profiles.find_one({"id": profile_id})
+    entries = _acl_entries(doc or {})
+    kept = []
+    for e in entries:
+        if tid and e.get("user_id") == tid:
+            continue
+        if email and e.get("email") == email:
+            continue
+        kept.append(e)
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id},
+        {"$set": {"acl": kept, "updated_at": _now_iso()}},
+    )
+    return {"ok": True, "acl": kept}
+
+
+@router.post("/{profile_id}/cloud-phone")
+async def bind_cloud_phone(request: Request, profile_id: str, body: CloudPhoneBindBody):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    await _get_profile_for_user(profile_id, uid, min_role="editor")
+    provider = (body.provider or "none").strip().lower()
+    if provider not in ("partner", "cpi", "none"):
+        raise HTTPException(status_code=400, detail="provider must be partner|cpi|none")
+    binding: Dict[str, Any] = {}
+    if provider != "none":
+        binding = {
+            "provider": provider,
+            "partner_url": (body.partner_url or "").strip()[:512],
+            "external_id": (body.external_id or "").strip()[:120],
+            "device_id": (body.device_id or "").strip()[:80],
+            "label": (body.label or "").strip()[:120],
+            "bound_at": _now_iso(),
+        }
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id},
+        {"$set": {"cloud_phone": binding, "updated_at": _now_iso()}},
+    )
+    return {"ok": True, "cloud_phone": binding}
+
+
+@router.post("/{profile_id}/open-on-device")
+async def open_profile_on_cpi_device(request: Request, profile_id: str, body: OpenOnDeviceBody):
+    """Queue URL open on CPI Android (worker picks up needs_action).
+
+    v2.7.21 — if device_id empty/offline, auto-pick first online android_* device.
+    """
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    url = (body.url or doc.get("start_url") or "https://www.google.com/").strip()[:1024]
+    if not url.startswith("http"):
+        raise HTTPException(status_code=400, detail="url must be http(s)")
+
+    device = None
+    wanted = (body.device_id or "").strip()
+    if not wanted:
+        # Prefer already-bound CPI device
+        bound = (doc.get("cloud_phone") or {}).get("device_id") or ""
+        if bound:
+            wanted = str(bound).strip()
+
+    if wanted:
+        device = await _DB.cpi_devices.find_one({"id": wanted, "user_id": uid})
+        if not device:
+            device = await _DB.cpi_devices.find_one({"device_id": wanted, "user_id": uid})
+        if device and device.get("status") == "offline" and body.auto_fallback:
+            device = None  # fall through to online pick
+
+    if not device:
+        # Auto-pick best online Android
+        cur = _DB.cpi_devices.find(
+            {
+                "user_id": uid,
+                "device_type": {"$regex": "^android_"},
+                "status": {"$in": ["online", "busy"]},
+            },
+            {"_id": 0},
+        ).sort("last_heartbeat", -1).limit(1)
+        async for d in cur:
+            device = d
+            break
+    if not device:
+        # Last resort: any android device for this user
+        device = await _DB.cpi_devices.find_one(
+            {"user_id": uid, "device_type": {"$regex": "^android_"}},
+            {"_id": 0},
+        )
+    if not device:
+        raise HTTPException(
+            status_code=404,
+            detail="No Krexion Android online — Enable Krexion Android on CPI Devices first",
+        )
+
+    action = {
+        "type": "open_url",
+        "url": url,
+        "profile_id": profile_id,
+        "queued_at": _now_iso(),
+    }
+    await _DB.cpi_devices.update_one(
+        {"id": device["id"]},
+        {"$set": {"needs_action": action, "updated_at": _now_iso()}},
+    )
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id},
+        {"$set": {
+            "cloud_phone": {
+                "provider": "cpi",
+                "device_id": device["id"],
+                "label": device.get("label") or "",
+                "last_open_url": url,
+                "bound_at": _now_iso(),
+            },
+            "updated_at": _now_iso(),
+        }},
+    )
+    return {
+        "ok": True,
+        "device_id": device["id"],
+        "device_label": device.get("label") or "",
+        "device_status": device.get("status") or "",
+        "needs_action": action,
+        "url": url,
+        "auto_picked": not bool((body.device_id or "").strip()),
+    }
+
+
+@router.get("/{profile_id}/cookies")
+async def export_cookies(request: Request, profile_id: str):
+    """Export Playwright storage_state cookies (+ origins)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    ss = doc.get("storage_state") or {}
+    return {
+        "profile_id": profile_id,
+        "storage_state": {
+            "cookies": ss.get("cookies") or [],
+            "origins": ss.get("origins") or [],
+        },
+        "cookie_count": len(ss.get("cookies") or []),
+        "synced_at": doc.get("storage_synced_at") or "",
+    }
+
+
+@router.put("/{profile_id}/cookies")
+async def import_cookies(request: Request, profile_id: str, body: CookieImportBody):
+    """Import cookies (replace or merge)."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
-    return {"profile": _public_view(doc)}
+    existing = dict(doc.get("storage_state") or {})
+    cookies: List[Dict[str, Any]] = []
+    origins = list(existing.get("origins") or [])
+    if body.storage_state and isinstance(body.storage_state, dict):
+        cookies = _normalize_cookie_list(body.storage_state.get("cookies") or [])
+        if "origins" in body.storage_state and isinstance(body.storage_state.get("origins"), list):
+            origins = body.storage_state["origins"]
+    elif body.cookies:
+        cookies = _normalize_cookie_list(body.cookies)
+    elif body.netscape:
+        cookies = _normalize_cookie_list(_parse_netscape_cookies(body.netscape))
+    else:
+        raise HTTPException(status_code=400, detail="Provide storage_state, cookies, or netscape text")
+    if body.merge:
+        by_key = {}
+        for c in (existing.get("cookies") or []) + cookies:
+            if not isinstance(c, dict):
+                continue
+            key = (c.get("domain"), c.get("path"), c.get("name"))
+            by_key[key] = c
+        cookies = list(by_key.values())
+    new_ss = {"cookies": cookies, "origins": origins}
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {
+            "$set": {
+                "storage_state": new_ss,
+                "storage_synced_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+        },
+    )
+    return {"ok": True, "cookie_count": len(cookies), "origin_count": len(origins)}
+
+
+@router.get("/{profile_id}/fingerprint")
+async def fingerprint_preview(request: Request, profile_id: str):
+    """Coherence panel data from stored profile fields — no browser launch."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    pub = _public_view(doc)
+    anti = doc.get("anti_detect") or {}
+    if not isinstance(anti, dict):
+        anti = {}
+    ua = str(doc.get("user_agent") or "")
+    webgl_preview: Dict[str, Any] = {}
+    try:
+        from anti_detect_v230 import align_webgl_to_ua_deterministic as _align_webgl
+        webgl_preview = _align_webgl(ua, profile_id) or {}
+    except Exception:
+        webgl_preview = {
+            "vendor": anti.get("webgl_vendor") or "",
+            "renderer": anti.get("webgl_renderer") or "",
+        }
+    ss = doc.get("storage_state") or {}
+    cookie_stats = {
+        "has_cookies": bool(ss.get("cookies")),
+        "cookie_count": len(ss.get("cookies") or []),
+        "origin_count": len(ss.get("origins") or []),
+        "synced_at": doc.get("storage_synced_at") or "",
+    }
+    running = str(doc.get("status") or "") in ("running", "launching")
+    return {
+        "ok": True,
+        "profile_id": profile_id,
+        "fingerprint_short": pub.get("fingerprint_short") or "",
+        "fingerprint_hash": str(doc.get("fingerprint_hash") or "")[:128],
+        "last_proxy_check": doc.get("last_proxy_check") or {},
+        "last_tls_prewarm_ok": doc.get("last_tls_prewarm_ok"),
+        "storage_synced_at": doc.get("storage_synced_at") or "",
+        "cookie_stats": cookie_stats,
+        "cdp_ws": (doc.get("cdp_ws") or "") if running else "",
+        "status": doc.get("status") or "idle",
+        "anti_detect": {
+            "master": bool(anti.get("master", True)),
+            "tls_prewarm": bool(anti.get("tls_prewarm", True)),
+            "canvas_mode": str(anti.get("canvas_mode") or "noise"),
+            "webgl_mode": str(anti.get("webgl_mode") or "noise"),
+            "audio_mode": str(anti.get("audio_mode") or "noise"),
+            "font_mode": str(anti.get("font_mode") or "noise"),
+            "webrtc_mode": str(anti.get("webrtc_mode") or "proxy"),
+            "use_persistent_context": bool(anti.get("use_persistent_context", False)),
+            "proxy_check_on_launch": bool(anti.get("proxy_check_on_launch", True)),
+            "proxy_check_block_on_fail": bool(anti.get("proxy_check_block_on_fail", False)),
+            "browser_kernel": str(anti.get("browser_kernel") or "auto"),
+            "fingerprint_win": bool(anti.get("fingerprint_win", True)),
+            "fingerprint_win_prefer_real": bool(anti.get("fingerprint_win_prefer_real", True)),
+        },
+        "preview": {
+            "user_agent": ua,
+            "os": doc.get("os") or "",
+            "timezone": doc.get("timezone") or "",
+            "locale": doc.get("locale") or doc.get("language") or "",
+            "geo_follow_proxy": bool(doc.get("geo_follow_proxy", True)),
+            "viewport": doc.get("viewport") or {},
+            "webgl_vendor": webgl_preview.get("vendor") or "",
+            "webgl_renderer": webgl_preview.get("renderer") or "",
+            "gpu_family": webgl_preview.get("gpu_family") or "",
+            "fingerprint_salt": str(doc.get("fingerprint_salt") or "")[:32],
+        },
+    }
+
+
+@router.post("/{profile_id}/fingerprint/refresh")
+async def fingerprint_refresh(request: Request, profile_id: str):
+    """Rotate fingerprint salt so next launch gets a new CreepJS-class identity.
+
+    Keeps cookies/storage; clears stored fingerprint_hash so UI shows fresh
+    short hash after relaunch. Desktop/native launch uses the new salt.
+    """
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    new_salt = secrets.token_hex(8)
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id},
+        {
+            "$set": {
+                "fingerprint_salt": new_salt,
+                "fingerprint_hash": "",
+                "fingerprint_refreshed_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+        },
+    )
+    return {
+        "ok": True,
+        "profile_id": profile_id,
+        "fingerprint_salt": new_salt,
+        "fingerprint_short": "",
+        "message": "Fingerprint rotated — relaunch profile to apply",
+    }
+
+
+@router.post("/{profile_id}/cookie-robot")
+async def cookie_robot(request: Request, profile_id: str, body: CookieRobotBody = Body(default_factory=CookieRobotBody)):
+    """Warm cookies via short stealth visits — local/native/desktop only."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    mode = (os.environ.get("KREXION_MODE") or "").lower()
+    if mode not in ("native", "local", "desktop"):
+        raise HTTPException(
+            status_code=501,
+            detail="Cookie robot requires desktop/native mode — use Krexion Desktop",
+        )
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    try:
+        from browser_profile_launcher import warm_profile_cookies
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Launcher unavailable: {e}") from e
+    profile_config = dict(doc)
+    profile_config.pop("_id", None)
+    result = await warm_profile_cookies(
+        profile_config,
+        urls=body.urls,
+        max_urls=int(body.max_urls or 5),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=str(result.get("error") or "cookie robot failed")[:300])
+    ss = result.get("storage_state") or {}
+    if isinstance(ss, dict) and (ss.get("cookies") or ss.get("origins")):
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {
+                "$set": {
+                    "storage_state": ss,
+                    "storage_synced_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }
+            },
+        )
+    return {
+        "ok": True,
+        "profile_id": profile_id,
+        "visited": result.get("visited") or [],
+        "cookie_count": len((ss.get("cookies") or [])),
+        "origin_count": len((ss.get("origins") or [])),
+        "storage_synced_at": _now_iso(),
+    }
+
+
+@router.delete("/{profile_id}/cookies")
+async def clear_cookies(request: Request, profile_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    res = await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {
+            "$set": {
+                "storage_state": {},
+                "storage_synced_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+        },
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"ok": True, "cleared": True}
+
+
+@router.post("/{profile_id}/check-proxy")
+async def check_proxy(request: Request, profile_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    result = await _probe_profile_proxy(doc, user)
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {"$set": {"last_proxy_check": result, "updated_at": _now_iso()}},
+    )
+    return result
+
+
+@router.post("/{profile_id}/share")
+async def share_profile(request: Request, profile_id: str, body: ShareProfileBody):
+    """Light team share: clone profile into another user account by email."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    email = (body.target_email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid target_email required")
+    target = await _DB.users.find_one({"email": email})
+    if not target and hasattr(_DB, "customers"):
+        target = await _DB.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if not target:
+        # Try case-insensitive
+        target = await _DB.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if not target or not target.get("id"):
+        raise HTTPException(status_code=404, detail="Target user not found")
+    target_uid = target["id"]
+    if target_uid == uid:
+        raise HTTPException(status_code=400, detail="Cannot share to yourself — use Clone")
+    new_doc = dict(doc)
+    new_doc.pop("_id", None)
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["user_id"] = target_uid
+    new_doc["name"] = (doc.get("name") or "Profile") + f" (from {user.get('email') or 'team'})"
+    if not body.include_cookies:
+        new_doc["storage_state"] = {}
+        new_doc["storage_synced_at"] = ""
+    new_doc["fingerprint_hash"] = ""
+    new_doc["total_launches"] = 0
+    new_doc["last_launched_at"] = ""
+    new_doc["status"] = "idle"
+    new_doc["session_id"] = ""
+    new_doc["cdp_ws"] = ""
+    new_doc["shared_from_user_id"] = uid
+    new_doc["created_at"] = _now_iso()
+    new_doc["updated_at"] = _now_iso()
+    await _DB.browser_profiles.insert_one(new_doc)
+    return {"ok": True, "id": new_doc["id"], "target_email": email}
 
 
 @router.put("/{profile_id}")
@@ -902,6 +2145,9 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["status"] = existing.get("status") or "idle"
     new_doc["last_session_duration_sec"] = existing.get("last_session_duration_sec", 0)
     new_doc["last_error"] = existing.get("last_error", "")
+    new_doc["storage_synced_at"] = existing.get("storage_synced_at", "")
+    new_doc["last_proxy_check"] = existing.get("last_proxy_check") or {}
+    new_doc["cdp_ws"] = existing.get("cdp_ws") or ""
     new_doc["updated_at"] = _now_iso()
     await _DB.browser_profiles.replace_one({"id": profile_id, "user_id": uid}, new_doc)
     return {"profile": _public_view(new_doc)}
@@ -920,7 +2166,11 @@ async def delete_profile(request: Request, profile_id: str):
 
 
 @router.post("/{profile_id}/clone")
-async def clone_profile(request: Request, profile_id: str):
+async def clone_profile(
+    request: Request,
+    profile_id: str,
+    body: CloneOptsBody = Body(default_factory=CloneOptsBody),
+):
     """Duplicate a profile with a new id + ' (copy)' suffix."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
@@ -931,11 +2181,18 @@ async def clone_profile(request: Request, profile_id: str):
     new_doc.pop("_id", None)
     new_doc["id"] = str(uuid.uuid4())
     new_doc["name"] = (existing.get("name") or "Profile") + " (copy)"
-    new_doc["storage_state"] = {}
+    if body and body.include_cookies:
+        new_doc["storage_state"] = dict(existing.get("storage_state") or {})
+        new_doc["storage_synced_at"] = existing.get("storage_synced_at") or ""
+    else:
+        new_doc["storage_state"] = {}
+        new_doc["storage_synced_at"] = ""
     new_doc["fingerprint_hash"] = ""
     new_doc["total_launches"] = 0
     new_doc["last_launched_at"] = ""
     new_doc["status"] = "idle"
+    new_doc["session_id"] = ""
+    new_doc["cdp_ws"] = ""
     new_doc["created_at"] = _now_iso()
     new_doc["updated_at"] = _now_iso()
     await _DB.browser_profiles.insert_one(new_doc)
@@ -948,9 +2205,8 @@ async def launch_profile(request: Request, profile_id: str,
     """Queue a launch job for the customer's local desktop client."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    owner_uid = str(doc.get("user_id") or uid)
 
     cur_status = str(doc.get("status") or "idle").lower()
     if cur_status in ("running", "launching", "stopping", "queued"):
@@ -963,7 +2219,7 @@ async def launch_profile(request: Request, profile_id: str,
     session = {
         "id": session_id,
         "profile_id": profile_id,
-        "user_id": uid,
+        "user_id": owner_uid,
         "started_at": _now_iso(),
         "status": "queued",
         "start_url": start_url or doc.get("start_url") or "https://www.google.com/",
@@ -1040,27 +2296,33 @@ async def launch_profile(request: Request, profile_id: str,
         try:
             from browser_profile_launcher import launch_profile_session
 
+            # v2.7.17 — enable CDP by default so Synchronizer / Local API can attach
+            doc = dict(doc)
+            doc["local_api_cdp"] = True
+            await _DB.browser_profiles.update_one(
+                {"id": profile_id},
+                {"$set": {"local_api_cdp": True}},
+            )
+
             async def _on_update(body: dict):
                 try:
-                    await _mirror_profile_session(uid, profile_id, session_id, body)
+                    await _mirror_profile_session(owner_uid, profile_id, session_id, body)
+                    patch: Dict[str, Any] = {}
                     if body.get("storage_state") and isinstance(body["storage_state"], dict):
-                        await _DB.browser_profiles.update_one(
-                            {"id": profile_id, "user_id": uid},
-                            {"$set": {"storage_state": body["storage_state"]}},
-                        )
+                        patch["storage_state"] = body["storage_state"]
+                        patch["storage_synced_at"] = _now_iso()
                     if body.get("fingerprint_hash"):
-                        await _DB.browser_profiles.update_one(
-                            {"id": profile_id, "user_id": uid},
-                            {"$set": {"fingerprint_hash": str(body["fingerprint_hash"])[:128]}},
-                        )
+                        patch["fingerprint_hash"] = str(body["fingerprint_hash"])[:128]
                     if body.get("duration_sec") is not None:
                         try:
-                            await _DB.browser_profiles.update_one(
-                                {"id": profile_id, "user_id": uid},
-                                {"$set": {"last_session_duration_sec": float(body["duration_sec"])}},
-                            )
+                            patch["last_session_duration_sec"] = float(body["duration_sec"])
                         except Exception:
                             pass
+                    if patch:
+                        await _DB.browser_profiles.update_one(
+                            {"id": profile_id},
+                            {"$set": patch},
+                        )
                 except Exception as e:
                     logger.debug(f"local on_update failed: {e}")
 
@@ -1180,9 +2442,7 @@ async def launch_profile(request: Request, profile_id: str,
 async def stop_profile(request: Request, profile_id: str):
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
     sid = doc.get("session_id") or ""
     cur_status = str(doc.get("status") or "idle").lower()
     if not sid and cur_status not in ("running", "launching", "stopping", "queued"):
@@ -1582,13 +2842,19 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 enabled=True,
                 provider_id=body.proxy.provider_id,
             )
-        elif proxy_mode == "manual" and body.proxy.server:
-            proxy_cfg = ProxyConfig(
-                enabled=True,
-                server=body.proxy.server.strip(),
-                username=body.proxy.username or "",
-                password=body.proxy.password or "",
-            )
+        elif proxy_mode == "manual":
+            # Unique line per profile when `lines` provided; else same server.
+            lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
+            if lines:
+                line = lines[i % len(lines)]
+                proxy_cfg = _parse_proxy_line_to_cfg(line)
+            elif body.proxy.server:
+                proxy_cfg = ProxyConfig(
+                    enabled=True,
+                    server=body.proxy.server.strip(),
+                    username=body.proxy.username or "",
+                    password=body.proxy.password or "",
+                )
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
             proxy_cfg = _parse_proxy_line_to_cfg(proxy_lines[i].strip())
 
@@ -1603,6 +2869,14 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         if plat == "desktop" and (device.get("brand") or "") == "mac":
             os_fallback = "macos"
 
+        _tags = [str(t).strip()[:40] for t in (body.tags or []) if str(t).strip()][:20]
+        _tz = (body.timezone or "").strip() or "America/New_York"
+        _locale = (body.locale or "").strip() or "en-US"
+        try:
+            _ref = body.referrer if isinstance(body.referrer, ReferrerProConfig) else ReferrerProConfig(**(body.referrer or {}))
+        except Exception:
+            _ref = ReferrerProConfig()
+
         pb = ProfileBody(
             name=name,
             country=country,
@@ -1615,14 +2889,17 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             os=_infer_os_from_ua(ua, is_mobile=is_mobile, fallback=os_fallback),
             start_url=body.start_url or "https://www.google.com/",
             notes=body.notes or "",
+            timezone=_tz,
+            locale=_locale,
+            language=_locale,
+            accept_language=f"{_locale},{_locale.split('-')[0]};q=0.9" if "-" in _locale else f"{_locale},en;q=0.9",
             proxy=proxy_cfg,
-            anti_detect=AntiDetectConfig(
-                master=bool(body.anti_detect_on),
-                tls_prewarm=bool(body.anti_detect_on),
-                behavioral_bio=bool(body.anti_detect_on),
-                browser_variant="rotate" if body.anti_detect_on else "auto",
-                identity_persist=bool(body.anti_detect_on),
-            ),
+            tags=_tags,
+            folder=(body.folder or "").strip()[:80],
+            geo_follow_proxy=bool(body.geo_follow_proxy),
+            quick_links=[str(u).strip()[:512] for u in (body.quick_links or []) if str(u).strip()][:12],
+            referrer=_ref,
+            anti_detect=_adv_anti_detect_cfg(body),
         )
         doc = _profile_doc(uid, pb)
         doc["device_model"] = str(device.get("slug") or "")
@@ -1790,8 +3067,17 @@ async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(..
         update["session_id"] = sid
     if "storage_state" in body and isinstance(body["storage_state"], dict):
         update["storage_state"] = body["storage_state"]
+        update["storage_synced_at"] = _now_iso()
     if "fingerprint_hash" in body:
         update["fingerprint_hash"] = str(body["fingerprint_hash"])[:128]
+    if "last_tls_prewarm_ok" in body:
+        update["last_tls_prewarm_ok"] = bool(body["last_tls_prewarm_ok"])
+    if "last_proxy_check" in body and isinstance(body.get("last_proxy_check"), dict):
+        update["last_proxy_check"] = body["last_proxy_check"]
+    if body.get("cdp_ws"):
+        update["cdp_ws"] = str(body.get("cdp_ws"))[:512]
+    if body.get("debugger_address"):
+        update["debugger_address"] = str(body.get("debugger_address"))[:128]
     if "duration_sec" in body:
         try:
             update["last_session_duration_sec"] = float(body["duration_sec"])

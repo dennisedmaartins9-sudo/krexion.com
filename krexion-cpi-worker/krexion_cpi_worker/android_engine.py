@@ -18,14 +18,61 @@ from .config import AndroidConfig, WorkflowConfig
 logger = logging.getLogger("cpi.android")
 
 
+def _classify_android_type(serial: str, model: str = "") -> str:
+    """Map ADB serial → device_type (real / emulator flavors / cloud)."""
+    s = (serial or "").strip().lower()
+    m = (model or "").lower()
+    # Network ADB (host:port)
+    if s.count(":") == 1 and s.split(":")[-1].isdigit():
+        host = s.split(":")[0]
+        if host in ("127.0.0.1", "localhost", "0.0.0.0") or host.startswith("10.0.2."):
+            if "ldplayer" in m or "leidian" in m:
+                return "android_ldplayer"
+            if "genymotion" in m or "vbox" in m:
+                return "android_genymotion"
+            if "bluestacks" in m:
+                return "android_bluestacks"
+            return "android_emulator"
+        # Remote host:port → treat as cloud ARM / partner tunnel
+        return "android_cloud"
+    # Local emulator serials (emulator-5554)
+    if s.startswith("emulator-"):
+        return "android_emulator"
+    if any(x in m for x in ("sdk_gphone", "google_sdk", "emulator", "android sdk")):
+        return "android_emulator"
+    if "ldplayer" in m or "leidian" in m:
+        return "android_ldplayer"
+    if "genymotion" in m:
+        return "android_genymotion"
+    return "android_real"
+
+
 class AndroidEngine:
     def __init__(self, adb: ADB, cfg: AndroidConfig, wf: WorkflowConfig):
         self.adb = adb
         self.cfg = cfg
         self.wf = wf
 
+    async def ensure_emulator_connections(self) -> None:
+        """Auto-connect configured local emulator + cloud ADB endpoints."""
+        endpoints: List[str] = []
+        for ep in list(self.cfg.emulator_endpoints or []) + list(self.cfg.cloud_adb_endpoints or []):
+            ep = str(ep or "").strip()
+            if ep and ep not in endpoints:
+                endpoints.append(ep)
+        if not endpoints:
+            return
+        for ep in endpoints:
+            try:
+                ok = await self.adb.connect(ep)
+                logger.info(f"adb connect {ep}: {'ok' if ok else 'fail'}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"adb connect {ep} error: {e}")
+
     # ── Discovery ──────────────────────────────────────────
     async def discover(self) -> List[Dict[str, str]]:
+        if self.cfg.prefer_emulator or self.cfg.emulator_endpoints or self.cfg.cloud_adb_endpoints:
+            await self.ensure_emulator_connections()
         devs = await self.adb.devices()
         result = []
         for d in devs:
@@ -34,18 +81,46 @@ class AndroidEngine:
             if self.cfg.serial_allowlist and d["serial"] not in self.cfg.serial_allowlist:
                 continue
             info = await self.adb.get_device_info(d["serial"])
-            d_type = "android_real"
-            if d["serial"].count(":") == 1 and d["serial"].split(":")[1].isdigit():
-                # Network-adb (Genymotion / LDPlayer / BlueStacks)
-                d_type = "android_genymotion"
+            model = info.get("ro.product.model") or d.get("model") or "Android"
+            d_type = _classify_android_type(d["serial"], model)
+            # v2.7.19 — white-label: customer only sees Krexion Android
+            if d_type.startswith("android_") and d_type not in ("android_real",):
+                if d_type != "android_cloud":
+                    d_type = "android_krexion"
+                    model = "Krexion Android"
+                else:
+                    model = "Krexion Cloud Android"
             result.append({
                 "serial": d["serial"],
                 "device_id": d["serial"],
                 "device_type": d_type,
-                "model": info.get("ro.product.model") or d.get("model") or "Android",
+                "model": model,
                 "os_version": f"Android {info.get('ro.build.version.release', '?')}",
             })
         return result
+
+    async def execute_action(self, serial: str, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle queued needs_action from backend (open_url / install_apk)."""
+        atype = str((action or {}).get("type") or "").strip().lower()
+        if atype == "open_url":
+            url = str(action.get("url") or "").strip()
+            if not url.startswith("http"):
+                return {"ok": False, "error": "invalid url"}
+            ok = await self.adb.open_url(serial, url)
+            return {"ok": bool(ok), "type": atype, "url": url}
+        if atype in ("install_apk", "install"):
+            apk_url = str(action.get("apk_url") or action.get("url") or "").strip()
+            if not apk_url.startswith("http"):
+                return {"ok": False, "error": "apk_url required"}
+            ok, detail = await self.adb.install_remote_url(serial, apk_url)
+            package = str(action.get("package_name") or "").strip()
+            if ok and package:
+                try:
+                    await self.adb.start_app(serial, package)
+                except Exception:
+                    pass
+            return {"ok": bool(ok), "type": atype, "detail": str(detail)[:200], "package": package}
+        return {"ok": False, "error": f"unknown action type: {atype}"}
 
     # ── Per-install workflow ───────────────────────────────
     async def execute_install(

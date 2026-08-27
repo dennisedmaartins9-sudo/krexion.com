@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import ReactFlow, {
   Background,
   Controls,
@@ -98,6 +98,7 @@ const nodeTypes = { rpa: FlowNode };
 export default function RPAStudioPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const [workflow, setWorkflow] = useState(null);
   const [catalog, setCatalog] = useState({ categories: [] });
   const [nodes, setNodes] = useState([]);
@@ -134,9 +135,25 @@ export default function RPAStudioPage() {
 
   useEffect(() => {
     if (!id || id === "new") {
-      setWorkflow({ name: "Untitled Workflow", nodes: [], edges: [], settings: {}, variables: {} });
+      const params = new URLSearchParams(location.search || "");
+      const bpId = (params.get("browser_profile_id") || "").trim();
+      const bpName = (params.get("name") || "").trim();
+      const baseSettings = bpId
+        ? { browser_profile_id: bpId, headless: false }
+        : {};
+      setWorkflow({
+        name: bpName ? `Profile: ${bpName}` : "Untitled Workflow",
+        nodes: [],
+        edges: [],
+        settings: baseSettings,
+        variables: {},
+      });
       setNodes([]);
       setEdges([]);
+      if (bpId) {
+        toast.success(`Linked Browser Profile ${bpId.slice(0, 8)}…`);
+        setShowSettings(true);
+      }
       return;
     }
     (async () => {
@@ -148,6 +165,13 @@ export default function RPAStudioPage() {
           return;
         }
         const wf = await r.json();
+        const params = new URLSearchParams(location.search || "");
+        const bpId = (params.get("browser_profile_id") || "").trim();
+        if (bpId) {
+          wf.settings = { ...(wf.settings || {}), browser_profile_id: bpId, headless: false };
+          toast.success(`Linked Browser Profile ${bpId.slice(0, 8)}…`);
+          setShowSettings(true);
+        }
         setWorkflow(wf);
         setNodes(deserializeNodes(wf.nodes || [], catalog));
         setEdges(deserializeEdges(wf.edges || []));
@@ -156,7 +180,7 @@ export default function RPAStudioPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, location.search]);
 
   // Build a lookup of {type: {label, color, category}} from catalog
   const typeLookup = useMemo(() => {
@@ -585,6 +609,21 @@ export default function RPAStudioPage() {
             {showSettings && (
               <div className="border-t border-slate-800 p-4 bg-slate-950/50">
                 <h4 className="text-xs font-semibold text-blue-400 mb-2">Workflow Settings</h4>
+                <label className="block text-xs text-slate-400 mb-1">Browser Profile ID</label>
+                <input
+                  type="text"
+                  value={workflow?.settings?.browser_profile_id ?? ""}
+                  onChange={(e) => setWorkflow({
+                    ...workflow,
+                    settings: {
+                      ...(workflow.settings || {}),
+                      browser_profile_id: e.target.value.slice(0, 80),
+                    },
+                  })}
+                  className="w-full bg-slate-800 px-2 py-1.5 rounded text-xs mb-2"
+                  placeholder="from Browser Profiles → RPA"
+                  data-testid="rpa-settings-browser-profile-id"
+                />
                 <label className="block text-xs text-slate-400 mb-1">Headless</label>
                 <select
                   value={workflow?.settings?.headless ?? true}
