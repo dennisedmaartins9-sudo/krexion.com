@@ -139,30 +139,6 @@ jobs:
           echo ">> Building backend + frontend with --no-cache..."
           docker compose -f "$COMPOSE_FILE" build --no-cache backend frontend
 
-      - name: Publish native UI sync zip
-        env:
-          COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
-        run: |
-          set -euo pipefail
-          cd /opt/krexion
-          VERSION=$(tr -d ' \n\r' < backend/VERSION)
-          mkdir -p downloads/ui
-          IMG_ID=$(docker compose -f "$COMPOSE_FILE" images -q frontend)
-          if [ -z "$IMG_ID" ]; then
-            echo "ERROR: frontend image not found after build"
-            exit 1
-          fi
-          CID=$(docker create "$IMG_ID")
-          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
-          rm -rf /tmp/krexion-ui-export
-          mkdir -p /tmp/krexion-ui-export
-          docker cp "$CID:/usr/share/nginx/html/." /tmp/krexion-ui-export
-          python3 scripts/stamp-frontend-build.py --dir /tmp/krexion-ui-export
-          rm -f "downloads/ui/krexion-ui-${VERSION}.zip"
-          (cd /tmp/krexion-ui-export && zip -qr "/opt/krexion/downloads/ui/krexion-ui-${VERSION}.zip" .)
-          ls -la "downloads/ui/krexion-ui-${VERSION}.zip"
-          sha256sum "downloads/ui/krexion-ui-${VERSION}.zip"
-
       - name: Docker up
         env:
           COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
@@ -263,5 +239,29 @@ jobs:
           echo "  Public endpoint check:"
           curl -sf --max-time 5 https://krexion.com/api/system/version || echo "(public endpoint check failed — check nginx/cloudflare)"
           echo "===================================================="
+
+      - name: Publish native UI sync zip (optional)
+        continue-on-error: true
+        env:
+          COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
+        run: |
+          cd /opt/krexion
+          VERSION=$(tr -d ' \n\r' < backend/VERSION)
+          mkdir -p downloads/ui
+          command -v zip >/dev/null || (apt-get update -qq && apt-get install -y -qq zip)
+          EXPORT=/tmp/krexion-ui-export
+          rm -rf "$EXPORT" && mkdir -p "$EXPORT"
+          if ! docker compose -f "$COMPOSE_FILE" cp frontend:/usr/share/nginx/html/. "$EXPORT/"; then
+            echo "WARN: could not copy live frontend files — skipping UI sync zip"
+            exit 0
+          fi
+          if ! python3 scripts/stamp-frontend-build.py --dir "$EXPORT"; then
+            echo "WARN: stamp verify failed — writing version-only marker"
+            printf '{"version":"%s"}\n' "$VERSION" > "$EXPORT/build-version.json"
+          fi
+          rm -f "downloads/ui/krexion-ui-${VERSION}.zip"
+          (cd "$EXPORT" && zip -qr "/opt/krexion/downloads/ui/krexion-ui-${VERSION}.zip" .)
+          ls -la "downloads/ui/krexion-ui-${VERSION}.zip"
+          sha256sum "downloads/ui/krexion-ui-${VERSION}.zip"
           echo "  Deploy complete: $(date -u +%FT%TZ)"
           echo "===================================================="

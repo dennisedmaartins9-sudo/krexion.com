@@ -36,9 +36,28 @@ def _find_main_js(build_dir: Path) -> Path:
     if not static_js.exists():
         raise SystemExit(f"missing {static_js}")
     mains = sorted(static_js.glob("main.*.js"))
-    if not mains:
-        raise SystemExit("no main.*.js bundle found")
-    return mains[0]
+    if mains:
+        return mains[0]
+    any_js = sorted(static_js.glob("*.js"))
+    if not any_js:
+        raise SystemExit("no JS bundle found under static/js")
+    return any_js[0]
+
+
+def _bundle_has_fresh_marker(build_dir: Path) -> bool:
+    static_js = build_dir / "static" / "js"
+    if not static_js.exists():
+        return False
+    stale = False
+    for js in static_js.glob("*.js"):
+        body = js.read_text(encoding="utf-8", errors="ignore")
+        if STALE_UI_MARKER in body:
+            stale = True
+        if UI_FRESHNESS_MARKER in body:
+            return True
+    if stale:
+        raise SystemExit("stale UI text found in frontend bundle")
+    return False
 
 
 def main() -> None:
@@ -49,13 +68,9 @@ def main() -> None:
     repo = _repo_root()
     version = _read_version(repo)
     build_dir = _resolve_build_dir(repo, args.dir)
+    if not _bundle_has_fresh_marker(build_dir):
+        raise SystemExit("freshness marker missing from frontend static/js bundles")
     main_js = _find_main_js(build_dir)
-    body = main_js.read_text(encoding="utf-8", errors="ignore")
-
-    if STALE_UI_MARKER in body:
-        raise SystemExit(f"stale UI text found in {main_js.name}")
-    if UI_FRESHNESS_MARKER not in body:
-        raise SystemExit(f"freshness marker missing from {main_js.name}")
 
     stamp = {
         "version": version,

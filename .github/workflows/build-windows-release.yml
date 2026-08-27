@@ -36,7 +36,7 @@ on:
 # doomed #194/#195 queue entries.
 concurrency:
   group: krexion-native-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # ----------------------------------------------------------------------
 # `contents: write` is required by softprops/action-gh-release@v2 in the
@@ -298,7 +298,7 @@ jobs:
           echo "REACT_APP_BACKEND_URL=http://127.0.0.1:8001" > .env.production
           yarn build
           cd ..
-          python scripts/stamp-frontend-build.py
+          python3 scripts/stamp-frontend-build.py
 
       - name: Upload frontend artifact
         # Installer job downloads this via GitHub API (no actions/cache
@@ -403,12 +403,26 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          if (Test-Path "frontend/build/index.html") {
-            python scripts/stamp-frontend-build.py
-            Write-Host "Frontend artifact stamped for native installer"
-          } else {
+          if (-not (Test-Path "frontend/build/index.html")) {
             Write-Host "No frontend artifact to stamp — local rebuild fallback will run"
+            exit 0
           }
+          $stamped = $false
+          foreach ($cmd in @('py -3', 'python3', 'python')) {
+            try {
+              Invoke-Expression "$cmd scripts/stamp-frontend-build.py"
+              if ($LASTEXITCODE -eq 0) {
+                $stamped = $true
+                break
+              }
+            } catch {
+              Write-Host "Stamp via $cmd failed: $($_.Exception.Message)"
+            }
+          }
+          if (-not $stamped) {
+            throw "Could not stamp frontend artifact (py/python missing?)"
+          }
+          Write-Host "Frontend artifact stamped for native installer"
 
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
@@ -462,7 +476,14 @@ jobs:
             throw "craco build reported success but build/index.html is missing"
           }
           cd ..
-          python scripts/stamp-frontend-build.py
+          foreach ($cmd in @('py -3', 'python3', 'python')) {
+            try {
+              Invoke-Expression "$cmd scripts/stamp-frontend-build.py"
+              if ($LASTEXITCODE -eq 0) { break }
+            } catch {
+              if ($cmd -eq 'python') { throw "Could not stamp rebuilt frontend" }
+            }
+          }
           Write-Host "Local frontend build complete."
 
       - name: Verify build outputs available
@@ -481,7 +502,14 @@ jobs:
             New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
             Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
           }
-          python scripts/stamp-frontend-build.py --dir build/frontend-build
+          foreach ($cmd in @('py -3', 'python3', 'python')) {
+            try {
+              Invoke-Expression "$cmd scripts/stamp-frontend-build.py --dir build/frontend-build"
+              if ($LASTEXITCODE -eq 0) { break }
+            } catch {
+              if ($cmd -eq 'python') { throw "Could not stamp build/frontend-build" }
+            }
+          }
           Write-Host "backend OK: $backendOk"
           Write-Host "frontend OK: $frontendOk"
           if (-not $backendOk) { throw "Backend build artifact missing from BOTH cache and artifact." }
