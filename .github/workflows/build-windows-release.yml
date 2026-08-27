@@ -401,8 +401,11 @@ jobs:
 
       - name: Stamp and verify frontend artifact
         shell: powershell
+        working-directory: ${{ github.workspace }}
         run: |
-          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1"
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/stamp-frontend-build.ps1
 
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
@@ -456,7 +459,7 @@ jobs:
             throw "craco build reported success but build/index.html is missing"
           }
           cd ..
-          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1"
+          & ./scripts/stamp-frontend-build.ps1
           Write-Host "Local frontend build complete."
 
       - name: Verify build outputs available
@@ -475,7 +478,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
             Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
           }
-          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1" -Dir "build/frontend-build"
+          & ./scripts/stamp-frontend-build.ps1 -Dir "build/frontend-build"
           Write-Host "backend OK: $backendOk"
           Write-Host "frontend OK: $frontendOk"
           if (-not $backendOk) { throw "Backend build artifact missing from BOTH cache and artifact." }
