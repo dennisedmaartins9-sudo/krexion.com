@@ -402,27 +402,7 @@ jobs:
       - name: Stamp and verify frontend artifact
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path "frontend/build/index.html")) {
-            Write-Host "No frontend artifact to stamp — local rebuild fallback will run"
-            exit 0
-          }
-          $stamped = $false
-          foreach ($cmd in @('py -3', 'python3', 'python')) {
-            try {
-              Invoke-Expression "$cmd scripts/stamp-frontend-build.py"
-              if ($LASTEXITCODE -eq 0) {
-                $stamped = $true
-                break
-              }
-            } catch {
-              Write-Host "Stamp via $cmd failed: $($_.Exception.Message)"
-            }
-          }
-          if (-not $stamped) {
-            throw "Could not stamp frontend artifact (py/python missing?)"
-          }
-          Write-Host "Frontend artifact stamped for native installer"
+          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1"
 
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
@@ -449,10 +429,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ((Test-Path "frontend/build/index.html") -or (Test-Path "build/frontend-build/index.html")) {
-            Write-Host "Frontend already available from artifact — skipping local rebuild"
+            Write-Host "Frontend already available from artifact - skipping local rebuild"
             exit 0
           }
-          Write-Host "Frontend missing from cache AND artifact — rebuilding locally..."
+          Write-Host "Frontend missing from cache AND artifact - rebuilding locally..."
           cd frontend
           yarn install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { throw "yarn install failed with exit $LASTEXITCODE" }
@@ -476,14 +456,7 @@ jobs:
             throw "craco build reported success but build/index.html is missing"
           }
           cd ..
-          foreach ($cmd in @('py -3', 'python3', 'python')) {
-            try {
-              Invoke-Expression "$cmd scripts/stamp-frontend-build.py"
-              if ($LASTEXITCODE -eq 0) { break }
-            } catch {
-              if ($cmd -eq 'python') { throw "Could not stamp rebuilt frontend" }
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1"
           Write-Host "Local frontend build complete."
 
       - name: Verify build outputs available
@@ -502,14 +475,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path "build/frontend-build" | Out-Null
             Copy-Item -Recurse -Force frontend/build/* build/frontend-build/
           }
-          foreach ($cmd in @('py -3', 'python3', 'python')) {
-            try {
-              Invoke-Expression "$cmd scripts/stamp-frontend-build.py --dir build/frontend-build"
-              if ($LASTEXITCODE -eq 0) { break }
-            } catch {
-              if ($cmd -eq 'python') { throw "Could not stamp build/frontend-build" }
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/scripts/stamp-frontend-build.ps1" -Dir "build/frontend-build"
           Write-Host "backend OK: $backendOk"
           Write-Host "frontend OK: $frontendOk"
           if (-not $backendOk) { throw "Backend build artifact missing from BOTH cache and artifact." }
