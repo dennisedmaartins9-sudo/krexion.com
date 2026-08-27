@@ -399,6 +399,17 @@ jobs:
             Write-Host "Frontend zip extracted but index.html missing; local rebuild fallback will run"
           }
 
+      - name: Stamp and verify frontend artifact
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path "frontend/build/index.html") {
+            python scripts/stamp-frontend-build.py
+            Write-Host "Frontend artifact stamped for native installer"
+          } else {
+            Write-Host "No frontend artifact to stamp — local rebuild fallback will run"
+          }
+
       - name: Build frontend locally (bulletproof fallback if cache + artifact both fail)
         # 2026-01-09 — when GitHub Actions artifact quota is exhausted
         # AND cache save/restore has any hiccup (cross-runner, cross-OS),
@@ -423,24 +434,11 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedVer = (Get-Content backend/VERSION -Raw).Trim()
-          $stampPath = "frontend/build/build-version.json"
-          $frontendFresh = $false
-          if (Test-Path $stampPath) {
-            try {
-              $stamp = Get-Content $stampPath -Raw | ConvertFrom-Json
-              if ($stamp.version -eq $expectedVer) {
-                $frontendFresh = $true
-              }
-            } catch {
-              Write-Host "Could not parse $stampPath — will rebuild frontend"
-            }
-          }
-          if ($frontendFresh -and ((Test-Path "frontend/build/index.html") -or (Test-Path "build/frontend-build/index.html"))) {
-            Write-Host "Frontend already stamped for v$expectedVer — skipping local rebuild"
+          if ((Test-Path "frontend/build/index.html") -or (Test-Path "build/frontend-build/index.html")) {
+            Write-Host "Frontend already available from artifact — skipping local rebuild"
             exit 0
           }
-          Write-Host "Frontend missing or stale for v$expectedVer — rebuilding locally..."
+          Write-Host "Frontend missing from cache AND artifact — rebuilding locally..."
           cd frontend
           yarn install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { throw "yarn install failed with exit $LASTEXITCODE" }
