@@ -325,6 +325,80 @@ async def list_team_offer_ledger_ips(db, scope_key: str, offer_key: str) -> Set[
     return out
 
 
+# Browser Profiles — team-wide exit IP diary (same isolation scope as RUT).
+PROFILE_IP_OFFER_KEY = "__krexion_browser_profile__"
+
+
+async def list_team_profile_used_ips(db, user_id: str) -> Set[str]:
+    """All exit IPs already bound to browser profiles for this isolation scope."""
+    uid = (user_id or "").strip()
+    used: Set[str] = set()
+    if not uid:
+        return used
+    try:
+        scope = await resolve_isolation_scope(db, uid)
+    except Exception:
+        scope = {"scope_key": f"user:{uid}", "member_ids": [uid]}
+    scope_key = str(scope.get("scope_key") or f"user:{uid}").strip()
+    members = [str(m).strip() for m in (scope.get("member_ids") or [uid]) if str(m).strip()]
+    try:
+        used.update(await list_team_offer_ledger_ips(db, scope_key, PROFILE_IP_OFFER_KEY))
+    except Exception:
+        pass
+    try:
+        for mid in members:
+            async for doc in db.browser_profiles.find(
+                {"user_id": mid, "exit_ip": {"$exists": True, "$ne": ""}},
+                {"exit_ip": 1, "_id": 0},
+            ):
+                canonical = canonicalize_ip(doc.get("exit_ip"))
+                if canonical:
+                    used.add(canonical)
+    except Exception:
+        pass
+    return used
+
+
+async def is_team_profile_ip_used(db, user_id: str, ip: str) -> bool:
+    canonical = canonicalize_ip(ip)
+    if not canonical:
+        return False
+    try:
+        used = await list_team_profile_used_ips(db, user_id)
+        return canonical in used
+    except Exception:
+        return False
+
+
+async def record_profile_exit_ip_for_user(
+    db,
+    user_id: str,
+    profile_id: str,
+    ip: str,
+    *,
+    source: str = "browser_profile",
+) -> bool:
+    """Persist profile exit IP into the team isolation ledger."""
+    uid = (user_id or "").strip()
+    pid = (profile_id or "").strip()
+    canonical = canonicalize_ip(ip)
+    if not uid or not pid or not canonical:
+        return False
+    try:
+        scope = await resolve_isolation_scope(db, uid)
+    except Exception:
+        scope = {"scope_key": f"user:{uid}"}
+    return await record_team_offer_ip_used(
+        db,
+        scope_key=str(scope.get("scope_key") or f"user:{uid}"),
+        offer_key=PROFILE_IP_OFFER_KEY,
+        ip=canonical,
+        user_id=uid,
+        offer_url_normalized=f"profile:{pid}",
+        source=source,
+    )
+
+
 async def backfill_team_offer_ledger_from_claims(db, *, limit: int = 50000) -> int:
     """One-time / startup heal: completed claims → flat ledger (idempotent)."""
     written = 0

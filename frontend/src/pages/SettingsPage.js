@@ -14,8 +14,9 @@ import { format } from "date-fns";
 import { 
   User, Lock, Users, Plus, Trash2, Edit2, 
   Eye, EyeOff, Shield, CheckCircle, XCircle,
-  Clock, Save, BarChart3, Link2, MousePointerClick, Server, Bell
+  Clock, Save, BarChart3, Link2, MousePointerClick, Server, Bell, Monitor
 } from "lucide-react";
+import { Link } from "react-router-dom";
 import FraudDetectionTab from "./FraudDetectionTab";
 import ProxyProvidersTab from "./ProxyProvidersTab";
 
@@ -115,6 +116,24 @@ export default function SettingsPage() {
       toast.error("Failed to fetch user data");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const toggleTeamFleet = async (enabled) => {
+    try {
+      await axios.put(
+        `${API}/team-fleet/settings`,
+        { enabled },
+        { headers: { Authorization: `Bearer ${getToken()}` } },
+      );
+      setUser((u) => ({ ...u, team_fleet_enabled: enabled }));
+      try {
+        const cur = JSON.parse(localStorage.getItem("user") || "{}");
+        localStorage.setItem("user", JSON.stringify({ ...cur, team_fleet_enabled: enabled }));
+      } catch (_) { /* ignore */ }
+      toast.success(enabled ? "Team Fleet Control enabled" : "Team Fleet Control disabled");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Failed to update Team Fleet");
     }
   };
 
@@ -524,6 +543,38 @@ export default function SettingsPage() {
               </form>
             </CardContent>
           </Card>
+
+          {!user?.is_sub_user && (
+            <Card className="bg-[var(--brand-card)] border-[var(--brand-border)]" data-testid="team-fleet-settings-card">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Monitor size={20} />
+                  Team Fleet Control
+                </CardTitle>
+                <CardDescription>
+                  Control team members&apos; native PCs from one dashboard. Heavy jobs run on their computers — not on the VPS.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <Switch
+                    id="settings-fleet-toggle"
+                    checked={!!user?.team_fleet_enabled}
+                    onCheckedChange={toggleTeamFleet}
+                    data-testid="settings-team-fleet-toggle"
+                  />
+                  <Label htmlFor="settings-fleet-toggle" className="cursor-pointer">
+                    {user?.team_fleet_enabled ? "Enabled" : "Disabled"}
+                  </Label>
+                </div>
+                {user?.team_fleet_enabled && (
+                  <Button asChild variant="outline" size="sm">
+                    <Link to="/team-command">Open Team Command Center →</Link>
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           {/* ────── AI Vision (Gemini / OpenAI / Claude / Emergent) ────── */}
           <Card className="bg-[var(--brand-card)] border-[var(--brand-border)]" data-testid="ai-settings-card">

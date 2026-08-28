@@ -1686,14 +1686,18 @@ def resolve_pro_visit(
     # AND campaign_type is 'auto' → legacy resolver runs unchanged.
     _is_paid_v2 = detect_is_paid(traffic_type, campaign_type, signal)
     if inapp_deep_path_enabled:
-        inapp_kind = is_inapp_browser_ua(ua)
-        if inapp_kind == signal:
-            # 2026-06-14: pass target_url so FB l.facebook.com wrapper
-            # gets the real destination URL in its `u=` parameter
-            # (avoids self-redirect-to-facebook.com bug).
-            # v2.6.24: also pass is_paid so the paid/organic split
-            # kicks in for social in-app clicks.
+        # v2.7.31 — Build in-app referer from the POOL PICK (`signal`), not
+        # from pre-coercion UA sniffing. When the pool is 100% TikTok but the
+        # uploaded UA batch still carries FBAN/FBAV markers,
+        # `is_inapp_browser_ua(ua)` returned "facebook" != "tiktok" and this
+        # branch skipped the deep referer — URL params showed tiktok/ttclid
+        # while the offer's Browser column still read "Facebook for Android".
+        if platform_needs_ua_match(signal):
             ref = build_inapp_deep_referer(signal, target_url, is_paid=_is_paid_v2)
+        else:
+            inapp_kind = is_inapp_browser_ua(ua)
+            if inapp_kind == signal:
+                ref = build_inapp_deep_referer(signal, target_url, is_paid=_is_paid_v2)
 
     if not ref and social_wrapper_enabled:
         ref = build_social_wrapper_referer(signal, target_url)

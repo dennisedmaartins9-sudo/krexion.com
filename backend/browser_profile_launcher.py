@@ -35,7 +35,10 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException
 
 logger = logging.getLogger("browser_profile_launcher")
 
@@ -610,8 +613,17 @@ async def _align_profile_geo_from_proxy(
 
 def _coerce_profile_ua(ua: str, profile_config: Dict[str, Any]) -> str:
     referrer = profile_config.get("referrer") or {}
+    if not referrer.get("enabled"):
+        return ua
+    if referrer.get("match_ua_to_platform") is False:
+        return ua
     platform = ""
-    if referrer.get("enabled"):
+    try:
+        state = _resolve_profile_referrer_state(ua, profile_config, "")
+        platform = state.platform or ""
+    except Exception:
+        platform = ""
+    if not platform:
         pw = referrer.get("platform_weights") or {}
         if isinstance(pw, dict) and pw:
             try:
@@ -654,43 +666,250 @@ def _compute_fingerprint_hash(
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
+@dataclass
+class _ProfileReferrerState:
+    """Sticky session referer resolved once from profile config."""
+    enabled: bool = False
+    referer_url: str = ""
+    sec_fetch: Dict[str, str] = field(default_factory=dict)
+    accept_language: str = ""
+    wrapper_redirect: bool = False
+    wrapper_template: str = ""
+    platform: str = ""
+    pro_extras: Dict[str, Any] = field(default_factory=dict)
+
+
+def _profile_referrer_effective(referrer: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge quality-tier defaults with explicit profile referrer fields."""
+    out = dict(referrer or {})
+    if not out.get("enabled"):
+        return out
+    try:
+        from referrer_pro import quality_tier_defaults
+        tier = str(out.get("quality_tier") or "standard").lower().strip()
+        td = quality_tier_defaults(tier)
+        _map = {
+            "lang_match": "referrer_pro_lang_match",
+            "social_wrapper": "referrer_pro_social_wrapper",
+            "inapp_deep_path": "referrer_pro_inapp_deep_path",
+            "strip_search_path": "referrer_pro_strip_search_path",
+            "wrapper_redirect": "referrer_pro_wrapper_redirect",
+            "tod_enabled": "referrer_pro_tod_enabled",
+            "device_mode": "referrer_pro_device_mode",
+        }
+        for local_key, tier_key in _map.items():
+            if local_key not in out or out.get(local_key) is None:
+                if tier_key in td:
+                    out[local_key] = td[tier_key]
+    except Exception:
+        pass
+    return out
+
+
+def _profile_referrer_resolve_cfg(
+    referrer: Dict[str, Any],
+    profile_config: Dict[str, Any],
+    target_url: str,
+    *,
+    ua: str = "",
+) -> Dict[str, Any]:
+    """Build `_resolve_visit_referer` cfg dict from profile referrer block."""
+    ref = _profile_referrer_effective(referrer)
+    pw = ref.get("platform_weights") or {}
+    ew = ref.get("email_weights") or {}
+    mode = str(ref.get("mode") or "auto").strip().lower()
+    if ref.get("pro_mode") and isinstance(pw, dict) and pw:
+        mode = mode if mode not in ("", "auto", "platform_pool") else "auto"
+    elif mode in ("", "auto") and isinstance(pw, dict) and pw:
+        mode = "platform_pool"
+    _vlow = (ua or "").lower()
+    _visitor_mobile = "mobi" in _vlow or "iphone" in _vlow or "android" in _vlow
+    country = (
+        str(ref.get("country") or "").strip().lower()
+        or str(profile_config.get("country") or "us").strip().lower()
+    )
+    cfg: Dict[str, Any] = {
+        "enabled": True,
+        "pro_mode": bool(ref.get("pro_mode", True)),
+        "mode": mode,
+        "value": str(ref.get("value") or ""),
+        "preset_platform": str(ref.get("preset_platform") or ""),
+        "platform_weights": json.dumps(pw) if isinstance(pw, dict) else str(pw or ""),
+        "platform_pool": str(ref.get("platform_pool") or ""),
+        "email_weights": json.dumps(ew) if isinstance(ew, dict) else str(ew or ""),
+        "brand": str(ref.get("brand") or ""),
+        "target_url": target_url or "",
+        "country": country,
+        "search_engine": str(ref.get("search_engine") or "google"),
+        "search_keywords": str(ref.get("search_keywords") or ""),
+        "social_wrapper": bool(ref.get("social_wrapper", True)),
+        "inapp_deep_path": bool(ref.get("inapp_deep_path", True)),
+        "strip_search_path": bool(ref.get("strip_search_path", True)),
+        "network_click_chain": bool(ref.get("network_click_chain", False)),
+        "traffic_type": str(ref.get("traffic_type") or "auto"),
+        "campaign_type": str(ref.get("campaign_type") or "auto"),
+        "lang_match": bool(ref.get("lang_match", True)),
+        "device_mode": str(ref.get("device_mode") or "auto"),
+        "tod_enabled": bool(ref.get("tod_enabled", False)),
+        "visitor_is_mobile": _visitor_mobile,
+    }
+    if mode == "google_search" and not cfg["search_keywords"]:
+        cfg["search_keywords"] = str(ref.get("value") or "")
+    return cfg
+
+
+def _resolve_profile_referrer_state(
+    ua: str,
+    profile_config: Dict[str, Any],
+    target_url: str = "",
+) -> _ProfileReferrerState:
+    """Resolve sticky session referer from profile config (RUT-grade)."""
+    referrer = profile_config.get("referrer") or {}
+    if not referrer.get("enabled"):
+        return _ProfileReferrerState(enabled=False)
+    try:
+        from real_user_traffic import _resolve_visit_referer
+        cfg = _profile_referrer_resolve_cfg(referrer, profile_config, target_url, ua=ua)
+        ref_url, plat, _esp, extras = _resolve_visit_referer(ua, cfg)
+        accept_lang = ""
+        try:
+            if bool(referrer.get("lang_match", True)):
+                from referrer_pro import accept_language_for_country
+                accept_lang = accept_language_for_country(cfg.get("country"))
+        except Exception:
+            pass
+        if not accept_lang:
+            try:
+                from referrer_pro import accept_language_for_country
+                accept_lang = accept_language_for_country(cfg.get("country"))
+            except Exception:
+                pass
+        ref_eff = _profile_referrer_effective(referrer)
+        wrapper_redirect = bool(ref_eff.get("wrapper_redirect", False))
+        wrapper_template = ref_url if wrapper_redirect and ref_url else ""
+        sec_fetch: Dict[str, str] = {}
+        sf = (extras or {}).get("sec_fetch") or {}
+        if isinstance(sf, dict):
+            sec_fetch = {str(k): str(v) for k, v in sf.items()}
+        return _ProfileReferrerState(
+            enabled=True,
+            referer_url=ref_url or "",
+            sec_fetch=sec_fetch,
+            accept_language=accept_lang,
+            wrapper_redirect=wrapper_redirect,
+            wrapper_template=wrapper_template,
+            platform=plat or "",
+            pro_extras=extras or {},
+        )
+    except Exception as _ref_err:
+        logger.debug(f"profile referer state resolve skipped: {_ref_err}")
+        return _ProfileReferrerState(enabled=False)
+
+
+def _is_wrapper_domain(url: str) -> bool:
+    low = (url or "").lower()
+    return any(
+        s in low
+        for s in (
+            "l.facebook.com/l.php",
+            "lm.facebook.com/l.php",
+            "m.facebook.com/flx",
+            "google.com/url",
+            "t.co/",
+            "lnkd.in/",
+            "l.instagram.com",
+            "tiktok.com/link/v2",
+        )
+    )
+
+
+def _should_profile_wrapper_bounce(url: str, state: _ProfileReferrerState, ua: str) -> bool:
+    if not state.wrapper_redirect or not state.wrapper_template:
+        return False
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    if _is_wrapper_domain(url):
+        return False
+    # Headed profile sessions are not cold external link clicks — always
+    # honour wrapper_redirect when navigating to a new offer/document URL.
+    return True
+
+
+def make_profile_referrer_route_handler(state: _ProfileReferrerState):
+    """Combined Sec-CH-UA + sticky Referer injection for ALL tabs/navigations."""
+    async def _handler(route, request):
+        try:
+            headers = dict(request.headers or {})
+            ua = headers.get("user-agent") or headers.get("User-Agent") or ""
+            headers = {
+                key: value for key, value in headers.items()
+                if not key.lower().startswith("sec-ch-ua")
+            }
+            try:
+                from referrer_pro import client_hint_headers_for_ua
+                _casing = {
+                    "sec-ch-ua": "Sec-CH-UA",
+                    "sec-ch-ua-mobile": "Sec-CH-UA-Mobile",
+                    "sec-ch-ua-platform": "Sec-CH-UA-Platform",
+                }
+                headers.update({
+                    _casing[key]: value
+                    for key, value in client_hint_headers_for_ua(ua).items()
+                })
+            except Exception:
+                pass
+
+            if (
+                state.enabled
+                and request.resource_type == "document"
+                and _should_profile_wrapper_bounce(request.url, state, ua)
+            ):
+                try:
+                    from referrer_pro import rebuild_referer_with_target as _rrwt
+                    wrapper = _rrwt(state.wrapper_template, request.url)
+                    if wrapper and wrapper.rstrip("/") != request.url.rstrip("/"):
+                        await route.fulfill(
+                            status=302,
+                            headers={
+                                "Location": wrapper,
+                                "Referrer-Policy": "unsafe-url",
+                            },
+                        )
+                        return
+                except Exception as _wrap_err:
+                    logger.debug(f"profile wrapper bounce skipped: {_wrap_err}")
+
+            if state.enabled and state.referer_url and request.resource_type == "document":
+                headers["referer"] = state.referer_url
+                if state.sec_fetch:
+                    headers.update(state.sec_fetch)
+            await route.continue_(headers=headers)
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+    return _handler
+
+
 async def _resolve_referer_for_goto(
     ua: str,
     profile_config: Dict[str, Any],
     target_url: str,
 ) -> tuple:
     """Return (referer_url, extra_headers) for the first navigation."""
-    referrer = profile_config.get("referrer") or {}
-    if not referrer.get("enabled"):
+    state = _resolve_profile_referrer_state(ua, profile_config, target_url)
+    if not state.enabled:
         return "", {}
-    try:
-        from real_user_traffic import _resolve_visit_referer
-        pw = referrer.get("platform_weights") or {}
-        ew = referrer.get("email_weights") or {}
-        cfg = {
-            "enabled": True,
-            "pro_mode": bool(referrer.get("pro_mode", True)),
-            "platform_weights": json.dumps(pw) if isinstance(pw, dict) else str(pw or ""),
-            "email_weights": json.dumps(ew) if isinstance(ew, dict) else str(ew or ""),
-            "brand": str(referrer.get("brand") or ""),
-            "target_url": target_url,
-            "country": profile_config.get("country"),
-            "search_engine": str(referrer.get("search_engine") or "google"),
-            "search_keywords": str(referrer.get("search_keywords") or ""),
-            "social_wrapper": bool(referrer.get("social_wrapper", True)),
-            "inapp_deep_path": bool(referrer.get("inapp_deep_path", True)),
-            "strip_search_path": bool(referrer.get("strip_search_path", True)),
-            "network_click_chain": bool(referrer.get("network_click_chain", False)),
-        }
-        ref_url, _plat, _esp, extras = _resolve_visit_referer(ua, cfg)
-        extra_headers: Dict[str, str] = {}
-        sf = (extras or {}).get("sec_fetch") or {}
-        if isinstance(sf, dict):
-            extra_headers.update({str(k): str(v) for k, v in sf.items()})
-        return ref_url or "", extra_headers
-    except Exception as _ref_err:
-        logger.debug(f"profile referer resolve skipped: {_ref_err}")
-        return "", {}
+    extra_headers: Dict[str, str] = {}
+    if state.accept_language:
+        extra_headers["Accept-Language"] = state.accept_language
+    if state.sec_fetch:
+        extra_headers.update(state.sec_fetch)
+    if state.referer_url:
+        extra_headers["Referer"] = state.referer_url
+    extra_headers["Referrer-Policy"] = "unsafe-url"
+    return state.referer_url or "", extra_headers
 
 
 async def launch_profile_session(
@@ -1002,9 +1221,32 @@ async def _launch_profile_session_inner(
         storage_state = None
 
     proxy_cfg = profile_config.get("proxy") or {}
+    # v2.7.30 — Resolve provider / ProxyJet → concrete server (RUT parity).
+    _uid = str(profile_config.get("user_id") or "").strip()
+    if _uid and not str(proxy_cfg.get("server") or "").strip():
+        try:
+            from browser_profile_module import resolve_profile_proxy_for_launch
+            proxy_cfg = await resolve_profile_proxy_for_launch(
+                _uid,
+                None,
+                proxy_cfg,
+                team_dedupe=False,
+                profile_country=profile_config.get("country"),
+            )
+            profile_config = dict(profile_config)
+            profile_config["proxy"] = proxy_cfg
+        except HTTPException:
+            raise
+        except Exception as _pr_err:
+            logger.warning(f"[profile-launch] inline proxy resolve skipped: {_pr_err}")
+
     proxy_arg = None
     proxy_diag: Dict[str, Any] = {"requested": False, "server": "", "ok": None, "error": ""}
-    _proxy_enabled = bool(proxy_cfg.get("enabled")) or bool(proxy_cfg.get("use_proxyjet"))
+    _proxy_enabled = bool(
+        proxy_cfg.get("enabled")
+        or proxy_cfg.get("use_proxyjet")
+        or str(proxy_cfg.get("provider_id") or "").strip()
+    )
     if _proxy_enabled and proxy_cfg.get("server"):
         # ── 2026-06 — Normalize the proxy server URL ──────────────
         # Customer report: launching a profile errored with
@@ -1108,7 +1350,10 @@ async def _launch_profile_session_inner(
     elif _proxy_enabled and not proxy_cfg.get("server"):
         proxy_diag["requested"] = True
         proxy_diag["ok"] = False
-        proxy_diag["error"] = "Proxy enabled but no server URL could be resolved (check ProxyJet credentials)"
+        proxy_diag["error"] = (
+            "Proxy enabled but no server URL could be resolved "
+            "(check Settings → Proxy Providers or ProxyJet credentials)"
+        )
 
     # RUT parity: when proxy is live, align timezone/locale/geo to exit IP.
     geo = await _align_profile_geo_from_proxy(geo, proxy_arg, ua, profile_config)
@@ -1497,14 +1742,42 @@ async def _launch_profile_session_inner(
         except Exception as _ch_err:
             logger.debug(f"profile client-hint build skipped: {_ch_err}")
 
+        _profile_referrer_state = _resolve_profile_referrer_state(
+            ua,
+            profile_config,
+            start_url or "https://www.google.com/",
+        )
         try:
-            from referrer_pro import make_sec_ch_ua_strip_route_handler
-            await context.route("**/*", make_sec_ch_ua_strip_route_handler())
+            if _profile_referrer_state.enabled:
+                await context.route(
+                    "**/*",
+                    make_profile_referrer_route_handler(_profile_referrer_state),
+                )
+                logger.info(
+                    f"[profile-launch] referrer pro ON platform={_profile_referrer_state.platform} "
+                    f"wrapper={_profile_referrer_state.wrapper_redirect} session={session_id[:8]}"
+                )
+            else:
+                from referrer_pro import make_sec_ch_ua_strip_route_handler
+                await context.route("**/*", make_sec_ch_ua_strip_route_handler())
         except Exception as _route_err:
-            logger.debug(f"profile sec-ch-ua route strip skipped: {_route_err}")
+            logger.debug(f"profile referrer/sec-ch route skipped: {_route_err}")
+            try:
+                from referrer_pro import make_sec_ch_ua_strip_route_handler
+                await context.route("**/*", make_sec_ch_ua_strip_route_handler())
+            except Exception:
+                pass
 
         _ctx_hdrs = dict(context_kwargs.get("extra_http_headers") or {})
         _ctx_hdrs["Accept-Language"] = accept_lang
+        if _profile_referrer_state.enabled:
+            if _profile_referrer_state.accept_language:
+                _ctx_hdrs["Accept-Language"] = _profile_referrer_state.accept_language
+            _ctx_hdrs["Referrer-Policy"] = "unsafe-url"
+            if _profile_referrer_state.referer_url:
+                _ctx_hdrs["Referer"] = _profile_referrer_state.referer_url
+            if _profile_referrer_state.sec_fetch:
+                _ctx_hdrs.update(_profile_referrer_state.sec_fetch)
 
         if master:
             try:

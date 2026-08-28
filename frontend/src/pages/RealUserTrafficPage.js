@@ -345,6 +345,10 @@ export default function RealUserTrafficPage() {
   const [links, setLinks] = useState([]);
   const [linkId, setLinkId] = useState("");
   const [targetUrlOverride, setTargetUrlOverride] = useState("");
+  // v2.7.32 — Team Fleet: run RUT on a member's native PC
+  const [teamFleetEnabled, setTeamFleetEnabled] = useState(false);
+  const [fleetMembers, setFleetMembers] = useState([]);
+  const [fleetMemberId, setFleetMemberId] = useState("");
   // AI Learning panel state — historical answer→conversion stats per offer host
   const [aiLearning, setAiLearning] = useState(null);
   const [aiLearningLoading, setAiLearningLoading] = useState(false);
@@ -786,6 +790,29 @@ export default function RealUserTrafficPage() {
         if (Array.isArray(d)) setMyTrafficPresets(d);
       })
       .catch(() => {});
+    // Team Fleet member list + deep-link ?fleet_member=
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((me) => {
+        if (me?.team_fleet_enabled) {
+          setTeamFleetEnabled(true);
+          return fetch(`${process.env.REACT_APP_BACKEND_URL}/api/team-fleet/members`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }
+        return null;
+      })
+      .then((r) => (r && r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.members) setFleetMembers(data.members);
+      })
+      .catch(() => {});
+    try {
+      const fm = new URLSearchParams(window.location.search).get("fleet_member");
+      if (fm) setFleetMemberId(fm);
+    } catch (_) { /* ignore */ }
   }, []);
 
   // Keep the underlying refererValue in sync with the customer's
@@ -1366,7 +1393,7 @@ export default function RealUserTrafficPage() {
     setDiagData(null);
     try {
       const r = await fetch(
-        `${API_URL}/api/real-user-traffic/jobs/${activeJob.job_id}/diagnostics`,
+        withFleetQuery(`${API_URL}/api/real-user-traffic/jobs/${activeJob.job_id}/diagnostics`),
         { headers: authH() },
       );
       if (r.ok) {
@@ -1390,6 +1417,11 @@ export default function RealUserTrafficPage() {
 
   const token = () => localStorage.getItem("token");
   const authH = () => ({ Authorization: `Bearer ${token()}` });
+  const withFleetQuery = (url) => {
+    if (!fleetMemberId) return url;
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}fleet_member_id=${encodeURIComponent(fleetMemberId)}`;
+  };
 
   // ─── Data fetching ─────────────────────────────────────────────
   const fetchLinks = async () => {
@@ -1519,7 +1551,7 @@ export default function RealUserTrafficPage() {
 
   const fetchJobDetail = async (jobId) => {
     try {
-      const r = await fetch(`${API_URL}/api/real-user-traffic/jobs/${jobId}`, { headers: authH() });
+      const r = await fetch(withFleetQuery(`${API_URL}/api/real-user-traffic/jobs/${jobId}`), { headers: authH() });
       if (r.ok) {
         const data = await r.json();
         setActiveJob(data);
@@ -1543,7 +1575,7 @@ export default function RealUserTrafficPage() {
   const fetchLiveSteps = async (jobId) => {
     try {
       const r = await fetch(
-        `${API_URL}/api/real-user-traffic/jobs/${jobId}/live-log?since=${liveCursorRef.current}`,
+        withFleetQuery(`${API_URL}/api/real-user-traffic/jobs/${jobId}/live-log?since=${liveCursorRef.current}`),
         { headers: authH() }
       );
       if (!r.ok) return;
@@ -1586,7 +1618,7 @@ export default function RealUserTrafficPage() {
   const fetchLiveVisits = async (jobId) => {
     try {
       const r = await fetch(
-        `${API_URL}/api/real-user-traffic/jobs/${jobId}/live-visits?include_frames=true`,
+        withFleetQuery(`${API_URL}/api/real-user-traffic/jobs/${jobId}/live-visits?include_frames=true`),
         { headers: authH() }
       );
       if (!r.ok) return;
@@ -2170,6 +2202,7 @@ export default function RealUserTrafficPage() {
 
       const fd = new FormData();
       fd.append("link_id", linkId);
+      if (fleetMemberId) fd.append("fleet_member_id", fleetMemberId);
       if (targetUrlOverride.trim()) fd.append("target_url", targetUrlOverride.trim());
 
       // Target Screenshot Verification — prefer pre-uploaded ID (tiny payload).
@@ -2579,7 +2612,7 @@ export default function RealUserTrafficPage() {
   const onStop = async (jobId) => {
     if (!window.confirm("Stop this job now? Partial screenshots + Excel will be packaged for download.")) return;
     try {
-      const r = await fetch(`${API_URL}/api/real-user-traffic/jobs/${jobId}/stop`, {
+      const r = await fetch(withFleetQuery(`${API_URL}/api/real-user-traffic/jobs/${jobId}/stop`), {
         method: "POST",
         headers: authH(),
       });
@@ -2680,6 +2713,38 @@ export default function RealUserTrafficPage() {
           </select>
         </CardContent>
       </Card>
+
+      {teamFleetEnabled && fleetMembers.length > 0 && (
+        <Card className="bg-zinc-900 border-indigo-800/50" data-testid="rut-fleet-member-card">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white flex items-center gap-2 text-base">
+              <Activity size={18} className="text-indigo-400" /> Run on team member PC
+            </CardTitle>
+            <CardDescription className="text-zinc-400 text-xs">
+              Optional — job runs on the selected member&apos;s native install (not your PC).
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <select
+              data-testid="rut-fleet-member-select"
+              value={fleetMemberId}
+              onChange={(e) => setFleetMemberId(e.target.value)}
+              className="w-full h-11 px-3 rounded-md bg-zinc-800 border border-zinc-700 text-zinc-100 text-sm"
+            >
+              <option value="">My PC (default)</option>
+              {fleetMembers
+                .filter((m) => m.fleet_control_allowed && m.is_active !== false)
+                .map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name || m.email}
+                    {m.online ? " · online" : " · offline"}
+                    {(m.fleet_permissions || {}).rut === false ? " (no RUT perm)" : ""}
+                  </option>
+                ))}
+            </select>
+          </CardContent>
+        </Card>
+      )}
 
       {/* ═══ Real Traffic Config ═══ */}
       <Card className="bg-zinc-900 border-zinc-800">

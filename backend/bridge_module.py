@@ -70,7 +70,6 @@ def _now_iso() -> str:
 # Helpers used by server.py heavy endpoints
 # ─────────────────────────────────────────────────────────────────────
 async def is_user_local_online(user_id: str) -> dict:
-    """Returns {online: bool, hostname, ram_gb, last_seen_sec_ago}."""
     # v1.0.21: sort by last_seen DESC so we always pick the FRESHEST
     # heartbeat document. Previously find_one returned ANY match —
     # and because sync_heartbeats is keyed on license_key (one doc
@@ -133,6 +132,50 @@ async def is_user_local_online(user_id: str) -> dict:
     }
 
 
+async def is_fleet_member_online(member_email: str, parent_user_id: str) -> dict:
+    """Online status for a fleet member (sub-user) native PC by email."""
+    if not member_email:
+        return {"online": False, "reason": "no_email"}
+    license_keys: list[str] = []
+    try:
+        async for lic in _db.licenses.find({"email": member_email}, {"license_key": 1, "_id": 0}):
+            lk = (lic or {}).get("license_key")
+            if lk:
+                license_keys.append(lk)
+    except Exception:  # noqa: BLE001
+        pass
+    or_clauses: list[dict] = [{"email": member_email.strip().lower()}]
+    if license_keys:
+        or_clauses.append({"license_key": {"$in": license_keys}})
+    hb = await _db.sync_heartbeats.find_one(
+        {"$or": or_clauses},
+        {"_id": 0},
+        sort=[("last_seen", -1)],
+    )
+    if not hb or not hb.get("last_seen"):
+        return {"online": False, "reason": "no_heartbeat_ever", "email": member_email}
+    try:
+        last = datetime.fromisoformat(str(hb["last_seen"]).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return {"online": False, "reason": "bad_heartbeat_ts", "email": member_email}
+    age = (_now() - last).total_seconds()
+    online = age <= ONLINE_WINDOW_SEC
+    return {
+        "online": online,
+        "email": member_email,
+        "hostname": hb.get("hostname") or "",
+        "ram_gb": hb.get("ram_gb"),
+        "cpu_cores": hb.get("cpu_cores"),
+        "platform": hb.get("platform") or "",
+        "version": hb.get("version") or "",
+        "last_seen": hb.get("last_seen"),
+        "last_seen_sec_ago": int(age),
+        "reason": None if online else "stale_heartbeat",
+        "sub_user_id": hb.get("sub_user_id"),
+        "parent_user_id": parent_user_id,
+    }
+
+
 async def enqueue_bridge_job(
     user: dict,
     feature: str,
@@ -140,6 +183,10 @@ async def enqueue_bridge_job(
     *,
     wait_for_result: bool = False,
     wait_timeout: int = 25,
+    target_email: Optional[str] = None,
+    requested_by: Optional[str] = None,
+    fleet_member_id: Optional[str] = None,
+    fleet_delegated: bool = False,
 ) -> dict:
     """Create a pending job for the user's local PC to execute.
 
@@ -148,16 +195,26 @@ async def enqueue_bridge_job(
     response for short jobs). Otherwise returns {job_id, status:'pending'}
     and the frontend polls /api/bridge/jobs/{id}.
     """
-    status = await is_user_local_online(user["id"])
+    if target_email:
+        status = await is_fleet_member_online(target_email.strip().lower(), user["id"])
+    else:
+        status = await is_user_local_online(user["id"])
     if not status["online"]:
         raise HTTPException(
             status_code=503,
             detail={
-                "code": "local_pc_offline",
+                "code": "member_pc_offline" if target_email else "local_pc_offline",
                 "message": (
-                    "Connection lost. Please open Krexion on your computer "
-                    "and keep AdsPower running — Krexion will reconnect "
-                    "automatically within a few seconds."
+                    (
+                        f"Member PC ({target_email}) is offline. Ask them to open "
+                        "Krexion on their computer."
+                    )
+                    if target_email
+                    else (
+                        "Connection lost. Please open Krexion on your computer "
+                        "and keep AdsPower running — Krexion will reconnect "
+                        "automatically within a few seconds."
+                    )
                 ),
                 "local_status": status,
             },
@@ -190,6 +247,14 @@ async def enqueue_bridge_job(
         "claimed_by": None,
         "excluded_workers": excluded_workers,
     }
+    if target_email:
+        doc["target_email"] = target_email.strip().lower()
+    if requested_by:
+        doc["requested_by"] = requested_by
+    if fleet_member_id:
+        doc["fleet_member_id"] = fleet_member_id
+    if fleet_delegated:
+        doc["fleet_delegated"] = True
     await _db.bridge_jobs.insert_one(doc)
     logger.info(
         f"[bridge] enqueued job {job_id[:8]} feature={feature} user={user.get('email')} "
@@ -317,16 +382,32 @@ async def worker_pull_jobs(
     lic, user = await _validate_license(x_krexion_license)
     limit = max(1, min(limit, 20))
 
+    worker_email = (
+        (user.get("fleet_worker_email") or lic.get("email") or user.get("email") or "")
+        .strip()
+        .lower()
+    )
     claimed = []
-    # v2.1.70 HEAL: match by user_id OR email so a stale users-collection
-    # duplicate (where find_one({"email": ...}) returns a different
-    # `id` than the one the cloud enqueue path saw) doesn't strand the
-    # bridge job in "pending" forever. Same pattern that v1.0.23 added
-    # to sync_heartbeats — see sync_module.py:197 comment.
+    # v2.7.32 — Fleet delegation: jobs with target_email are exclusive
+    # to that member's PC. Untargeted jobs match parent user_id/email.
     _user_match: list = [{"user_id": user["id"]}]
     if user.get("email"):
         _user_match.append({"email": user["email"]})
-    base_query: dict = {"$or": _user_match, "status": "pending"}
+    if worker_email:
+        pull_or: list[dict] = [{"target_email": worker_email}]
+        pull_or.append({
+            "$and": [
+                {"$or": [
+                    {"target_email": None},
+                    {"target_email": ""},
+                    {"target_email": {"$exists": False}},
+                ]},
+                {"$or": _user_match},
+            ]
+        })
+        base_query: dict = {"$or": pull_or, "status": "pending"}
+    else:
+        base_query = {"$or": _user_match, "status": "pending"}
     # v1.0.19: workers identify themselves via `worker_type` (free-form
     # string). The Python sync_client passes `worker_type=python`, the
     # legacy PowerShell scheduled task passes nothing. Any job that was

@@ -1908,6 +1908,43 @@ def _with_traffic_type_extras(
     return merged
 
 
+def _infer_dominant_pro_platform(cfg: Optional[Dict[str, Any]]) -> str:
+    """When pro-mode pool is effectively single-platform, return that platform.
+
+    Used to auto-scrub foreign in-app UA markers (FBAN on a 100% TikTok pool)
+    even when the operator didn't separately pick the In-App Browser Preset.
+    """
+    if not cfg:
+        return ""
+    try:
+        from referrer_pro import parse_weighted_pool, platform_needs_ua_match
+    except Exception:
+        return ""
+    try:
+        weights_raw = str(cfg.get("platform_weights") or "").strip()
+        pool_raw = str(cfg.get("platform_pool") or "").strip()
+        pool = []
+        if weights_raw:
+            pool = parse_weighted_pool(weights_raw)
+        elif pool_raw:
+            pool = parse_weighted_pool(pool_raw)
+        if not pool:
+            return ""
+        total = sum(float(w or 0) for _, w in pool)
+        if total <= 0:
+            return ""
+        ranked = sorted(pool, key=lambda x: -float(x[1] or 0))
+        top_plat = str(ranked[0][0] or "").strip().lower()
+        top_share = float(ranked[0][1] or 0) / total
+        if not platform_needs_ua_match(top_plat):
+            return ""
+        if len(ranked) == 1 or top_share >= 0.95:
+            return top_plat
+    except Exception:
+        pass
+    return ""
+
+
 def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str, str, str, Dict[str, Any]]:
     """Pick the (Referer URL, platform signal, esp signal, pro_extras) for ONE visit.
 
@@ -2004,6 +2041,12 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
         if cfg.get("pro_mode"):
             try:
                 from referrer_pro import resolve_pro_visit
+                _vlow = (ua or "").lower()
+                _visitor_mobile = bool(
+                    cfg.get("visitor_is_mobile")
+                    if cfg.get("visitor_is_mobile") is not None
+                    else ("mobi" in _vlow or "iphone" in _vlow or "android" in _vlow)
+                )
                 pro = resolve_pro_visit(
                     ua=ua,
                     platform_pool_value=str(cfg.get("platform_weights") or cfg.get("platform_pool") or ""),
@@ -2017,7 +2060,10 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     inapp_deep_path_enabled=bool(cfg.get("inapp_deep_path", True)),
                     strip_search_path=bool(cfg.get("strip_search_path", True)),
                     network_click_chain_enabled=False,
-                    # v2.6.24 — Paid vs Organic split (auto|paid|organic|mixed)
+                    lang_match=bool(cfg.get("lang_match", False)),
+                    visitor_is_mobile=_visitor_mobile,
+                    device_mode=str(cfg.get("device_mode") or "auto"),
+                    tod_enabled=bool(cfg.get("tod_enabled", False)),
                     traffic_type=str(cfg.get("traffic_type") or "auto"),
                     campaign_type=str(cfg.get("campaign_type") or "auto"),
                 )
@@ -9244,6 +9290,33 @@ async def run_real_user_traffic_job(
         ],
     }
 
+    # v2.7.31 — Pro-mode single-platform parity: TikTok 100% pool must NOT
+    # leave FB/IG markers in the UA batch just because the separate In-App
+    # Preset dropdown was left on "none".
+    if (not _inapp_preset_key or _inapp_preset_key == "none") and (
+        bool(referer_pro_mode) or bool(_referer_cfg.get("pro_mode"))
+    ):
+        _dom_plat = _infer_dominant_pro_platform(_referer_cfg)
+        if _dom_plat:
+            _inapp_preset_key = _dom_plat
+            _preset_platform_for_ua = _dom_plat
+            _referer_cfg["preset_platform"] = _dom_plat
+            referer_match_ua_to_platform = True
+            referer_override_enabled = True
+            _referer_cfg["enabled"] = True
+            _referer_cfg["match_ua_to_platform"] = True
+            user_agents = _apply_inapp_preset_to_uas(
+                user_agents, total_clicks, preset_platform=_dom_plat,
+            )
+            try:
+                push_live_step(
+                    job_id, 0, "preset", "info",
+                    f"Pro pool auto-bound · platform={_dom_plat} · "
+                    f"foreign in-app UA markers stripped (RUT/link parity)",
+                )
+            except Exception:
+                pass
+
     # Guarantee chromium is installed BEFORE launching any visits.
     # This is the single robust guard that recovers from pod restarts that
     # wipe ad-hoc browser installs. First job on a fresh pod will pause
@@ -11649,14 +11722,66 @@ async def run_real_user_traffic_job(
                             return
                         if _coerced_ua:
                             ua = _coerced_ua
-                        else:
+                        elif _needs_strict_identity:
+                            entry["status"] = "skipped_ua"
+                            entry["error"] = (
+                                f"Could not build a valid {_kx_platform} in-app UA; "
+                                "visit skipped to avoid Chrome/generic browser leak"
+                            )
                             try:
-                                push_live_step(
-                                    job_id, i + 1, "ua", "warn",
-                                    f"UA coerce for {_kx_platform} returned empty — using base UA",
-                                )
+                                async with report_lock:
+                                    RUT_JOBS[job_id]["skipped_ua"] = (
+                                        int(RUT_JOBS[job_id].get("skipped_ua") or 0) + 1
+                                    )
                             except Exception:
                                 pass
+                            push_live_step(
+                                job_id, i + 1, "ua", "skipped",
+                                entry["error"],
+                            )
+                            await _record(job_id, entry, report, report_lock, db)
+                            return
+                        # v2.7.31 — Hard gate: platform pick vs detected in-app identity
+                        try:
+                            from referrer_pro import (
+                                is_inapp_browser_ua as _detect_inapp_plat,
+                                platform_needs_ua_match as _pnm_gate,
+                            )
+                            if _kx_platform and _pnm_gate(_kx_platform):
+                                _detected_plat = _detect_inapp_plat(ua)
+                                if _detected_plat and _detected_plat != _kx_platform:
+                                    _retry_ua = _ensure_inapp_ua(
+                                        _mobile_ua_for_inapp(),
+                                        _kx_platform,
+                                        _locale_for_ua,
+                                        mobile_ua_factory=_mobile_ua_for_inapp,
+                                        attempts=4,
+                                    )
+                                    _retry_detected = _detect_inapp_plat(_retry_ua or "")
+                                    if _retry_ua and (
+                                        not _retry_detected
+                                        or _retry_detected == _kx_platform
+                                    ):
+                                        ua = _retry_ua
+                                        push_live_step(
+                                            job_id, i + 1, "ua", "info",
+                                            f"Foreign {_detected_plat} marker scrubbed → "
+                                            f"{_kx_platform} in-app UA",
+                                        )
+                                    else:
+                                        entry["status"] = "skipped_ua"
+                                        entry["error"] = (
+                                            f"UA identity mismatch: pool={_kx_platform} "
+                                            f"but browser={_detected_plat}; visit skipped"
+                                        )
+                                        push_live_step(
+                                            job_id, i + 1, "ua", "skipped",
+                                            entry["error"],
+                                        )
+                                        await _record(job_id, entry, report, report_lock, db)
+                                        return
+                        except Exception:
+                            pass
                     except Exception as _coerce_err:
                         try:
                             push_live_step(

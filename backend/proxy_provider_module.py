@@ -764,6 +764,176 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
         "ttl_key": None,
         "ttl_unit": None,
     },
+    {
+        # Thordata residential — dash DSL in username:
+        # td-customer-USER-country-us-state-california-sessid-XXX-sesstime-10
+        "name": "Thordata",
+        "hosts": ["thordata.net", "t.pr.thordata.net", "t.na.thordata.net", "pr.thordata.net"],
+        "prefix": "-",
+        "delim": "-",
+        "kv": "-",
+        "keys": {
+            "country": "country", "state": "state", "city": "city",
+            "zip": "zip", "asn": "asn",
+        },
+        "state_fmt": "{slug}",
+        "sid_key": "sessid",
+        "ttl_key": "sesstime",
+        "ttl_unit": "min",
+    },
+    {
+        "name": "NetNut",
+        "hosts": ["netnut.io", "gw.netnut.net", "rotating-residential.netnut.io"],
+        "prefix": "-",
+        "delim": "-",
+        "kv": "-",
+        "keys": {
+            "country": "country", "state": "state", "city": "city",
+            "zip": "zip", "asn": "asn",
+        },
+        "state_fmt": "{code_lower}",
+        "sid_key": "session",
+        "ttl_key": "sessionduration",
+        "ttl_unit": "min",
+    },
+]
+
+# v2.7.33 — One-click famous provider presets (Settings › Proxy Providers).
+# Customer picks a brand, enters dashboard username + password only —
+# gateway host/port and auto-targeting DSL are pre-filled.
+PROVIDER_CATALOG: List[Dict[str, Any]] = [
+    {
+        "id": "dataimpulse",
+        "name": "DataImpulse",
+        "tagline": "Residential · auto cr/state/sessid DSL",
+        "gateway_host": "gw.dataimpulse.com",
+        "gateway_port": "823",
+        "alt_ports": ["10000", "822"],
+        "username_hint": "Dashboard username (e.g. abc123__cr.us or full gateway user)",
+        "docs_url": "https://docs.dataimpulse.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "smartproxy",
+        "name": "Smartproxy / Decodo",
+        "tagline": "Residential · gate.smartproxy.com",
+        "gateway_host": "gate.smartproxy.com",
+        "gateway_port": "7000",
+        "alt_ports": ["10000", "10001"],
+        "username_hint": "user-USERNAME or smart-… (from Smartproxy dashboard)",
+        "docs_url": "https://help.smartproxy.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "smartproxy_smart",
+        "name": "Smartproxy Smart Region",
+        "tagline": "Underscore DSL · proxy.smartproxy.net",
+        "gateway_host": "proxy.smartproxy.net",
+        "gateway_port": "3120",
+        "alt_ports": ["7000"],
+        "username_hint": "smart-{id}_area-US_state-california_life-120 (from panel)",
+        "docs_url": "https://help.smartproxy.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "thordata",
+        "name": "Thordata",
+        "tagline": "Residential · t.pr.thordata.net",
+        "gateway_host": "t.pr.thordata.net",
+        "gateway_port": "9999",
+        "alt_ports": ["7777", "5555"],
+        "username_hint": "td-customer-USERNAME (proxy user from Thordata panel)",
+        "docs_url": "https://doc.thordata.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "oxylabs",
+        "name": "Oxylabs",
+        "tagline": "Residential · pr.oxylabs.io",
+        "gateway_host": "pr.oxylabs.io",
+        "gateway_port": "7777",
+        "alt_ports": ["8001"],
+        "username_hint": "customer-USER-cc-US (from Oxylabs dashboard)",
+        "docs_url": "https://developers.oxylabs.io/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "brightdata",
+        "name": "Bright Data",
+        "tagline": "Luminati / Bright Data gateway",
+        "gateway_host": "brd.superproxy.io",
+        "gateway_port": "33335",
+        "alt_ports": ["22225", "24000"],
+        "username_hint": "brd-customer-XXX-zone-resi (from Bright Data)",
+        "docs_url": "https://docs.brightdata.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "iproyal",
+        "name": "IPRoyal",
+        "tagline": "Residential gateway",
+        "gateway_host": "geo.iproyal.com",
+        "gateway_port": "12321",
+        "alt_ports": ["11200"],
+        "username_hint": "IPRoyal gateway username from dashboard",
+        "docs_url": "https://docs.iproyal.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "soax",
+        "name": "Soax",
+        "tagline": "Mobile/residential · semicolon DSL",
+        "gateway_host": "proxy.soax.com",
+        "gateway_port": "5000",
+        "alt_ports": ["9000"],
+        "username_hint": "Soax package username from dashboard",
+        "docs_url": "https://help.soax.com/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "proxyempire",
+        "name": "ProxyEmpire",
+        "tagline": "Residential rotating gateway",
+        "gateway_host": "rotating.proxyempire.io",
+        "gateway_port": "9000",
+        "alt_ports": [],
+        "username_hint": "ProxyEmpire username from dashboard",
+        "docs_url": "https://docs.proxyempire.io/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "packetstream",
+        "name": "PacketStream",
+        "tagline": "P2P residential",
+        "gateway_host": "proxy.packetstream.io",
+        "gateway_port": "31112",
+        "alt_ports": [],
+        "username_hint": "PacketStream username",
+        "docs_url": "https://packetstream.io/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "netnut",
+        "name": "NetNut",
+        "tagline": "Residential · gw.netnut.net",
+        "gateway_host": "gw.netnut.net",
+        "gateway_port": "5959",
+        "alt_ports": ["7777"],
+        "username_hint": "NetNut sub-user username",
+        "docs_url": "https://help.netnut.io/",
+        "proxy_type": "http",
+    },
+    {
+        "id": "webshare",
+        "name": "Webshare",
+        "tagline": "Static/rotating — paste or API",
+        "kind": "api_endpoint",
+        "api_url": "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=1",
+        "method": "GET",
+        "username_hint": "Use API token in headers — see Webshare docs",
+        "docs_url": "https://apidocs.webshare.io/",
+        "proxy_type": "http",
+    },
 ]
 
 # Placeholder tokens the customer may embed manually in a saved
@@ -805,7 +975,8 @@ def _detect_profile(
         "soax": "Soax",
         "packetstream": "PacketStream",
         "webshare": "IPRoyal",
-        "netnut": "Oxylabs",
+        "netnut": "NetNut",
+        "thordata": "Thordata",
     }
     for needle, pname in _name_needles.items():
         if needle in n:
@@ -2222,6 +2393,8 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
                     "ProxyEmpire": 60,
                     "Soax": 60,
                     "PacketStream": 30,
+                    "Thordata": 90,
+                    "NetNut": 30,
                 }
                 ttl_cap_min = caps.get(profile["name"], 120)
                 hint = f"{profile['name']} detected — auto-applies its DSL for the fields you fill."
@@ -2258,6 +2431,11 @@ def init_router(main_db, get_current_user_dep) -> APIRouter:
             "supported": supported,
             "ttl_cap_min": ttl_cap_min,
         }
+
+    @router.get("/_meta/catalog")
+    async def provider_catalog():
+        """Famous proxy brands — pre-filled gateway settings for one-click add."""
+        return {"providers": PROVIDER_CATALOG, "total": len(PROVIDER_CATALOG)}
 
     @router.get("/_meta/kinds")
     async def kinds_meta():

@@ -1,6 +1,7 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 import { useState, useEffect, useMemo } from "react";
 import ProxyProviderSelect from "../components/ProxyProviderSelect";
+import ReferrerProProfilePanel, { DEFAULT_PROFILE_REFERRER } from "../components/ReferrerProProfilePanel";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -123,19 +124,7 @@ const DEFAULT_NEW = {
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
   },
-  referrer: {
-    enabled: false,
-    pro_mode: true,
-    platform_weights: { google: 50, facebook: 25, tiktok: 25 },
-    email_weights: {},
-    social_wrapper: true,
-    inapp_deep_path: true,
-    strip_search_path: true,
-    network_click_chain: false,
-    search_engine: "google",
-    search_keywords: "",
-    brand: "",
-  },
+  referrer: { ...DEFAULT_PROFILE_REFERRER },
 };
 
 /** Relative or ISO timestamp for storage_state sync chip */
@@ -237,7 +226,6 @@ export default function BrowserProfilesPage() {
   const [advTimezone, setAdvTimezone] = useState("");
   const [advLocale, setAdvLocale] = useState("");
   const [advGeoFollow, setAdvGeoFollow] = useState(true);
-  const [advReferrerEnabled, setAdvReferrerEnabled] = useState(false);
   const [advQuickLinks, setAdvQuickLinks] = useState("");
   const [advProxyLines, setAdvProxyLines] = useState("");
   const [showFpAdvanced, setShowFpAdvanced] = useState(false);
@@ -363,8 +351,22 @@ export default function BrowserProfilesPage() {
       return handleAdvancedCreate();
     }
     try {
+      const payload = { ...form };
+      if (payload.proxy?.provider_id) {
+        payload.proxy = {
+          ...payload.proxy,
+          enabled: true,
+          proxyjet_country: (
+            payload.proxy.proxyjet_country
+            || payload.country
+            || "US"
+          ).toUpperCase(),
+        };
+      } else if (payload.proxy?.use_proxyjet) {
+        payload.proxy = { ...payload.proxy, enabled: true };
+      }
       const r = await fetch(`${API}/${editingId}`, {
-        method: "PUT", headers: authHeaders, body: JSON.stringify(form),
+        method: "PUT", headers: authHeaders, body: JSON.stringify(payload),
       });
       if (!r.ok) throw new Error(await r.text());
       toast.success("Profile updated");
@@ -423,10 +425,20 @@ export default function BrowserProfilesPage() {
           region: advUA.region || (form.country || "US").toUpperCase(),
         },
         proxy: (() => {
+          if (advProxy.provider_id) {
+            return {
+              mode: "provider",
+              provider_id: advProxy.provider_id,
+              country: (form.country || advProxy.country || "US").toUpperCase(),
+              state: (advProxy.state || "").toUpperCase(),
+            };
+          }
           if (advProxy.mode === "provider" && advProxy.provider_id) {
             return {
               mode: "provider",
               provider_id: advProxy.provider_id,
+              country: (form.country || "US").toUpperCase(),
+              state: (advProxy.state || "").toUpperCase(),
             };
           }
           if (advProxy.mode === "proxyjet") {
@@ -458,12 +470,7 @@ export default function BrowserProfilesPage() {
         timezone: (advTimezone || "").trim() || (form.timezone || ""),
         locale: (advLocale || "").trim() || (form.locale || ""),
         geo_follow_proxy: !!advGeoFollow,
-        referrer: {
-          enabled: !!advReferrerEnabled,
-          ...(advReferrerEnabled && form.referrer?.search_keywords
-            ? { search_keywords: form.referrer.search_keywords, pro_mode: true }
-            : {}),
-        },
+        referrer: { ...DEFAULT_PROFILE_REFERRER, ...(form.referrer || {}) },
         quick_links: (advQuickLinks || "")
           .split(/\r?\n/)
           .map((u) => u.trim())
@@ -495,7 +502,7 @@ export default function BrowserProfilesPage() {
       setAdvDeviceMode("random"); setAdvDeviceId("");
       setAdvResolutionMode("match_device");
       setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
-      setAdvGeoFollow(true); setAdvReferrerEnabled(false);
+      setAdvGeoFollow(true);
       setAdvQuickLinks(""); setAdvProxyLines("");
       fetchProfiles();
     } catch (e) {
@@ -1060,7 +1067,7 @@ export default function BrowserProfilesPage() {
                 setEditingId(null); setForm(DEFAULT_NEW); setShowCreate(true);
                 setShowFpAdvanced(false);
                 setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
-                setAdvGeoFollow(true); setAdvReferrerEnabled(false);
+                setAdvGeoFollow(true);
                 setAdvQuickLinks(""); setAdvProxyLines("");
               }}
               variant="outline" className="border-zinc-700 text-zinc-300"
@@ -1287,6 +1294,11 @@ export default function BrowserProfilesPage() {
                         >
                           tls:{String(p.last_tls_prewarm_ok === true ? "ok" : p.last_tls_prewarm_ok)}
                         </Badge>
+                      )}
+                      {p.exit_ip && (
+                        <span className="text-cyan-300" title="Bound exit IP (team isolation)">
+                          ip:{p.exit_ip}
+                        </span>
                       )}
                       {p.last_proxy_check?.ip || p.last_proxy_check?.exit_ip ? (
                         <span className={p.last_proxy_check.ok === false ? "text-red-400" : "text-cyan-400"}>
@@ -1735,24 +1747,6 @@ export default function BrowserProfilesPage() {
                         className="w-4 h-4 rounded accent-fuchsia-500" />
                       geo_follow_proxy — timezone/locale follow proxy IP
                     </label>
-                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
-                      <input type="checkbox" checked={advReferrerEnabled}
-                        onChange={(e) => setAdvReferrerEnabled(e.target.checked)}
-                        className="w-4 h-4 rounded accent-fuchsia-500" />
-                      Referrer Pro enabled
-                    </label>
-                    {advReferrerEnabled && (
-                      <div>
-                        <Label className="text-zinc-300 text-xs">Referrer keywords</Label>
-                        <Input value={form.referrer?.search_keywords || ""}
-                          onChange={(e) => setForm({
-                            ...form,
-                            referrer: { ...form.referrer, enabled: true, search_keywords: e.target.value },
-                          })}
-                          className="bg-zinc-900 border-zinc-700 text-zinc-100"
-                          placeholder="search keywords for referrer chain" />
-                      </div>
-                    )}
                     <div>
                       <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>
                       <Textarea value={advQuickLinks} onChange={(e) => setAdvQuickLinks(e.target.value)}
@@ -1761,6 +1755,13 @@ export default function BrowserProfilesPage() {
                     </div>
                   </div>
                 )}
+
+                <ReferrerProProfilePanel
+                  referrer={form.referrer}
+                  onChange={(referrer) => setForm({ ...form, referrer })}
+                  profileCountry={form.country}
+                  testIdPrefix="bp"
+                />
 
                 {/* Anti-Detect */}
                 <div className="p-3 rounded-lg border border-fuchsia-500/30 bg-fuchsia-950/10">
@@ -2011,26 +2012,6 @@ export default function BrowserProfilesPage() {
                         className="w-4 h-4 rounded accent-fuchsia-500" />
                       geo_follow_proxy
                     </label>
-                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
-                      <input type="checkbox" checked={!!form.referrer?.enabled}
-                        onChange={(e) => setForm({
-                          ...form,
-                          referrer: { ...form.referrer, enabled: e.target.checked },
-                        })}
-                        className="w-4 h-4 rounded accent-fuchsia-500" />
-                      Referrer Pro enabled
-                    </label>
-                    {form.referrer?.enabled && (
-                      <div>
-                        <Label className="text-zinc-300 text-xs">Referrer keywords</Label>
-                        <Input value={form.referrer?.search_keywords || ""}
-                          onChange={(e) => setForm({
-                            ...form,
-                            referrer: { ...form.referrer, search_keywords: e.target.value },
-                          })}
-                          className="bg-zinc-900 border-zinc-700 text-zinc-100" />
-                      </div>
-                    )}
                     <div>
                       <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>
                       <Textarea
@@ -2061,7 +2042,7 @@ export default function BrowserProfilesPage() {
                   <div className="p-3 rounded-lg border border-cyan-500/30 bg-cyan-950/10 space-y-3">
                     <div className="flex items-center justify-between">
                       <span className="text-cyan-300 text-sm font-semibold">🌍 Proxy</span>
-                      <span className="text-[10px] text-zinc-500">Same engine as /proxies — every profile gets a unique exit-IP</span>
+                      <span className="text-[10px] text-zinc-500">Team-unique exit IP at create — IP isolation ledger (duplicate block)</span>
                     </div>
                     {/* v2.4.0 — Provider dropdown at the very top of Proxy section */}
                     <div className="pb-2 border-b border-cyan-500/20">
@@ -2384,7 +2365,7 @@ export default function BrowserProfilesPage() {
                           <input type="checkbox" checked={form.proxy.use_proxyjet}
                             onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, use_proxyjet: e.target.checked } })}
                             className="w-4 h-4 rounded accent-cyan-500" />
-                          Auto-generate unique proxy per profile (uses selected Provider)
+                          Auto-generate unique proxy via selected Provider (same as RUT)
                         </label>
                         {!form.proxy.use_proxyjet && (
                           <div className="grid grid-cols-2 gap-2">

@@ -468,10 +468,195 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
     return {"server": server, "username": username, "password": password}
 
 
-async def _resolve_proxy_for_launch(uid: str, user: dict, proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve ProxyJet / provider proxy to a concrete server URL before launch."""
+def _profile_provider_targeting(
+    proxy_cfg: Dict[str, Any],
+    profile_country: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """RUT parity — country/state hints for rotating_gateway username tokens."""
+    targeting: Dict[str, Any] = {}
+    cc = (
+        str(
+            proxy_cfg.get("proxyjet_country")
+            or proxy_cfg.get("country")
+            or profile_country
+            or ""
+        )
+        .strip()
+        .upper()
+    )
+    if cc and cc != "ANY":
+        targeting["country"] = cc
+    st = str(
+        proxy_cfg.get("proxyjet_state") or proxy_cfg.get("state") or ""
+    ).strip().upper()
+    if st:
+        targeting["state"] = st
+    return targeting or None
+
+
+def _apply_resolved_line_to_proxy_cfg(
+    cfg: Dict[str, Any],
+    line: str,
+    *,
+    provider_id: str = "",
+) -> Dict[str, Any]:
+    """Merge a provider/ProxyJet line into a profile proxy dict."""
+    out = dict(cfg or {})
+    parsed = _parse_proxy_line(str(line))
+    out["enabled"] = True
+    if provider_id:
+        out["provider_id"] = provider_id
+    out["server"] = parsed.get("server") or ""
+    out["username"] = parsed.get("username") or ""
+    out["password"] = parsed.get("password") or ""
+    out["raw_line"] = str(line).strip()
+    if not out["server"]:
+        raw = str(line).strip()
+        if "@" in raw:
+            out["server"] = f"http://{raw.rsplit('@', 1)[-1]}"
+        else:
+            out["server"] = raw if "://" in raw else f"http://{raw}"
+    out["use_proxyjet"] = False
+    return out
+
+
+async def _resolve_proxy_for_launch(
+    uid: str,
+    user: dict,
+    proxy_cfg: Dict[str, Any],
+    *,
+    profile_country: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve provider / ProxyJet proxy to a concrete server URL before launch."""
+    return await resolve_profile_proxy_for_launch(
+        uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+    )
+
+
+async def _fallback_provider_proxy_line(
+    uid: str,
+    user: Optional[dict],
+    provider_id: str,
+    *,
+    targeting: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """VR/RUT-style single-line fallback when bulk unique fetch fails."""
+    from proxy_provider_module import get_proxy_from_provider, get_proxy_lines_from_provider
+
+    pp_res = await get_proxy_from_provider(uid, provider_id)
+    if pp_res.get("use_proxyjet"):
+        bulk = await get_proxy_lines_from_provider(
+            uid,
+            provider_id,
+            1,
+            strict_unique_ip=True,
+            skip_datacenter_ip=True,
+            targeting=targeting,
+        )
+        lines = bulk.get("lines") or []
+        if lines:
+            return str(lines[0])
+        if bulk.get("error"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Proxy provider failed: {bulk['error']}",
+            )
+        return None
+    if pp_res.get("proxy"):
+        return str(pp_res["proxy"])
+    if pp_res.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Proxy provider failed: {pp_res['error']}",
+        )
+    return None
+
+
+async def resolve_profile_proxy_for_launch(
+    uid: str,
+    user: Optional[dict],
+    proxy_cfg: Dict[str, Any],
+    *,
+    team_dedupe: bool = True,
+    profile_country: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ensure profile proxy dict has a usable `server` when provider/proxyjet is set."""
     cfg = dict(proxy_cfg or {})
-    if cfg.get("use_proxyjet") and not str(cfg.get("server") or "").strip():
+    if str(cfg.get("server") or "").strip():
+        cfg["enabled"] = True
+        return cfg
+
+    provider_id = str(cfg.get("provider_id") or "").strip()
+    targeting = _profile_provider_targeting(cfg, profile_country)
+
+    if provider_id:
+        used: Set[str] = set()
+        if team_dedupe:
+            used = await _load_team_profile_used_ips(uid)
+        try:
+            lines = await _allocate_provider_proxy_lines(
+                uid, provider_id, 1, used, targeting=targeting,
+            )
+            resolved = _apply_resolved_line_to_proxy_cfg(
+                cfg, lines[0], provider_id=provider_id,
+            )
+            logger.info(
+                f"[browser-profile] provider {provider_id[:8]} resolved → "
+                f"{str(resolved.get('server') or '')[:48]}"
+            )
+            return resolved
+        except HTTPException as bulk_err:
+            # Launch rescue: team ledger may block every IP while RUT still works.
+            if team_dedupe and bulk_err.status_code == 502:
+                try:
+                    lines = await _allocate_provider_proxy_lines(
+                        uid, provider_id, 1, set(), targeting=targeting,
+                    )
+                    resolved = _apply_resolved_line_to_proxy_cfg(
+                        cfg, lines[0], provider_id=provider_id,
+                    )
+                    logger.info(
+                        f"[browser-profile] provider {provider_id[:8]} resolved "
+                        f"(launch retry, no team dedupe) → "
+                        f"{str(resolved.get('server') or '')[:48]}"
+                    )
+                    return resolved
+                except HTTPException:
+                    pass
+            try:
+                fb_line = await _fallback_provider_proxy_line(
+                    uid, user, provider_id, targeting=targeting,
+                )
+                if fb_line:
+                    resolved = _apply_resolved_line_to_proxy_cfg(
+                        cfg, fb_line, provider_id=provider_id,
+                    )
+                    logger.info(
+                        f"[browser-profile] provider {provider_id[:8]} fallback → "
+                        f"{str(resolved.get('server') or '')[:48]}"
+                    )
+                    return resolved
+            except HTTPException:
+                raise
+            raise bulk_err
+        except Exception as exc:
+            logger.warning(f"[browser-profile] provider resolve failed: {exc}")
+            try:
+                fb_line = await _fallback_provider_proxy_line(
+                    uid, user, provider_id, targeting=targeting,
+                )
+                if fb_line:
+                    return _apply_resolved_line_to_proxy_cfg(
+                        cfg, fb_line, provider_id=provider_id,
+                    )
+            except HTTPException:
+                raise
+            raise HTTPException(
+                status_code=502,
+                detail=f"Provider proxy resolve failed: {exc}",
+            ) from exc
+
+    if cfg.get("use_proxyjet") and not provider_id:
         if _PROXYJET_GEN is None:
             logger.warning("[browser-profile] ProxyJet enabled but generator not bound")
             return cfg
@@ -592,10 +777,14 @@ class AntiDetectConfig(BaseModel):
 
 
 class ReferrerProConfig(BaseModel):
-    """Per-profile Referrer Pro config (used when this profile opens a
-    new tab to a 3rd-party URL — engine injects matching Referer)."""
+    """Per-profile Referrer Pro config — RUT-grade referrer engine applied
+    on every navigation in every tab while the profile session is open."""
     enabled: bool = False
     pro_mode: bool = True
+    # Legacy / basic modes (same vocabulary as RUT referer override)
+    mode: str = "auto"  # auto | platform_pool | custom | random_list | google_search | direct
+    value: str = ""  # custom URL, URL list, or google keywords (mode-dependent)
+    preset_platform: str = ""
     platform_weights: Dict[str, float] = Field(default_factory=dict)
     email_weights: Dict[str, float] = Field(default_factory=dict)
     social_wrapper: bool = True
@@ -605,6 +794,16 @@ class ReferrerProConfig(BaseModel):
     search_engine: str = "google"
     search_keywords: str = ""
     brand: str = ""
+    country: str = ""  # ISO override for geo-localized SERP referers
+    wrapper_redirect: bool = False
+    lang_match: bool = True
+    device_mode: str = "auto"  # auto | match_platform | mobile_only | desktop_only
+    tod_enabled: bool = False
+    campaign_type: str = "auto"
+    quality_tier: str = "standard"  # premium | standard | aggressive
+    traffic_type: str = "auto"  # auto | paid | organic | mixed
+    match_ua_to_platform: bool = True
+    sticky_session: bool = True  # one resolved referer for whole launch session
 
 
 class ProfileBody(BaseModel):
@@ -985,6 +1184,7 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "total_launches": 0,
         "storage_synced_at": "",
         "last_proxy_check": {},
+        "exit_ip": "",
         "last_tls_prewarm_ok": None,
         "cdp_ws": "",
         "created_at": _now_iso(),
@@ -1011,6 +1211,7 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     fh = str(d.get("fingerprint_hash") or "")
     d["fingerprint_short"] = fh[:12] if fh else ""
     d["last_proxy_check"] = d.get("last_proxy_check") or {}
+    d["exit_ip"] = str(d.get("exit_ip") or (d.get("proxy") or {}).get("exit_ip") or "").strip()
     if "last_tls_prewarm_ok" not in d:
         d["last_tls_prewarm_ok"] = None
     # CDP endpoint only for local automation clients (still useful in UI copy)
@@ -1179,6 +1380,155 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     return result
 
 
+async def _load_team_profile_used_ips(uid: str) -> Set[str]:
+    try:
+        from cross_user_ip_isolation import list_team_profile_used_ips
+        return await list_team_profile_used_ips(_DB, uid)
+    except Exception as exc:
+        logger.debug(f"team profile IP ledger fallback: {exc}")
+        used: Set[str] = set()
+        try:
+            from cross_user_ip_isolation import canonicalize_ip
+            async for doc in _DB.browser_profiles.find(
+                {"user_id": uid, "exit_ip": {"$exists": True, "$ne": ""}},
+                {"exit_ip": 1},
+            ):
+                c = canonicalize_ip(doc.get("exit_ip"))
+                if c:
+                    used.add(c)
+        except Exception:
+            pass
+        return used
+
+
+async def _bind_profile_exit_ip(
+    uid: str,
+    profile_id: str,
+    exit_ip: str,
+    *,
+    source: str = "browser_profile",
+) -> None:
+    try:
+        from cross_user_ip_isolation import canonicalize_ip, record_profile_exit_ip_for_user
+        canonical = canonicalize_ip(exit_ip)
+        if not canonical:
+            return
+        await record_profile_exit_ip_for_user(
+            _DB, uid, profile_id, canonical, source=source,
+        )
+    except Exception as exc:
+        logger.debug(f"profile exit IP ledger write skipped: {exc}")
+
+
+async def _probe_proxy_cfg_exit_ip(user: dict, proxy_cfg: Dict[str, Any]) -> str:
+    result = await _probe_profile_proxy({"proxy": proxy_cfg or {}}, user)
+    return str(result.get("exit_ip") or "").strip()
+
+
+async def _assert_unique_team_profile_ip(
+    uid: str,
+    exit_ip: str,
+    used_ips: Set[str],
+    *,
+    profile_id: Optional[str] = None,
+) -> str:
+    """Fail if exit_ip already used by team; else reserve in-batch set."""
+    try:
+        from cross_user_ip_isolation import canonicalize_ip, is_team_profile_ip_used
+        canonical = canonicalize_ip(exit_ip)
+    except Exception:
+        canonical = (exit_ip or "").strip()
+    if not canonical:
+        raise HTTPException(status_code=502, detail="Could not detect proxy exit IP")
+    if canonical in used_ips:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Duplicate exit IP {canonical} — already assigned to another profile in this batch",
+        )
+    try:
+        if await is_team_profile_ip_used(_DB, uid, canonical):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Duplicate exit IP {canonical} — already used by a team profile "
+                    f"(IP isolation). Pick another provider session or country."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    used_ips.add(canonical)
+    if profile_id:
+        await _bind_profile_exit_ip(uid, profile_id, canonical)
+    return canonical
+
+
+async def _allocate_provider_proxy_lines(
+    uid: str,
+    provider_id: str,
+    count: int,
+    used_ips: Set[str],
+    *,
+    targeting: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    from proxy_provider_module import get_proxy_lines_from_provider
+    pp_res = await get_proxy_lines_from_provider(
+        uid,
+        provider_id,
+        count,
+        unique_ip_seen=set(used_ips),
+        strict_unique_ip=True,
+        skip_datacenter_ip=True,
+        targeting=targeting,
+    )
+    if pp_res.get("error") and not pp_res.get("lines"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider proxy allocation failed: {pp_res.get('error')}",
+        )
+    lines = [str(x).strip() for x in (pp_res.get("lines") or []) if str(x).strip()]
+    if len(lines) < count:
+        warn = (pp_res.get("warnings") or [""])[0] if pp_res.get("warnings") else ""
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Provider returned only {len(lines)}/{count} unique clean IPs. "
+                f"{warn or 'Try another country or smaller batch.'}"
+            ),
+        )
+    return lines
+
+
+async def _finalize_doc_proxy_and_ip(
+    uid: str,
+    user: dict,
+    doc: Dict[str, Any],
+    used_ips: Set[str],
+) -> None:
+    """Probe profile proxy, enforce team uniqueness, persist exit_ip on doc."""
+    proxy = doc.get("proxy") or {}
+    if not (
+        proxy.get("enabled")
+        or proxy.get("provider_id")
+        or proxy.get("use_proxyjet")
+        or str(proxy.get("server") or "").strip()
+    ):
+        return
+    exit_ip = await _probe_proxy_cfg_exit_ip(user, proxy)
+    if not exit_ip:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed",
+        )
+    canonical = await _assert_unique_team_profile_ip(
+        uid, exit_ip, used_ips, profile_id=str(doc.get("id") or ""),
+    )
+    doc["exit_ip"] = canonical
+    doc["proxy"]["exit_ip"] = canonical
+    doc["proxy"]["sticky_session"] = True
+
+
 async def _resolve_user(request: Request) -> dict:
     """Module-internal helper — calls the bound get_current_user with the
     incoming request and returns the user dict (or raises 401)."""
@@ -1248,6 +1598,24 @@ async def create_profile(request: Request, body: ProfileBody):
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     doc = _profile_doc(uid, body)
+    proxy = doc.get("proxy") or {}
+    if (
+        proxy.get("enabled")
+        or proxy.get("provider_id")
+        or proxy.get("use_proxyjet")
+        or str(proxy.get("server") or "").strip()
+    ):
+        used_ips = await _load_team_profile_used_ips(uid)
+        if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
+            lines = await _allocate_provider_proxy_lines(
+                uid, str(proxy["provider_id"]), 1, used_ips,
+            )
+            parsed = _parse_proxy_line(lines[0])
+            doc["proxy"]["enabled"] = True
+            doc["proxy"]["server"] = parsed.get("server") or ""
+            doc["proxy"]["username"] = parsed.get("username") or ""
+            doc["proxy"]["password"] = parsed.get("password") or ""
+        await _finalize_doc_proxy_and_ip(uid, user, doc, used_ips)
     await _DB.browser_profiles.insert_one(doc)
     return {"profile": _public_view(doc), "id": doc["id"]}
 
@@ -2074,9 +2442,31 @@ async def check_proxy(request: Request, profile_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
     result = await _probe_profile_proxy(doc, user)
+    patch: Dict[str, Any] = {"last_proxy_check": result, "updated_at": _now_iso()}
+    exit_ip = str(result.get("exit_ip") or "").strip()
+    if exit_ip:
+        used = await _load_team_profile_used_ips(uid)
+        try:
+            from cross_user_ip_isolation import canonicalize_ip
+            cur = canonicalize_ip(doc.get("exit_ip") or "")
+            if cur:
+                used.discard(cur)
+        except Exception:
+            pass
+        try:
+            canonical = await _assert_unique_team_profile_ip(
+                uid, exit_ip, used, profile_id=profile_id,
+            )
+            patch["exit_ip"] = canonical
+            patch["proxy.exit_ip"] = canonical
+            patch["proxy.sticky_session"] = True
+        except HTTPException as exc:
+            result["duplicate_ip"] = True
+            result["error"] = str(exc.detail)
+            patch["last_proxy_check"] = result
     await _DB.browser_profiles.update_one(
         {"id": profile_id, "user_id": uid},
-        {"$set": {"last_proxy_check": result, "updated_at": _now_iso()}},
+        {"$set": patch},
     )
     return result
 
@@ -2147,8 +2537,44 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["last_error"] = existing.get("last_error", "")
     new_doc["storage_synced_at"] = existing.get("storage_synced_at", "")
     new_doc["last_proxy_check"] = existing.get("last_proxy_check") or {}
+    new_doc["exit_ip"] = existing.get("exit_ip") or ""
     new_doc["cdp_ws"] = existing.get("cdp_ws") or ""
     new_doc["updated_at"] = _now_iso()
+    _proxy = new_doc.get("proxy") or {}
+    _wants_proxy = bool(
+        _proxy.get("enabled")
+        or str(_proxy.get("provider_id") or "").strip()
+        or _proxy.get("use_proxyjet")
+    )
+    if _wants_proxy and not str(_proxy.get("server") or "").strip():
+        _used = await _load_team_profile_used_ips(uid)
+        try:
+            from cross_user_ip_isolation import canonicalize_ip
+            cur = canonicalize_ip(existing.get("exit_ip") or "")
+            if cur:
+                _used.discard(cur)
+        except Exception:
+            pass
+        new_doc["proxy"] = await resolve_profile_proxy_for_launch(
+            uid, user, _proxy, profile_country=new_doc.get("country"),
+        )
+        await _finalize_doc_proxy_and_ip(uid, user, new_doc, _used)
+    elif _wants_proxy and str(_proxy.get("server") or "").strip():
+        _old_srv = str((existing.get("proxy") or {}).get("server") or "")
+        _new_srv = str(_proxy.get("server") or "")
+        if _old_srv != _new_srv or not new_doc.get("exit_ip"):
+            _used = await _load_team_profile_used_ips(uid)
+            try:
+                from cross_user_ip_isolation import canonicalize_ip
+                cur = canonicalize_ip(existing.get("exit_ip") or "")
+                if cur:
+                    _used.discard(cur)
+            except Exception:
+                pass
+            try:
+                await _finalize_doc_proxy_and_ip(uid, user, new_doc, _used)
+            except HTTPException:
+                raise
     await _DB.browser_profiles.replace_one({"id": profile_id, "user_id": uid}, new_doc)
     return {"profile": _public_view(new_doc)}
 
@@ -2193,8 +2619,24 @@ async def clone_profile(
     new_doc["status"] = "idle"
     new_doc["session_id"] = ""
     new_doc["cdp_ws"] = ""
+    new_doc["exit_ip"] = ""
+    if isinstance(new_doc.get("proxy"), dict):
+        new_doc["proxy"].pop("exit_ip", None)
     new_doc["created_at"] = _now_iso()
     new_doc["updated_at"] = _now_iso()
+    proxy = new_doc.get("proxy") or {}
+    if str(proxy.get("provider_id") or "").strip() or str(proxy.get("server") or "").strip():
+        used = await _load_team_profile_used_ips(uid)
+        if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
+            lines = await _allocate_provider_proxy_lines(
+                uid, str(proxy["provider_id"]), 1, used,
+            )
+            parsed = _parse_proxy_line(lines[0])
+            new_doc["proxy"]["enabled"] = True
+            new_doc["proxy"]["server"] = parsed.get("server") or ""
+            new_doc["proxy"]["username"] = parsed.get("username") or ""
+            new_doc["proxy"]["password"] = parsed.get("password") or ""
+        await _finalize_doc_proxy_and_ip(uid, user, new_doc, used)
     await _DB.browser_profiles.insert_one(new_doc)
     return {"profile": _public_view(new_doc), "id": new_doc["id"]}
 
@@ -2230,48 +2672,63 @@ async def launch_profile(request: Request, profile_id: str,
     # don't reuse the same sticky IP.
     _proxy_cfg = doc.get("proxy") or {}
     _provider_id = str(_proxy_cfg.get("provider_id") or "").strip()
-    if _provider_id:
-        try:
-            import importlib
-            _pp_mod = importlib.import_module("proxy_provider_module")
-            _pp_bulk = getattr(_pp_mod, "get_proxy_lines_from_provider", None)
-            _pp_get = getattr(_pp_mod, "get_proxy_from_provider", None)
-            _pp_res = None
-            if _pp_bulk:
-                _pp_res = await _pp_bulk(uid, _provider_id, 1)
-                _lines = _pp_res.get("lines") or []
-                _proxy_line = _lines[0] if _lines else None
-                if _pp_res.get("use_proxyjet"):
-                    _proxy_cfg["use_proxyjet"] = True
-                    if _pp_res.get("country"):
-                        _proxy_cfg["proxyjet_country"] = _pp_res["country"]
-                    if _pp_res.get("state"):
-                        _proxy_cfg["proxyjet_state"] = _pp_res["state"]
-                    _proxy_cfg["enabled"] = True
-                elif _proxy_line:
-                    _proxy_cfg["enabled"] = True
-                    _proxy_cfg["server"] = _proxy_line
-            elif _pp_get:
-                _pp_res = await _pp_get(uid, _provider_id)
-                if _pp_res.get("use_proxyjet"):
-                    _proxy_cfg["use_proxyjet"] = True
-                    if _pp_res.get("country"):
-                        _proxy_cfg["proxyjet_country"] = _pp_res["country"]
-                    if _pp_res.get("state"):
-                        _proxy_cfg["proxyjet_state"] = _pp_res["state"]
-                    _proxy_cfg["enabled"] = True
-                elif _pp_res.get("proxy"):
-                    _proxy_cfg["enabled"] = True
-                    _proxy_cfg["server"] = _pp_res["proxy"]
-            # Persist the resolved snapshot back onto the doc so the
-            # launcher (which reads .proxy) uses the just-picked value.
-            doc["proxy"] = _proxy_cfg
-        except Exception as _pp_err:
-            logger.warning(f"[browser-profile launch] provider resolve failed: {_pp_err}")
+    _sticky_exit_ip = str(doc.get("exit_ip") or _proxy_cfg.get("exit_ip") or "").strip()
+    _has_bound_server = bool(str(_proxy_cfg.get("server") or "").strip())
 
-    # v2.6.32 — ProxyJet-only profiles may have enabled=True but no server yet.
-    _proxy_cfg = await _resolve_proxy_for_launch(uid, user, _proxy_cfg)
+    # v2.7.29 — Always resolve when server is missing (provider / ProxyJet).
+    # Sticky IP only applies when we already have a bound proxy line.
+    if not _has_bound_server:
+        try:
+            _proxy_cfg = await resolve_profile_proxy_for_launch(
+                uid, user, _proxy_cfg, profile_country=doc.get("country"),
+            )
+            doc["proxy"] = _proxy_cfg
+            _has_bound_server = bool(str(_proxy_cfg.get("server") or "").strip())
+        except HTTPException:
+            raise
+        except Exception as _pp_err:
+            logger.warning(f"[browser-profile launch] proxy resolve failed: {_pp_err}")
+    elif _provider_id and _sticky_exit_ip:
+        logger.info(
+            f"[browser-profile launch] sticky exit_ip={_sticky_exit_ip} "
+            f"profile={profile_id[:8]}"
+        )
+
+    _proxy_cfg = await _resolve_proxy_for_launch(
+        uid, user, doc.get("proxy") or _proxy_cfg, profile_country=doc.get("country"),
+    )
     doc["proxy"] = _proxy_cfg
+    _proxy_patch: Dict[str, Any] = {"proxy": _proxy_cfg, "updated_at": _now_iso()}
+    if not _sticky_exit_ip:
+        _p = doc.get("proxy") or {}
+        if _p.get("enabled") or _p.get("provider_id") or str(_p.get("server") or "").strip():
+            try:
+                _used = await _load_team_profile_used_ips(uid)
+                await _finalize_doc_proxy_and_ip(uid, user, doc, _used)
+                _proxy_patch["exit_ip"] = doc.get("exit_ip") or ""
+            except HTTPException:
+                raise
+            except Exception as _ip_bind_err:
+                logger.warning(f"[browser-profile launch] exit_ip bind skipped: {_ip_bind_err}")
+
+    if str(_proxy_cfg.get("server") or "").strip():
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": _proxy_patch},
+        )
+    elif (
+        _proxy_cfg.get("enabled")
+        or _provider_id
+        or _proxy_cfg.get("use_proxyjet")
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Proxy is enabled but no server URL could be resolved. "
+                "Open Settings → Proxy Providers, verify credentials, then "
+                "edit the profile and save again (or pick a different country/state)."
+            ),
+        )
 
     await _DB.browser_profile_sessions.insert_one(session)
 
@@ -2551,6 +3008,14 @@ async def import_bulk(request: Request, body: BulkCreateBody):
     uid = _resolve_user_or_401(user)
     docs: List[Dict[str, Any]] = []
     pad = max(2, len(str(body.count)))
+    team_used_ips = await _load_team_profile_used_ips(uid)
+    provider_lines: List[str] = []
+    base_proxy = body.base.proxy if hasattr(body.base, "proxy") else ProxyConfig()
+    provider_id = str(getattr(base_proxy, "provider_id", None) or "").strip()
+    if body.auto_unique_proxy and provider_id:
+        provider_lines = await _allocate_provider_proxy_lines(
+            uid, provider_id, body.count, team_used_ips,
+        )
     for i in range(1, body.count + 1):
         profile_body = body.base.copy(deep=True) if hasattr(body.base, "copy") else body.base
         profile_body.name = f"{body.name_prefix} {str(i).zfill(pad)}"
@@ -2558,11 +3023,34 @@ async def import_bulk(request: Request, body: BulkCreateBody):
             profile_body.user_agent = _gen_random_ua(profile_body.is_mobile or profile_body.device_type == "mobile")
         if body.randomize_viewport:
             profile_body.viewport = _gen_random_viewport(profile_body.is_mobile or profile_body.device_type == "mobile")
+        if body.auto_unique_proxy and provider_id and i - 1 < len(provider_lines):
+            parsed = _parse_proxy_line(provider_lines[i - 1])
+            profile_body.proxy.enabled = True
+            profile_body.proxy.provider_id = provider_id
+            profile_body.proxy.server = parsed.get("server") or ""
+            profile_body.proxy.username = parsed.get("username") or ""
+            profile_body.proxy.password = parsed.get("password") or ""
         doc = _profile_doc(uid, profile_body)
         docs.append(doc)
+    batch_used = set(team_used_ips)
+    for doc in docs:
+        proxy = doc.get("proxy") or {}
+        if (
+            body.auto_unique_proxy
+            and (
+                proxy.get("enabled")
+                or proxy.get("provider_id")
+                or str(proxy.get("server") or "").strip()
+            )
+        ):
+            await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
     if docs:
         await _DB.browser_profiles.insert_many(docs)
-    return {"created": len(docs), "profiles": [_public_view(d) for d in docs]}
+    return {
+        "created": len(docs),
+        "profiles": [_public_view(d) for d in docs],
+        "unique_ips_bound": sum(1 for d in docs if d.get("exit_ip")),
+    }
 
 
 @router.get("/export/all")
@@ -2716,10 +3204,28 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         )
         ua_cursors[plat] = 0
 
-    # ── Proxies (unchanged ProxyJet / provider / manual) ───────────
+    # ── Proxies — team-unique exit IP per profile ───────────────────
     proxy_lines: List[str] = []
+    provider_lines: List[str] = []
     proxy_mode = (body.proxy.mode or "none").lower()
-    if proxy_mode == "proxyjet":
+    team_used_ips = await _load_team_profile_used_ips(uid)
+
+    if proxy_mode == "provider" and body.proxy.provider_id:
+        _prov_targeting = _profile_provider_targeting(
+            {
+                "proxyjet_country": body.proxy.country,
+                "proxyjet_state": body.proxy.state,
+            },
+            body.country,
+        )
+        provider_lines = await _allocate_provider_proxy_lines(
+            uid,
+            str(body.proxy.provider_id),
+            count,
+            team_used_ips,
+            targeting=_prov_targeting,
+        )
+    elif proxy_mode == "proxyjet":
         if _PROXYJET_GEN is None:
             raise HTTPException(
                 status_code=503,
@@ -2754,7 +3260,14 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 ),
             )
 
-    def _parse_proxy_line_to_cfg(line: str) -> ProxyConfig:
+    def _parse_proxy_line_to_cfg(
+        line: str,
+        *,
+        provider_id: str = "",
+        use_proxyjet: bool = False,
+        proxyjet_country: str = "US",
+        proxyjet_state: str = "",
+    ) -> ProxyConfig:
         server = ""
         username = ""
         password = ""
@@ -2799,9 +3312,10 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             server=server,
             username=username,
             password=password,
-            use_proxyjet=True,
-            proxyjet_country=(body.proxy.country or "").upper() or "US",
-            proxyjet_state=(body.proxy.state or "").upper(),
+            provider_id=str(provider_id or "").strip(),
+            use_proxyjet=bool(use_proxyjet),
+            proxyjet_country=(proxyjet_country or "US").upper(),
+            proxyjet_state=(proxyjet_state or "").upper(),
         )
 
     pad = max(2, len(str(count)))
@@ -2838,10 +3352,16 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
         proxy_cfg = ProxyConfig()
         if proxy_mode == "provider" and body.proxy.provider_id:
-            proxy_cfg = ProxyConfig(
-                enabled=True,
-                provider_id=body.proxy.provider_id,
-            )
+            if i < len(provider_lines):
+                proxy_cfg = _parse_proxy_line_to_cfg(
+                    provider_lines[i].strip(),
+                    provider_id=str(body.proxy.provider_id or ""),
+                )
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Provider line missing for profile slot {i + 1}/{count}",
+                )
         elif proxy_mode == "manual":
             # Unique line per profile when `lines` provided; else same server.
             lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
@@ -2856,7 +3376,12 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     password=body.proxy.password or "",
                 )
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
-            proxy_cfg = _parse_proxy_line_to_cfg(proxy_lines[i].strip())
+            proxy_cfg = _parse_proxy_line_to_cfg(
+                proxy_lines[i].strip(),
+                use_proxyjet=True,
+                proxyjet_country=(body.proxy.country or "US"),
+                proxyjet_state=(body.proxy.state or ""),
+            )
 
         viewport = _viewport_for_device(
             device,
@@ -2907,6 +3432,11 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         doc["device_catalog_id"] = str(device.get("id") or "")
         docs.append(doc)
 
+    if docs and proxy_mode in ("provider", "proxyjet", "manual"):
+        batch_used = set(team_used_ips)
+        for doc in docs:
+            await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
+
     if docs:
         await _DB.browser_profiles.insert_many(docs)
     return {
@@ -2914,7 +3444,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "profiles": [_public_view(d) for d in docs],
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
-        "proxies_allocated": len(proxy_lines) if proxy_mode == "proxyjet" else 0,
+        "proxies_allocated": len(provider_lines or proxy_lines) if proxy_mode in ("proxyjet", "provider") else 0,
+        "unique_ips_bound": sum(1 for d in docs if d.get("exit_ip")),
         "mix": {plat: n for plat, n in (mix_plan or [])},
     }
 

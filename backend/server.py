@@ -1151,6 +1151,11 @@ async def require_local_mode(request: Request):
     # We still surface `local_status` so the frontend can render the
     # most relevant 503 modal copy.
     local_status: Dict[str, Any] = {"online": False, "reason": "status_unknown"}
+    _uid = None
+    _leader_email = ""
+    _fleet_target_email = None
+    _fleet_member_doc = None
+    _fleet_member_id = ""
     try:
         from bridge_module import is_user_local_online as _is_online
         auth = request.headers.get("Authorization") or ""
@@ -1162,14 +1167,16 @@ async def require_local_mode(request: Request):
                 # line ~1220). Heartbeats key on `user_id` (the doc
                 # UUID), so resolve email→user_id before lookup.
                 _uid = _payload.get("user_id")
+                _leader_email = _payload.get("sub") or ""
                 if not _uid:
                     _email = _payload.get("sub")
                     if _email:
                         _u = await db.users.find_one(
-                            {"email": _email}, {"id": 1, "_id": 0}
+                            {"email": _email}, {"id": 1, "email": 1, "_id": 0}
                         )
                         if _u:
                             _uid = _u.get("id")
+                            _leader_email = _u.get("email") or _leader_email
                 if _uid:
                     local_status = await _is_online(_uid)
             except Exception:
@@ -1177,11 +1184,52 @@ async def require_local_mode(request: Request):
     except Exception:
         pass
 
+    # v2.7.32 — Team Fleet: delegate heavy work to a member's native PC.
+    _fleet_member_id = (
+        request.headers.get("X-Krexion-Fleet-Member-Id")
+        or request.query_params.get("fleet_member_id")
+        or _fleet_member_id
+    ).strip()
+    if not _fleet_member_id:
+        try:
+            _ct_peek = (request.headers.get("content-type") or "").lower()
+            if "multipart/form-data" in _ct_peek or "application/x-www-form-urlencoded" in _ct_peek:
+                _peek_form = await request.form()
+                _fleet_member_id = str(_peek_form.get("fleet_member_id") or "").strip()
+        except Exception:  # noqa: BLE001
+            pass
+    if _fleet_member_id and _uid:
+        try:
+            from team_fleet_module import (
+                assert_member_permission,
+                log_fleet_audit,
+                register_fleet_job_route,
+                resolve_fleet_context_from_request,
+            )
+            _leader = await db.users.find_one({"id": _uid}, {"_id": 0})
+            if _leader and not _leader.get("is_sub_user"):
+                _req_path = (request.url.path or "").lower()
+                _fleet_perm = "profiles" if "browser-profile" in _req_path else (
+                    "links" if "/links" in _req_path and "real-user-traffic" not in _req_path else "rut"
+                )
+                _fleet_ctx = await resolve_fleet_context_from_request(_leader, _fleet_member_id)
+                await assert_member_permission(_fleet_ctx["member"], _fleet_perm)
+                local_status = _fleet_ctx["online"]
+                _fleet_target_email = _fleet_ctx["member"]["email"]
+                _fleet_member_doc = _fleet_ctx["member"]
+                _leader_email = _leader.get("email") or _leader_email
+        except HTTPException:
+            raise
+        except Exception as _fleet_gate_err:  # noqa: BLE001
+            logger.warning(f"[fleet] require_local_mode resolve failed: {_fleet_gate_err}")
+
     # Pick the most actionable hint for the frontend's "open desktop
     # app" modal. Customers with an online PC are the easiest case —
     # they just need to launch the desktop app instead of clicking the
     # cloud UI button.
-    if local_status.get("online"):
+    if _fleet_target_email and not local_status.get("online"):
+        actionable_hint = "member_pc_offline"
+    elif local_status.get("online"):
         actionable_hint = "use_desktop_app"
     elif local_status.get("reason") == "stale_heartbeat":
         actionable_hint = "turn_on_pc"
@@ -1498,11 +1546,15 @@ async def require_local_mode(request: Request):
                         logger.warning(f"[bridge] ProxyJet creds lookup failed: {_pj_lookup_err}")
 
                 bridge_resp = await _enq(
-                    {"id": _uid, "email": local_status.get("email")},
+                    {"id": _uid, "email": _leader_email or local_status.get("email")},
                     feature,
                     payload,
                     wait_for_result=True,
                     wait_timeout=25,
+                    target_email=_fleet_target_email,
+                    requested_by=_leader_email,
+                    fleet_member_id=(_fleet_member_doc or {}).get("id"),
+                    fleet_delegated=bool(_fleet_target_email),
                 )
                 # When the desktop completes synchronously, return its body.
                 # When still pending, hand back the job_id so the frontend
@@ -1515,6 +1567,33 @@ async def require_local_mode(request: Request):
                     )
                     if _status == "done":
                         result = bridge_resp.get("result") or {}
+                        # v2.7.32 — Remember fleet RUT job routes for polling middleware.
+                        if _fleet_member_doc and _fleet_target_email:
+                            try:
+                                from team_fleet_module import log_fleet_audit, register_fleet_job_route
+                                _rut_body = result.get("body") if isinstance(result.get("body"), dict) else result
+                                _rut_job_id = ""
+                                if isinstance(_rut_body, dict):
+                                    _rut_job_id = str(_rut_body.get("job_id") or _rut_body.get("id") or "")
+                                if _rut_job_id and "real-user-traffic" in feature:
+                                    await register_fleet_job_route(
+                                        job_id=_rut_job_id,
+                                        parent_user_id=_uid,
+                                        member_id=_fleet_member_doc.get("id") or "",
+                                        member_email=_fleet_target_email,
+                                        feature="rut",
+                                    )
+                                    await log_fleet_audit(
+                                        parent_user_id=_uid,
+                                        leader_email=_leader_email,
+                                        member_id=_fleet_member_doc.get("id") or "",
+                                        member_email=_fleet_target_email,
+                                        action="delegate_rut_start",
+                                        feature=feature,
+                                        job_id=_rut_job_id,
+                                    )
+                            except Exception as _fleet_reg_err:  # noqa: BLE001
+                                logger.warning(f"[fleet] register rut route failed: {_fleet_reg_err}")
                         # v1.0.19: previously raised HTTPException(200,
                         # detail=...) which made FastAPI wrap the body
                         # as {"detail": <body>}. Frontend then saw
@@ -2358,12 +2437,16 @@ class SubUserCreate(BaseModel):
     password: str
     name: str
     permissions: dict = {}  # e.g., {"view_clicks": True, "view_links": True}
+    fleet_control_allowed: bool = False
+    fleet_permissions: dict = Field(default_factory=lambda: {"rut": True, "links": True, "profiles": True})
 
 class SubUserUpdate(BaseModel):
     name: Optional[str] = None
     password: Optional[str] = None
     permissions: Optional[dict] = None
     is_active: Optional[bool] = None
+    fleet_control_allowed: Optional[bool] = None
+    fleet_permissions: Optional[dict] = None
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -4874,6 +4957,8 @@ async def get_me(user: dict = Depends(get_current_user)):
         "sub_user_count": sub_user_count,
         "max_sub_users": max_sub_users,
         "is_sub_user": False,
+        # v2.7.32 — Team Fleet Command Center toggle
+        "team_fleet_enabled": bool(user.get("team_fleet_enabled")),
         # v2.6.1 — per-customer VPS heavy override
         "allow_cloud_heavy": bool(user.get("allow_cloud_heavy")),
         "admin_contact": ADMIN_CONTACT_EMAIL
@@ -5160,6 +5245,12 @@ async def create_sub_user(sub_user: SubUserCreate, user: dict = Depends(get_curr
             "view_proxies": False,
             "edit": False
         },
+        "fleet_control_allowed": bool(sub_user.fleet_control_allowed),
+        "fleet_permissions": sub_user.fleet_permissions or {
+            "rut": True,
+            "links": True,
+            "profiles": True,
+        },
         "is_active": True,
         "last_active": None,
         "created_at": datetime.now(timezone.utc).isoformat()
@@ -5195,6 +5286,10 @@ async def update_sub_user(sub_user_id: str, update: SubUserUpdate, user: dict = 
         update_data["permissions"] = update.permissions
     if update.is_active is not None:
         update_data["is_active"] = update.is_active
+    if update.fleet_control_allowed is not None:
+        update_data["fleet_control_allowed"] = bool(update.fleet_control_allowed)
+    if update.fleet_permissions is not None:
+        update_data["fleet_permissions"] = update.fleet_permissions
     
     if update_data:
         await db.sub_users.update_one({"id": sub_user_id}, {"$set": update_data})
@@ -9832,6 +9927,60 @@ async def rut_create_job(
         "abort_on_tracker_block": bool(abort_on_tracker_block),
         "tracker_block_extra_patterns": (tracker_block_extra_patterns or "")[:4000],
     }
+    # v2.7.31 — Link ↔ RUT referrer parity: when the target link has Pro-
+    # Referrer enabled (TikTok pool etc.) but the RUT form left pro-mode
+    # OFF / empty, inherit the link's pool so URL params + UA + Referer
+    # don't diverge (ttclid on URL but Facebook in-app UA on the offer).
+    if bool(link.get("referrer_pro_enabled")):
+        if not params_dict.get("referer_pro_mode"):
+            params_dict["referer_pro_mode"] = True
+        if not params_dict.get("referer_override_enabled"):
+            params_dict["referer_override_enabled"] = True
+        if not str(params_dict.get("referer_platform_weights") or "").strip():
+            _link_pool = str(link.get("referrer_pro_platform_pool") or "").strip()
+            if _link_pool:
+                params_dict["referer_platform_weights"] = _link_pool[:4096]
+        if not str(params_dict.get("referer_email_weights") or "").strip():
+            _link_esp = str(link.get("referrer_pro_email_weights") or "").strip()
+            if _link_esp:
+                params_dict["referer_email_weights"] = _link_esp[:4096]
+        if not str(params_dict.get("referer_brand") or "").strip():
+            _link_brand = str(link.get("referrer_pro_brand") or "").strip()
+            if _link_brand:
+                params_dict["referer_brand"] = _link_brand[:64]
+        _cur_preset = str(params_dict.get("inapp_browser_preset") or "").strip().lower()
+        if not _cur_preset or _cur_preset == "none":
+            try:
+                from real_user_traffic import _infer_dominant_pro_platform
+                _dom = _infer_dominant_pro_platform({
+                    "platform_weights": params_dict.get("referer_platform_weights"),
+                    "platform_pool": params_dict.get("referer_platform_pool"),
+                })
+                if _dom:
+                    params_dict["inapp_browser_preset"] = _dom[:24]
+            except Exception:
+                pass
+        for _lk, _pk, _default in (
+            ("referrer_pro_traffic_type", "referer_traffic_type", "auto"),
+            ("referrer_pro_campaign_type", "referer_campaign_type", "auto"),
+            ("referrer_pro_search_engine", "referer_search_engine", "google"),
+            ("referrer_pro_search_keywords", "referer_search_keywords", ""),
+        ):
+            if _default in ("", "auto", "google") and str(params_dict.get(_pk) or "") in ("", "auto", "google"):
+                _lv = link.get(_lk)
+                if _lv not in (None, ""):
+                    params_dict[_pk] = _lv
+        if params_dict.get("referer_traffic_type") in (None, "", "auto"):
+            _lv = link.get("referrer_pro_traffic_type")
+            if _lv:
+                params_dict["referer_traffic_type"] = str(_lv)[:16]
+        for _lk, _pk in (
+            ("referrer_pro_social_wrapper", "referer_social_wrapper"),
+            ("referrer_pro_inapp_deep_path", "referer_inapp_deep"),
+            ("referrer_pro_strip_search_path", "referer_strip_search_path"),
+        ):
+            if link.get(_lk) is not None:
+                params_dict[_pk] = bool(link.get(_lk))
     # A job is auto-resumable on backend restart only if it has no in-memory
     # bytes attached (Mongo can't store huge UploadFile blobs efficiently
     # and they'd never survive a restart anyway). Inline-file submissions
@@ -25292,6 +25441,24 @@ except Exception as _bridge_err:  # noqa: BLE001
     is_user_local_online = None  # type: ignore
 
 
+# ─── Team Fleet Command Center (v2.7.32) ─────────────────────────────
+try:
+    import team_fleet_module
+    from team_fleet_module import fleet_router as _fleet_router
+    from bridge_module import is_fleet_member_online as _fleet_member_online_fn
+    team_fleet_module._bind(
+        main_db=main_db,
+        get_current_user=get_current_user,
+        is_member_online=_fleet_member_online_fn,
+        enqueue_bridge_job=enqueue_bridge_job,
+        online_window_sec=int(os.environ.get("BRIDGE_ONLINE_WINDOW_SEC", "300") or 300),
+    )
+    app.include_router(_fleet_router)
+    logger.info("Team Fleet module loaded — /api/team-fleet/*")
+except Exception as _fleet_load_err:  # noqa: BLE001
+    logger.error(f"Team Fleet module failed to load: {_fleet_load_err}")
+
+
 # ─── AdsPower module (bulk profile creator via bridge) ────────────────
 try:
     import adspower_module
@@ -25713,7 +25880,34 @@ async def _vr_bridge_middleware(request: Request, call_next):
         uid = user_doc["id"]
         if is_user_local_online is None or enqueue_bridge_job is None:
             return await call_next(request)
-        local_status = await is_user_local_online(uid)
+        _bridge_target_email = None
+        _bridge_fleet_member_id = request.query_params.get("fleet_member_id") or ""
+        if is_rut_job and "/jobs/" in path:
+            try:
+                from team_fleet_module import lookup_fleet_job_route
+                from bridge_module import is_fleet_member_online as _fleet_online
+                _job_id_guess = path.split("/jobs/")[-1].split("/")[0].strip()
+                if _job_id_guess and _job_id_guess not in ("pending-candidates", "bulk-delete"):
+                    _fleet_route = await lookup_fleet_job_route(_job_id_guess)
+                    if _fleet_route and _fleet_route.get("member_email"):
+                        _bridge_target_email = _fleet_route.get("member_email")
+                        local_status = await _fleet_online(_bridge_target_email, uid)
+                    elif _bridge_fleet_member_id:
+                        _member = await db.sub_users.find_one(
+                            {"id": _bridge_fleet_member_id, "parent_user_id": uid},
+                            {"email": 1, "_id": 0},
+                        )
+                        if _member and _member.get("email"):
+                            _bridge_target_email = _member["email"]
+                            local_status = await _fleet_online(_bridge_target_email, uid)
+                    else:
+                        local_status = await is_user_local_online(uid)
+                else:
+                    local_status = await is_user_local_online(uid)
+            except Exception:  # noqa: BLE001
+                local_status = await is_user_local_online(uid)
+        else:
+            local_status = await is_user_local_online(uid)
         if not local_status.get("online"):
             return await call_next(request)
 
@@ -25809,6 +26003,10 @@ async def _vr_bridge_middleware(request: Request, call_next):
             payload,
             wait_for_result=True,
             wait_timeout=60,
+            target_email=_bridge_target_email,
+            requested_by=user_doc.get("email"),
+            fleet_member_id=_bridge_fleet_member_id or None,
+            fleet_delegated=bool(_bridge_target_email),
         )
         from fastapi.responses import JSONResponse as _JR, Response as _Resp
         if not bridge_resp:

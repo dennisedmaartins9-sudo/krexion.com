@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { LayoutDashboard, Link2, MousePointerClick, DollarSign, Server, Menu, LogOut, User, Settings, TrendingUp, Upload, Mail, Phone, Filter, Smartphone, Search, ClipboardCheck, Fingerprint, Package, Apple, Cpu, Briefcase, ChevronDown, ChevronRight, ChevronLeft, PanelLeftClose, PanelLeftOpen, Link as LinkIcon, Activity, Camera, UserPlus, KeyRound, Zap, Globe } from "lucide-react";
+import { LayoutDashboard, Link2, MousePointerClick, DollarSign, Server, Menu, LogOut, User, Settings, TrendingUp, Upload, Mail, Phone, Filter, Smartphone, Search, ClipboardCheck, Fingerprint, Package, Apple, Cpu, Briefcase, ChevronDown, ChevronRight, ChevronLeft, PanelLeftClose, PanelLeftOpen, Link as LinkIcon, Activity, Camera, UserPlus, KeyRound, Zap, Globe, Users } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "./ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "./ui/dropdown-menu";
@@ -120,6 +120,11 @@ export default function DashboardLayout({ children }) {
   // Sub-users NEVER see Settings
   if (!isSubUser && features.settings !== false) {
     navigation.push({ name: "Settings", path: "/settings", icon: Settings, feature: "settings" });
+  }
+
+  // v2.7.32 — Team Command Center (owner only, when fleet enabled)
+  if (!isSubUser && user.team_fleet_enabled) {
+    navigation.push({ name: "Team Command", path: "/team-command", icon: Users, feature: null });
   }
 
   // System Health is ALWAYS visible to every logged-in user (main + sub).

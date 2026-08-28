@@ -41,17 +41,20 @@ export default function ProxyProvidersTab() {
   const [qualityLoading, setQualityLoading] = useState(false);
   const [qualityResult, setQualityResult] = useState(null);
   const [qualityProviderName, setQualityProviderName] = useState("");
+  const [catalog, setCatalog] = useState([]);
 
   const load = async () => {
     setLoading(true);
     try {
-      const [p, m] = await Promise.all([
+      const [p, m, cat] = await Promise.all([
         axios.get(`${API}/proxy-providers`, { headers: authHeaders() }),
         axios.get(`${API}/proxy-providers/_meta/kinds`, { headers: authHeaders() }),
+        axios.get(`${API}/proxy-providers/_meta/catalog`, { headers: authHeaders() }).catch(() => ({ data: { providers: [] } })),
       ]);
       setProviders(p.data || []);
       setKinds(m.data.kinds || []);
       setProxyTypes(m.data.proxy_types || proxyTypes);
+      setCatalog(cat.data?.providers || []);
     } catch (e) {
       toast.error("Failed to load proxy providers");
     } finally {
@@ -69,14 +72,43 @@ export default function ProxyProvidersTab() {
       proxy_type: "http",
       enabled: true,
       config: {
-        // v2.6.10 CUSTOMER-REQUEST — safe defaults ON so every new
-        // provider guarantees unique + non-VPN exit IPs. Customer can
-        // disable per provider if they want raw speed over safety.
         strict_unique_ip: true,
         skip_datacenter_ip: true,
       },
     });
     setDialogOpen(true);
+  };
+
+  const openCatalogProvider = (item) => {
+    if (!item) return;
+    const isApi = item.kind === "api_endpoint";
+    setEditing({ isNew: true, catalogId: item.id });
+    setForm({
+      name: item.name,
+      kind: isApi ? "api_endpoint" : "rotating_gateway",
+      proxy_type: item.proxy_type || "http",
+      enabled: true,
+      config: isApi
+        ? {
+            api_url: item.api_url || "",
+            method: item.method || "GET",
+            headers: item.headers || "",
+            body: item.body || "",
+            response_path: item.response_path || "",
+            strict_unique_ip: true,
+            skip_datacenter_ip: true,
+          }
+        : {
+            gateway_host: item.gateway_host || "",
+            gateway_port: String(item.gateway_port || ""),
+            username: "",
+            password: "",
+            strict_unique_ip: true,
+            skip_datacenter_ip: true,
+          },
+    });
+    setDialogOpen(true);
+    toast.info(`Enter your ${item.name} dashboard username + password — gateway is pre-filled.`);
   };
 
   const openEdit = (p) => {
@@ -296,7 +328,34 @@ export default function ProxyProvidersTab() {
             </Button>
           </div>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-6">
+          {catalog.length > 0 && (
+            <div data-testid="proxy-provider-catalog">
+              <p className="text-sm font-medium text-white mb-2">Popular providers — one-click setup</p>
+              <p className="text-xs text-[var(--brand-muted)] mb-3">
+                Pick your brand, paste dashboard username + password. Host, port, and geo/session DSL auto-configure for RUT, Browser Profiles, and CPI.
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                {catalog.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => openCatalogProvider(item)}
+                    className="text-left rounded-lg border border-[var(--brand-border)] bg-[#0f1419] hover:border-[#3B82F6]/50 hover:bg-[#1a2332] px-3 py-2 transition-colors"
+                    data-testid={`proxy-catalog-${item.id}`}
+                  >
+                    <div className="font-medium text-sm text-white truncate">{item.name}</div>
+                    <div className="text-[10px] text-[var(--brand-muted)] mt-0.5 line-clamp-2">{item.tagline}</div>
+                    {!item.kind && item.gateway_host && (
+                      <div className="text-[10px] font-mono text-cyan-400/80 mt-1 truncate">
+                        {item.gateway_host}:{item.gateway_port}
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {providers.length === 0 && (
             <div className="text-sm text-[var(--brand-muted)] italic py-4">
               No providers yet &mdash; click &quot;Add Provider&quot; to add your first one, or continue using Krexion&apos;s default proxy flow.
@@ -360,7 +419,21 @@ export default function ProxyProvidersTab() {
               on pages that use proxies (RUT, Browser Profiles, CPI, Proxy Test).
             </DialogDescription>
           </DialogHeader>
-          {editing?.isNew && (
+          {editing?.catalogId && (() => {
+            const cat = catalog.find((c) => c.id === editing.catalogId);
+            if (!cat) return null;
+            return (
+              <div className="rounded-md border border-emerald-500/30 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-100">
+                <strong>{cat.name}</strong> preset — {cat.username_hint}
+                {cat.docs_url && (
+                  <a href={cat.docs_url} target="_blank" rel="noreferrer" className="ml-2 underline text-emerald-300">
+                    Open docs
+                  </a>
+                )}
+              </div>
+            );
+          })()}
+          {editing?.isNew && !editing?.catalogId && (
             <div className="rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 flex items-center justify-between text-xs">
               <span className="text-blue-200">
                 Don&apos;t know host/port? Paste any raw proxy strings and let Krexion auto-detect

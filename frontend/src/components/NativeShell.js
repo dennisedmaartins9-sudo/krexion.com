@@ -29,7 +29,7 @@ import {
   Fingerprint, Package, Camera, UserPlus, Activity, ChevronDown, Bell,
   CloudUpload, HelpCircle, Plus, Crown, Minus, Square, X as XIcon,
   ListChecks, Tag, Layers, FileText, Wrench, KeyRound, PanelLeftClose,
-  PanelLeftOpen, RefreshCw, Zap, Globe
+  PanelLeftOpen, RefreshCw, Zap, Globe, Users
 } from "lucide-react";
 import axios from "axios";
 import { useBranding } from "../context/BrandingContext";
@@ -114,6 +114,7 @@ const NAV_GROUPS = [
     id: "system",
     label: "System",
     items: [
+      { name: "Team Command",  path: "/team-command",  icon: Users,    feature: "__team_fleet__" },
       { name: "License",       path: "/license",       icon: KeyRound, feature: null },
       { name: "System Health", path: "/system-health", icon: Activity, feature: null },
       { name: "Settings",      path: "/settings",      icon: Settings, feature: "settings" }, // hidden for sub-users below
@@ -230,12 +231,15 @@ export default function NativeShell({ children }) {
             if (features.settings === false) return false;
             return true;
           }
+          if (it.feature === "__team_fleet__") {
+            return !isSubUser && !!user?.team_fleet_enabled;
+          }
           return hasFeature(features, it.feature);
         });
         return { ...g, items };
       })
       .filter((g) => g.items.length > 0);
-  }, [features, isSubUser]);
+  }, [features, isSubUser, user?.team_fleet_enabled]);
 
   const currentPage = useMemo(() => {
     for (const g of visibleGroups) {

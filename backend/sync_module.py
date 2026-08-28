@@ -65,6 +65,19 @@ async def _validate_license(license_key: Optional[str]):
             pass
     user = await _db.users.find_one({"email": lic["email"]}, {"_id": 0})
     if not user:
+        # v2.7.32 — Sub-user native installs pair with the sub-user email.
+        # Resolve to the parent account for shared DB access while keeping
+        # fleet_worker_email so bridge pull routes jobs correctly.
+        sub_user = await _db.sub_users.find_one({"email": lic["email"]}, {"_id": 0})
+        if sub_user:
+            parent = await _db.users.find_one({"id": sub_user.get("parent_user_id")}, {"_id": 0})
+            if parent:
+                parent = dict(parent)
+                parent["is_fleet_worker"] = True
+                parent["fleet_worker_email"] = sub_user.get("email") or lic["email"]
+                parent["sub_user_id"] = sub_user.get("id")
+                parent["sub_user_email"] = sub_user.get("email")
+                return lic, parent
         raise HTTPException(status_code=403, detail="No user account for this license")
     return lic, user
 
@@ -229,9 +242,15 @@ async def heartbeat(
     x_krexion_license: Optional[str] = Header(None),
 ):
     lic, user = await _validate_license(x_krexion_license)
+    worker_email = (
+        user.get("fleet_worker_email")
+        or lic.get("email")
+        or user.get("email")
+        or ""
+    ).strip().lower()
     update_doc = {
         "license_key": lic["license_key"],
-        "email": user["email"],
+        "email": worker_email or user.get("email"),
         "user_id": user["id"],
         "hostname": (body.get("hostname") or "")[:120],
         "version": (body.get("version") or "")[:32],
@@ -239,6 +258,10 @@ async def heartbeat(
         "ip": (request.client.host if request.client else "")[:60],
         "last_seen": _now_iso(),
     }
+    if user.get("is_fleet_worker"):
+        update_doc["fleet_worker_email"] = worker_email
+        if user.get("sub_user_id"):
+            update_doc["sub_user_id"] = user.get("sub_user_id")
     # Hardware info for cloud-orchestrated load tuning (bridge module)
     if body.get("ram_gb") is not None:
         try:
@@ -275,7 +298,12 @@ async def heartbeat(
     return {
         "ok": True,
         "server_time": _now_iso(),
-        "user": {"id": user["id"], "email": user.get("email")},
+        "user": {
+            "id": user["id"],
+            "email": worker_email or user.get("email"),
+            "fleet_worker_email": user.get("fleet_worker_email"),
+            "sub_user_id": user.get("sub_user_id"),
+        },
         "license": {
             "license_key": lic["license_key"],
             "status": lic.get("status"),

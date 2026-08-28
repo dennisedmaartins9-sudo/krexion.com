@@ -13,6 +13,7 @@ import ClicksPage from "./pages/ClicksPage";
 import ConversionsPage from "./pages/ConversionsPage";
 import ProxiesPage from "./pages/ProxiesPage";
 import SettingsPage from "./pages/SettingsPage";
+import TeamCommandPage from "./pages/TeamCommandPage";
 import ReferrerStatsPage from "./pages/ReferrerStatsPage";
 // import ImportTrafficPage from "./pages/ImportTrafficPage";  // removed v2.6.1 — merged into RUT
 import EmailCheckerPage from "./pages/EmailCheckerPage";
@@ -339,6 +340,9 @@ function App() {
                         <FeatureRoute feature="cpi">
                           <CPIWorkerSetupPage />
                         </FeatureRoute>
+                      } />
+                      <Route path="/team-command" element={
+                        <TeamCommandPage />
                       } />
                       <Route path="/settings" element={
                         <FeatureRoute feature="settings">
