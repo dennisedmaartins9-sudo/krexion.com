@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: krexion-cdn-sync
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   sync:
