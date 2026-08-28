@@ -35,10 +35,8 @@ jobs:
   deploy:
     name: Sync source + rebuild containers
     runs-on: [self-hosted, krexion-vps]
-    # 45 min hard cap — full no-cache build for backend + frontend on
-    # the VPS typically finishes in 8-12 min but installers with a
-    # cold docker cache can take ~30 min.
-    timeout-minutes: 45
+    # 60 min — docker no-cache can exceed 45m on busy VPS; CDN sync must run.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code via git
