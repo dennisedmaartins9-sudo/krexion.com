@@ -265,3 +265,16 @@ jobs:
           sha256sum "downloads/ui/krexion-ui-${VERSION}.zip"
           echo "  Deploy complete: $(date -u +%FT%TZ)"
           echo "===================================================="
+
+      # v2.7.36 — Reliable CDN sync from GitHub Release (self-hosted VPS).
+      # Mirror jobs can hang on artifact download; deploy always refreshes
+      # /opt/krexion/downloads/ after every main push.
+      - name: Sync installer CDN from GitHub Release
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          chmod +x scripts/sync_cdn_from_github_release.sh
+          bash scripts/sync_cdn_from_github_release.sh
