@@ -1345,7 +1345,14 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
         proxy_url = f"{scheme}://{quote(str(username))}:{quote(str(password))}@{rest}"
 
     try:
-        async with httpx.AsyncClient(proxies=proxy_url, timeout=20.0, follow_redirects=True) as client:
+        # httpx 0.28+ removed `proxies=` — use transport (same as server.py ipify probe).
+        transport = httpx.AsyncHTTPTransport(proxy=proxy_url, verify=False)
+        async with httpx.AsyncClient(
+            transport=transport,
+            timeout=httpx.Timeout(20.0),
+            follow_redirects=True,
+            verify=False,
+        ) as client:
             r = await client.get("https://api.ipify.org?format=json")
             r.raise_for_status()
             result["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()

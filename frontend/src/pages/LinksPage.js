@@ -1202,7 +1202,20 @@ export default function LinksPage() {
                       <input
                         type="checkbox"
                         checked={formData.referrer_pro_enabled}
-                        onChange={(e) => setFormData({ ...formData, referrer_pro_enabled: e.target.checked })}
+                        onChange={(e) => {
+                          const enabled = e.target.checked;
+                          setFormData({
+                            ...formData,
+                            referrer_pro_enabled: enabled,
+                            ...(enabled ? {
+                              forced_source: "",
+                              forced_source_name: "",
+                              simulate_platform: "",
+                              referrer_mode: formData.referrer_mode === "no_referrer" ? "normal" : formData.referrer_mode,
+                              referrer_pro_wrapper_redirect: formData.referrer_pro_wrapper_redirect || true,
+                            } : {}),
+                          });
+                        }}
                         className="w-4 h-4"
                         data-testid="pro-referrer-enabled"
                       />

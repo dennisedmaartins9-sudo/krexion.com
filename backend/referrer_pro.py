@@ -716,9 +716,18 @@ def rebuild_referer_with_target(referer_url: str, new_target_url: str) -> str:
 
         # Determine which param holds the wrapped URL
         param_name = ""
+        _path = (parsed.path or "").lower()
         if host in _SHIM_HOSTS_U_PARAM:
             param_name = "u"
         elif host in _SHIM_HOSTS_URL_PARAM:
+            param_name = "url"
+        elif "tiktok.com" in host and "/link/v2" in _path:
+            param_name = "u"
+        elif host.startswith("www.google.") and _path == "/url":
+            param_name = "q"
+        elif host.startswith("google.") and _path == "/url":
+            param_name = "q"
+        elif host in ("twitter.com", "www.twitter.com", "x.com", "www.x.com") and _path == "/i/redirect":
             param_name = "url"
         else:
             # Not a recognised shim host — pass through unchanged so we
@@ -1478,6 +1487,11 @@ def resolve_pro_visit(
     strip_search_path: bool = True,
     network_click_chain_enabled: bool = False,
     network_click_host: Optional[str] = None,
+    # v2.7.35 — When True, never return an empty referer (preview / premium).
+    require_non_empty_referer: bool = False,
+    # v2.7.35 — When True, prefer bounce-capable wrapper URLs so link
+    # wrapper-redirect actually reaches the offer with a platform Referer.
+    wrapper_redirect: bool = False,
     # v2.1.83 — International guardrail knobs (all optional, defaults
     # preserve pre-existing behaviour so any older caller keeps working).
     lang_match: bool = False,
@@ -1654,6 +1668,15 @@ def resolve_pro_visit(
                     ref = _v2_ref_se
             except Exception:
                 pass  # keep legacy build_search_referer output
+        _paid_bool_se = bool(_is_paid_v2_se) if _is_paid_v2_se is not None else True
+        ref = _finalize_referer_for_visit(
+            ref,
+            actual_signal,
+            target_url or "",
+            is_paid=_paid_bool_se,
+            require_non_empty=bool(require_non_empty_referer or wrapper_redirect),
+            wrapper_redirect=bool(wrapper_redirect),
+        )
         out["referer"] = ref
         out["platform"] = actual_signal
         out["utm_source"], out["utm_medium"] = pick_utm_variation(actual_signal, brand)
@@ -1751,6 +1774,15 @@ def resolve_pro_visit(
         except Exception:
             pass  # keep legacy ref on any error
 
+    _paid_bool = bool(_is_paid_v2) if _is_paid_v2 is not None else True
+    ref = _finalize_referer_for_visit(
+        ref,
+        signal,
+        target_url or "",
+        is_paid=_paid_bool,
+        require_non_empty=bool(require_non_empty_referer or wrapper_redirect),
+        wrapper_redirect=bool(wrapper_redirect),
+    )
     out["referer"] = ref
     out["platform"] = signal
     out["utm_source"], out["utm_medium"] = pick_utm_variation(signal, brand)
@@ -3060,6 +3092,161 @@ _TOK_BING_SERP           = "__BING_SERP__"
 
 # Values are (token_or_literal, weight) tuples. Weights normalise
 # at pick time — they don't need to sum to 100 exactly.
+
+_PLATFORM_HOMEPAGES: Dict[str, str] = {
+    "facebook": "https://www.facebook.com/",
+    "instagram": "https://www.instagram.com/",
+    "tiktok": "https://www.tiktok.com/",
+    "youtube": "https://www.youtube.com/",
+    "twitter": "https://twitter.com/",
+    "x": "https://x.com/",
+    "snapchat": "https://www.snapchat.com/",
+    "pinterest": "https://www.pinterest.com/",
+    "reddit": "https://www.reddit.com/",
+    "linkedin": "https://www.linkedin.com/",
+    "whatsapp": "https://www.whatsapp.com/",
+    "telegram": "https://t.me/",
+    "discord": "https://discord.com/",
+    "messenger": "https://www.messenger.com/",
+    "google": "https://www.google.com/",
+    "bing": "https://www.bing.com/",
+    "duckduckgo": "https://duckduckgo.com/",
+    "yahoo": "https://search.yahoo.com/",
+    "yandex": "https://yandex.com/",
+}
+
+
+def _platform_homepage(platform: str) -> str:
+    p = (platform or "").lower().strip()
+    if p == "x":
+        return _PLATFORM_HOMEPAGES["x"]
+    return _PLATFORM_HOMEPAGES.get(p, "")
+
+
+def _referer_is_bounce_capable(referer: str) -> bool:
+    """True when navigating to `referer` can forward the user via u=/url=/q=."""
+    if not (referer or "").strip():
+        return False
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(referer)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        qs = parse_qs(parsed.query)
+        if host in _SHIM_HOSTS_U_PARAM and qs.get("u"):
+            return True
+        if host in _SHIM_HOSTS_URL_PARAM and qs.get("url"):
+            return True
+        if "tiktok.com" in host and "/link/v2" in path and qs.get("u"):
+            return True
+        if "google." in host and path == "/url" and qs.get("q"):
+            return True
+        if host in ("twitter.com", "www.twitter.com", "x.com", "www.x.com") and path == "/i/redirect" and qs.get("url"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def build_wrapper_bounce_url(
+    platform: str,
+    destination_url: str,
+    is_paid: bool = True,
+) -> str:
+    """Build a platform URL the browser can open that embeds `destination_url`
+    and forwards the user while preserving a realistic platform Referer."""
+    p = (platform or "").lower().strip()
+    dest = (destination_url or "").strip() or "https://example.com/"
+    enc = quote_plus(dest)
+    if p == "tiktok":
+        return f"https://www.tiktok.com/link/v2?aid=1988&lang=en&u={enc}"
+    if p in ("facebook", "messenger", "instagram"):
+        h = _rand_fb_h_hash()
+        host = "l.facebook.com" if p != "instagram" else "l.instagram.com"
+        if p == "instagram":
+            return f"https://{host}/?u={enc}&e={_rand_hash(16)}"
+        return f"https://{host}/l.php?u={enc}&h=AT{h}"
+    if p in ("twitter", "x"):
+        host = "x.com" if p == "x" else "twitter.com"
+        return f"https://{host}/i/redirect?url={enc}"
+    if p == "linkedin":
+        return f"https://www.linkedin.com/redir/redirect?url={enc}"
+    if p == "reddit":
+        return f"https://out.reddit.com/?url={enc}&token={_rand_hash(32)}"
+    if p in ("google", "bing", "yahoo", "duckduckgo", "yandex"):
+        if p == "google":
+            return f"https://www.google.com/url?q={enc}"
+        if p == "bing":
+            return f"https://www.bing.com/aclick?u={enc}"
+        return _platform_homepage(p) or f"https://www.google.com/url?q={enc}"
+    if p == "youtube":
+        return f"https://www.youtube.com/redirect?q={enc}&redir_token={_rand_hash(16)}"
+    if p == "pinterest":
+        return f"https://www.pinterest.com/offsite/?url={enc}"
+    home = _platform_homepage(p)
+    if home:
+        return home
+    return f"https://www.tiktok.com/link/v2?aid=1988&lang=en&u={enc}"
+
+
+def ensure_wrapper_bounce_url(
+    referer: str,
+    platform: str,
+    destination_url: str,
+    is_paid: bool = True,
+) -> str:
+    if _referer_is_bounce_capable(referer):
+        return referer
+    return build_wrapper_bounce_url(platform, destination_url, is_paid)
+
+
+def ensure_non_empty_referer(
+    referer: str,
+    platform: str,
+    target_url: str = "",
+    is_paid: bool = True,
+) -> str:
+    """Never return blank — pick a realistic platform referer."""
+    if (referer or "").strip():
+        return referer.strip()
+    p = (platform or "").lower().strip()
+    for _ in range(8):
+        try:
+            cand = build_social_wrapper_referer(p, target_url)
+            if cand:
+                return cand
+        except Exception:
+            break
+    try:
+        deep = build_inapp_deep_referer(p, target_url, is_paid=is_paid)
+        if deep:
+            return deep
+    except Exception:
+        pass
+    home = _platform_homepage(p)
+    if home:
+        return home
+    return ""
+
+
+def _finalize_referer_for_visit(
+    referer: str,
+    platform: str,
+    target_url: str,
+    *,
+    is_paid: bool = True,
+    require_non_empty: bool = False,
+    wrapper_redirect: bool = False,
+) -> str:
+    ref = (referer or "").strip()
+    p = (platform or "").lower().strip()
+    if wrapper_redirect and (target_url or "").strip():
+        ref = ensure_wrapper_bounce_url(ref, p, target_url, is_paid)
+    if require_non_empty and not ref:
+        ref = ensure_non_empty_referer(ref, p, target_url, is_paid)
+    return ref or ""
+
+
 _PAID_ORGANIC_POOLS: Dict[str, Dict[str, List[Tuple[str, float]]]] = {
     "tiktok": {
         "paid": [
@@ -3417,6 +3604,198 @@ def detect_is_paid(traffic_type: str, campaign_type: str = "auto",
     return None  # Fully unknown → legacy behaviour
 
 
+# ── v2.7.36 — Link-level Pro-Referrer (RUT parity for manual clicks) ──
+_LINK_SOCIAL_PLATFORMS = frozenset({
+    "facebook", "instagram", "tiktok", "twitter", "x", "snapchat",
+    "pinterest", "linkedin", "messenger", "reddit", "youtube",
+})
+_LINK_SEARCH_PLATFORMS = frozenset({
+    "google", "bing", "duckduckgo", "yahoo", "yandex", "baidu", "naver", "ecosia", "brave",
+})
+
+
+def platform_wants_auto_wrapper(platform: str) -> bool:
+    p = (platform or "").lower().strip()
+    return p in _LINK_SOCIAL_PLATFORMS or p in _LINK_SEARCH_PLATFORMS
+
+
+def pool_is_social_heavy(platform_pool_value: str, threshold: float = 0.34) -> bool:
+    pool = parse_weighted_pool(platform_pool_value)
+    if not pool:
+        return False
+    heavy = sum(
+        float(w) for p, w in pool
+        if (p or "").lower() in _LINK_SOCIAL_PLATFORMS
+        or (p or "").lower() in _LINK_SEARCH_PLATFORMS
+    )
+    total = sum(float(w) for _, w in pool)
+    return total > 0 and (heavy / total) >= threshold
+
+
+def normalize_link_pro_settings(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Clear classic/pro conflicts and enable wrapper for social-heavy pools."""
+    out = dict(doc or {})
+    if not out.get("referrer_pro_enabled"):
+        return out
+    out["forced_source"] = None
+    out["forced_source_name"] = None
+    out["simulate_platform"] = None
+    rm = (out.get("referrer_mode") or "normal").strip().lower()
+    if rm in ("no_referrer", "none"):
+        out["referrer_mode"] = "normal"
+    pool = str(out.get("referrer_pro_platform_pool") or "").strip()
+    if pool and not bool(out.get("referrer_pro_wrapper_redirect")):
+        if pool_is_social_heavy(pool):
+            out["referrer_pro_wrapper_redirect"] = True
+    return out
+
+
+def effective_link_wrapper_redirect(link: Dict[str, Any], platform: str) -> bool:
+    if not link.get("referrer_pro_enabled"):
+        return bool(link.get("referrer_pro_wrapper_redirect"))
+    if bool(link.get("referrer_pro_wrapper_redirect")):
+        return True
+    return platform_wants_auto_wrapper(platform)
+
+
+def enrich_destination_link_realism(
+    destination_url: str,
+    *,
+    user_agent: str = "",
+    referer: str = "",
+    accept_language: str = "",
+    platform: str = "",
+) -> str:
+    """Append common tracker passthrough params networks read (RUT parity)."""
+    url = (destination_url or "").strip()
+    if not url:
+        return url
+    try:
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+        parsed = urlparse(url)
+        qs = {k: v for k, v in parse_qsl(parsed.query, keep_blank_values=True)}
+        low_keys = {str(k).lower() for k in qs.keys()}
+        if user_agent and "ua" not in low_keys and "user_agent" not in low_keys:
+            qs["ua"] = str(user_agent)[:512]
+        if referer and "referer" not in low_keys and "referrer" not in low_keys:
+            qs["referer"] = str(referer)[:512]
+        if accept_language and "lang" not in low_keys and "accept_language" not in low_keys:
+            qs["lang"] = str(accept_language).split(",")[0][:32]
+        if platform and "platform" not in low_keys:
+            qs.setdefault("platform", str(platform)[:40])
+        return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    except Exception:
+        return url
+
+
+def prepare_link_pro_click(
+    link: Dict[str, Any],
+    *,
+    user_agent: str = "",
+    destination_url: str = "",
+    country: Optional[str] = None,
+    kx_src_verified: bool = False,
+    kx_platform: str = "",
+    kx_traffic_type: str = "",
+) -> Dict[str, Any]:
+    """Resolve one manual link click with RUT-parity referrer + UA coercion."""
+    out: Dict[str, Any] = {
+        "pro_result": {},
+        "user_agent": user_agent or "",
+        "raw_user_agent": user_agent or "",
+        "platform": "",
+        "referer": "",
+        "simulate_platform": "",
+        "wrapper_target": "",
+        "accept_language": "",
+        "use_wrapper": False,
+        "custom_params_patch": {},
+    }
+    if kx_src_verified:
+        plat = (kx_platform or "").strip().lower()
+        if plat:
+            out["platform"] = plat
+            out["simulate_platform"] = plat
+        if kx_traffic_type in ("paid", "organic"):
+            out["pro_result"] = {
+                "traffic_type": kx_traffic_type,
+                "is_paid": (kx_traffic_type == "paid"),
+                "platform": plat,
+            }
+        return out
+    if not link.get("referrer_pro_enabled"):
+        return out
+    ua = user_agent or ""
+    _ua_low = ua.lower()
+    visitor_mobile = ("mobi" in _ua_low or "iphone" in _ua_low or "android" in _ua_low)
+    pool = str(link.get("referrer_pro_platform_pool") or "").strip()
+    use_wrapper_flag = bool(link.get("referrer_pro_wrapper_redirect")) or pool_is_social_heavy(pool)
+    try:
+        pro = resolve_pro_visit(
+            ua=ua,
+            platform_pool_value=pool,
+            email_weights_value=str(link.get("referrer_pro_email_weights") or ""),
+            brand=str(link.get("referrer_pro_brand") or ""),
+            target_url=destination_url or "",
+            country=(link.get("referrer_pro_country") or country or None),
+            search_engine=str(link.get("referrer_pro_search_engine") or "google"),
+            search_keywords=str(link.get("referrer_pro_search_keywords") or ""),
+            social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
+            inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
+            strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
+            network_click_chain_enabled=False,
+            network_click_host=None,
+            lang_match=bool(link.get("referrer_pro_lang_match", True)),
+            visitor_is_mobile=visitor_mobile,
+            device_mode=str(link.get("referrer_pro_device_mode") or "auto"),
+            tod_enabled=bool(link.get("referrer_pro_tod_enabled", False)),
+            campaign_type=str(link.get("referrer_pro_campaign_type") or "auto"),
+            traffic_type=str(link.get("referrer_pro_traffic_type") or "auto"),
+            require_non_empty_referer=True,
+            wrapper_redirect=use_wrapper_flag,
+        )
+    except Exception:
+        return out
+    out["pro_result"] = pro or {}
+    plat = str((pro or {}).get("platform") or "").strip()
+    referer = str((pro or {}).get("referer") or "").strip()
+    out["platform"] = plat
+    out["referer"] = referer
+    out["accept_language"] = str((pro or {}).get("accept_language") or "")
+    if plat:
+        out["simulate_platform"] = plat
+        raw = ua
+        if platform_needs_ua_match(plat):
+            try:
+                coerced = coerce_ua_for_platform(raw, plat)
+                if coerced:
+                    out["user_agent"] = coerced
+                    out["raw_user_agent"] = raw
+            except Exception:
+                pass
+        brand = str(link.get("referrer_pro_brand") or "").strip()
+        if brand:
+            out["custom_params_patch"]["__brand"] = brand[:64]
+        if plat == "email" and (pro or {}).get("esp"):
+            out["custom_params_patch"]["__force_esp"] = str(pro.get("esp") or "")
+    if effective_link_wrapper_redirect(link, plat) and (destination_url or "").strip():
+        try:
+            bounce = ensure_wrapper_bounce_url(
+                referer,
+                plat,
+                destination_url,
+                is_paid=bool((pro or {}).get("is_paid")),
+            )
+            if bounce:
+                referer = bounce
+                out["referer"] = referer
+                out["wrapper_target"] = bounce
+                out["use_wrapper"] = True
+        except Exception:
+            pass
+    return out
+
+
 __all__ = [
     # Resolvers
     "resolve_pro_visit",
@@ -3456,8 +3835,17 @@ __all__ = [
     "VALID_QUALITY_TIERS",
     # v2.6.24 — Paid vs Organic split
     "build_paid_organic_referer",
+    "ensure_non_empty_referer",
+    "ensure_wrapper_bounce_url",
+    "build_wrapper_bounce_url",
     "detect_is_paid",
     "apply_organic_platform_param_override",
+    "normalize_link_pro_settings",
+    "effective_link_wrapper_redirect",
+    "prepare_link_pro_click",
+    "enrich_destination_link_realism",
+    "platform_wants_auto_wrapper",
+    "pool_is_social_heavy",
     # Constants
     "VALID_PLATFORM_KEYS",
     "VALID_EMAIL_KEYS",

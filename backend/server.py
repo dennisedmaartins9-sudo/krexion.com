@@ -15736,14 +15736,15 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     try:
-        from referrer_pro import quality_tier_defaults as _qtd
+        from referrer_pro import quality_tier_defaults as _qtd, normalize_link_pro_settings as _nlps
         _tier = (link_doc.get("referrer_pro_quality_tier") or "standard").strip().lower()
         if _tier != "standard":
             link_doc.update(_qtd(_tier))
             link_doc["referrer_pro_quality_tier"] = _tier
+        link_doc = _nlps(link_doc)
     except Exception:
         pass
-    
+
     await db.links.insert_one(link_doc)
     return LinkResponse(**link_doc)
 
@@ -15813,6 +15814,19 @@ async def update_link(link_id: str, link_update: LinkUpdate, user: dict = Depend
             pass
     
     if update_data:
+        try:
+            from referrer_pro import normalize_link_pro_settings as _nlps
+            _merged = {**link, **update_data}
+            if _merged.get("referrer_pro_enabled"):
+                _norm = _nlps(_merged)
+                for _nk in (
+                    "forced_source", "forced_source_name", "simulate_platform",
+                    "referrer_mode", "referrer_pro_wrapper_redirect",
+                ):
+                    if _norm.get(_nk) != link.get(_nk):
+                        update_data[_nk] = _norm[_nk]
+        except Exception:
+            pass
         await db.links.update_one({"id": link_id}, {"$set": update_data})
         link.update(update_data)
         _new_short = link.get("short_code") or _old_short
@@ -15871,25 +15885,34 @@ async def preview_referrer_settings(
     # mix (desktop + mobile) the customer's audience will click from.
     # v2.7.7 — Sample UAs aligned to Chromium 136 (Playwright binary).
     # iOS Safari samples kept for referrer-preview realism only.
-    _SAMPLE_UAS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
+    _SAMPLE_UAS_MOBILE = [
         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1",
         "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Mobile Safari/537.36",
         "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.113 Mobile Safari/537.36",
+    ]
+    _SAMPLE_UAS_DESKTOP = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.125 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15",
     ]
 
     n = max(1, min(int(req.sample_count or 20), 100))
     samples: List[Dict[str, Any]] = []
     platform_counts: Dict[str, int] = {}
+    _pool_preview = str(req.referrer_pro_platform_pool or "").strip()
+    try:
+        from referrer_pro import pool_is_social_heavy as _pish
+        _wrapper_preview = bool(req.referrer_pro_wrapper_redirect) or _pish(_pool_preview)
+    except Exception:
+        _wrapper_preview = bool(req.referrer_pro_wrapper_redirect)
+    _require_ref = bool(_wrapper_preview or _pool_preview)
     for i in range(n):
-        ua = _SAMPLE_UAS[i % len(_SAMPLE_UAS)]
+        ua = _SAMPLE_UAS_MOBILE[i % len(_SAMPLE_UAS_MOBILE)]
         _ua_low = (ua or "").lower()
-        _visitor_is_mobile = ("mobi" in _ua_low or "iphone" in _ua_low or "android" in _ua_low)
+        _visitor_is_mobile = True
         try:
             pro = _rpv(
                 ua=ua,
-                platform_pool_value=str(req.referrer_pro_platform_pool or ""),
+                platform_pool_value=_pool_preview,
                 email_weights_value=str(req.referrer_pro_email_weights or ""),
                 brand=str(req.referrer_pro_brand or ""),
                 target_url=str(req.offer_url or "https://example.com/offer"),
@@ -15907,6 +15930,8 @@ async def preview_referrer_settings(
                 tod_enabled=bool(req.referrer_pro_tod_enabled),
                 campaign_type=str(req.referrer_pro_campaign_type or "auto"),
                 traffic_type=str(req.referrer_pro_traffic_type or "auto"),  # v2.6.29
+                require_non_empty_referer=_require_ref,
+                wrapper_redirect=_wrapper_preview,
             )
         except Exception as e:
             samples.append({"index": i + 1, "error": str(e)})
@@ -15914,6 +15939,20 @@ async def preview_referrer_settings(
 
         plat = pro.get("platform") or "unknown"
         platform_counts[plat] = platform_counts.get(plat, 0) + 1
+        # Pick UA that matches platform device expectation (TikTok → mobile).
+        try:
+            from referrer_pro import platform_device_expectation as _pde
+            _exp = _pde(plat)
+            if _exp == "desktop_leaning":
+                ua = _SAMPLE_UAS_DESKTOP[i % len(_SAMPLE_UAS_DESKTOP)]
+            elif _exp == "mobile_only":
+                ua = _SAMPLE_UAS_MOBILE[i % len(_SAMPLE_UAS_MOBILE)]
+            else:
+                ua = (_SAMPLE_UAS_MOBILE if (i % 2) else _SAMPLE_UAS_DESKTOP)[
+                    i % max(1, len(_SAMPLE_UAS_MOBILE if (i % 2) else _SAMPLE_UAS_DESKTOP))
+                ]
+        except Exception:
+            pass
         coerced_ua = ua
         ua_coerced = False
         if plat and plat not in ("email", "direct", "unknown"):
@@ -15925,12 +15964,13 @@ async def preview_referrer_settings(
                     ua_coerced = (_cua != ua)
             except Exception:
                 pass
+        _ref_display = pro.get("referer") or ""
         samples.append({
             "index": i + 1,
-            "ua_type": "mobile" if ("Mobile" in ua or "iPhone" in ua) else "desktop",
+            "ua_type": "mobile" if ("Mobile" in coerced_ua or "iPhone" in coerced_ua or "Android" in coerced_ua) else "desktop",
             "platform": plat,
             "esp": pro.get("esp") or "",
-            "referer": pro.get("referer") or "",
+            "referer": _ref_display,
             "ua_coerced": ua_coerced,
             "ua_preview_snippet": (coerced_ua or "")[:160],
             "utm_source": pro.get("utm_source") or "",
@@ -15939,7 +15979,7 @@ async def preview_referrer_settings(
             "network_click_referer": pro.get("network_click_referer") or "",
             "traffic_type": pro.get("traffic_type") or "",
             "is_paid": pro.get("is_paid"),
-            "wrapper_will_bounce": bool(req.referrer_pro_wrapper_redirect and pro.get("referer")),
+            "wrapper_will_bounce": bool(_wrapper_preview and pro.get("referer")),
         })
 
     # Distribution summary the UI can show as a mini bar chart.
@@ -15952,7 +15992,7 @@ async def preview_referrer_settings(
         "sample_count": n,
         "samples": samples,
         "distribution": dist,
-        "wrapper_redirect": bool(req.referrer_pro_wrapper_redirect),
+        "wrapper_redirect": _wrapper_preview,
     }
 
 
@@ -16353,7 +16393,7 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
             "referrer_pro_device_mode": "mobile_only",
             "referrer_pro_social_wrapper": True,
             "referrer_pro_inapp_deep_path": True,
-            "referrer_pro_wrapper_redirect": False,  # TT wrapper triggers warnings
+            "referrer_pro_wrapper_redirect": True,  # v2.7.36: TT link/v2 wrapper (RUT parity)
             "referrer_pro_campaign_type": "video_ad",
         },
         "google_ads": {
@@ -16412,6 +16452,11 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
         raise HTTPException(status_code=400, detail=f"Unknown preset '{preset_key}'. Valid: {list(_presets.keys())}")
 
     _updates = _presets[preset_key]
+    try:
+        from referrer_pro import normalize_link_pro_settings as _nlps
+        _updates = _nlps({**link, **_updates})
+    except Exception:
+        pass
     await db.links.update_one({"id": link_id}, {"$set": _updates})
     return {"ok": True, "preset": preset_key, "applied": _updates}
 
@@ -20083,18 +20128,145 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     url_params = dict(request.query_params)
     # RUT-signed visits defer tracker click insert — engine logs once via early log.
     _defer_click_to_rut = _should_defer_click_log_to_rut(request)
-    
-    # Categorize referrer source - use forced_source from link if set
-    if link.get("forced_source"):
+
+    # ── v2.7.36: Destination + Pro resolve BEFORE click row (RUT parity) ──
+    offers = await db.offers.find({"link_id": link["id"]}, {"_id": 0}).to_list(100)
+    _link_offer_pool = str(link.get("referrer_pro_offer_urls") or "").strip()
+    if _link_offer_pool:
+        try:
+            from referrer_pro import pick_offer_url as _pou
+            destination_url = _pou(_link_offer_pool, link["offer_url"])
+        except Exception:
+            destination_url = link["offer_url"]
+    elif offers:
+        import random
+        total_weight = sum(offer["weight"] for offer in offers)
+        rand = random.randint(1, total_weight)
+        cumulative = 0
+        selected_offer = None
+        for offer in offers:
+            cumulative += offer["weight"]
+            if rand <= cumulative:
+                selected_offer = offer
+                break
+        if selected_offer:
+            destination_url = selected_offer["offer_url"]
+            await db.offers.update_one({"id": selected_offer["id"]}, {"$inc": {"clicks": 1}})
+        else:
+            destination_url = link["offer_url"]
+    else:
+        destination_url = link["offer_url"]
+    if "?" in destination_url:
+        destination_url += f"&clickid={click_id}"
+    else:
+        destination_url += f"?clickid={click_id}"
+
+    simulate_platform = None if link.get("referrer_pro_enabled") else link.get("simulate_platform")
+    custom_params = dict(link.get("url_params") or {})
+    referrer_mode = link.get("referrer_mode") or "normal"
+    if link.get("referrer_pro_enabled") and (referrer_mode or "").lower() in ("no_referrer", "none"):
+        referrer_mode = "normal"
+
+    _kx_src_was_verified = False
+    _kx_tt = None
+    _kx_tt_sig = None
+    _kx_src = None
+    try:
+        _kx_src     = (url_params or {}).pop("_kx_src",     None) if isinstance(url_params, dict) else None
+        _kx_sig     = (url_params or {}).pop("_kx_sig",     None) if isinstance(url_params, dict) else None
+        _kx_esp     = (url_params or {}).pop("_kx_esp",     None) if isinstance(url_params, dict) else None
+        _kx_esp_sig = (url_params or {}).pop("_kx_esp_sig", None) if isinstance(url_params, dict) else None
+        _kx_brand   = (url_params or {}).pop("_kx_brand",   None) if isinstance(url_params, dict) else None
+        _kx_tt      = (url_params or {}).pop("_kx_traffic_type", None) if isinstance(url_params, dict) else None
+        _kx_tt_sig  = (url_params or {}).pop("_kx_tt_sig",  None) if isinstance(url_params, dict) else None
+        if isinstance(url_params, dict):
+            for _internal_claim_key in (
+                "_kx_rut_defer", "_kx_rut_defer_sig", "_kx_visit_token"
+            ):
+                url_params.pop(_internal_claim_key, None)
+        if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
+            simulate_platform = _kx_src
+            _kx_src_was_verified = True
+            if isinstance(custom_params, dict):
+                for _k in (
+                    "_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand",
+                    "_kx_traffic_type", "_kx_tt_sig", "_kx_rut_defer",
+                    "_kx_rut_defer_sig", "_kx_visit_token",
+                ):
+                    custom_params.pop(_k, None)
+            if (_kx_src == "email" and _kx_esp and _kx_esp_sig
+                    and _kx_esp_verify(_kx_src, _kx_esp, _kx_esp_sig)):
+                custom_params["__force_esp"] = _kx_esp
+            if _kx_brand:
+                custom_params["__brand"] = str(_kx_brand)[:64]
+    except Exception:
+        pass
+
+    pro_wrapper_target = ""
+    _pro_result: Dict[str, Any] = {}
+    _visit_accept_language = ""
+    _pro_referer = ""
+    _raw_ua = user_agent or ""
+    _pro_platform = ""
+
+    if _kx_src_was_verified:
+        try:
+            if _kx_tt in ("paid", "organic") and _kx_tt_sig and _kx_traffic_type_verify(str(_kx_tt), str(_kx_tt_sig)):
+                _pro_result = {
+                    "traffic_type": str(_kx_tt),
+                    "is_paid": (str(_kx_tt) == "paid"),
+                    "platform": str(simulate_platform or _kx_src or ""),
+                }
+        except Exception:
+            pass
+        _pro_platform = str(simulate_platform or _kx_src or "").strip()
+    elif bool(link.get("referrer_pro_enabled")):
+        try:
+            from referrer_pro import prepare_link_pro_click as _plpc
+            _prep = _plpc(
+                link,
+                user_agent=user_agent,
+                destination_url=destination_url,
+                country=country,
+                kx_src_verified=False,
+                kx_platform="",
+                kx_traffic_type="",
+            )
+            _pro_result = _prep.get("pro_result") or {}
+            _pro_referer = str(_prep.get("referer") or "")
+            _visit_accept_language = str(_prep.get("accept_language") or "")
+            pro_wrapper_target = str(_prep.get("wrapper_target") or "")
+            _pro_platform = str(_pro_result.get("platform") or _prep.get("platform") or "").strip()
+            if _prep.get("simulate_platform"):
+                simulate_platform = _prep["simulate_platform"]
+            if _prep.get("user_agent") and _prep["user_agent"] != _raw_ua:
+                user_agent = _prep["user_agent"]
+                device_info = detect_device(user_agent)
+            _params_patch = _prep.get("custom_params_patch") or {}
+            if isinstance(_params_patch, dict) and _params_patch:
+                custom_params.update(_params_patch)
+        except Exception as _pro_err:
+            logger.debug(f"[link-pro-referrer] prepare failed (safe fallback): {_pro_err}")
+
+    _click_referrer = _pro_referer or referrer
+    if link.get("referrer_pro_enabled") and _pro_platform:
+        referrer_info = {
+            "source": _pro_platform,
+            "source_name": _pro_platform.title(),
+            "domain": None,
+            "detected_from": "referrer_pro",
+        }
+        if _pro_referer:
+            _click_referrer = _pro_referer
+    elif link.get("forced_source") and not link.get("referrer_pro_enabled"):
         referrer_info = {
             "source": link["forced_source"],
             "source_name": link.get("forced_source_name") or link["forced_source"].title(),
             "domain": None,
-            "detected_from": "forced"
+            "detected_from": "forced",
         }
     else:
-        # Pass URL params for better detection (igshid, fbclid, etc.)
-        referrer_info = categorize_referrer(referrer, url_params)
+        referrer_info = categorize_referrer(_click_referrer or referrer, url_params)
     
     click_doc = {
         "id": str(uuid.uuid4()),
@@ -20122,13 +20294,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "is_duplicate_proxy": is_duplicate_proxy,
         "vpn_score": vpn_score,
         "user_agent": user_agent,
-        "user_agent_raw": user_agent,  # Store raw user agent for debugging
-        "referrer": referrer,
+        "user_agent_raw": _raw_ua,
+        "referrer": _click_referrer,
+        "referrer_pro_simulated": _pro_referer or None,
         "referrer_source": referrer_info["source"],
         "referrer_source_name": referrer_info["source_name"],
         "referrer_domain": referrer_info["domain"],
-        "referrer_detected_from": referrer_info.get("detected_from", "unknown"),  # Track how referrer was detected
-        "forced_source": link.get("forced_source"),  # Track if source was forced
+        "referrer_detected_from": referrer_info.get("detected_from", "unknown"),
+        "forced_source": None if link.get("referrer_pro_enabled") else link.get("forced_source"),
         "device": device_info["device_type"],
         "device_type": device_info["device_type"],
         "device_brand": device_info.get("device_brand", "Unknown"),
@@ -20216,242 +20389,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         click_doc.pop("_id", None)
         asyncio.create_task(manager.broadcast_click(main_user_id, click_doc))
     
-    offers = await db.offers.find({"link_id": link["id"]}, {"_id": 0}).to_list(100)
-    
-    # v2.1.83 Feature 7 — Multi-URL A/B rotation on the link itself.
-    # When `referrer_pro_offer_urls` is set, it takes precedence over the
-    # legacy `db.offers` collection (customers can still use offers for
-    # advanced setups; but the LinksPage UI now exposes a simpler
-    # weighted-URL string that avoids the need to click through to the
-    # separate offers page).
-    _link_offer_pool = str(link.get("referrer_pro_offer_urls") or "").strip()
-    if _link_offer_pool:
-        try:
-            from referrer_pro import pick_offer_url as _pou
-            destination_url = _pou(_link_offer_pool, link["offer_url"])
-        except Exception:
-            destination_url = link["offer_url"]
-    elif offers:
-        import random
-        total_weight = sum(offer["weight"] for offer in offers)
-        rand = random.randint(1, total_weight)
-        
-        cumulative = 0
-        selected_offer = None
-        for offer in offers:
-            cumulative += offer["weight"]
-            if rand <= cumulative:
-                selected_offer = offer
-                break
-        
-        if selected_offer:
-            destination_url = selected_offer["offer_url"]
-            await db.offers.update_one({"id": selected_offer["id"]}, {"$inc": {"clicks": 1}})
-        else:
-            destination_url = link["offer_url"]
-    else:
-        destination_url = link["offer_url"]
-    
-    # Add clickid parameter
-    if "?" in destination_url:
-        destination_url += f"&clickid={click_id}"
-    else:
-        destination_url += f"?clickid={click_id}"
-    
-    # Add platform simulation parameters if configured
-    simulate_platform = link.get("simulate_platform")
-    custom_params = link.get("url_params") or {}
-    referrer_mode = link.get("referrer_mode", "normal")
-
-    # ── 2026-06: Per-visit RUT platform override (HMAC-signed) ────────
-    # The RUT engine may append:
-    #    ?_kx_src=<platform>&_kx_sig=<hmac>
-    #    [&_kx_esp=<esp>&_kx_esp_sig=<hmac>]
-    #    [&_kx_brand=<urlencoded_brand>]
-    # to tell us:
-    #   - "for THIS visit only, simulate <platform>" (overrides link's
-    #     static simulate_platform). Verified with HMAC.
-    #   - For email visits, force a specific ESP so the URL params
-    #     (mc_cid vs _kx vs _hsenc) line up with the engine's chosen
-    #     Referer host. Also verified with HMAC.
-    #   - Optional brand identifier (e.g. "acme") that the params
-    #     generator uses to produce brand-tagged UTMs. Not signed —
-    #     worst-case impact is cosmetic.
-    # We strip all five params from `url_params` so the offer never
-    # sees the handshake tokens.
-    _kx_src_was_verified = False  # v2.1.80: gate so link-level pro-referrer
-                                  # only fires for MANUAL clicks (RUT already
-                                  # did its own resolve_pro_visit for signed visits).
-    _kx_tt = None
-    _kx_tt_sig = None
-    try:
-        _kx_src     = (url_params or {}).pop("_kx_src",     None) if isinstance(url_params, dict) else None
-        _kx_sig     = (url_params or {}).pop("_kx_sig",     None) if isinstance(url_params, dict) else None
-        _kx_esp     = (url_params or {}).pop("_kx_esp",     None) if isinstance(url_params, dict) else None
-        _kx_esp_sig = (url_params or {}).pop("_kx_esp_sig", None) if isinstance(url_params, dict) else None
-        _kx_brand   = (url_params or {}).pop("_kx_brand",   None) if isinstance(url_params, dict) else None
-        _kx_tt      = (url_params or {}).pop("_kx_traffic_type", None) if isinstance(url_params, dict) else None
-        _kx_tt_sig  = (url_params or {}).pop("_kx_tt_sig",  None) if isinstance(url_params, dict) else None
-        if isinstance(url_params, dict):
-            for _internal_claim_key in (
-                "_kx_rut_defer", "_kx_rut_defer_sig", "_kx_visit_token"
-            ):
-                url_params.pop(_internal_claim_key, None)
-        if _kx_src and _kx_sig and _kx_src_verify(_kx_src, _kx_sig):
-            simulate_platform = _kx_src
-            _kx_src_was_verified = True
-            # Also drop them from custom_params if echoed there.
-            if isinstance(custom_params, dict):
-                for _k in (
-                    "_kx_src", "_kx_sig", "_kx_esp", "_kx_esp_sig", "_kx_brand",
-                    "_kx_traffic_type", "_kx_tt_sig", "_kx_rut_defer",
-                    "_kx_rut_defer_sig", "_kx_visit_token",
-                ):
-                    custom_params.pop(_k, None)
-            # Force the chosen ESP for email visits if signature checks.
-            if (_kx_src == "email" and _kx_esp and _kx_esp_sig
-                    and _kx_esp_verify(_kx_src, _kx_esp, _kx_esp_sig)):
-                if not isinstance(custom_params, dict):
-                    custom_params = {}
-                custom_params["__force_esp"] = _kx_esp
-            # Brand label is unsigned — only used for UTM cosmetics.
-            if _kx_brand:
-                if not isinstance(custom_params, dict):
-                    custom_params = {}
-                custom_params["__brand"] = str(_kx_brand)[:64]
-    except Exception:
-        # Defensive: never let signal handshake bugs break the redirect.
-        pass
-
-    # ── v2.1.80 — Link-level Pro-Referrer (RUT-style, MANUAL clicks) ──
-    # When the link has `referrer_pro_enabled=True` AND this visit is a
-    # MANUAL click (not a RUT-signed visit that already resolved its
-    # own platform), we run the FULL RUT referrer engine here so the
-    # same link, pasted anywhere by the customer (WhatsApp, IG bio,
-    # email, whatever), produces per-click platform/UTM/click-id
-    # rotation identical to what a RUT job would send.
-    #
-    # Backward compatibility: this whole block is a no-op unless the
-    # customer explicitly enables the toggle on their link. Every
-    # existing link stays on the classic `forced_source`/`simulate_platform`
-    # code path unchanged.
-    pro_wrapper_target = ""  # set below when wrapper_redirect is enabled
-    # v2.1.83 — persisted per-visit values we'll feed into macro
-    # expansion below (Feature 2) even if pro-referrer is OFF (we still
-    # want click_id / country / ip macros to work on classic links).
-    _pro_result: Dict[str, Any] = {}
-    _visit_accept_language = ""
-    # v2.6.29 — RUT signed traffic_type so sub2 / {traffic_type} macros work
-    # on tracker redirects even when resolve_pro_visit is skipped for _kx_src.
-    if _kx_src_was_verified:
-        try:
-            if _kx_tt in ("paid", "organic") and _kx_tt_sig and _kx_traffic_type_verify(str(_kx_tt), str(_kx_tt_sig)):
-                _pro_result = {"traffic_type": str(_kx_tt), "is_paid": (str(_kx_tt) == "paid")}
-        except Exception:
-            pass
-    if (not _kx_src_was_verified) and bool(link.get("referrer_pro_enabled")):
-        try:
-            from referrer_pro import resolve_pro_visit as _rpv, is_inapp_browser_ua as _iiba
-            # v2.1.83 — visitor device sniff for Feature 3 (device match).
-            _ua_low = (user_agent or "").lower()
-            _visitor_is_mobile = ("mobi" in _ua_low or "iphone" in _ua_low or "android" in _ua_low)
-            _pro = _rpv(
-                ua=user_agent or "",
-                platform_pool_value=str(link.get("referrer_pro_platform_pool") or ""),
-                email_weights_value=str(link.get("referrer_pro_email_weights") or ""),
-                brand=str(link.get("referrer_pro_brand") or ""),
-                target_url=destination_url,
-                country=(link.get("referrer_pro_country") or country or None),
-                search_engine=str(link.get("referrer_pro_search_engine") or "google"),
-                search_keywords=str(link.get("referrer_pro_search_keywords") or ""),
-                social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
-                inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
-                strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
-                network_click_chain_enabled=False,
-                network_click_host=None,
-                # v2.1.83 — International guardrail params
-                lang_match=bool(link.get("referrer_pro_lang_match", True)),
-                visitor_is_mobile=_visitor_is_mobile,
-                device_mode=str(link.get("referrer_pro_device_mode") or "auto"),
-                tod_enabled=bool(link.get("referrer_pro_tod_enabled", False)),
-                campaign_type=str(link.get("referrer_pro_campaign_type") or "auto"),
-                traffic_type=str(link.get("referrer_pro_traffic_type") or "auto"),  # v2.6.24
-            )
-            _pro_result = _pro or {}
-            _pro_platform = _pro.get("platform", "")
-            _pro_referer  = _pro.get("referer", "")
-            _visit_accept_language = str(_pro.get("accept_language") or "")
-            if _pro_platform:
-                # Feed the picked platform into the existing UTM / click-id
-                # generator (fbclid / gclid / ttclid / utm_* etc.) — the
-                # same code the manual `simulate_platform` toggle uses.
-                simulate_platform = _pro_platform
-                # Preserve brand so generate_platform_params can produce
-                # branded UTM campaigns.
-                _brand_val = link.get("referrer_pro_brand") or ""
-                if _brand_val:
-                    if not isinstance(custom_params, dict):
-                        custom_params = {}
-                    custom_params.setdefault("__brand", str(_brand_val)[:64])
-                # Email path — forward chosen ESP so URL params (mc_cid,
-                # _kx, _hsenc, ...) match the referer host generate_platform_params picks.
-                _pro_esp = _pro.get("esp", "")
-                if _pro_platform == "email" and _pro_esp:
-                    if not isinstance(custom_params, dict):
-                        custom_params = {}
-                    custom_params.setdefault("__force_esp", _pro_esp)
-            # Wrapper-redirect: instead of a bare 302 to the target, bounce
-            # through the wrapper referer URL (l.facebook.com / google.com/url
-            # / t.co / etc.) so the offer sees a REAL platform Referer header.
-            # The wrapper URL from resolve_pro_visit already embeds the
-            # final target in its `u=` / `q=` param, so the user lands on
-            # the actual offer after one extra hop (~50 ms).
-            #
-            # v2.2.0 (2026-07) — SMART WRAPPER FIX: previously, wrapper
-            # redirects to l.facebook.com/l.php or m.facebook.com/flx/warn
-            # from EXTERNAL cold-click browsers (WhatsApp share, direct
-            # paste, cross-app) triggered Facebook's "Leaving Facebook"
-            # interstitial (2023+ FB security). Same for TikTok's
-            # www.tiktok.com/link/v2 external-click check page.
-            #
-            # Fix: detect cold external clicks (no in-app UA, no referer)
-            # and SKIP the wrapper for warning-trigger domains. In-app
-            # clicks from FB/IG/TT native browsers still get the wrapper
-            # (silently bypassed within-app). fbclid/utm URL params are
-            # still generated in both paths so advertiser attribution
-            # remains 100% intact (modern trackers rely on fbclid, not
-            # Referer). Full explanation in referrer_pro.py header.
-            if bool(link.get("referrer_pro_wrapper_redirect")) and _pro_referer:
-                _skip_wrapper = False
-                try:
-                    _is_inapp = bool(_iiba(user_agent or ""))
-                    _has_social_referer = bool(referrer) and any(
-                        s in (referrer or "").lower()
-                        for s in ("facebook.com", "instagram.com", "tiktok.com",
-                                  "twitter.com", "x.com", "linkedin.com", "t.co")
-                    )
-                    _is_warning_wrapper = any(
-                        s in (_pro_referer or "").lower()
-                        for s in ("l.facebook.com/l.php", "lm.facebook.com/l.php",
-                                  "m.facebook.com/flx", "tiktok.com/link/v2")
-                    )
-                    # Cold click = external browser (not in-app) + no
-                    # social referer. If the wrapper URL is a known
-                    # warning-trigger, skip it and go direct-302.
-                    if _is_warning_wrapper and not _is_inapp and not _has_social_referer:
-                        _skip_wrapper = True
-                        logger.info(
-                            f"[link-pro-referrer] cold-click detected — "
-                            f"skipping warning-trigger wrapper for {short_code}"
-                        )
-                except Exception:
-                    _skip_wrapper = False
-                if not _skip_wrapper:
-                    pro_wrapper_target = _pro_referer
-        except Exception as _pro_err:
-            # Defensive: never let a bad platform_pool string break the
-            # redirect. Fall through to legacy behaviour silently.
-            logger.debug(f"[link-pro-referrer] resolve failed (safe fallback): {_pro_err}")
+    # destination / kx / pro resolved above (v2.7.36 — before click insert)
 
     # ── v2.1.83 Feature 2 — Rich macro expansion (server-wide) ────────
     # We now build ONE macro context dict and expand it in TWO places:
@@ -20473,8 +20411,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         "region":          region or "",
         "ip":              primary_ip_for_storage or client_ip or "",
         "ua":              user_agent or "",
-        "referer":         referrer or "",
-        "referrer":        referrer or "",
+        "referer":         str(_pro_result.get("referer") or _pro_referer or referrer or ""),
+        "referrer":        str(_pro_result.get("referer") or _pro_referer or referrer or ""),
         "utm_source":      str(_pro_result.get("utm_source") or ""),
         "utm_medium":      str(_pro_result.get("utm_medium") or ""),
         "utm_campaign":    str(_pro_result.get("utm_campaign") or ""),
@@ -20691,6 +20629,19 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         except Exception:
             pass
 
+    # v2.7.36 — RUT-parity passthrough params on destination URL
+    try:
+        from referrer_pro import enrich_destination_link_realism as _edlr
+        destination_url = _edlr(
+            destination_url,
+            user_agent=user_agent or "",
+            referer=str(_pro_result.get("referer") or _pro_referer or referrer or ""),
+            accept_language=_visit_accept_language or "",
+            platform=str(_pro_result.get("platform") or simulate_platform or ""),
+        )
+    except Exception:
+        pass
+
     # Set referrer policy based on referrer_mode
     # v2.6.26 — DEFAULT policy is now `unsafe-url` (was: unset → browser
     # default `strict-origin-when-cross-origin`, which stripped Referer to
@@ -20707,6 +20658,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     # `referrer_mode` field: "no_referrer" / "origin" / "strict_origin" /
     # "same_origin" / "unsafe_url" (default).
     headers = {}
+    if _visit_accept_language:
+        headers["Accept-Language"] = _visit_accept_language
     if referrer_mode == "no_referrer":
         headers["Referrer-Policy"] = "no-referrer"
     elif referrer_mode == "origin":
