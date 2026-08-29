@@ -23,6 +23,15 @@ name: Deploy to VPS
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # CI-only edits should not cancel/restart an in-flight VPS deploy.
+      - '.github/workflows/build-electron-desktop.yml'
+      - '.github/workflows/build-windows-release.yml'
+      - '.github/workflows/emergency-vps-runner-recovery.yml'
+      - '.github/workflows/cdn-sync.yml'
+      - '.github/workflows/recover-services.yml'
+      - '.github/workflows/fix-caddy.yml'
+      - '.github/workflows/recover-caddy.yml'
   workflow_dispatch:
 
 # Only one deploy at a time — latest push wins so stacked 2.6.50/51/52
