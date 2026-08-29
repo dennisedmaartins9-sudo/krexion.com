@@ -35,8 +35,8 @@ jobs:
   deploy:
     name: Sync source + rebuild containers
     runs-on: [self-hosted, krexion-vps]
-    # 60 min — docker no-cache can exceed 45m on busy VPS; CDN sync must run.
-    timeout-minutes: 60
+    # 90 min — docker no-cache can exceed 45m on busy VPS.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code via git
@@ -240,6 +240,7 @@ jobs:
 
       - name: Publish native UI sync zip (optional)
         continue-on-error: true
+        timeout-minutes: 8
         env:
           COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
         run: |
@@ -264,15 +265,5 @@ jobs:
           echo "  Deploy complete: $(date -u +%FT%TZ)"
           echo "===================================================="
 
-      # v2.7.36 — Reliable CDN sync from GitHub Release (self-hosted VPS).
-      # Mirror jobs can hang on artifact download; deploy always refreshes
-      # /opt/krexion/downloads/ after every main push.
-      - name: Sync installer CDN from GitHub Release
-        continue-on-error: true
-        timeout-minutes: 30
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          chmod +x scripts/sync_cdn_from_github_release.sh
-          bash scripts/sync_cdn_from_github_release.sh
+      # Installer CDN is synced by .github/workflows/cdn-sync.yml (ubuntu + SCP).
+      # Keeping deploy focused on source + containers avoids 600MB+ downloads on VPS.
