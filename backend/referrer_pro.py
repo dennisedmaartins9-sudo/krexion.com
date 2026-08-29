@@ -238,14 +238,12 @@ _SOCIAL_WRAPPER_REFERERS: Dict[str, List[Tuple[float, str]]] = {
         (0.10, ""),  # in-app webview strip
     ],
     "tiktok": [
-        # 2026-07 v2.2.0 — REBALANCED. www.tiktok.com/link/v2?u= shows a
-        # "You're leaving TikTok" check page on external cold clicks
-        # (2024+ policy). Bare origins + empty referer produce zero
-        # warnings and are still 100% believable via ttclid URL param.
-        (0.12, "https://www.tiktok.com/link/v2?aid=1988&lang=en&u={enc_u}"),
-        (0.50, "https://www.tiktok.com/"),
-        (0.28, "https://m.tiktok.com/"),
-        (0.10, ""),  # in-app deep-link strips referrer
+        # 2026-08 v2.7.39 — NEVER use www.tiktok.com/link/v2 for referer OR bounce.
+        # External cold clicks hit TikTok "Something Wrong" — offer never loads.
+        # Paid/organic pools + ttclid on destination URL carry attribution.
+        (0.55, "https://www.tiktok.com/"),
+        (0.30, "https://m.tiktok.com/"),
+        (0.15, ""),  # in-app / direct strip
     ],
     "twitter": [
         # t.co silently redirects (no interstitial) — safe to keep 85%
@@ -2733,6 +2731,28 @@ def expand_link_macros(text: str, ctx: Dict[str, Any]) -> str:
         "random":          _random_hex_token(8),
         "random16":        _random_hex_token(16),
         "random32":        _random_hex_token(32),
+        "payout":          str(ctx.get("payout") or ctx.get("amount") or ctx.get("revenue") or ""),
+        "amount":          str(ctx.get("amount") or ctx.get("payout") or ctx.get("revenue") or ""),
+        "revenue":         str(ctx.get("revenue") or ctx.get("payout") or ctx.get("amount") or ""),
+        "sale":            str(ctx.get("sale") or ctx.get("payout") or ctx.get("amount") or ""),
+        "sum":             str(ctx.get("sum") or ctx.get("payout") or ctx.get("amount") or ""),
+        "price":           str(ctx.get("price") or ctx.get("payout") or ctx.get("amount") or ""),
+        "commission":      str(ctx.get("commission") or ctx.get("payout") or ""),
+        "adv1":            str(ctx.get("adv1") or ctx.get("payout") or ""),
+        "status":          str(ctx.get("status") or ""),
+        "sub1":            str(ctx.get("sub1") or ""),
+        "sub2":            str(ctx.get("sub2") or ""),
+        "sub3":            str(ctx.get("sub3") or ""),
+        "s1":              str(ctx.get("s1") or ctx.get("sub1") or ""),
+        "s2":              str(ctx.get("s2") or ctx.get("sub2") or ""),
+        "s3":              str(ctx.get("s3") or ctx.get("sub3") or ""),
+        "transaction_id":  str(ctx.get("transaction_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "cid":             str(ctx.get("cid") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "requestid":       str(ctx.get("requestid") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "cnv_id":          str(ctx.get("cnv_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "external_id":     str(ctx.get("external_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "aff_click_id":    str(ctx.get("aff_click_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
+        "subid":           str(ctx.get("subid") or ctx.get("sub1") or ctx.get("click_id") or ""),
     }
     # Do a per-key encoded replace so callers get URL-safe substitution
     # regardless of where in the URL the macro sits (path / query / frag).
@@ -3123,9 +3143,95 @@ def _platform_homepage(platform: str) -> str:
     return _PLATFORM_HOMEPAGES.get(p, "")
 
 
+# Platforms whose link-shims break on external cold clicks (interstitial / error page).
+_WARNING_TRIGGER_WRAPPER_FRAGMENTS: Tuple[str, ...] = (
+    "tiktok.com/link/v2",
+    "l.facebook.com/l.php",
+    "lm.facebook.com/l.php",
+    "l.messenger.com/l.php",
+    "l.instagram.com/",
+    "m.facebook.com/flx",
+    "facebook.com/flx/warn",
+    "youtube.com/redirect",
+    "l.snapchat.com/",
+    "pinterest.com/offsite",
+    "linkedin.com/redir/redirect",
+    "out.reddit.com/",
+    "twitter.com/i/redirect",
+    "x.com/i/redirect",
+)
+
+# Only search-engine shims reliably forward cold external clicks without errors.
+_SAFE_HTTP_BOUNCE_PREFIXES: Tuple[str, ...] = (
+    "https://www.google.com/url?",
+    "https://google.com/url?",
+    "https://www.bing.com/aclick?",
+    "https://bing.com/aclick?",
+)
+
+# Social / video platforms — never HTTP-bounce; use direct 302 + platform params.
+_NO_HTTP_BOUNCE_PLATFORMS = frozenset({
+    "tiktok", "tt", "facebook", "messenger", "instagram",
+    "twitter", "x", "linkedin", "reddit", "youtube", "snapchat",
+    "pinterest", "whatsapp", "telegram", "discord",
+})
+
+
+def is_warning_trigger_wrapper_url(url: str) -> bool:
+    """True when navigating here shows interstitials/errors on external cold clicks."""
+    if not (url or "").strip():
+        return False
+    low = (url or "").lower()
+    return any(frag in low for frag in _WARNING_TRIGGER_WRAPPER_FRAGMENTS)
+
+
+def is_cold_external_link_click(user_agent: str, platform: str) -> bool:
+    """True when the visitor is NOT inside the platform's in-app WebView."""
+    inapp = is_inapp_browser_ua(user_agent or "")
+    if not inapp:
+        return True
+    plat = (platform or "").lower().strip()
+    if plat == "x":
+        plat = "twitter"
+    if inapp == "twitter" and plat in ("twitter", "x"):
+        return False
+    return inapp != plat
+
+
+def is_safe_http_wrapper_bounce(url: str) -> bool:
+    """Whitelist-only: only proven-safe search shims may HTTP-bounce."""
+    if not (url or "").strip():
+        return False
+    if is_warning_trigger_wrapper_url(url):
+        return False
+    low = (url or "").lower()
+    return any(low.startswith(prefix) for prefix in _SAFE_HTTP_BOUNCE_PREFIXES)
+
+
+def should_http_wrapper_bounce(user_agent: str, platform: str, url: str) -> bool:
+    """v2.2.0 cold-click rule: skip warning-trigger shims for external browsers."""
+    if not (url or "").strip():
+        return False
+    if not is_safe_http_wrapper_bounce(url):
+        return False
+    if is_warning_trigger_wrapper_url(url) and is_cold_external_link_click(user_agent, platform):
+        return False
+    return True
+
+
+def platform_supports_http_wrapper_bounce(platform: str) -> bool:
+    """Only Google/Bing search shims support safe HTTP wrapper bounce on link clicks."""
+    p = (platform or "").lower().strip()
+    if p == "x":
+        p = "twitter"
+    return p in ("google", "bing")
+
+
 def _referer_is_bounce_capable(referer: str) -> bool:
     """True when navigating to `referer` can forward the user via u=/url=/q=."""
     if not (referer or "").strip():
+        return False
+    if not is_safe_http_wrapper_bounce(referer):
         return False
     try:
         from urllib.parse import urlparse, parse_qs
@@ -3154,39 +3260,23 @@ def build_wrapper_bounce_url(
     is_paid: bool = True,
 ) -> str:
     """Build a platform URL the browser can open that embeds `destination_url`
-    and forwards the user while preserving a realistic platform Referer."""
+    and forwards the user while preserving a realistic platform Referer.
+
+    Social/video shims (FB l.php, TikTok link/v2, YouTube redirect, etc.)
+    break on external cold clicks — those platforms return "" and rely on
+    direct 302 + fbclid/ttclid/utm params instead."""
     p = (platform or "").lower().strip()
+    if p == "x":
+        p = "twitter"
     dest = (destination_url or "").strip() or "https://example.com/"
     enc = quote_plus(dest)
-    if p == "tiktok":
-        return f"https://www.tiktok.com/link/v2?aid=1988&lang=en&u={enc}"
-    if p in ("facebook", "messenger", "instagram"):
-        h = _rand_fb_h_hash()
-        host = "l.facebook.com" if p != "instagram" else "l.instagram.com"
-        if p == "instagram":
-            return f"https://{host}/?u={enc}&e={_rand_hash(16)}"
-        return f"https://{host}/l.php?u={enc}&h=AT{h}"
-    if p in ("twitter", "x"):
-        host = "x.com" if p == "x" else "twitter.com"
-        return f"https://{host}/i/redirect?url={enc}"
-    if p == "linkedin":
-        return f"https://www.linkedin.com/redir/redirect?url={enc}"
-    if p == "reddit":
-        return f"https://out.reddit.com/?url={enc}&token={_rand_hash(32)}"
-    if p in ("google", "bing", "yahoo", "duckduckgo", "yandex"):
-        if p == "google":
-            return f"https://www.google.com/url?q={enc}"
-        if p == "bing":
-            return f"https://www.bing.com/aclick?u={enc}"
-        return _platform_homepage(p) or f"https://www.google.com/url?q={enc}"
-    if p == "youtube":
-        return f"https://www.youtube.com/redirect?q={enc}&redir_token={_rand_hash(16)}"
-    if p == "pinterest":
-        return f"https://www.pinterest.com/offsite/?url={enc}"
-    home = _platform_homepage(p)
-    if home:
-        return home
-    return f"https://www.tiktok.com/link/v2?aid=1988&lang=en&u={enc}"
+    if p in _NO_HTTP_BOUNCE_PLATFORMS:
+        return ""
+    if p == "google":
+        return f"https://www.google.com/url?q={enc}"
+    if p == "bing":
+        return f"https://www.bing.com/aclick?u={enc}"
+    return ""
 
 
 def ensure_wrapper_bounce_url(
@@ -3195,9 +3285,12 @@ def ensure_wrapper_bounce_url(
     destination_url: str,
     is_paid: bool = True,
 ) -> str:
+    if not platform_supports_http_wrapper_bounce(platform):
+        return ""
     if _referer_is_bounce_capable(referer):
         return referer
-    return build_wrapper_bounce_url(platform, destination_url, is_paid)
+    built = build_wrapper_bounce_url(platform, destination_url, is_paid)
+    return built if is_safe_http_wrapper_bounce(built) else ""
 
 
 def ensure_non_empty_referer(
@@ -3786,7 +3879,8 @@ def prepare_link_pro_click(
                 destination_url,
                 is_paid=bool((pro or {}).get("is_paid")),
             )
-            if bounce:
+            _bounce_ua = out.get("user_agent") or ua
+            if bounce and should_http_wrapper_bounce(_bounce_ua, plat, bounce):
                 referer = bounce
                 out["referer"] = referer
                 out["wrapper_target"] = bounce
@@ -3838,6 +3932,11 @@ __all__ = [
     "ensure_non_empty_referer",
     "ensure_wrapper_bounce_url",
     "build_wrapper_bounce_url",
+    "is_safe_http_wrapper_bounce",
+    "is_warning_trigger_wrapper_url",
+    "is_cold_external_link_click",
+    "should_http_wrapper_bounce",
+    "platform_supports_http_wrapper_bounce",
     "detect_is_paid",
     "apply_organic_platform_param_override",
     "normalize_link_pro_settings",

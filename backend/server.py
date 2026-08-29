@@ -295,6 +295,7 @@ def get_db_for_user(user: dict):
 from click_scope import (
     apply_click_created_at_filter,
     build_user_clicks_scope_query,
+    completed_click_status_filter,
     merge_click_filters,
 )
 # Each user has their own MongoDB database (`krexion_user_<id>`). The
@@ -2682,6 +2683,12 @@ class ClickResponse(BaseModel):
     sub1: Optional[str] = None
     sub2: Optional[str] = None
     sub3: Optional[str] = None
+    click_status: Optional[str] = None
+    conversion_page_reached: Optional[bool] = None
+    conversion_recorded: Optional[bool] = None
+    conversion_source: Optional[str] = None
+    visit_status: Optional[str] = None
+    final_url: Optional[str] = None
     created_at: str = ""
 
 class ConversionResponse(BaseModel):
@@ -2691,6 +2698,7 @@ class ConversionResponse(BaseModel):
     link_id: str
     payout: float
     status: str
+    source: Optional[str] = None
     ip_address: str
     created_at: str
 
@@ -11800,6 +11808,7 @@ async def import_clicks_from_ips(
                 "sub1": None,
                 "sub2": None,
                 "sub3": None,
+                "click_status": "completed",
                 "created_at": now
             })
         
@@ -11979,6 +11988,7 @@ async def import_bulk_clicks(
                 "sub1": click_data.get("sub1"),
                 "sub2": click_data.get("sub2"),
                 "sub3": click_data.get("sub3"),
+                "click_status": "completed",
                 # Spread timestamps across last hour for realistic distribution
                 "created_at": (now - timedelta(seconds=i * 30)).isoformat()
             }
@@ -16115,28 +16125,45 @@ async def qa_check_link(link_id: str, user: dict = Depends(get_current_user_with
             "status": "info", "detail": "Single URL (no A/B)",
         })
 
-    # 8. Postback URL
+    # 8. Outbound postback URL + macro validation
     pb = str(link.get("postback_url") or "").strip()
-    if pb:
-        checks.append({
-            "id": "postback", "label": "Outbound S2S postback",
-            "status": "pass",
-            "detail": f"→ {pb[:80]}{'…' if len(pb) > 80 else ''}",
-        })
-    else:
-        checks.append({
-            "id": "postback", "label": "Outbound S2S postback",
-            "status": "info", "detail": "Not set (fine for direct offers)",
-        })
-
-    # 9. Wrapper redirect (extra realism)
+    try:
+        from postback_module import validate_outbound_postback_url
+        _pb_val = validate_outbound_postback_url(pb)
+    except Exception:
+        _pb_val = {"ok": bool(pb), "status": "pass" if pb else "info", "detail": pb or "Not set"}
     checks.append({
-        "id": "wrapper", "label": "Wrapper redirect (l.facebook.com / google.com/url / t.co)",
-        "status": "pass" if link.get("referrer_pro_wrapper_redirect") else "warn",
-        "detail": "ON — premium networks like it" if link.get("referrer_pro_wrapper_redirect") else "OFF — enable for MaxBounty / Cake top tier",
+        "id": "postback_outbound",
+        "label": "Outbound tracker postback (Voluum/Everflow/etc.)",
+        "status": _pb_val.get("status") if _pb_val.get("status") in ("pass", "warn", "info", "missing") else ("pass" if _pb_val.get("ok") else "warn"),
+        "detail": _pb_val.get("detail") or (pb[:80] if pb else "Not set — fine for direct offers"),
     })
 
-    # 10. Auto-pause
+    # 9. Inbound postback (offer network → Krexion)
+    _api_base = (APP_URL or "https://krexion.com").rstrip("/")
+    _token_ok = POSTBACK_TOKEN != "secure-postback-token-123"
+    checks.append({
+        "id": "postback_inbound",
+        "label": "Inbound S2S postback (offer → Krexion)",
+        "status": "pass" if _token_ok else "warn",
+        "detail": (
+            f"Configure on offer network · token={'custom ✅' if _token_ok else 'DEFAULT ⚠️ set POSTBACK_TOKEN in .env'}"
+        ),
+    })
+
+    # 10. Wrapper redirect (v2.7.40 — social shims disabled on cold clicks)
+    _wrap_on = bool(link.get("referrer_pro_wrapper_redirect"))
+    checks.append({
+        "id": "wrapper", "label": "Referrer engine + platform params",
+        "status": "pass" if _wrap_on else "info",
+        "detail": (
+            "ON — Google/Bing safe bounce + platform params (fbclid/ttclid/utm)"
+            if _wrap_on else
+            "OFF — direct 302 with platform params only (safe for all social platforms)"
+        ),
+    })
+
+    # 11. Auto-pause
     if bool(link.get("referrer_pro_auto_pause_enabled")):
         thresh = int(link.get("referrer_pro_auto_pause_threshold") or 10)
         streak = int(link.get("consecutive_no_conversions") or 0)
@@ -16207,6 +16234,11 @@ async def qa_check_link(link_id: str, user: dict = Depends(get_current_user_with
     _passes = sum(1 for c in checks if c["status"] == "pass")
     _warns = sum(1 for c in checks if c["status"] == "warn")
     _score = round((_passes / max(1, len(checks))) * 100, 1)
+    try:
+        from postback_module import build_inbound_postback_urls
+        _postback_setup = build_inbound_postback_urls(_api_base)
+    except Exception:
+        _postback_setup = {}
     return {
         "ok": True,
         "link_id": link_id,
@@ -16217,6 +16249,8 @@ async def qa_check_link(link_id: str, user: dict = Depends(get_current_user_with
         "total_checks": len(checks),
         "checks": checks,
         "samples": samples,
+        "postback_setup": _postback_setup,
+        "inbound_postback_url": (_postback_setup or {}).get("primary_get", ""),
         "last_postback_fired_at": link.get("last_postback_fired_at"),
         "last_postback_status_code": link.get("last_postback_status_code"),
         "consecutive_no_conversions": int(link.get("consecutive_no_conversions") or 0),
@@ -16293,11 +16327,16 @@ async def get_link_believability(link_id: str, user: dict = Depends(get_current_
                     "set_keywords", "Add 3-5 search keywords (+3%)",
                     {})
 
-    # Wrapper redirect intelligence (v2.2.0 warning-fix aware)
+        # Outbound postback for tracker attribution
+        if not str(link.get("postback_url") or "").strip():
+            _deduct(5, "No outbound postback URL — Voluum/Everflow won't receive conversions",
+                    "set_postback", "Add outbound postback URL (+5%)",
+                    {"postback_url": "https://YOUR-TRACKER.com/postback?click_id={click_id}&payout={payout}"})
+
+    # Wrapper redirect intelligence (v2.7.40 — social HTTP bounce disabled)
     if not link.get("referrer_pro_wrapper_redirect"):
-        # Warn only mildly — v2.2.0 cold-click fix means direct-302 is now fine
-        _deduct(2, "Wrapper redirect OFF — Premium networks (MaxBounty/Cake) score slightly lower without it. Cold clicks now bypass wrappers automatically in v2.2.0.",
-                "enable_wrapper", "Enable Wrapper redirect chain (+2%)",
+        _deduct(1, "Wrapper redirect OFF — direct 302 + platform params is the safe default since v2.7.40 (no TikTok/FB error pages).",
+                "enable_wrapper", "Enable Referrer engine wrapper (+1%)",
                 {"referrer_pro_wrapper_redirect": True})
 
     # Force-hide negatives if link is disabled
@@ -16328,7 +16367,7 @@ async def get_link_believability(link_id: str, user: dict = Depends(get_current_
         "color": color,
         "reasons": reasons,
         "fixes": fixes,
-        "version": "v2.2.0",
+        "version": "v2.7.43",
     }
 
 
@@ -16393,7 +16432,7 @@ async def apply_perfect_preset(link_id: str, preset: Dict[str, Any], user: dict 
             "referrer_pro_device_mode": "mobile_only",
             "referrer_pro_social_wrapper": True,
             "referrer_pro_inapp_deep_path": True,
-            "referrer_pro_wrapper_redirect": True,  # v2.7.36: TT link/v2 wrapper (RUT parity)
+            "referrer_pro_wrapper_redirect": True,  # referer pools ON; TikTok HTTP bounce disabled (v2.7.39)
             "referrer_pro_campaign_type": "video_ad",
         },
         "google_ads": {
@@ -16568,8 +16607,9 @@ async def import_clicks(request: Request, user: dict = Depends(get_current_user_
                     "device": click_data.get("device") or "desktop",
                     "sub1": click_data.get("sub1"),
                     "sub2": click_data.get("sub2"),
-                    "sub3": click_data.get("sub3"),
-                    "created_at": click_data.get("created_at") or datetime.now(timezone.utc).isoformat()
+                "sub3": click_data.get("sub3"),
+                "click_status": "completed",
+                "created_at": click_data.get("created_at") or datetime.now(timezone.utc).isoformat()
                 }
                 
                 imported_clicks.append(click_doc)
@@ -16847,7 +16887,7 @@ async def get_clicks(
     user_links = await db.links.find(link_query, {"_id": 0, "id": 1, "short_code": 1}).to_list(1000000)
     
     scope = build_user_clicks_scope_query(user, user_links, link_id=link_id)
-    query = merge_click_filters(scope, {"click_status": "completed"})
+    query = merge_click_filters(scope, completed_click_status_filter())
     
     # Date filtering
     created_at: dict = {}
@@ -16970,7 +17010,7 @@ async def get_clicks_count(
     user_links = await db.links.find({"user_id": user["id"]}, {"_id": 0, "id": 1, "short_code": 1}).to_list(100000)
     
     scope = build_user_clicks_scope_query(user, user_links, link_id=link_id)
-    query = merge_click_filters(scope, {"click_status": "completed"})
+    query = merge_click_filters(scope, completed_click_status_filter())
     
     # ── Date filter: explicit range wins over filter_type ──────────────
     applied_explicit = False
@@ -17395,169 +17435,135 @@ async def get_conversions(user: dict = Depends(get_current_user), limit: int = 1
     conversions = await db.conversions.find({"link_id": {"$in": link_ids}}, {"_id": 0}).sort("created_at", -1).to_list(limit)
     return [ConversionResponse(**conv) for conv in conversions]
 
+@api_router.get("/postback/info")
+async def postback_international_info(user: dict = Depends(get_current_user)):
+    """International postback catalog — inbound/outbound URLs and supported networks."""
+    check_user_feature(user, "conversions")
+    from postback_module import get_postback_international_catalog
+    base = (APP_URL or "https://krexion.com").rstrip("/")
+    out = get_postback_international_catalog(base)
+    out["token_configured"] = POSTBACK_TOKEN != "secure-postback-token-123"
+    return out
+
+
 async def find_click_across_dbs(clickid: str):
-    """Find a click by click_id across the main DB and all per-user DBs.
-    Returns (click_doc, source_db) or (None, None) if not found.
-    Clicks are normally written to user-specific DBs (krexion_user_*) by the
-    redirect handler, so a simple lookup on main_db is not sufficient.
-    """
-    # 1. Legacy/main DB first (fast path)
-    click = await db.clicks.find_one({"click_id": clickid}, {"_id": 0})
-    if click:
-        return click, db
-    # 2. Scan per-user databases
+    """Find a click by click_id across the main DB and all per-user DBs."""
+    from conversion_module import find_click_across_dbs as _find
+    return await _find(db, client, clickid)
+
+
+async def _merge_request_postback_params(request: Request) -> Dict[str, Any]:
+    """Merge query string, form body, and JSON body for universal network postbacks."""
+    merged: Dict[str, Any] = dict(request.query_params)
     try:
-        all_db_names = await client.list_database_names()
-        for name in all_db_names:
-            if not name.startswith("krexion_user_"):
-                continue
-            user_db_instance = client[name]
-            click = await user_db_instance.clicks.find_one({"click_id": clickid}, {"_id": 0})
-            if click:
-                return click, user_db_instance
-    except Exception as e:
-        logger.warning(f"Error scanning user DBs for click {clickid}: {e}")
-    return None, None
+        form = await request.form()
+        for k, v in form.items():
+            if k not in merged or not str(merged.get(k) or "").strip():
+                merged[k] = v
+    except Exception:
+        pass
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            for k, v in body.items():
+                if k not in merged or not str(merged.get(k) or "").strip():
+                    merged[k] = v
+    except Exception:
+        pass
+    return merged
+
+
+async def _handle_inbound_postback(params: Dict[str, Any]) -> Dict[str, Any]:
+    from postback_module import parse_inbound_postback
+    from conversion_module import record_conversion as _record_conv
+
+    parsed = parse_inbound_postback(params)
+    if parsed.get("token") != POSTBACK_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    click_id = str(parsed.get("click_id") or "").strip()
+    if not click_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing click identifier — use clickid, click_id, transaction_id, "
+                "sub1, cid, or any supported network alias"
+            ),
+        )
+
+    payout = float(parsed.get("payout") or 0)
+    status = str(parsed.get("status") or "approved")
+    result = await _record_conv(
+        db, client, click_id, payout,
+        status=status, source="postback", forward_outbound=True,
+    )
+    if result.get("duplicate"):
+        return {
+            "message": "Conversion already recorded",
+            "conversion_id": result.get("conversion_id"),
+            "duplicate": True,
+        }
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail="Click not found")
+    return {"message": "Conversion recorded", "conversion_id": result["conversion_id"]}
+
 
 @api_router.get("/postback")
-async def postback(clickid: str, payout: float, status: str = "approved", token: str = ""):  # noqa: F811 - `status` is the postback API's query key, intentional shadow of fastapi.status
-    if token != POSTBACK_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
-    click, _ = await find_click_across_dbs(clickid)
-    if not click:
-        raise HTTPException(status_code=404, detail="Click not found")
-    
-    existing = await db.conversions.find_one({"click_id": clickid})
-    if existing:
-        raise HTTPException(status_code=400, detail="Conversion already recorded")
-    
-    conversion_doc = {
-        "id": str(uuid.uuid4()),
-        "click_id": clickid,
-        "link_id": click["link_id"],
-        "payout": payout,
-        "status": status,
-        "ip_address": click.get("ip_address", "unknown"),
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.conversions.insert_one(conversion_doc)
-    await db.links.update_one(
-        {"id": click["link_id"]},
-        {
-            "$inc": {"conversions": 1, "revenue": payout},
-            # v2.1.83 Feature 10 — a conversion resets the non-converting
-            # streak so we DON'T auto-pause a link that's still working.
-            "$set": {"consecutive_no_conversions": 0},
-        },
-    )
+async def postback(
+    request: Request,
+    clickid: str = "",
+    payout: float = 0,
+    status: str = "approved",
+    token: str = "",
+):  # noqa: F811
+    params = await _merge_request_postback_params(request)
+    if clickid and "clickid" not in params and "click_id" not in params:
+        params.setdefault("clickid", clickid)
+    if payout and "payout" not in params and "amount" not in params:
+        params.setdefault("payout", payout)
+    if status and "status" not in params:
+        params.setdefault("status", status)
+    if token and "token" not in params:
+        params.setdefault("token", token)
+    return await _handle_inbound_postback(params)
 
-    # v2.1.83 Feature 8 — Outbound S2S postback forwarding. If the link
-    # owner has set `postback_url` on the link (e.g. Voluum / Everflow /
-    # HasOffers / Cake tracker), we fire a GET to it with macros
-    # substituted. Non-blocking (asyncio task) so the response to the
-    # offer network stays fast. Silent on network errors — the customer
-    # can see the last delivery status via the QA-check endpoint.
-    try:
-        _link = await db.links.find_one({"id": click["link_id"]}, {"_id": 0})
-        _pb_url = str((_link or {}).get("postback_url") or "").strip()
-        if _pb_url:
-            from referrer_pro import expand_link_macros as _exp_macros
-            _pb_ctx = {
-                "click_id":     clickid,
-                "clickid":      clickid,
-                "payout":       str(payout),
-                "revenue":      str(payout),
-                "status":       status,
-                "source":       str((click.get("referrer_source") or "")),
-                "source_name":  str((click.get("referrer_source_name") or "")),
-                "country":      str(click.get("country") or ""),
-                "city":         str(click.get("city") or ""),
-                "ip":           str(click.get("ip_address") or ""),
-                "ua":           str(click.get("user_agent") or ""),
-                "campaign":     str(click.get("utm_campaign") or ""),
-                "brand":        str((_link or {}).get("referrer_pro_brand") or ""),
-            }
-            # Expand macros. `expand_link_macros` supports `{payout}` too
-            # via the ctx map (we added it above; unknown keys pass
-            # through untouched).
-            _final_pb = _exp_macros(_pb_url, _pb_ctx)
-            # Also expand a lightweight custom set (payout) that
-            # expand_link_macros' default map doesn't include.
-            from urllib.parse import quote as _q
-            _final_pb = _final_pb.replace("{payout}", _q(str(payout), safe=""))
-            _final_pb = _final_pb.replace("{revenue}", _q(str(payout), safe=""))
-            _final_pb = _final_pb.replace("{status}", _q(str(status), safe=""))
 
-            async def _fire_pb(url: str):
-                try:
-                    import httpx
-                    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as ac:
-                        r = await ac.get(url)
-                        logger.info(f"[postback-forward] {url[:120]}... → {r.status_code}")
-                        try:
-                            await db.links.update_one(
-                                {"id": click["link_id"]},
-                                {"$set": {
-                                    "last_postback_fired_at": datetime.now(timezone.utc).isoformat(),
-                                    "last_postback_status_code": r.status_code,
-                                    "last_postback_url": url[:512],
-                                }},
-                            )
-                        except Exception:
-                            pass
-                except Exception as _pbe:
-                    logger.warning(f"[postback-forward] failed: {_pbe}")
-                    try:
-                        await db.links.update_one(
-                            {"id": click["link_id"]},
-                            {"$set": {
-                                "last_postback_fired_at": datetime.now(timezone.utc).isoformat(),
-                                "last_postback_status_code": -1,
-                                "last_postback_error": str(_pbe)[:200],
-                            }},
-                        )
-                    except Exception:
-                        pass
+@api_router.post("/postback")
+async def postback_post(request: Request):
+    """POST S2S postback — Everflow, HasOffers, Affise, and others often use POST."""
+    params = await _merge_request_postback_params(request)
+    return await _handle_inbound_postback(params)
 
-            asyncio.create_task(_fire_pb(_final_pb))
-    except Exception as _pb_outer:
-        logger.debug(f"[postback-forward] setup skipped: {_pb_outer}")
-
-    return {"message": "Conversion recorded", "conversion_id": conversion_doc["id"]}
 
 @api_router.get("/pixel")
-async def pixel_tracking(clickid: str, payout: float):
-    click, _ = await find_click_across_dbs(clickid)
-    if not click:
-        return Response(content="", media_type="image/gif")
-    
-    existing = await db.conversions.find_one({"click_id": clickid})
-    if existing:
-        return Response(content="", media_type="image/gif")
-    
-    conversion_doc = {
-        "id": str(uuid.uuid4()),
-        "click_id": clickid,
-        "link_id": click["link_id"],
-        "payout": payout,
-        "status": "approved",
-        "ip_address": click.get("ip_address", "unknown"),
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.conversions.insert_one(conversion_doc)
-    await db.links.update_one(
-        {"id": click["link_id"]},
-        {
-            "$inc": {"conversions": 1, "revenue": payout},
-            # v2.1.83 Feature 10 — reset the auto-pause streak on
-            # conversion so a healthy link never gets paused.
-            "$set": {"consecutive_no_conversions": 0},
-        },
-    )
-    
+async def pixel_tracking(
+    request: Request,
+    clickid: str = "",
+    payout: float = 0,
+    token: str = "",
+):
+    params = await _merge_request_postback_params(request)
+    if clickid:
+        params.setdefault("clickid", clickid)
+    if payout:
+        params.setdefault("payout", payout)
+    if token:
+        params.setdefault("token", token)
+    try:
+        await _handle_inbound_postback(params)
+    except HTTPException:
+        pass
+    pixel = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
+    return Response(content=pixel, media_type="image/gif")
+
+
+@api_router.post("/pixel")
+async def pixel_tracking_post(request: Request):
+    params = await _merge_request_postback_params(request)
+    try:
+        await _handle_inbound_postback(params)
+    except HTTPException:
+        pass
     pixel = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
     return Response(content=pixel, media_type="image/gif")
 
@@ -17573,15 +17579,16 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     user_links = await db.links.find(link_query, {"_id": 0, "id": 1, "short_code": 1}).to_list(100000)
     scope = build_user_clicks_scope_query(user, user_links)
-    
+    scope_completed = merge_click_filters(scope, completed_click_status_filter())
+
     # Count clicks from BOTH user_db and main db (legacy data)
-    user_db_clicks = await user_db.clicks.count_documents(scope)
-    main_db_clicks = await db.clicks.count_documents(scope)
+    user_db_clicks = await user_db.clicks.count_documents(scope_completed)
+    main_db_clicks = await db.clicks.count_documents(scope_completed)
     total_clicks = user_db_clicks + main_db_clicks
-    
+
     # Get unique IPs from both databases
-    user_db_ips = await user_db.clicks.distinct("ip_address", scope)
-    main_db_ips = await db.clicks.distinct("ip_address", scope)
+    user_db_ips = await user_db.clicks.distinct("ip_address", scope_completed)
+    main_db_ips = await db.clicks.distinct("ip_address", scope_completed)
     unique_ips = set(user_db_ips + main_db_ips)
     unique_clicks = len(unique_ips)
     
@@ -17596,7 +17603,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     # Aggregate clicks by country from user_db
     clicks_by_country = await user_db.clicks.aggregate([
-        {"$match": scope},
+        {"$match": scope_completed},
         {"$group": {"_id": "$country", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
         {"$limit": 10}
@@ -17604,13 +17611,13 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     # Aggregate clicks by device from user_db
     clicks_by_device = await user_db.clicks.aggregate([
-        {"$match": scope},
+        {"$match": scope_completed},
         {"$group": {"_id": "$device", "count": {"$sum": 1}}}
     ]).to_list(10)
-    
+
     # Aggregate clicks by date from user_db
     clicks_by_date = await user_db.clicks.aggregate([
-        {"$match": scope},
+        {"$match": scope_completed},
         {"$group": {
             "_id": {"$substr": ["$created_at", 0, 10]},
             "count": {"$sum": 1}
@@ -19200,6 +19207,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             "proxy_ips": 1,
             "browser_fingerprint": 1,
             "link_id": 1,
+            "created_at": 1,
         }
         try:
             existing_click = await user_db.clicks.find_one(duplicate_query, _DUP_PROJECTION)
@@ -19419,10 +19427,21 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             except Exception as _claim_err:
                 logger.warning(f"[dup-check] same-second IP claim failed: {_claim_err}")
     
-    # Get timer settings for display (NOT for checking duplicates)
+    # Get timer settings — when enabled, re-allow same IP after N seconds
     timer_enabled = link.get("duplicate_timer_enabled", False)
-    timer_seconds = link.get("duplicate_timer_seconds", 5)
-    
+    timer_seconds = max(1, int(link.get("duplicate_timer_seconds", 5) or 5))
+
+    if existing_click and timer_enabled:
+        try:
+            _created_raw = str(existing_click.get("created_at") or "").strip()
+            if _created_raw:
+                _created_dt = datetime.fromisoformat(_created_raw.replace("Z", "+00:00"))
+                _elapsed = (datetime.now(timezone.utc) - _created_dt).total_seconds()
+                if _elapsed >= timer_seconds:
+                    existing_click = None
+        except Exception as _timer_err:
+            logger.debug(f"[dup-check] duplicate timer parse skipped: {_timer_err}")
+
     if existing_click:
         # Found duplicate - STRICTLY BLOCK - NO ACCESS AT ALL
         # 2026-02 — pick the ACTUAL matched IP out of whichever field
@@ -20333,6 +20352,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             "browser_fp": browser_fp or None,
             "cookie_token": expected_cookie_token,
         },
+        "click_status": "completed",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     
@@ -20686,18 +20706,27 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     _final_redirect_url = destination_url
     if pro_wrapper_target:
         try:
-            # Re-write the wrapper's inner target to the FULLY
-            # decorated destination_url (with fbclid/gclid/utm_* etc.
-            # already merged in above) so the offer sees params AND a
-            # real wrapper Referer.
-            from referrer_pro import rebuild_referer_with_target as _rrwt
-            _rebuilt = _rrwt(pro_wrapper_target, destination_url)
-            if _rebuilt:
-                _final_redirect_url = _rebuilt
-            # Wrapper flow must NOT strip the referrer — the whole point
-            # is the wrapper domain becomes the Referer.
-            headers.pop("Referrer-Policy", None)
-            headers["Referrer-Policy"] = "unsafe-url"
+            from referrer_pro import (
+                rebuild_referer_with_target as _rrwt,
+                should_http_wrapper_bounce,
+            )
+            if should_http_wrapper_bounce(user_agent, _pro_platform, pro_wrapper_target):
+                # Re-write the wrapper's inner target to the FULLY
+                # decorated destination_url (with fbclid/gclid/utm_* etc.
+                # already merged in above) so the offer sees params AND a
+                # real wrapper Referer.
+                _rebuilt = _rrwt(pro_wrapper_target, destination_url)
+                if _rebuilt:
+                    _final_redirect_url = _rebuilt
+                # Wrapper flow must NOT strip the referrer — the whole point
+                # is the wrapper domain becomes the Referer.
+                headers.pop("Referrer-Policy", None)
+                headers["Referrer-Policy"] = "unsafe-url"
+            else:
+                logger.info(
+                    f"[/r/{short_code}] unsafe wrapper skipped "
+                    f"— direct 302 with platform params (platform={_pro_platform or '?'})"
+                )
         except Exception as _wrap_err:
             logger.debug(f"[link-pro-referrer] wrapper rebuild failed (safe fallback to direct 302): {_wrap_err}")
             _final_redirect_url = destination_url
@@ -26651,24 +26680,34 @@ async def startup_db_indexes():
     # app yet.
     async def _ensure_playwright_chromium():
         try:
-            from real_user_traffic import _ensure_chromium_available, get_engine_status
+            from real_user_traffic import (
+                _ensure_chromium_available,
+                _ensure_full_chromium_available,
+                get_engine_status,
+                normalize_playwright_browsers_path,
+            )
+            normalize_playwright_browsers_path()
             info = get_engine_status()
             if info.get("status") == "ready":
                 logger.info(
                     f"Playwright chromium-headless-shell already present "
                     f"(rev {info.get('expected_revision')}) — skipping install."
                 )
-                return
-            logger.warning(
-                f"Playwright chromium-headless-shell not ready "
-                f"(status={info.get('status')}, rev={info.get('expected_revision')}) "
-                f"— installing now in background."
-            )
-            ok = await _ensure_chromium_available()
-            if ok:
-                logger.info("Playwright chromium-headless-shell install: OK")
             else:
-                logger.warning("Playwright chromium-headless-shell install FAILED")
+                logger.warning(
+                    f"Playwright chromium-headless-shell not ready "
+                    f"(status={info.get('status')}, rev={info.get('expected_revision')}) "
+                    f"— installing now in background."
+                )
+                ok = await _ensure_chromium_available()
+                if ok:
+                    logger.info("Playwright chromium-headless-shell install: OK")
+                else:
+                    logger.warning("Playwright chromium-headless-shell install FAILED")
+            # Native/desktop: also warm full chromium for headed profile launch.
+            _mode = (os.environ.get("KREXION_MODE") or "").lower().strip()
+            if _mode in ("native", "local", "desktop"):
+                await _ensure_full_chromium_available()
         except Exception as e:
             logger.warning(f"Playwright install startup hook failed (non-fatal): {e}")
 

@@ -231,7 +231,7 @@ export default function DownloadPage() {
               <div className="flex-1">
                 <div className="text-[10px] uppercase tracking-wider opacity-70 font-bold mb-0.5">Recommended for heavy jobs</div>
                 <div className="text-base font-bold leading-tight">Download for Windows</div>
-                <div className="text-[11px] opacity-80 mt-0.5 font-normal">Native installer · ~571 MB · 64-bit</div>
+                <div className="text-[11px] opacity-80 mt-0.5 font-normal">Native installer · v{installerVersion} · ~571 MB · 64-bit</div>
               </div>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-hover:translate-y-0.5 transition-transform"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </div>
@@ -252,7 +252,7 @@ export default function DownloadPage() {
               <div className="flex-1">
                 <div className="text-[10px] uppercase tracking-wider opacity-70 font-bold mb-0.5 text-[#A1A1AA]">Cross-platform · Auto-update</div>
                 <div className="text-base font-bold leading-tight">Download for Mac / Linux</div>
-                <div className="text-[11px] opacity-70 mt-0.5 font-normal">Electron build · ~579 MB · auto-updates silently</div>
+                <div className="text-[11px] opacity-70 mt-0.5 font-normal">Electron build · v{installerVersion} · ~579 MB · auto-updates</div>
               </div>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-hover:translate-y-0.5 transition-transform"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </div>

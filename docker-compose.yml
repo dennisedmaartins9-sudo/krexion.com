@@ -214,6 +214,7 @@ services:
         # service. Same-origin = no CORS headaches, no host-specific
         # build, no rebuild needed when moving between PCs.
         REACT_APP_BACKEND_URL: ""
+        KREXION_VERSION: ${KREXION_VERSION:-0.0.0}
     container_name: krexion-frontend
     restart: unless-stopped
     depends_on:

@@ -143,6 +143,55 @@ def is_newer(remote: str, local: str) -> bool:
     return _parse(remote) > _parse(local)
 
 
+def _github_native_download_url(version: str) -> str:
+    """Stable GitHub Releases asset URL for the native Windows installer."""
+    ver = (version or "").strip().lstrip("vV")
+    repo = os.environ.get("GITHUB_REPOSITORY", "krexion-com-final/krexion.com-final")
+    return (
+        f"https://github.com/{repo}/releases/download/v{ver}/"
+        f"Krexion-Setup-v{ver}.exe"
+    )
+
+
+async def sync_deployed_release_record() -> dict[str, Any]:
+    """Upsert a published release row matching backend/VERSION after VPS deploy.
+
+    Keeps /download, /api/system/installer-info, and customer update banners
+    aligned with the live CDN without manual Quick Publish.
+    """
+    ver = current_version().strip().lstrip("vV")
+    if not ver or ver == "0.0.0":
+        return {"ok": False, "reason": "no_version"}
+    if _db is None:
+        return {"ok": False, "reason": "db_unbound"}
+
+    download_url = _github_native_download_url(ver)
+    payload = {
+        "version": ver,
+        "title": f"Krexion {ver}",
+        "notes": f"Live on krexion.com — native + desktop CDN synced for v{ver}.",
+        "severity": "recommended",
+        "download_url": download_url,
+        "published": True,
+        "source": "deploy-sync",
+        "updated_at": _now_iso(),
+    }
+    existing = await _db.app_releases.find_one({"version": ver}, {"_id": 0, "id": 1})
+    if existing:
+        await _db.app_releases.update_one({"version": ver}, {"$set": payload})
+        release_id = existing.get("id")
+    else:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "created_at": _now_iso(),
+            **payload,
+        }
+        await _db.app_releases.insert_one(doc)
+        release_id = doc["id"]
+    logger.info("[releases] deploy-sync v%s (id=%s)", ver, release_id)
+    return {"ok": True, "version": ver, "id": release_id, "download_url": download_url}
+
+
 def _bump_patch(version: str) -> str:
     """Bump the patch component of a semver version (1.0.4 → 1.0.5)."""
     major, minor, patch = _parse(version)
@@ -705,7 +754,36 @@ def _build_customer_endpoints(get_user_dep):
             "min_windows": "Windows 10 64-bit",
           }
         """
-        # Find the newest published release that ships a `.exe` download.
+        # Cloud VPS deploy always updates backend/VERSION — that is the
+        # download-page source of truth (CDN *-latest.exe mirrors match).
+        file_ver = current_version().strip().lstrip("vV")
+        if file_ver and file_ver != "0.0.0":
+            size_bytes = None
+            released_at = None
+            try:
+                if _db is not None:
+                    rel = await _db.app_releases.find_one(
+                        {"published": True, "version": file_ver},
+                        projection={
+                            "_id": 0,
+                            "installer_size_bytes": 1,
+                            "created_at": 1,
+                            "updated_at": 1,
+                        },
+                    )
+                    if rel:
+                        size_bytes = rel.get("installer_size_bytes") or None
+                        released_at = rel.get("updated_at") or rel.get("created_at")
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "kind": "native-exe",
+                "version": file_ver,
+                "size_bytes": size_bytes,
+                "min_windows": "Windows 10 64-bit",
+                "released_at": released_at,
+            }
+        # Legacy fallback when VERSION missing (should not happen on cloud).
         try:
             rel = await _db.app_releases.find_one(
                 {"published": True, "download_url": {"$regex": r"\.exe(\?|$)"}},
@@ -722,29 +800,6 @@ def _build_customer_endpoints(get_user_dep):
                 "min_windows": "Windows 10 64-bit",
                 "released_at": rel.get("created_at"),
             }
-        # 2026-02 — Self-hosted Electron Desktop fallback. Even when no
-        # admin-curated release row exists yet, we always advertise the
-        # Electron Desktop installer that the build workflow has SCPed
-        # to https://krexion.com/downloads/desktop/. This means a fresh
-        # VPS deploy serves the latest Krexion build to customers from
-        # day one, no manual admin action required.
-        try:
-            current_version = (VERSION_FILE.read_text(encoding="utf-8").strip()
-                               if VERSION_FILE.exists() else "")
-        except Exception:  # noqa: BLE001
-            current_version = ""
-        if current_version:
-            return {
-                "kind": "native-exe",
-                "version": current_version,
-                # 414 MB Electron Desktop (approx). We don't have the live
-                # byte-count without HEADing the mirror, so we ship a sane
-                # default — the UI uses this only for the "~XXX MB" label.
-                "size_bytes": 414 * 1024 * 1024,
-                "min_windows": "Windows 10 64-bit",
-                "released_at": None,
-            }
-        # No native release yet — fall back to legacy ZIP advertising.
         local = await _displayed_current_version()
         return {
             "kind": "legacy-zip",
@@ -753,6 +808,20 @@ def _build_customer_endpoints(get_user_dep):
             "min_windows": "Windows 10 64-bit",
             "released_at": None,
         }
+
+    @router.post("/api/system/sync-deploy-release")
+    async def sync_deploy_release(request: Request):
+        """Internal — called by VPS deploy after health check.
+
+        Localhost-only so the public internet cannot forge release rows.
+        """
+        client = (request.client.host if request.client else "") or ""
+        allowed = client in ("127.0.0.1", "::1", "localhost") or client.startswith(
+            ("172.", "10.", "192.168.")
+        )
+        if not allowed:
+            raise HTTPException(403, "sync-deploy-release is localhost-only")
+        return await sync_deployed_release_record()
 
     @router.post("/api/system/install-update")
     async def trigger_update(request: Request, user: dict = Depends(get_user_dep)):

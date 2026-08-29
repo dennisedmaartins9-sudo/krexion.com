@@ -606,23 +606,6 @@ async def resolve_profile_proxy_for_launch(
             )
             return resolved
         except HTTPException as bulk_err:
-            # Launch rescue: team ledger may block every IP while RUT still works.
-            if team_dedupe and bulk_err.status_code == 502:
-                try:
-                    lines = await _allocate_provider_proxy_lines(
-                        uid, provider_id, 1, set(), targeting=targeting,
-                    )
-                    resolved = _apply_resolved_line_to_proxy_cfg(
-                        cfg, lines[0], provider_id=provider_id,
-                    )
-                    logger.info(
-                        f"[browser-profile] provider {provider_id[:8]} resolved "
-                        f"(launch retry, no team dedupe) → "
-                        f"{str(resolved.get('server') or '')[:48]}"
-                    )
-                    return resolved
-                except HTTPException:
-                    pass
             try:
                 fb_line = await _fallback_provider_proxy_line(
                     uid, user, provider_id, targeting=targeting,
@@ -1534,6 +1517,89 @@ async def _finalize_doc_proxy_and_ip(
     doc["exit_ip"] = canonical
     doc["proxy"]["exit_ip"] = canonical
     doc["proxy"]["sticky_session"] = True
+
+
+async def _ensure_profile_launch_proxy(
+    uid: str,
+    user: dict,
+    doc: Dict[str, Any],
+    *,
+    profile_country: Optional[str] = None,
+    max_retries: int = 5,
+) -> Dict[str, Any]:
+    """Resolve proxy, probe exit IP, and guarantee a team-unique IP before launch."""
+    proxy_cfg = dict(doc.get("proxy") or {})
+    profile_id = str(doc.get("id") or "")
+    provider_id = str(proxy_cfg.get("provider_id") or "").strip()
+
+    # Rotating providers: always request a fresh session line at launch.
+    if provider_id:
+        proxy_cfg.pop("exit_ip", None)
+        proxy_cfg["server"] = ""
+        proxy_cfg = await resolve_profile_proxy_for_launch(
+            uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+        )
+    elif not str(proxy_cfg.get("server") or "").strip():
+        proxy_cfg = await resolve_profile_proxy_for_launch(
+            uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+        )
+
+    used_ips = await _load_team_profile_used_ips(uid)
+    try:
+        from cross_user_ip_isolation import canonicalize_ip
+        cur = canonicalize_ip(doc.get("exit_ip") or "")
+        if cur:
+            used_ips.discard(cur)
+    except Exception:
+        pass
+
+    targeting = _profile_provider_targeting(proxy_cfg, profile_country)
+    last_err: Optional[HTTPException] = None
+
+    for attempt in range(max_retries):
+        doc["proxy"] = dict(proxy_cfg)
+        try:
+            exit_ip = await _probe_proxy_cfg_exit_ip(user, proxy_cfg)
+            if not exit_ip:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Profile '{doc.get('name') or profile_id[:8]}': "
+                        "proxy configured but exit IP probe failed"
+                    ),
+                )
+            canonical = await _assert_unique_team_profile_ip(
+                uid, exit_ip, used_ips, profile_id=profile_id,
+            )
+            doc["exit_ip"] = canonical
+            doc["proxy"]["exit_ip"] = canonical
+            doc["proxy"]["sticky_session"] = True
+            logger.info(
+                f"[browser-profile launch] unique exit_ip={canonical} "
+                f"profile={profile_id[:8]} attempt={attempt + 1}"
+            )
+            return proxy_cfg
+        except HTTPException as exc:
+            last_err = exc
+            if exc.status_code != 409 or not provider_id or attempt >= max_retries - 1:
+                raise
+            logger.warning(
+                f"[browser-profile launch] duplicate IP on attempt {attempt + 1} "
+                f"— rotating provider session"
+            )
+            lines = await _allocate_provider_proxy_lines(
+                uid, provider_id, 1, used_ips, targeting=targeting,
+            )
+            proxy_cfg = _apply_resolved_line_to_proxy_cfg(
+                proxy_cfg, lines[0], provider_id=provider_id,
+            )
+
+    if last_err:
+        raise last_err
+    raise HTTPException(
+        status_code=502,
+        detail="Could not allocate a unique proxy exit IP for this profile",
+    )
 
 
 async def _resolve_user(request: Request) -> dict:
@@ -2673,50 +2739,28 @@ async def launch_profile(request: Request, profile_id: str,
         "status": "queued",
         "start_url": start_url or doc.get("start_url") or "https://www.google.com/",
     }
-    # v2.4.0 wire-up: resolve provider_id → live proxy just before launch
-    # 2026-07 v2.5.3 — For rotating_gateway providers we now request a
-    # single line with session rotation so back-to-back profile launches
-    # don't reuse the same sticky IP.
+    # v2.7.37 — Resolve proxy + probe team-unique exit IP before every launch.
     _proxy_cfg = doc.get("proxy") or {}
     _provider_id = str(_proxy_cfg.get("provider_id") or "").strip()
-    _sticky_exit_ip = str(doc.get("exit_ip") or _proxy_cfg.get("exit_ip") or "").strip()
-    _has_bound_server = bool(str(_proxy_cfg.get("server") or "").strip())
-
-    # v2.7.29 — Always resolve when server is missing (provider / ProxyJet).
-    # Sticky IP only applies when we already have a bound proxy line.
-    if not _has_bound_server:
-        try:
-            _proxy_cfg = await resolve_profile_proxy_for_launch(
-                uid, user, _proxy_cfg, profile_country=doc.get("country"),
-            )
-            doc["proxy"] = _proxy_cfg
-            _has_bound_server = bool(str(_proxy_cfg.get("server") or "").strip())
-        except HTTPException:
-            raise
-        except Exception as _pp_err:
-            logger.warning(f"[browser-profile launch] proxy resolve failed: {_pp_err}")
-    elif _provider_id and _sticky_exit_ip:
-        logger.info(
-            f"[browser-profile launch] sticky exit_ip={_sticky_exit_ip} "
-            f"profile={profile_id[:8]}"
+    try:
+        _proxy_cfg = await _ensure_profile_launch_proxy(
+            uid, user, doc, profile_country=doc.get("country"),
         )
+        doc["proxy"] = _proxy_cfg
+    except HTTPException:
+        raise
+    except Exception as _pp_err:
+        logger.warning(f"[browser-profile launch] proxy ensure failed: {_pp_err}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Proxy setup failed before launch: {_pp_err}",
+        ) from _pp_err
 
-    _proxy_cfg = await _resolve_proxy_for_launch(
-        uid, user, doc.get("proxy") or _proxy_cfg, profile_country=doc.get("country"),
-    )
-    doc["proxy"] = _proxy_cfg
-    _proxy_patch: Dict[str, Any] = {"proxy": _proxy_cfg, "updated_at": _now_iso()}
-    if not _sticky_exit_ip:
-        _p = doc.get("proxy") or {}
-        if _p.get("enabled") or _p.get("provider_id") or str(_p.get("server") or "").strip():
-            try:
-                _used = await _load_team_profile_used_ips(uid)
-                await _finalize_doc_proxy_and_ip(uid, user, doc, _used)
-                _proxy_patch["exit_ip"] = doc.get("exit_ip") or ""
-            except HTTPException:
-                raise
-            except Exception as _ip_bind_err:
-                logger.warning(f"[browser-profile launch] exit_ip bind skipped: {_ip_bind_err}")
+    _proxy_patch: Dict[str, Any] = {
+        "proxy": _proxy_cfg,
+        "exit_ip": doc.get("exit_ip") or "",
+        "updated_at": _now_iso(),
+    }
 
     if str(_proxy_cfg.get("server") or "").strip():
         await _DB.browser_profiles.update_one(

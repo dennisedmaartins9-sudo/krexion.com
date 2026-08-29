@@ -32,8 +32,89 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
 from ua_profile_contract import client_hint_headers_for_ua
 
-if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH") and os.path.isdir("/pw-browsers"):
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/pw-browsers"
+# PLAYWRIGHT_BROWSERS_PATH is normalized to an absolute directory at import
+# (see normalize_playwright_browsers_path). Relative `\pw-browsers` paths
+# on Windows were causing profile launch "Executable doesn't exist" errors.
+def _dir_has_browser_bundle(root: Path) -> bool:
+    try:
+        if not root.is_dir():
+            return False
+        for child in root.iterdir():
+            name = child.name
+            if name.startswith(("chromium-", "chromium_headless_shell-", "webkit-")):
+                return True
+    except (OSError, PermissionError):
+        return False
+    return False
+
+
+def normalize_playwright_browsers_path() -> str:
+    """Resolve PLAYWRIGHT_BROWSERS_PATH to an absolute install root.
+
+    Native Windows installs ship browsers under ``{app}\\browser-engine``.
+    When the env var is missing, relative, or points at ``/pw-browsers`` on
+    Windows, Playwright looks for ``\\pw-browsers\\chromium-*\\chrome.exe``
+    and profile launch fails permanently until this is corrected.
+    """
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates: List[Path] = []
+    env_raw = (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "").strip()
+    if env_raw:
+        ep = Path(env_raw)
+        if not ep.is_absolute():
+            # Strip leading slashes so "/pw-browsers" → "pw-browsers"
+            name = env_raw.lstrip("\\/") or "browser-engine"
+            ep = (exe_dir / name).resolve()
+        candidates.append(ep)
+
+    candidates.extend([
+        exe_dir / "browser-engine",
+        exe_dir.parent / "browser-engine",
+        Path(r"C:\Program Files\Krexion\browser-engine"),
+    ])
+    if sys.platform.startswith("win"):
+        local = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if local:
+            candidates.append(Path(local) / "ms-playwright")
+    if os.path.isdir("/pw-browsers"):
+        candidates.append(Path("/pw-browsers"))
+
+    seen: set[str] = set()
+    for c in candidates:
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _dir_has_browser_bundle(c):
+            abs_p = str(c.resolve())
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = abs_p
+            return abs_p
+
+    for c in candidates:
+        key = str(c)
+        if key in seen and not c.is_dir():
+            continue
+        if c.is_dir():
+            abs_p = str(c.resolve())
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = abs_p
+            return abs_p
+
+    if sys.platform.startswith("win"):
+        target = exe_dir / "browser-engine"
+    elif os.path.isdir("/pw-browsers"):
+        target = Path("/pw-browsers")
+    else:
+        target = Path.home() / ".cache" / "ms-playwright"
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    abs_p = str(target.resolve())
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = abs_p
+    return abs_p
+
+
+normalize_playwright_browsers_path()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -347,7 +428,7 @@ async def _ensure_webkit_available() -> bool:
     global _WEBKIT_AVAIL, _WEBKIT_INSTALL_IN_PROGRESS
     if _webkit_runtime_available():
         return True
-    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+    browsers_root = normalize_playwright_browsers_path()
     async with _WEBKIT_INSTALL_LOCK:
         # Re-check after lock (another coroutine may have finished install).
         _WEBKIT_AVAIL = None
@@ -613,13 +694,29 @@ def _apply_inapp_preset_to_uas(user_agents: List[str], want_count: int, preset_p
 #   The system cannot find the file specified
 # These helpers return the OS-correct sub-path so the same code works
 # on the cloud VPS (Linux) AND on customers' native Windows installs.
-def _pw_platform_dir() -> str:
-    """Playwright's per-OS sub-folder inside chromium-* / chromium_headless_shell-*."""
+def _pw_chrome_platform_dirs() -> List[str]:
+    """Platform subfolders inside chromium-* (Playwright 1.49+ uses chrome-win64)."""
     if sys.platform.startswith("win"):
-        return "chrome-win"
+        return ["chrome-win64", "chrome-win"]
     if sys.platform == "darwin":
-        return "chrome-mac"
-    return "chrome-linux"
+        return ["chrome-mac"]
+    return ["chrome-linux"]
+
+
+def _pw_platform_dir() -> str:
+    """Primary Playwright per-OS sub-folder (first match in _pw_chrome_platform_dirs)."""
+    return _pw_chrome_platform_dirs()[0]
+
+
+def _chromium_binary_at(base: Path, rev: str, *, headless_shell: bool = False) -> Optional[Path]:
+    """Return chrome/headless_shell binary path if present under *base* for *rev*."""
+    prefix = "chromium_headless_shell" if headless_shell else "chromium"
+    for plat in _pw_chrome_platform_dirs():
+        name = _headless_shell_binary_name() if headless_shell else _chrome_binary_name()
+        bp = base / f"{prefix}-{rev}" / plat / name
+        if bp.exists():
+            return bp
+    return None
 
 
 def _headless_shell_binary_name() -> str:
@@ -671,7 +768,7 @@ def get_engine_status() -> Dict[str, Any]:
         missing    → binary absent and no install in progress
         error      → couldn't read browsers.json (unexpected)
     """
-    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+    browsers_root = normalize_playwright_browsers_path()
     expected: Optional[str] = None
     try:
         import json as _json
@@ -695,7 +792,9 @@ def get_engine_status() -> Dict[str, Any]:
             "browser_path": None,
         }
 
-    binary_path = Path(browsers_root) / f"chromium_headless_shell-{expected}" / _pw_platform_dir() / _headless_shell_binary_name()
+    binary_path = _chromium_binary_at(Path(browsers_root), expected or "", headless_shell=True)
+    if binary_path is None and expected:
+        binary_path = Path(browsers_root) / f"chromium_headless_shell-{expected}" / _pw_platform_dir() / _headless_shell_binary_name()
     # 2026-01: Detect which engine is actually being used at runtime so
     # the admin engine-status badge can show "Full Chromium (--headless=new)"
     # vs "Headless Shell (legacy)". Helps confirm the anti-detect upgrade
@@ -750,7 +849,7 @@ async def _ensure_chromium_available() -> bool:
     the EXACT revision from Playwright's bundled browsers.json and verify
     that specific path exists.
     """
-    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+    browsers_root = normalize_playwright_browsers_path()
 
     def _expected_revision() -> Optional[str]:
         """Read the chromium-headless-shell revision Playwright expects.
@@ -775,7 +874,7 @@ async def _ensure_chromium_available() -> bool:
     def _binary_for(rev: Optional[str]) -> Optional[Path]:
         if not rev:
             return None
-        return Path(browsers_root) / f"chromium_headless_shell-{rev}" / _pw_platform_dir() / _headless_shell_binary_name()
+        return _chromium_binary_at(Path(browsers_root), rev, headless_shell=True)
 
     expected = _expected_revision()
 
@@ -788,8 +887,11 @@ async def _ensure_chromium_available() -> bool:
             return False
         # Fallback (only when we can't read browsers.json): glob check.
         try:
-            for p in Path(browsers_root).glob("chromium_headless_shell-*"):
-                if (p / _pw_platform_dir() / _headless_shell_binary_name()).exists():
+            root = Path(browsers_root)
+            for p in root.glob("chromium_headless_shell-*"):
+                rev_part = p.name.split("-", 1)[-1]
+                bp = _chromium_binary_at(root, rev_part, headless_shell=True)
+                if bp and bp.exists():
                     return True
         except Exception:
             pass
@@ -906,6 +1008,7 @@ _KREXION_BROWSERS_DEFAULT = Path(r"C:\Program Files\Krexion\browser-engine")
 
 def _browsers_search_roots() -> List[Path]:
     """Ordered list of directories that may contain chromium-* / headless_shell-*."""
+    normalize_playwright_browsers_path()
     roots: List[Path] = []
     seen: set[str] = set()
 
@@ -920,6 +1023,9 @@ def _browsers_search_roots() -> List[Path]:
     env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if env_root:
         add(Path(env_root))
+    exe_dir = Path(sys.executable).resolve().parent
+    add(exe_dir / "browser-engine")
+    add(exe_dir.parent / "browser-engine")
     add(_KREXION_BROWSERS_DEFAULT)
     add(Path("/pw-browsers"))
     return roots
@@ -968,10 +1074,9 @@ def _full_chromium_binary_path() -> Optional[Path]:
     """
     rev = _chromium_revision_from_playwright()
     if rev:
-        rel = Path(f"chromium-{rev}") / _pw_platform_dir() / _chrome_binary_name()
         for root in _browsers_search_roots():
-            bp = root / rel
-            if bp.exists():
+            bp = _chromium_binary_at(root, rev, headless_shell=False)
+            if bp is not None:
                 return bp
     # ── v2.6.49 Bug #10 fallback: any chromium-<rev> that exists ──
     best: Optional[Tuple[int, Path]] = None
@@ -990,11 +1095,13 @@ def _full_chromium_binary_path() -> Optional[Path]:
                     rev_num = int(name.split("-", 1)[1])
                 except (ValueError, IndexError):
                     continue
-                bp = child / _pw_platform_dir() / _chrome_binary_name()
-                if not bp.exists():
-                    continue
-                if best is None or rev_num > best[0]:
-                    best = (rev_num, bp)
+                for plat in _pw_chrome_platform_dirs():
+                    bp = child / plat / _chrome_binary_name()
+                    if not bp.exists():
+                        continue
+                    if best is None or rev_num > best[0]:
+                        best = (rev_num, bp)
+                    break
         except (OSError, PermissionError):
             continue
     return best[1] if best else None
@@ -1102,11 +1209,12 @@ async def _install_full_chromium_background() -> None:
     never raises — chromium-headless-shell remains the safety net."""
     if _full_chromium_binary_path() is not None:
         return
-    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+    browsers_root = normalize_playwright_browsers_path()
     try:
         logger.info("Installing full chromium binary for --headless=new mode…")
+        import sys as _sys
         proc = await asyncio.create_subprocess_exec(
-            "playwright", "install", "chromium", "--no-shell",
+            _sys.executable, "-m", "playwright", "install", "chromium",
             env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browsers_root},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1127,6 +1235,89 @@ async def _install_full_chromium_background() -> None:
             )
     except Exception as e:
         logger.warning(f"Full chromium install failed: {e} — staying on headless-shell")
+
+
+_FULL_CHROMIUM_INSTALL_IN_PROGRESS = False
+
+
+def get_headed_engine_status() -> Dict[str, Any]:
+    """Engine status for headed Browser Profile launch (needs full chromium)."""
+    normalize_playwright_browsers_path()
+    fc = _full_chromium_binary_path()
+    if fc is not None:
+        return {
+            "status": "ready",
+            "message": f"Full Chromium ready at {fc}",
+            "browser_path": str(fc),
+            "engine_mode": "full-chromium-headed",
+        }
+    if _FULL_CHROMIUM_INSTALL_IN_PROGRESS or _CHROMIUM_INSTALL_IN_PROGRESS:
+        return {
+            "status": "installing",
+            "message": "Downloading full Chromium for profile launch (~150 MB)…",
+            "browser_path": None,
+            "engine_mode": "full-chromium-headed",
+        }
+    return {
+        "status": "missing",
+        "message": "Full Chromium not installed — required for headed profile launch",
+        "browser_path": None,
+        "engine_mode": "full-chromium-headed",
+    }
+
+
+async def _ensure_full_chromium_available() -> bool:
+    """Ensure full chromium binary exists for headed profile launch."""
+    normalize_playwright_browsers_path()
+    if _full_chromium_binary_path() is not None:
+        return True
+    global _FULL_CHROMIUM_INSTALL_IN_PROGRESS
+    async with _CHROMIUM_INSTALL_LOCK:
+        normalize_playwright_browsers_path()
+        if _full_chromium_binary_path() is not None:
+            return True
+        _FULL_CHROMIUM_INSTALL_IN_PROGRESS = True
+        browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/pw-browsers")
+        try:
+            logger.warning(
+                "Full Chromium missing for profile launch — installing now (~150 MB)…"
+            )
+            import sys as _sys
+            proc = await asyncio.create_subprocess_exec(
+                _sys.executable, "-m", "playwright", "install", "chromium",
+                env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browsers_root},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _out, err = await asyncio.wait_for(proc.communicate(), timeout=600)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                logger.error("Full chromium install timed out after 10 min")
+                return False
+            if proc.returncode != 0:
+                logger.error(
+                    f"Full chromium install returned {proc.returncode}: "
+                    f"{(err or b'').decode(errors='ignore')[:300]}"
+                )
+                return False
+            logger.info("Full Chromium install OK — headed profile launch enabled")
+            return _full_chromium_binary_path() is not None
+        except Exception as e:
+            logger.error(f"Full chromium install failed: {e}")
+            return False
+        finally:
+            _FULL_CHROMIUM_INSTALL_IN_PROGRESS = False
+
+
+async def _ensure_chromium_ready() -> bool:
+    """Alias used by browser_bootstrap — headless shell OR full chromium."""
+    if _full_chromium_binary_path() is not None:
+        return True
+    return await _ensure_chromium_available()
 
 
 # Shared launch-args list — kept here so both the primary launch and the
@@ -11888,6 +12079,8 @@ async def run_real_user_traffic_job(
                 _goto_referer_kw: Dict[str, Any] = {}
                 if _ua_referer:
                     _goto_referer_kw["referer"] = _ua_referer
+                entry["visit_referer"] = _ua_referer or ""
+                entry["visit_platform"] = _kx_platform or ""
                 _explicit_ua_locale = str(fp.get("explicit_locale") or "").strip()
                 _context_locale = _explicit_ua_locale or geo["locale"]
                 _context_accept_language = (
@@ -20986,6 +21179,53 @@ async def _resolve_click_link_id(
     return link_id
 
 
+async def _record_rut_conversion(
+    entry: Dict[str, Any],
+    main_db,
+) -> None:
+    """Bridge RUT heuristic conversion into db.conversions + outbound postback."""
+    if not entry.get("conversion_page_reached") or main_db is None:
+        return
+    click_id = str(
+        entry.get("_early_click_id")
+        or entry.get("_tracker_click_id")
+        or ""
+    ).strip()
+    if not click_id:
+        return
+    try:
+        from conversion_module import record_conversion as _record_conv
+        await _record_conv(
+            main_db,
+            main_db.client,
+            click_id,
+            0.0,
+            status="rut_heuristic",
+            source="rut_heuristic",
+            forward_outbound=True,
+        )
+    except Exception as exc:
+        logger.debug(f"RUT conversion bridge skipped: {exc}")
+
+
+_RUT_PLATFORM_LABELS: Dict[str, str] = {
+    "facebook": "Facebook",
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+    "twitter": "Twitter/X",
+    "x": "Twitter/X",
+    "google": "Google",
+    "bing": "Bing",
+    "youtube": "YouTube",
+    "linkedin": "LinkedIn",
+    "snapchat": "Snapchat",
+    "pinterest": "Pinterest",
+    "reddit": "Reddit",
+    "messenger": "Messenger",
+    "email": "Email",
+}
+
+
 async def _log_click_for_link(
     entry: Dict[str, Any],
     job_info: Dict[str, Any],
@@ -21051,6 +21291,14 @@ async def _log_click_for_link(
                         "click_status": "completed",
                         "final_url": entry.get("final_url") or "",
                         "conversion_page_reached": bool(entry.get("conversion_page_reached")),
+                        "referrer": (entry.get("visit_referer") or ""),
+                        "referrer_pro_simulated": (entry.get("visit_referer") or None),
+                        "referrer_source": (entry.get("visit_platform") or "rut"),
+                        "referrer_source_name": _RUT_PLATFORM_LABELS.get(
+                            (entry.get("visit_platform") or "").lower(),
+                            (entry.get("visit_platform") or "Real User Traffic").title()
+                            if entry.get("visit_platform") else "Real User Traffic",
+                        ),
                         "is_vpn": is_vpn,
                         **({"ip_address": exit_ip} if exit_ip else {}),
                         **({"ipv4": exit_ip} if exit_ip and ":" not in exit_ip else {}),
@@ -21114,6 +21362,9 @@ async def _log_click_for_link(
             str(entry.get("_tracker_click_id") or "").strip()
             or str(_uuid.uuid4())
         )
+        _plat = (entry.get("visit_platform") or "").strip().lower()
+        _ref = (entry.get("visit_referer") or "").strip()
+        _src_name = _RUT_PLATFORM_LABELS.get(_plat) or (_plat.title() if _plat else "Real User Traffic")
         click_doc = {
             "id": new_id,
             "click_id": new_id,
@@ -21151,9 +21402,11 @@ async def _log_click_for_link(
             "os_version": "",
             "browser": "Chrome",
             "browser_version": "",
-            "referrer": "",
-            "referrer_source": "rut",
-            "referrer_source_name": "Real User Traffic",
+            "referrer": _ref,
+            "referrer_pro_simulated": _ref or None,
+            "referrer_source": _plat or "rut",
+            "referrer_source_name": _src_name,
+            "referrer_detected_from": "rut_engine" if _plat else "rut",
             "source": "real_user_traffic",
             "visit_status": ("pending" if early else (entry.get("status") or "")),
             # 2026-08: 1 browser landing = 1 completed click (Clicks == Hosts).
@@ -21306,6 +21559,12 @@ async def _record(
         #    Clicks page + duplicate-IP detection both see RUT traffic) ──
         try:
             await _log_click_for_link(entry, j, db)
+        except Exception:
+            pass
+
+        # v2.7.41 — Bridge heuristic conversion into official conversions DB
+        try:
+            await _record_rut_conversion(entry, db)
         except Exception:
             pass
 

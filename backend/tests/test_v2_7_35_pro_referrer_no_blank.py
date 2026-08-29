@@ -27,14 +27,17 @@ def test_tiktok_preview_never_empty_referer_with_wrapper():
         assert (out.get("referer") or "").strip(), "referer must not be blank"
 
 
-def test_tiktok_wrapper_bounce_url_has_destination_param():
+def test_tiktok_wrapper_bounce_url_no_link_v2():
     rp = _rp()
     dest = "https://offer.example.com/?clickid=abc"
     bounce = rp.build_wrapper_bounce_url("tiktok", dest, is_paid=True)
-    assert "tiktok.com" in bounce
-    assert "u=" in bounce
-    rebuilt = rp.rebuild_referer_with_target(bounce, dest)
-    assert dest in rebuilt or "offer.example.com" in rebuilt
+    assert bounce == "", "TikTok must not HTTP-bounce through link/v2"
+    assert not rp.is_safe_http_wrapper_bounce(
+        "https://www.tiktok.com/link/v2?aid=1988&lang=en&u=https%3A%2F%2Fx.com"
+    )
+    assert not rp.platform_supports_http_wrapper_bounce("tiktok")
+    ensure = rp.ensure_wrapper_bounce_url("", "tiktok", dest, is_paid=True)
+    assert ensure == ""
 
 
 def test_ensure_non_empty_falls_back_to_homepage():

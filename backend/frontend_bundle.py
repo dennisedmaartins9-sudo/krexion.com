@@ -217,6 +217,25 @@ def frontend_sync_status() -> dict[str, Any]:
     fe_dir = resolve_frontend_dir()
     fe_ver = read_frontend_bundle_version(fe_dir)
     stale = frontend_bundle_is_stale(fe_dir, backend_ver) if mode == "native" else False
+
+    # Cloud: compare backend VERSION vs stamped bundle on frontend nginx.
+    if mode == "cloud" and not fe_ver:
+        for url in (
+            "http://frontend/build-version.json",
+            f"{(os.environ.get('KREXION_CLOUD_URL') or 'https://krexion.com').rstrip('/')}/build-version.json",
+        ):
+            try:
+                resp = requests.get(url, timeout=8)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                if isinstance(data, dict) and data.get("version"):
+                    fe_ver = str(data["version"]).strip().lstrip("vV")
+                    stale = fe_ver.lstrip("vV") != backend_ver.lstrip("vV")
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
     return {
         "backend_version": backend_ver,
         "frontend_version": fe_ver,

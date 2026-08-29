@@ -121,6 +121,9 @@ export default function ConversionsPage() {
             <code className="block bg-[var(--brand-card)] p-3 rounded-md text-xs font-mono break-all">
               {BACKEND_URL}/api/postback?clickid=&#123;clickid&#125;&amp;payout=&#123;payout&#125;&amp;status=approved&amp;token=YOUR_POSTBACK_TOKEN
             </code>
+            <p className="text-xs text-muted-foreground mt-2">
+              GET or POST. Networks may send clickid, transaction_id, sub1, cid, amount, sale, or payout — all accepted.
+            </p>
           </div>
 
           <div>

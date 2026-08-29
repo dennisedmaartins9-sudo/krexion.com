@@ -42,6 +42,16 @@ def build_user_clicks_scope_query(
     return {"$or": clauses}
 
 
+def completed_click_status_filter() -> dict:
+    """Visible clicks: completed rows + legacy docs without click_status."""
+    return {
+        "$or": [
+            {"click_status": "completed"},
+            {"click_status": {"$exists": False}},
+        ]
+    }
+
+
 def merge_click_filters(scope: dict, extra: dict) -> dict:
     if not extra:
         return dict(scope)

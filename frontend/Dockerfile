@@ -8,10 +8,12 @@
 FROM node:20-alpine AS builder
 
 ARG REACT_APP_BACKEND_URL=""
+ARG KREXION_VERSION="0.0.0"
 ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL \
     DISABLE_ESLINT_PLUGIN=true \
     GENERATE_SOURCEMAP=false \
-    CI=false
+    CI=false \
+    KREXION_VERSION=$KREXION_VERSION
 
 WORKDIR /app
 
@@ -30,6 +32,16 @@ RUN if [ -f yarn.lock ]; then \
 # Copy sources and build
 COPY . .
 RUN yarn build
+
+# Stamp build-version.json — native UI sync + cloud version checks rely on this.
+RUN set -e; \
+    VER="$(echo "$KREXION_VERSION" | tr -d ' \r\nvV')"; \
+    MAIN="$(ls /app/build/static/js/main.*.js 2>/dev/null | head -1)"; \
+    test -n "$MAIN"; \
+    grep -q "Krexion Browser Profiles" "$MAIN"; \
+    printf '{"version":"%s","built_at":"%s","main_js":"%s","marker":"krexion-browser-profiles-v1"}\n' \
+      "$VER" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$MAIN")" \
+      > /app/build/build-version.json
 
 # ---- Stage 2: nginx ----
 FROM nginx:1.27-alpine

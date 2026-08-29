@@ -1,5 +1,9 @@
 """Clicks scope matches cloud-logged RUT rows by short_code on local installs."""
-from click_scope import build_user_clicks_scope_query, merge_click_filters
+from click_scope import (
+    build_user_clicks_scope_query,
+    completed_click_status_filter,
+    merge_click_filters,
+)
 
 
 def test_scope_includes_short_code_when_cloud_link_id_differs():
@@ -20,9 +24,10 @@ def test_scope_includes_short_code_when_cloud_link_id_differs():
             },
         ]
     }
-    query = merge_click_filters(scope, {"click_status": "completed"})
+    filt = completed_click_status_filter()
+    query = merge_click_filters(scope, filt)
     assert query["$and"][0] == scope
-    assert query["$and"][1] == {"click_status": "completed"}
+    assert query["$and"][1] == filt
 
 
 def test_scope_honours_explicit_local_link_id():

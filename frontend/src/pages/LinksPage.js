@@ -9,6 +9,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
 import { Plus, Copy, Pencil, Trash2, TrendingUp, Globe, Shield, Monitor, Smartphone, ExternalLink, Sparkles, Eye, ChevronDown, ChevronUp, X, Search } from "lucide-react";
+import {
+  TRAFFIC_SOURCE_PRESET_OPTIONS,
+  TRAFFIC_SOURCE_PRESET_SUMMARY,
+  buildLinkProPatchFromPreset,
+  buildLinkPatchFromSavedPreset,
+} from "../lib/trafficSourcePresets";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -179,6 +185,42 @@ const POSTBACK_TEMPLATES = [
     url: "https://www.maxbounty.com/postback.asp?adv=YOUR_ADV_ID&cd={click_id}&sale={payout}",
     hint: "Replace YOUR_ADV_ID with your MaxBounty advertiser ID.",
   },
+  {
+    key: "affise",
+    label: "Affise",
+    url: "https://YOUR-DOMAIN.affise.com/postback?clickid={click_id}&sum={payout}&status={status}",
+    hint: "Replace YOUR-DOMAIN with your Affise tracker domain.",
+  },
+  {
+    key: "everflow_adv",
+    label: "Everflow (adv postback)",
+    url: "https://YOUR-NETWORK.evyy.net/?nid=YOUR_NID&transaction_id={transaction_id}&amount={amount}&adv1={payout}",
+    hint: "Use transaction_id={click_id} on inbound; outbound uses same macros.",
+  },
+  {
+    key: "glitchy",
+    label: "Glitchy / PerformCB-style",
+    url: "https://YOUR-TRACKER.com/postback?click_id={click_id}&payout={payout}&sub1={sub1}&status={status}",
+    hint: "Replace YOUR-TRACKER with your network postback host.",
+  },
+  {
+    key: "binom",
+    label: "Binom",
+    url: "https://YOUR-DOMAIN.com/click.php?cnv_id={click_id}&payout={payout}&cnv_status={status}",
+    hint: "Replace YOUR-DOMAIN with your Binom tracker URL.",
+  },
+  {
+    key: "redtrack",
+    label: "RedTrack",
+    url: "https://YOUR-DOMAIN.rtk.io/postback?clickid={click_id}&sum={payout}",
+    hint: "Replace YOUR-DOMAIN with your RedTrack subdomain.",
+  },
+  {
+    key: "clickdealer",
+    label: "ClickDealer",
+    url: "https://YOUR-NETWORK.clickdealer.com/aff_lsr?transaction_id={click_id}&amount={payout}",
+    hint: "Tune/HasOffers-family macro layout.",
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -243,6 +285,37 @@ const stringifyOfferUrls = (arr) => {
   return arr.filter(x => x.url && x.weight > 0)
     .map(x => `${x.url}:${x.weight}`).join(",");
 };
+
+const KNOWN_PLATFORM_POOL_PRESETS = {
+  "facebook:30,instagram:15,tiktok:20,google:20,twitter:5,email:10": "mixed_realistic",
+  "facebook:40,instagram:30,tiktok:25,twitter:5": "social_media_ads",
+  "google:65,bing:25,duckduckgo:5,yandex:5": "search_engine_ads",
+  "email:100": "email_campaign",
+};
+
+const inferTrafficPresetFromLink = (link) => {
+  if (!link?.referrer_pro_enabled) {
+    if ((link?.referrer_mode || "").toLowerCase() === "no_referrer") return "direct_traffic";
+    return "off";
+  }
+  const pool = String(link?.referrer_pro_platform_pool || "").replace(/\s/g, "");
+  return KNOWN_PLATFORM_POOL_PRESETS[pool] || "custom";
+};
+
+const defaultProLinkFields = () => ({
+  ...buildLinkProPatchFromPreset("mixed_realistic"),
+  referrer_pro_brand: "",
+  referrer_pro_country: "",
+  referrer_pro_search_keywords: "",
+  referrer_pro_network_click_chain: false,
+  referrer_pro_network_click_host: "",
+  traffic_type_param: "",
+  referrer_pro_offer_urls: "",
+  postback_url: "",
+  referrer_pro_auto_pause_enabled: false,
+  referrer_pro_auto_pause_threshold: 10,
+  url_params: {},
+});
 
 // Host for user-facing tracking links. If REACT_APP_BACKEND_URL is empty
 // (nginx-same-origin deployments like local Docker), fall back to the
@@ -362,8 +435,13 @@ export default function LinksPage() {
   const [loading, setLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingLink, setEditingLink] = useState(null);
-  // v2.1.80 — Pro-Referrer collapsible section state
-  const [proReferrerOpen, setProReferrerOpen] = useState(false);
+  // Referrer Engine — RUT-parity simple mode + advanced toggles
+  const [proReferrerOpen, setProReferrerOpen] = useState(true);
+  const [trafficSourcePreset, setTrafficSourcePreset] = useState("mixed_realistic");
+  const [myTrafficPresets, setMyTrafficPresets] = useState([]);
+  const [selectedMyPresetId, setSelectedMyPresetId] = useState("");
+  const [proAdvancedOpen, setProAdvancedOpen] = useState(false);
+  const [presetApplyLock, setPresetApplyLock] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewData, setPreviewData] = useState(null);
@@ -398,37 +476,28 @@ export default function LinksPage() {
     referrer_mode: "normal",
     simulate_platform: "",
     url_params: {},
-    // v2.1.80 — Pro-Referrer defaults (all match backend defaults so
-    // creating a link with the section untouched behaves identically
-    // to before this feature landed).
-    referrer_pro_enabled: false,
-    referrer_pro_platform_pool: "",
-    referrer_pro_email_weights: "",
-    referrer_pro_brand: "",
-    referrer_pro_country: "",
-    referrer_pro_search_engine: "google",
-    referrer_pro_search_keywords: "",
-    referrer_pro_social_wrapper: true,
-    referrer_pro_inapp_deep_path: true,
-    referrer_pro_strip_search_path: true,
-    referrer_pro_network_click_chain: false,
-    referrer_pro_network_click_host: "",
-    referrer_pro_wrapper_redirect: false,
-    // v2.1.83 — International guardrails (10-feature pack). Defaults
-    // match the server-side defaults so pre-existing links keep
-    // behaving IDENTICALLY when the customer opens them for edit.
-    referrer_pro_lang_match: true,
-    referrer_pro_device_mode: "auto",
-    referrer_pro_tod_enabled: false,
-    referrer_pro_campaign_type: "auto",
-    referrer_pro_quality_tier: "standard",
-    referrer_pro_traffic_type: "auto",
-    traffic_type_param: "",
-    referrer_pro_offer_urls: "",
-    postback_url: "",
-    referrer_pro_auto_pause_enabled: false,
-    referrer_pro_auto_pause_threshold: 10
+    ...defaultProLinkFields(),
   });
+
+  useEffect(() => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    fetch(`${BACKEND_URL}/api/referrer-pro/my-presets`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((d) => {
+        if (Array.isArray(d)) setMyTrafficPresets(d);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!dialogOpen || presetApplyLock) return;
+    if (!trafficSourcePreset || trafficSourcePreset === "custom") return;
+    const patch = buildLinkProPatchFromPreset(trafficSourcePreset);
+    setFormData((prev) => ({ ...prev, ...patch }));
+  }, [trafficSourcePreset, dialogOpen, presetApplyLock]);
 
   useEffect(() => {
     fetchLinks();
@@ -541,8 +610,8 @@ export default function LinksPage() {
   };
 
   const resetForm = () => {
-    setFormData({ 
-      offer_url: "", 
+    setFormData({
+      offer_url: "",
       status: "active",
       name: "",
       custom_short_code: "",
@@ -554,37 +623,13 @@ export default function LinksPage() {
       duplicate_timer_enabled: false,
       duplicate_timer_seconds: 5,
       strict_duplicate_check: true,
-      forced_source: "",
-      forced_source_name: "",
-      referrer_mode: "normal",
-      simulate_platform: "",
-      url_params: {},
-      referrer_pro_enabled: false,
-      referrer_pro_platform_pool: "",
-      referrer_pro_email_weights: "",
-      referrer_pro_brand: "",
-      referrer_pro_country: "",
-      referrer_pro_search_engine: "google",
-      referrer_pro_search_keywords: "",
-      referrer_pro_social_wrapper: true,
-      referrer_pro_inapp_deep_path: true,
-      referrer_pro_strip_search_path: true,
-      referrer_pro_network_click_chain: false,
-      referrer_pro_network_click_host: "",
-      referrer_pro_wrapper_redirect: false,
-      referrer_pro_lang_match: true,
-      referrer_pro_device_mode: "auto",
-      referrer_pro_tod_enabled: false,
-      referrer_pro_campaign_type: "auto",
-      referrer_pro_quality_tier: "standard",
-      referrer_pro_traffic_type: "auto",
-      traffic_type_param: "",
-      referrer_pro_offer_urls: "",
-      postback_url: "",
-      referrer_pro_auto_pause_enabled: false,
-      referrer_pro_auto_pause_threshold: 10
+      ...defaultProLinkFields(),
     });
-    setProReferrerOpen(false);
+    setTrafficSourcePreset("mixed_realistic");
+    setSelectedMyPresetId("");
+    setProReferrerOpen(true);
+    setProAdvancedOpen(false);
+    setPresetApplyLock(false);
   };
 
   const handleDelete = async (id) => {
@@ -691,7 +736,7 @@ export default function LinksPage() {
         referrer_pro_social_wrapper: true,
         referrer_pro_inapp_deep_path: true,
         referrer_pro_strip_search_path: true,
-        referrer_pro_wrapper_redirect: false,
+        referrer_pro_wrapper_redirect: true,
         referrer_pro_tod_enabled: false,
         referrer_pro_device_mode: "auto",
       },
@@ -724,11 +769,25 @@ export default function LinksPage() {
     }
   };
 
+  const applyMyPresetToLink = (mp) => {
+    if (!mp) return;
+    setSelectedMyPresetId(mp.id || "");
+    setPresetApplyLock(true);
+    setTrafficSourcePreset(mp.base_preset || "custom");
+    const patch = buildLinkPatchFromSavedPreset(mp);
+    setFormData((prev) => ({ ...prev, ...patch }));
+    setProReferrerOpen(true);
+    setTimeout(() => setPresetApplyLock(false), 50);
+    toast.success(`Loaded preset "${mp.name}"`);
+  };
+
   const openEditDialog = (link) => {
     setEditingLink(link);
     const hasCountryRestriction = link.allowed_countries && link.allowed_countries.length > 0;
     const hasOsRestriction = link.allowed_os && link.allowed_os.length > 0;
-    
+    setPresetApplyLock(true);
+    setTrafficSourcePreset(inferTrafficPresetFromLink(link));
+    setSelectedMyPresetId("");
     setFormData({ 
       offer_url: link.offer_url, 
       status: link.status,
@@ -778,7 +837,9 @@ export default function LinksPage() {
     });
     // Auto-expand the Pro-Referrer section when editing a link that
     // already has it enabled — customer immediately sees their settings.
-    setProReferrerOpen(!!link.referrer_pro_enabled);
+    setProReferrerOpen(!!link.referrer_pro_enabled || inferTrafficPresetFromLink(link) !== "off");
+    setProAdvancedOpen(inferTrafficPresetFromLink(link) === "custom");
+    setPresetApplyLock(false);
     setDialogOpen(true);
   };
 
@@ -1105,13 +1166,14 @@ export default function LinksPage() {
                 )}
               </div>
 
-              {/* Referrer Simulation - Make destination see specific referrer */}
+              {/* Basic referrer — only when Advanced Referrer Engine is OFF */}
+              {!formData.referrer_pro_enabled && (
               <div className="p-4 bg-[var(--brand-card)] rounded-lg border border-[var(--brand-border)]">
                 <div className="flex items-center gap-2 mb-3">
                   <ExternalLink size={18} className="text-[#8B5CF6]" />
                   <div>
-                    <Label className="text-base font-medium">Referrer Simulation</Label>
-                    <p className="text-xs text-muted-foreground mt-1">Make destination website see traffic as from specific platform</p>
+                    <Label className="text-base font-medium">Basic Referrer Settings</Label>
+                    <p className="text-xs text-muted-foreground mt-1">Simple mode — fixed platform + click IDs. For international-grade rotation use Referrer Engine below.</p>
                   </div>
                 </div>
                 
@@ -1172,9 +1234,10 @@ export default function LinksPage() {
                   )}
                 </div>
               </div>
+              )}
 
-              {/* v2.1.80 — Advanced Referrer System (RUT-style, applied per-click) */}
-              <div className="p-4 bg-[var(--brand-card)] rounded-lg border border-[var(--brand-border)]">
+              {/* Referrer Engine — same preset system as RUT jobs (recommended) */}
+              <div className="p-4 bg-[var(--brand-card)] rounded-lg border border-[#F59E0B40]">
                 <button
                   type="button"
                   onClick={() => setProReferrerOpen(!proReferrerOpen)}
@@ -1185,10 +1248,10 @@ export default function LinksPage() {
                     <Sparkles size={18} className="text-[#F59E0B]" />
                     <div>
                       <Label className="text-base font-medium cursor-pointer">
-                        Advanced Referrer System (RUT-style)
+                        Referrer Engine
                       </Label>
                       <p className="text-xs text-muted-foreground mt-1">
-                        Per-click platform rotation, real referer wrappers, brand-tagged UTMs — same engine as RUT jobs, applied automatically when anyone clicks this link
+                        Same international referrer system as RUT jobs — per-click rotation, fraud-detector guardrails, network compliance
                       </p>
                     </div>
                   </div>
@@ -1197,38 +1260,109 @@ export default function LinksPage() {
 
                 {proReferrerOpen && (
                   <div className="mt-4 space-y-4 pt-4 border-t border-[var(--brand-border)]">
-                    {/* Master toggle */}
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
                         checked={formData.referrer_pro_enabled}
                         onChange={(e) => {
                           const enabled = e.target.checked;
-                          setFormData({
-                            ...formData,
-                            referrer_pro_enabled: enabled,
-                            ...(enabled ? {
-                              forced_source: "",
-                              forced_source_name: "",
-                              simulate_platform: "",
-                              referrer_mode: formData.referrer_mode === "no_referrer" ? "normal" : formData.referrer_mode,
-                              referrer_pro_wrapper_redirect: formData.referrer_pro_wrapper_redirect || true,
-                            } : {}),
-                          });
+                          if (enabled) {
+                            setTrafficSourcePreset("mixed_realistic");
+                            setFormData({
+                              ...formData,
+                              ...buildLinkProPatchFromPreset("mixed_realistic"),
+                            });
+                          } else {
+                            setTrafficSourcePreset("off");
+                            setFormData({
+                              ...formData,
+                              referrer_pro_enabled: false,
+                            });
+                          }
                         }}
                         className="w-4 h-4"
                         data-testid="pro-referrer-enabled"
                       />
                       <span className="text-sm font-medium">
-                        Enable Pro-Referrer for this link
+                        Enable Advanced Referrer Engine (Recommended)
                       </span>
                     </label>
-                    <p className="text-xs text-[#F59E0B] -mt-2">
-                      When OFF, this link uses the classic Traffic Source + Referrer Mode fields above (safe / unchanged behavior). When ON, every click resolves fresh from the pool below.
+                    <p className="text-xs text-[#22C55E] -mt-2">
+                      ON = RUT-grade referrer on every click. OFF = basic settings above only.
                     </p>
 
                     {formData.referrer_pro_enabled && (
                       <>
+                        {/* RUT Simple Mode — one-click traffic source */}
+                        <div className="p-4 rounded-lg border-2 border-[#F59E0B50] bg-gradient-to-br from-[#F59E0B08] to-[#3B82F608]">
+                          <Label className="text-sm font-semibold text-[#F59E0B]">
+                            Traffic Source (Simple Mode)
+                          </Label>
+                          <p className="text-xs text-[#A1A1AA] mt-1 mb-2">
+                            One click — same presets as Real User Traffic jobs. Pick a source; platform weights and realism toggles auto-fill.
+                          </p>
+                          <select
+                            value={trafficSourcePreset === "off" ? "mixed_realistic" : trafficSourcePreset}
+                            onChange={(e) => {
+                              setSelectedMyPresetId("");
+                              setTrafficSourcePreset(e.target.value);
+                              if (e.target.value === "custom") {
+                                setProAdvancedOpen(true);
+                              }
+                            }}
+                            className="w-full p-2.5 rounded-md bg-[var(--brand-card)] border border-[#F59E0B60] text-white text-sm"
+                            data-testid="link-traffic-source-preset"
+                          >
+                            {TRAFFIC_SOURCE_PRESET_OPTIONS.filter((o) => o.value !== "direct_traffic").map((o) => (
+                              <option key={o.value} value={o.value}>{o.label}</option>
+                            ))}
+                            <option value="direct_traffic">Direct Traffic (no Referer)</option>
+                          </select>
+
+                          {myTrafficPresets.length > 0 && (
+                            <div className="mt-3 p-2 rounded border border-indigo-700/40 bg-indigo-950/20">
+                              <Label className="text-xs text-indigo-200 font-semibold">My Saved Presets (shared with RUT)</Label>
+                              <div className="flex flex-wrap gap-2 mt-2">
+                                {myTrafficPresets.map((mp) => (
+                                  <button
+                                    key={mp.id}
+                                    type="button"
+                                    onClick={() => applyMyPresetToLink(mp)}
+                                    className={`text-xs px-3 py-1.5 rounded-full border transition ${
+                                      selectedMyPresetId === mp.id
+                                        ? "bg-indigo-500 border-indigo-300 text-white"
+                                        : "bg-zinc-900 border-indigo-700/60 text-indigo-200 hover:bg-indigo-900/60"
+                                    }`}
+                                    data-testid={`link-my-preset-${mp.id}`}
+                                  >
+                                    {mp.name}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {trafficSourcePreset !== "custom" && TRAFFIC_SOURCE_PRESET_SUMMARY[trafficSourcePreset] && (
+                            <ul className="mt-3 text-[11px] text-[#A1A1AA] space-y-1 list-disc pl-4">
+                              {TRAFFIC_SOURCE_PRESET_SUMMARY[trafficSourcePreset].map((line) => (
+                                <li key={line}>{line}</li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setProAdvancedOpen(!proAdvancedOpen)}
+                          className="text-xs text-[#F59E0B] hover:underline flex items-center gap-1"
+                          data-testid="link-pro-advanced-toggle"
+                        >
+                          {proAdvancedOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          {proAdvancedOpen ? "Hide advanced settings" : "Show advanced settings (platform pool, quality tier, postback…)"}
+                        </button>
+
+                        {(proAdvancedOpen || trafficSourcePreset === "custom") && (
+                          <>
                         {/* ═════════════════════════════════════════════════
                             v2.1.83 — Beginner Step-by-Step Guide.
                             Shown right after the customer flips the master
@@ -1770,7 +1904,7 @@ export default function LinksPage() {
                         </label>
 
                         {/* ─────────────────────────────────────────────────
-                            v2.1.83 — International Fraud-Detector Guardrails
+                            Network Compliance Guardrails
                             (10-feature pack, network-agnostic MaxBounty /
                              ClickDealer / Everflow / Cake / Voluum ready)
                            ───────────────────────────────────────────────── */}
@@ -1781,7 +1915,7 @@ export default function LinksPage() {
 
                           {/* Feature 6 — Quality Tier one-click preset */}
                           <div className="mb-4">
-                            <Label className="text-xs text-[#A1A1AA]">Quality Tier (Feature 6 — one-click preset)</Label>
+                            <Label className="text-xs text-[#A1A1AA]">Quality Tier</Label>
                             <div className="grid grid-cols-3 gap-2 mt-1">
                               {[
                                 { v: "premium",    l: "🟢 Premium",    d: "MaxBounty / Cake top tier" },
@@ -1820,9 +1954,9 @@ export default function LinksPage() {
                                 data-testid="pro-lang-match"
                               />
                               <div>
-                                <div className="text-xs font-medium">🌍 Match Accept-Language to country</div>
+                                <div className="text-xs font-medium">Match Accept-Language to country</div>
                                 <p className="text-[10px] text-[#52525B] mt-0.5">
-                                  Feature 1 — Germany proxy sends <code>de-DE,de;q=0.9</code> not <code>en-US</code>. Boosts EU/Asia offer accept rate 20-40%.
+                                  Germany proxy sends <code>de-DE,de;q=0.9</code> not <code>en-US</code>. Boosts EU/Asia offer accept rate 20-40%.
                                 </p>
                               </div>
                             </label>
@@ -1837,9 +1971,9 @@ export default function LinksPage() {
                                 data-testid="pro-tod-enabled"
                               />
                               <div>
-                                <div className="text-xs font-medium">🕒 Time-of-day realism weighting</div>
+                                <div className="text-xs font-medium">Time-of-day realism weighting</div>
                                 <p className="text-[10px] text-[#52525B] mt-0.5">
-                                  Feature 4 — FB peaks 7-9am / 7-10pm, TikTok 6-11pm, LinkedIn business hours. Avoids &quot;suspicious 3am spike&quot; flags.
+                                  FB peaks 7-9am / 7-10pm, TikTok 6-11pm, LinkedIn business hours. Avoids &quot;suspicious 3am spike&quot; flags.
                                 </p>
                               </div>
                             </label>
@@ -1847,7 +1981,7 @@ export default function LinksPage() {
 
                           {/* Feature 3 — Device Type per Platform */}
                           <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">📱 Device Distribution (Feature 3)</Label>
+                            <Label className="text-xs text-[#A1A1AA]">Device Distribution</Label>
                             <select
                               value={formData.referrer_pro_device_mode}
                               onChange={(e) => setFormData({ ...formData, referrer_pro_device_mode: e.target.value })}
@@ -1866,7 +2000,7 @@ export default function LinksPage() {
 
                           {/* Feature 5 — Campaign Type Preset */}
                           <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">🎯 Campaign Type / UTM Preset (Feature 5)</Label>
+                            <Label className="text-xs text-[#A1A1AA]">Campaign Type / UTM Preset</Label>
                             <select
                               value={formData.referrer_pro_campaign_type}
                               onChange={(e) => setFormData({ ...formData, referrer_pro_campaign_type: e.target.value })}
@@ -1889,9 +2023,9 @@ export default function LinksPage() {
                             </p>
                           </div>
 
-                          {/* v2.6.24 — Traffic Type: Paid vs Organic Referer Split */}
+                          {/* Traffic Type: Paid vs Organic */}
                           <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">🚦 Traffic Type (v2.6.24 — Paid vs Organic split)</Label>
+                            <Label className="text-xs text-[#A1A1AA]">Traffic Type (Paid vs Organic)</Label>
                             <select
                               value={formData.referrer_pro_traffic_type || 'auto'}
                               onChange={(e) => setFormData({ ...formData, referrer_pro_traffic_type: e.target.value })}
@@ -2053,7 +2187,7 @@ export default function LinksPage() {
                               data-testid="pro-postback-url"
                             />
                             <p className="text-[10px] text-[#52525B] mt-1">
-                              When a conversion hits Krexion&apos;s /postback endpoint, we forward it to this URL (Voluum / Everflow / HasOffers / Cake). Macros: <code>{"{click_id}"}, {"{payout}"}, {"{status}"}, {"{source}"}</code>.
+                              When a conversion hits Krexion&apos;s /postback endpoint, we forward it to this URL. Works with Voluum, Everflow, HasOffers, Cake, MaxBounty, Affise, Glitchy, Binom, RedTrack, and more. Macros: <code>{"{click_id}"}, {"{transaction_id}"}, {"{payout}"}, {"{amount}"}, {"{status}"}, {"{sub1}"}, {"{source}"}</code>. Inbound postback accepts GET or POST with any common alias (<code>clickid</code>, <code>transaction_id</code>, <code>sub1</code>, etc.).
                             </p>
                           </div>
 
@@ -2068,7 +2202,7 @@ export default function LinksPage() {
                                 data-testid="pro-auto-pause"
                               />
                               <div>
-                                <div className="text-xs font-medium">🛑 Auto-Pause on Rejection Spike (Feature 10)</div>
+                                <div className="text-xs font-medium">Auto-Pause on Rejection Spike</div>
                                 <p className="text-[10px] text-[#52525B] mt-0.5">
                                   Pauses this link automatically after N consecutive non-converting clicks. Saves proxy quota when an offer gets IP-banned / budget-capped. Resets on any conversion.
                                 </p>
@@ -2088,7 +2222,8 @@ export default function LinksPage() {
                               />
                             </div>
                           </div>
-                        </div>
+                          </>
+                        )}
 
                         {/* Preview button */}
                         <div className="flex flex-wrap items-center gap-2 pt-2">
@@ -2354,6 +2489,9 @@ export default function LinksPage() {
               <code className="block bg-[var(--brand-card)] p-3 rounded-md text-sm font-mono">
                 {PUBLIC_HOST}/api/postback?clickid=&#123;clickid&#125;&amp;payout=&#123;amount&#125;&amp;status=approved&amp;token=YOUR_TOKEN
               </code>
+              <p className="text-xs text-muted-foreground mt-2">
+                Supports GET or POST. Aliases: clickid, click_id, transaction_id, sub1, cid, amount, sale, payout.
+              </p>
             </div>
           </CardContent>
         </Card>
@@ -2544,6 +2682,14 @@ export default function LinksPage() {
                 </div>
               )}
 
+              {qaData.inbound_postback_url && (
+                <div className="p-3 bg-[var(--brand-card)] rounded border border-[var(--brand-border)] space-y-2">
+                  <p className="text-xs font-semibold text-[#E4E4E7]">Inbound postback (paste on offer network)</p>
+                  <code className="block text-[10px] font-mono break-all text-[#A1A1AA]">{qaData.inbound_postback_url}</code>
+                  <p className="text-[10px] text-muted-foreground">GET or POST · supports clickid, transaction_id, sub1, amount, sale, etc.</p>
+                </div>
+              )}
+
               {qaData.last_postback_fired_at && (
                 <div className="p-2 bg-[var(--brand-card)] rounded border border-[var(--brand-border)] text-[11px]">
                   <p className="text-[#A1A1AA]">
@@ -2575,7 +2721,7 @@ export default function LinksPage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
             {[
               { key: "facebook_ads",      label: "Facebook Ads",       emoji: "📘", tint: "border-[#1877F2] hover:bg-[#1877F2]/10", desc: "Mobile-first, in-app deep paths, video ad UTMs" },
-              { key: "tiktok_ads",        label: "TikTok Ads",         emoji: "🎵", tint: "border-[#FE2C55] hover:bg-[#FE2C55]/10", desc: "Mobile-only, silent redirect (bypass warnings)" },
+              { key: "tiktok_ads",        label: "TikTok Ads",         emoji: "🎵", tint: "border-[#FE2C55] hover:bg-[#FE2C55]/10", desc: "Mobile-only, direct 302 + ttclid (no broken link/v2)" },
               { key: "google_ads",        label: "Google Ads",         emoji: "🔍", tint: "border-[#34A853] hover:bg-[#34A853]/10", desc: "Search + YouTube split, google.com/url wrapper" },
               { key: "linkedin_ads",      label: "LinkedIn Ads",       emoji: "💼", tint: "border-[#0A66C2] hover:bg-[#0A66C2]/10", desc: "Desktop-first, business hours, sponsored UTMs" },
               { key: "maxbounty_premium", label: "MaxBounty Premium",  emoji: "⭐", tint: "border-[#FFD700] hover:bg-[#FFD700]/10", desc: "Multi-platform mix, wrapper ON, auto-pause 15" },

@@ -830,6 +830,13 @@ def _should_profile_wrapper_bounce(url: str, state: _ProfileReferrerState, ua: s
         return False
     if _is_wrapper_domain(url):
         return False
+    try:
+        from referrer_pro import should_http_wrapper_bounce
+        if not should_http_wrapper_bounce(ua, state.platform, state.wrapper_template):
+            return False
+    except Exception:
+        if "tiktok.com/link/v2" in (state.wrapper_template or "").lower():
+            return False
     # Headed profile sessions are not cold external link clicks — always
     # honour wrapper_redirect when navigating to a new offer/document URL.
     return True
@@ -1013,25 +1020,22 @@ async def _launch_session_inline(
             )
             return {"ok": False, "error": f"Playwright not installed: {_ie}"}
 
-        # ── v2.1.59 Pre-flight: Chromium binary readiness check ─────────
-        # On a fresh Krexion install the PowerShell installer tries to
-        # download the pre-bundled Chromium ZIP from GitHub Releases —
-        # when that step is skipped/fails it logs:
-        #   "Krexion backend will auto-download Chromium on first launch"
-        # The actual download is then kicked off in the backend's
-        # startup hook (_ensure_playwright_chromium) and runs for ~60s.
-        # If the customer clicks Launch on a Browser Profile DURING that
-        # window, Playwright's `chromium.launch()` raises a cryptic
-        # "Executable doesn't exist at ..." error. We pre-check the
-        # binary HERE and surface a friendly status that the UI can
-        # render — auto-triggering the install if it hasn't started yet,
-        # so the customer's next click "just works" after ~60-90s.
+        # ── v2.7.37 Pre-flight: FULL Chromium for headed profile launch ───
+        # Headed profiles need chromium-{rev}/chrome.exe — NOT headless-shell.
+        # Relative \\pw-browsers paths on Windows caused permanent launch
+        # failures; normalize + install synchronously before first launch.
         try:
-            from real_user_traffic import get_engine_status, _ensure_chromium_available  # type: ignore
-            engine = get_engine_status()
+            from real_user_traffic import (  # type: ignore
+                get_headed_engine_status,
+                _ensure_full_chromium_available,
+                normalize_playwright_browsers_path,
+                _full_chromium_binary_path,
+            )
+            normalize_playwright_browsers_path()
+            engine = get_headed_engine_status()
             estatus = (engine or {}).get("status") or "error"
             if estatus == "ready":
-                pass  # All good — proceed to launch
+                pass
             elif estatus == "installing":
                 await _notify_error(
                     "Chromium browser engine is still downloading "
@@ -1041,34 +1045,24 @@ async def _launch_session_inline(
                 return {"ok": False, "session_id": session_id,
                         "error": "chromium_installing"}
             elif estatus == "missing":
-                # Kick off the install in the background and tell the
-                # operator to retry. We deliberately don't await here —
-                # the download takes too long for a synchronous UI click.
-                try:
-                    asyncio.create_task(_ensure_chromium_available())
-                except Exception:  # noqa: BLE001
-                    pass
-                await _notify_error(
-                    "Chromium browser engine is missing — downloading "
-                    "it now (~150 MB, takes ~60-90 seconds). Click "
-                    "Launch again once this banner clears."
-                )
-                return {"ok": False, "session_id": session_id,
-                        "error": "chromium_missing_install_started"}
+                ok = await _ensure_full_chromium_available()
+                if not ok or _full_chromium_binary_path() is None:
+                    await _notify_error(
+                        "Chromium browser engine is missing — downloading "
+                        "it now (~150 MB, takes ~60-90 seconds). Click "
+                        "Launch again once this banner clears."
+                    )
+                    return {"ok": False, "session_id": session_id,
+                            "error": "chromium_missing_install_started"}
             else:
-                # 'error' or unknown — fall through to the actual launch
-                # so Playwright surfaces its native error (better than
-                # blocking on a metadata read glitch).
                 logger.warning(
-                    f"[profile-launch] chromium engine status='{estatus}' "
+                    f"[profile-launch] headed chromium status='{estatus}' "
                     f"(msg={(engine or {}).get('message','')}); continuing anyway"
                 )
         except ImportError:
-            # real_user_traffic helper isn't available in this build —
-            # not fatal, just skip the pre-check and let Playwright handle it.
-            logger.debug("[profile-launch] engine status helper not importable; skipping pre-check")
+            logger.debug("[profile-launch] headed engine helper not importable; skipping pre-check")
         except Exception as _ge:  # noqa: BLE001
-            logger.debug(f"[profile-launch] chromium pre-check skipped: {_ge}")
+            logger.debug(f"[profile-launch] headed chromium pre-check skipped: {_ge}")
 
         started_at = time.time()
         # Taskbar slot = open-profile number badge (1, 2, 3…) on Krexion icon.
@@ -1230,7 +1224,7 @@ async def _launch_profile_session_inner(
                 _uid,
                 None,
                 proxy_cfg,
-                team_dedupe=False,
+                team_dedupe=True,
                 profile_country=profile_config.get("country"),
             )
             profile_config = dict(profile_config)
@@ -1434,6 +1428,18 @@ async def _launch_profile_session_inner(
                 launch_kwargs["args"].append(_sa)
         if _kernel_plan.get("executable_path"):
             launch_kwargs["executable_path"] = _kernel_plan["executable_path"]
+        else:
+            try:
+                from real_user_traffic import (  # type: ignore
+                    normalize_playwright_browsers_path,
+                    _full_chromium_binary_path,
+                )
+                normalize_playwright_browsers_path()
+                _fc = _full_chromium_binary_path()
+                if _fc is not None:
+                    launch_kwargs["executable_path"] = str(_fc)
+            except Exception:
+                pass
         logger.info(
             f"[profile-launch] kernel={_kernel_plan.get('kernel_label')} "
             f"driver={_kernel_plan.get('driver')} exe={bool(_kernel_plan.get('executable_path'))}"
@@ -1457,8 +1463,38 @@ async def _launch_profile_session_inner(
             except Exception as _lex:
                 logger.warning(f"[profile-launch] kernel launch failed ({_lex}); stock chromium")
                 _kw = dict(launch_kwargs)
-                _kw.pop("executable_path", None)
-                return await p.chromium.launch(**_kw)
+                try:
+                    from real_user_traffic import (  # type: ignore
+                        _ensure_full_chromium_available,
+                        _full_chromium_binary_path,
+                        normalize_playwright_browsers_path,
+                    )
+                    normalize_playwright_browsers_path()
+                    _fc = _full_chromium_binary_path()
+                    if _fc is not None:
+                        _kw["executable_path"] = str(_fc)
+                    else:
+                        _kw.pop("executable_path", None)
+                except Exception:
+                    _kw.pop("executable_path", None)
+                try:
+                    return await p.chromium.launch(**_kw)
+                except Exception as _lex2:
+                    _msg = str(_lex2)
+                    if "Executable doesn't exist" in _msg or "executable doesn't exist" in _msg.lower():
+                        try:
+                            from real_user_traffic import (  # type: ignore
+                                _ensure_full_chromium_available,
+                                _full_chromium_binary_path,
+                            )
+                            if await _ensure_full_chromium_available():
+                                _fc2 = _full_chromium_binary_path()
+                                if _fc2 is not None:
+                                    _kw["executable_path"] = str(_fc2)
+                                    return await p.chromium.launch(**_kw)
+                        except Exception as _retry_err:
+                            logger.warning(f"[profile-launch] chromium retry failed: {_retry_err}")
+                    raise _lex2 from _lex
         # v2.7.13 — Local API CDP: optional remote debugging for Playwright connect
         _cdp_port: Optional[int] = None
         _want_cdp = bool(

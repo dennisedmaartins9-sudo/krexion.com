@@ -143,7 +143,8 @@ jobs:
           COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
         run: |
           cd /opt/krexion
-          echo ">> Building backend + frontend with --no-cache..."
+          export KREXION_VERSION="$(tr -d ' \n\r' < backend/VERSION)"
+          echo ">> Building backend + frontend with --no-cache (UI version=$KREXION_VERSION)..."
           docker compose -f "$COMPOSE_FILE" build --no-cache backend frontend
 
       - name: Docker up
@@ -247,6 +248,17 @@ jobs:
           curl -sf --max-time 5 https://krexion.com/api/system/version || echo "(public endpoint check failed — check nginx/cloudflare)"
           echo "===================================================="
 
+      - name: Sync download page release record (auto)
+        continue-on-error: true
+        env:
+          COMPOSE_FILE: ${{ steps.compose.outputs.compose_file }}
+        run: |
+          cd /opt/krexion
+          echo ">> Syncing app_releases row for download page / update banner..."
+          curl -sf -X POST http://localhost:8001/api/system/sync-deploy-release \
+            && echo "  ✅ Release record synced from backend/VERSION" \
+            || echo "  WARN: release sync skipped (endpoint may need redeploy first)"
+
       - name: Publish native UI sync zip (optional)
         continue-on-error: true
         timeout-minutes: 8
@@ -263,12 +275,21 @@ jobs:
             echo "WARN: could not copy live frontend files — skipping UI sync zip"
             exit 0
           fi
+          # CRITICAL: frontend container bind-mounts /downloads (600MB+ installers).
+          # Never zip that into krexion-ui-*.zip — broke native UI sync (~25GB zips).
+          rm -rf "$EXPORT/downloads"
           if ! python3 scripts/stamp-frontend-build.py --dir "$EXPORT"; then
             echo "WARN: stamp verify failed — writing version-only marker"
             printf '{"version":"%s"}\n' "$VERSION" > "$EXPORT/build-version.json"
           fi
           rm -f "downloads/ui/krexion-ui-${VERSION}.zip"
           (cd "$EXPORT" && zip -qr "/opt/krexion/downloads/ui/krexion-ui-${VERSION}.zip" .)
+          ZIP_BYTES=$(stat -c%s "downloads/ui/krexion-ui-${VERSION}.zip" 2>/dev/null || stat -f%z "downloads/ui/krexion-ui-${VERSION}.zip")
+          if [ "$ZIP_BYTES" -gt 104857600 ]; then
+            echo "::error::UI zip too large (${ZIP_BYTES} bytes) — likely included downloads/ by mistake"
+            rm -f "downloads/ui/krexion-ui-${VERSION}.zip"
+            exit 1
+          fi
           ls -la "downloads/ui/krexion-ui-${VERSION}.zip"
           sha256sum "downloads/ui/krexion-ui-${VERSION}.zip"
           echo "  Deploy complete: $(date -u +%FT%TZ)"

@@ -47,15 +47,15 @@ def test_prepare_link_pro_click_tiktok_coerces_ua_and_wrapper():
     low = coerced.lower()
     assert "musical_ly" in low or "trill" in low or "tiktok" in low
     assert (prep.get("referer") or "").strip()
-    assert prep.get("wrapper_target") or prep.get("use_wrapper")
+    wt = str(prep.get("wrapper_target") or "")
+    assert "link/v2" not in wt.lower()
 
 
-def test_twitter_wrapper_uses_x_redirect_not_tco():
+def test_twitter_wrapper_no_http_bounce():
     rp = _rp()
     dest = "https://offer.example.com/landing"
     bounce = rp.build_wrapper_bounce_url("twitter", dest, is_paid=True)
-    assert "x.com/i/redirect" in bounce or "twitter.com" in bounce
-    assert "t.co/" not in bounce.split("?")[0]
+    assert bounce == "", "Twitter/X i/redirect breaks on cold clicks — direct 302 only"
 
 
 def test_enrich_destination_adds_realism_params():

@@ -309,7 +309,11 @@ class TestConversions:
 
         r2 = s.get(
             f"{API}/pixel",
-            params={"clickid": pixel_click_id, "payout": 0.5},
+            params={
+                "clickid": pixel_click_id,
+                "payout": 0.5,
+                "token": "secure-postback-token-123",
+            },
             timeout=30,
         )
         assert r2.status_code == 200, r2.text
