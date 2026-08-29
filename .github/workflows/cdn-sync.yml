@@ -20,7 +20,7 @@ jobs:
   sync:
     name: Download from GitHub Release → SCP to VPS CDN
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
