@@ -39,6 +39,8 @@ jobs:
     name: SSH into VPS, restart krexion-runner, free disk
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    permissions:
+      actions: read
     steps:
       - name: SSH into VPS and restart runner + cleanup
         uses: appleboy/ssh-action@v1.2.0
@@ -100,12 +102,12 @@ jobs:
 
       - name: Poll GitHub API — confirm krexion-vps runner is ONLINE
         env:
-          GH_PAT: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ github.token }}
         run: |
           set -e
-          for i in $(seq 1 12); do
+          for i in $(seq 1 24); do
             sleep 5
-            RESPONSE=$(curl -sfH "Authorization: token $GH_PAT" \
+            RESPONSE=$(curl -sfH "Authorization: Bearer $GH_PAT" \
               "https://api.github.com/repos/${{ github.repository }}/actions/runners")
             STATUS=$(echo "$RESPONSE" | python3 -c "
           import json, sys
@@ -114,6 +116,8 @@ jobs:
               if r['name'] == 'krexion-vps':
                   print(r['status'])
                   break
+          else:
+              print('unknown')
           " 2>/dev/null || echo "unknown")
             echo "  Poll #$i: krexion-vps = $STATUS"
             if [ "$STATUS" = "online" ]; then
@@ -121,5 +125,5 @@ jobs:
               exit 0
             fi
           done
-          echo "  ⚠️ Runner did NOT come back online after 60s. Check runner logs on VPS manually."
+          echo "  ⚠️ Runner did NOT come back online after 120s. SSH restart succeeded — check runner logs on VPS."
           exit 1
