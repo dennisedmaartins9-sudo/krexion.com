@@ -421,27 +421,15 @@ jobs:
   mirror-to-vps:
     name: Mirror to krexion.com VPS (self-hosted CDN)
     needs: build
-    # 2026-01-09 — moved from ubuntu-latest to krexion-vps runner.
-    # Since the runner IS the VPS, SCP+SSH is replaced by local `cp`.
-    # Free forever + faster (no network round-trip).
     runs-on: [self-hosted, linux, krexion-vps]
     if: ${{ needs.build.result == 'success' }}
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
-      # v2.1.56 — Try artifact first (fast path, no network round-trip
-      # to GitHub Releases), then fall back to downloading from the
-      # GitHub Release that the build job just published.
-      - name: Download installer artifact from build job
-        id: dl-artifact
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: Krexion-Desktop-Setup-${{ needs.build.outputs.version }}
-          path: dist
-
-      - name: Fallback — download installer from GitHub Release (via curl)
-        if: steps.dl-artifact.outcome != 'success'
+      # v2.7.36 — Always curl from GitHub Release. download-artifact on
+      # self-hosted VPS hung on 600MB+ cross-runner transfers (~50+ min).
+      - name: Download installer from GitHub Release (via curl)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VER: ${{ needs.build.outputs.version }}
