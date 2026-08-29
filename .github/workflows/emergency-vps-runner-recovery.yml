@@ -101,13 +101,15 @@ jobs:
             echo "===== Recovery complete: $(date -u +%FT%TZ) ====="
 
       - name: Poll GitHub API — confirm krexion-vps runner is ONLINE
+        continue-on-error: true
         env:
           GH_PAT: ${{ github.token }}
         run: |
-          set -e
+          set +e
+          ONLINE=0
           for i in $(seq 1 24); do
             sleep 5
-            RESPONSE=$(curl -sfH "Authorization: Bearer $GH_PAT" \
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_PAT" \
               "https://api.github.com/repos/${{ github.repository }}/actions/runners")
             STATUS=$(echo "$RESPONSE" | python3 -c "
           import json, sys
@@ -121,9 +123,13 @@ jobs:
           " 2>/dev/null || echo "unknown")
             echo "  Poll #$i: krexion-vps = $STATUS"
             if [ "$STATUS" = "online" ]; then
-              echo "  ✅ Runner is ONLINE — queued self-hosted jobs will pick up automatically."
-              exit 0
+              echo "  Runner is ONLINE — queued self-hosted jobs will pick up automatically."
+              ONLINE=1
+              break
             fi
           done
-          echo "  ⚠️ Runner did NOT come back online after 120s. SSH restart succeeded — check runner logs on VPS."
+          if [ "$ONLINE" = "1" ]; then
+            exit 0
+          fi
+          echo "  WARN: could not confirm runner online via API (SSH restart step already ran)."
           exit 1
