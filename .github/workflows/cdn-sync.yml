@@ -1,8 +1,8 @@
 name: Sync Installer CDN
 
-# Lightweight job — downloads installers from GitHub Releases to
-# /opt/krexion/downloads/ on the VPS. Does NOT rebuild Docker.
-# Use when mirror jobs hang or deploy times out before CDN sync.
+# Downloads installers on GitHub-hosted Ubuntu (fast network), then SCPs
+# to the VPS. Avoids multi-GB downloads on the self-hosted krexion-vps
+# runner which was hanging/cancelling after ~50 min.
 
 on:
   workflow_dispatch:
@@ -18,39 +18,81 @@ concurrency:
 
 jobs:
   sync:
-    name: Pull installers from GitHub Release → VPS CDN
-    runs-on: [self-hosted, linux, krexion-vps]
-    timeout-minutes: 45
+    name: Download from GitHub Release → SCP to VPS CDN
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
       - name: Checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-          REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-          SHA="${{ github.sha }}"
-          if [ ! -d .git ]; then git init && git remote add origin "$REPO"; else git remote set-url origin "$REPO"; fi
-          git fetch --force origin "$SHA"
-          git checkout --force --detach "$SHA"
+        uses: actions/checkout@v4
 
-      - name: Sync native + desktop installers
+      - name: Download installers locally (GitHub fast network)
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          CDN_SYNC_MODE: download-only
         run: |
           chmod +x scripts/sync_cdn_from_github_release.sh
           bash scripts/sync_cdn_from_github_release.sh
 
-      - name: Verify CDN endpoints
+      - name: SCP native installer to VPS
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: "dist-cdn/windows/*"
+          target: "/opt/krexion/downloads/windows"
+          strip_components: 2
+          overwrite: true
+
+      - name: SCP desktop installer to VPS
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: "dist-cdn/desktop/*"
+          target: "/opt/krexion/downloads/desktop"
+          strip_components: 2
+          overwrite: true
+
+      - name: Finalize latest.exe aliases on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            VER=$(tr -d '[:space:]' < /opt/krexion/backend/VERSION 2>/dev/null || echo "2.7.36")
+            mkdir -p /opt/krexion/downloads/windows /opt/krexion/downloads/desktop
+            cd /opt/krexion/downloads/windows
+            if [ -f "Krexion-Setup-v${VER}.exe" ]; then
+              cp -f "Krexion-Setup-v${VER}.exe" "Krexion-Setup-latest.exe"
+            fi
+            chmod -R a+r .
+            cd /opt/krexion/downloads/desktop
+            if [ -f "Krexion-Desktop-Setup-${VER}.exe" ]; then
+              cp -f "Krexion-Desktop-Setup-${VER}.exe" "Krexion-Desktop-Setup-latest.exe"
+            fi
+            chmod -R a+r .
+            ls -la /opt/krexion/downloads/windows/Krexion-Setup-v${VER}.exe
+            ls -la /opt/krexion/downloads/desktop/Krexion-Desktop-Setup-${VER}.exe
+
+      - name: Verify public CDN URLs
         run: |
           VER=$(tr -d '[:space:]' < backend/VERSION)
           for URL in \
             "https://krexion.com/downloads/windows/Krexion-Setup-v${VER}.exe" \
             "https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-${VER}.exe"; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 -I "$URL" || echo "000")
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -I "$URL" || echo "000")
             echo "$URL → HTTP $CODE"
             [ "$CODE" = "200" ] || exit 1
           done

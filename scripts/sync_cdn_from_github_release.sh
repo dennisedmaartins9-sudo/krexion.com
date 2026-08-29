@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
-# Sync native + Electron installers from GitHub Releases to /opt/krexion/downloads/.
-# Runs on the krexion-vps self-hosted runner (local cp, no SSH).
+# Sync native + Electron installers from GitHub Releases to VPS CDN.
+# Modes:
+#   install (default) — copy to /opt/krexion/downloads/ on krexion-vps runner
+#   download-only     — write to ./dist-cdn/ for SCP from ubuntu-latest CI job
 set -euo pipefail
 
 VER="${1:-$(tr -d '[:space:]' < backend/VERSION)}"
 REPO="${GITHUB_REPOSITORY:-krexion-com-final/krexion.com-final}"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+MODE="${CDN_SYNC_MODE:-install}"
 if [ -z "$TOKEN" ]; then
   echo "::warning::No GH token — skipping CDN sync"
   exit 0
+fi
+
+ROOT_DIR="$(pwd)"
+if [ "$MODE" = "download-only" ]; then
+  NAT_INSTALL_DIR="$ROOT_DIR/dist-cdn/windows"
+  DESK_INSTALL_DIR="$ROOT_DIR/dist-cdn/desktop"
+else
+  NAT_INSTALL_DIR="/opt/krexion/downloads/windows"
+  DESK_INSTALL_DIR="/opt/krexion/downloads/desktop"
 fi
 
 WORKDIR="${RUNNER_TEMP:-/tmp}/krexion-cdn-sync-$$"
@@ -63,15 +75,18 @@ PY
 NAT_DIR="$WORKDIR/native"
 download_release_assets "v${VER}" "$NAT_DIR" "Krexion-Setup-"
 if compgen -G "$NAT_DIR/Krexion-Setup-*.exe" >/dev/null; then
-  AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
-  if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
-    echo "::error::VPS disk low (<2.5GB free) — prune old installers first"
-    df -h /opt/krexion/downloads || true
-    exit 1
+  if [ "$MODE" != "download-only" ]; then
+    AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
+      echo "::error::VPS disk low (<2.5GB free) — prune old installers first"
+      df -h /opt/krexion/downloads || true
+      exit 1
+    fi
   fi
-  mkdir -p /opt/krexion/downloads/windows
-  cp -f "$NAT_DIR"/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
-  cd /opt/krexion/downloads/windows
+  mkdir -p "$NAT_INSTALL_DIR"
+  cp -f "$NAT_DIR"/Krexion-Setup-*.exe "$NAT_INSTALL_DIR/"
+  if [ "$MODE" != "download-only" ]; then
+  cd "$NAT_INSTALL_DIR"
   if [ -f "Krexion-Setup-v${VER}.exe" ]; then
     cp -f "Krexion-Setup-v${VER}.exe" "Krexion-Setup-latest.exe"
   else
@@ -87,18 +102,20 @@ if compgen -G "$NAT_DIR/Krexion-Setup-*.exe" >/dev/null; then
     [ "$keep" = "0" ] && rm -f -- "$f" && echo "pruned $f"
   done
   chmod -R a+r .
-  echo "✅ Native CDN: https://krexion.com/downloads/windows/Krexion-Setup-v${VER}.exe"
+  fi
+  echo "✅ Native CDN: Krexion-Setup-v${VER}.exe"
 fi
 
 # ── Electron desktop installer ──
 DESK_DIR="$WORKDIR/desktop"
 download_release_assets "desktop-v${VER}" "$DESK_DIR" "Krexion-Desktop-Setup-" "latest.yml"
 if compgen -G "$DESK_DIR/Krexion-Desktop-Setup-*.exe" >/dev/null || [ -f "$DESK_DIR/latest.yml" ]; then
-  mkdir -p /opt/krexion/downloads/desktop
-  cp -f "$DESK_DIR"/Krexion-Desktop-Setup-*.exe /opt/krexion/downloads/desktop/ 2>/dev/null || true
-  cp -f "$DESK_DIR"/Krexion-Desktop-Setup-*.exe.blockmap /opt/krexion/downloads/desktop/ 2>/dev/null || true
-  cp -f "$DESK_DIR/latest.yml" /opt/krexion/downloads/desktop/ 2>/dev/null || true
-  cd /opt/krexion/downloads/desktop
+  mkdir -p "$DESK_INSTALL_DIR"
+  cp -f "$DESK_DIR"/Krexion-Desktop-Setup-*.exe "$DESK_INSTALL_DIR/" 2>/dev/null || true
+  cp -f "$DESK_DIR"/Krexion-Desktop-Setup-*.exe.blockmap "$DESK_INSTALL_DIR/" 2>/dev/null || true
+  cp -f "$DESK_DIR/latest.yml" "$DESK_INSTALL_DIR/" 2>/dev/null || true
+  if [ "$MODE" != "download-only" ]; then
+  cd "$DESK_INSTALL_DIR"
   if [ -f "Krexion-Desktop-Setup-${VER}.exe" ]; then
     cp -f "Krexion-Desktop-Setup-${VER}.exe" "Krexion-Desktop-Setup-latest.exe"
   else
@@ -120,7 +137,8 @@ if compgen -G "$DESK_DIR/Krexion-Desktop-Setup-*.exe" >/dev/null || [ -f "$DESK_
     [ "$keep" = "0" ] && rm -f -- "$f" && echo "pruned $f"
   done
   chmod -R a+r .
-  echo "✅ Desktop CDN: https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-v${VER}.exe"
+  fi
+  echo "✅ Desktop CDN: Krexion-Desktop-Setup-${VER}.exe"
 fi
 
 echo "CDN sync complete for v${VER}"
