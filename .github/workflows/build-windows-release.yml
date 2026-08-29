@@ -722,6 +722,7 @@ jobs:
       - name: Compile installer
         shell: powershell
         run: |
+          if (Test-Path installer/Output) { Remove-Item -Recurse -Force installer/Output }
           New-Item -ItemType Directory -Force -Path installer/Output | Out-Null
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
               /Qp installer/krexion-setup.iss `
@@ -747,10 +748,12 @@ jobs:
           $tag   = $env:RELEASE_TAG
           $token = $env:RELEASE_TOKEN
           if (-not $token) { $token = $env:GITHUB_TOKEN }
-          $expected = @(Get-ChildItem installer/Output -Filter 'Krexion-Setup-*.exe' -File | ForEach-Object { $_.FullName })
-          if (-not $expected -or $expected.Count -eq 0) {
-            throw "No Krexion-Setup-*.exe files found in installer/Output. ISCC compile must have failed."
+          $expectedName = "Krexion-Setup-$tag.exe"
+          $expectedPath = Join-Path "installer/Output" $expectedName
+          if (-not (Test-Path $expectedPath)) {
+            throw "Expected $expectedName in installer/Output but not found. ISCC compile must have failed."
           }
+          $expected = @($expectedPath)
           $headers = @{
             'Authorization' = "token $token"
             'Accept'        = 'application/vnd.github+json'
@@ -877,6 +880,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           VER: ${{ needs.build-backend.outputs.version }}
+          TARGET: Krexion-Setup-${{ needs.build-backend.outputs.version }}.exe
         run: |
           set -e
           mkdir -p dist
@@ -886,6 +890,7 @@ jobs:
           # self-hosted runner doesn't have GitHub CLI installed.
           # Retry up to 6 times — release propagation lag from
           # softprops/action-gh-release@v2 is occasionally up to ~45s.
+          TARGET="Krexion-Setup-${VER}.exe"
           for i in 1 2 3 4 5 6; do
             HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -898,24 +903,50 @@ jobs:
             echo "  attempt $i: HTTP $HTTP, sleeping 10s..."
             sleep 10
           done
-          # Extract asset URLs
-          python3 - <<'PY' > /tmp/assets.tsv
-          import json
-          with open('/tmp/rel.json') as f:
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Release tag $VER not visible after retries (HTTP $HTTP)"
+            exit 1
+          fi
+          # Mirror ONLY the current release installer — never every historical
+          # Krexion-Setup-*.exe on the release (19+ files / ~12GB caused timeouts).
+          python3 - <<PY > /tmp/assets.tsv
+          import json, os, sys
+          target = os.environ["TARGET"]
+          with open("/tmp/rel.json") as f:
               d = json.load(f)
-          for a in d.get('assets', []):
-              if a['name'].startswith('Krexion-Setup-') and a['name'].endswith('.exe'):
-                  print(f"{a['url']}\t{a['name']}")
+          matches = [a for a in d.get("assets", []) if a.get("name") == target]
+          if not matches:
+              names = [a.get("name") for a in d.get("assets", [])]
+              print(f"::error::Asset {target} missing on release {os.environ.get('VER')}. Have: {names}", file=sys.stderr)
+              sys.exit(1)
+          a = matches[0]
+          print(f"{a['url']}\t{a['name']}\t{a.get('size', 0)}")
           PY
-          echo "Assets to download:"
+          echo "Asset to download:"
           cat /tmp/assets.tsv
-          while IFS=$'\t' read -r URL NAME; do
+          while IFS=$'\t' read -r URL NAME EXPECTED; do
             [ -z "$URL" ] && continue
-            echo "Downloading $NAME ..."
-            curl -sL \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/octet-stream" \
-              -o "dist/$NAME" "$URL"
+            echo "Downloading $NAME (expected ${EXPECTED} bytes) ..."
+            for attempt in 1 2 3 4 5; do
+              if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                -o "dist/$NAME" "$URL"; then
+                GOT=$(stat -c%s "dist/$NAME" 2>/dev/null || wc -c < "dist/$NAME")
+                if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "0" ] && [ "$GOT" != "$EXPECTED" ]; then
+                  echo "  attempt $attempt: size mismatch got=$GOT expected=$EXPECTED"
+                  rm -f "dist/$NAME"
+                  sleep 15
+                  continue
+                fi
+                echo "  downloaded $NAME ($GOT bytes)"
+                break
+              fi
+              echo "  attempt $attempt failed, retrying..."
+              rm -f "dist/$NAME"
+              sleep 15
+            done
+            test -s "dist/$NAME"
           done < /tmp/assets.tsv
           ls -lah dist/
 
