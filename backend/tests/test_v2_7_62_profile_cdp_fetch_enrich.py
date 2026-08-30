@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_version_is_2_7_62():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.64"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.65"
 
 
 def test_profile_network_enrich_module_exists():

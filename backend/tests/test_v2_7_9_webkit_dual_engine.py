@@ -43,7 +43,7 @@ ANDROID_CHROME = (
 
 
 def test_version_is_2_7_9():
-    assert _read("VERSION").strip() == "2.7.64"
+    assert _read("VERSION").strip() == "2.7.65"
 
 
 def test_ua_prefers_webkit_safari_and_crios():

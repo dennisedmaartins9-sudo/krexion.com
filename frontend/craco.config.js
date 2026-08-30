@@ -8,6 +8,17 @@ function pkgAlias(relativePath) {
   return fs.existsSync(resolved) ? resolved : null;
 }
 
+// CJS entrypoints — CRA's ESM resolver chokes on lucide/framer-motion barrels.
+const cjsAliases = {};
+const lucideCjs = pkgAlias("node_modules/lucide-react/dist/cjs/lucide-react.js");
+const motionUtilsCjs = pkgAlias("node_modules/motion-utils/dist/cjs/index.js");
+const motionDomCjs = pkgAlias("node_modules/motion-dom/dist/cjs/index.js");
+if (lucideCjs) cjsAliases["lucide-react"] = lucideCjs;
+if (motionUtilsCjs) cjsAliases["motion-utils"] = motionUtilsCjs;
+if (motionDomCjs) cjsAliases["motion-dom"] = motionDomCjs;
+
+const ModuleScopePlugin = require("react-dev-utils/ModuleScopePlugin");
+
 // Check if we're in development/preview mode (not production build)
 // Craco sets NODE_ENV=development for start, NODE_ENV=production for build
 const isDevServer = process.env.NODE_ENV !== "production";
@@ -51,18 +62,16 @@ const webpackConfig = {
   webpack: {
     alias: {
       '@': path.resolve(__dirname, 'src'),
-      // ESM barrels fail CRA/webpack named-export analysis on some Node versions.
-      ...(pkgAlias('node_modules/lucide-react/dist/cjs/lucide-react.js')
-        ? { 'lucide-react': pkgAlias('node_modules/lucide-react/dist/cjs/lucide-react.js') }
-        : {}),
-      ...(pkgAlias('node_modules/motion-utils/dist/cjs/index.js')
-        ? { 'motion-utils': pkgAlias('node_modules/motion-utils/dist/cjs/index.js') }
-        : {}),
-      ...(pkgAlias('node_modules/motion-dom/dist/cjs/index.js')
-        ? { 'motion-dom': pkgAlias('node_modules/motion-dom/dist/cjs/index.js') }
-        : {}),
+      ...cjsAliases,
     },
     configure: (webpackConfig) => {
+      // Absolute node_modules aliases are blocked by CRA's ModuleScopePlugin
+      // on Linux CI/Docker (ubuntu + alpine). Allow CJS shims when present.
+      if (Object.keys(cjsAliases).length > 0) {
+        webpackConfig.resolve.plugins = (webpackConfig.resolve.plugins || []).filter(
+          (plugin) => !(plugin instanceof ModuleScopePlugin),
+        );
+      }
 
       // Add ignored patterns to reduce watched directories
         webpackConfig.watchOptions = {
