@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Textarea } from "./ui/textarea";
+import { CUSTOM_UTM_FIELDS } from "../lib/referrerProFormUtils";
 
 export const DEFAULT_PROFILE_REFERRER = {
   enabled: false,
@@ -30,6 +31,13 @@ export const DEFAULT_PROFILE_REFERRER = {
   sticky_session: true,
   pass_to_offer: true,
   allow_risky_wrapper: false,
+  custom_utm_enabled: false,
+  custom_utm_source: "",
+  custom_utm_medium: "",
+  custom_utm_campaign: "",
+  custom_utm_content: "",
+  custom_utm_term: "",
+  custom_click_id: "",
 };
 
 function ReferrerProMultiSelect({ title, description, keys, weights, onChange, accent = "fuchsia", testIdPrefix }) {
@@ -448,6 +456,56 @@ export default function ReferrerProProfilePanel({
                 onChange={(e) => patch({ brand: e.target.value.slice(0, 64) })}
                 placeholder="your-brand"
                 className="mt-1 bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
+            </div>
+          </div>
+
+          <div className="p-3 rounded-md border border-emerald-700/50 bg-emerald-950/20 space-y-3">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                data-testid={`${testIdPrefix}-custom-utm-enabled`}
+                checked={!!ref.custom_utm_enabled}
+                onChange={(e) => patch({ custom_utm_enabled: e.target.checked })}
+                className="w-4 h-4 rounded accent-emerald-500 mt-0.5"
+              />
+              <div>
+                <div className="text-xs text-emerald-300 font-semibold">Custom UTM Tags (real ad style)</div>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  Jese Facebook Ads Manager mein — apni marzi se utm_source / utm_medium / utm_campaign likhein.
+                  Khali fields auto realistic values use karengi. Macros: {"{click_id}"}, {"{source}"}, {"{brand}"}, {"{campaign}"}.
+                </p>
+              </div>
+            </label>
+
+            {ref.custom_utm_enabled && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                {CUSTOM_UTM_FIELDS.map(({ key, label, placeholder }) => (
+                  <div key={key}>
+                    <Label className="text-xs text-zinc-400">{label}</Label>
+                    <Input
+                      data-testid={`${testIdPrefix}-${key}`}
+                      value={ref[key] || ""}
+                      onChange={(e) => patch({ [key]: e.target.value.slice(0, 256) })}
+                      placeholder={placeholder}
+                      className="mt-1 bg-zinc-900 border-zinc-700 text-zinc-100 text-xs"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div>
+              <Label className="text-xs text-zinc-400">Click ID (Everflow / tracker)</Label>
+              <Input
+                data-testid={`${testIdPrefix}-custom-click-id`}
+                value={ref.custom_click_id || ""}
+                onChange={(e) => patch({ custom_click_id: e.target.value.slice(0, 256) })}
+                placeholder='Khali = auto unique · ya {click_id} · ya apna fixed ID'
+                className="mt-1 bg-zinc-900 border-zinc-700 text-zinc-100 text-xs font-mono"
+              />
+              <p className="text-[10px] text-zinc-500 mt-1">
+                Offer / tracker URL par clickid, click_id, cid, transaction_id append hota hai — Everflow Parameters mein dikhega.
+              </p>
             </div>
           </div>
         </div>

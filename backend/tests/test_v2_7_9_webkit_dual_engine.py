@@ -43,7 +43,7 @@ ANDROID_CHROME = (
 
 
 def test_version_is_2_7_9():
-    assert _read("VERSION").strip() == "2.7.10"
+    assert _read("VERSION").strip() == "2.7.63"
 
 
 def test_ua_prefers_webkit_safari_and_crios():
@@ -106,7 +106,7 @@ def test_profile_launcher_references_webkit_launch():
     assert "_normalize_mobile_ua_for_visit" in src
 
 
-def test_frontend_note_mentions_webkit():
+def test_frontend_note_mentions_mobile_engines():
     fe = (
         Path(__file__).resolve().parent.parent.parent
         / "frontend"
@@ -114,8 +114,8 @@ def test_frontend_note_mentions_webkit():
         / "pages"
         / "BrowserProfilesPage.js"
     ).read_text(encoding="utf-8")
-    assert "WebKit" in fe
-    assert "Android uses Chromium" in fe or "Chromium" in fe
+    assert "Safari" in fe
+    assert "Chromium" in fe
 
 
 def test_mobile_ua_for_inapp_can_emit_ios_when_webkit():

@@ -616,7 +616,9 @@ def _coerce_profile_ua(
     profile_config: Dict[str, Any],
     *,
     referrer_state: Optional[_ProfileReferrerState] = None,
+    locale: str = "",
 ) -> str:
+    """RUT-grade UA ↔ platform parity for browser profiles (Everflow browser field)."""
     referrer = profile_config.get("referrer") or {}
     if not referrer.get("enabled"):
         return ua
@@ -624,7 +626,16 @@ def _coerce_profile_ua(
         return ua
     platform = ""
     if referrer_state and referrer_state.enabled:
-        platform = referrer_state.platform or ""
+        platform = (
+            str(getattr(referrer_state, "ua_platform", "") or "").strip().lower()
+            or str(referrer_state.platform or "").strip().lower()
+        )
+        if not platform and referrer_state.referer_url:
+            try:
+                from real_user_traffic import _platform_from_referer_url
+                platform = (_platform_from_referer_url(referrer_state.referer_url) or "").strip().lower()
+            except Exception:
+                platform = ""
     if not platform:
         try:
             state = _resolve_profile_referrer_state(ua, profile_config, "")
@@ -632,28 +643,70 @@ def _coerce_profile_ua(
         except Exception:
             platform = ""
     if not platform:
-        pw = referrer.get("platform_weights") or {}
-        if isinstance(pw, dict) and pw:
-            try:
-                platform = max(pw, key=lambda k: float(pw.get(k) or 0))
-            except Exception:
-                platform = next(iter(pw.keys()), "")
-        if not platform and referrer.get("brand"):
-            platform = str(referrer.get("brand")).lower()
-    if not platform:
         try:
-            from real_user_traffic import _get_referer_from_ua, _platform_from_referer_url
-            ref = _get_referer_from_ua(ua)
-            platform = _platform_from_referer_url(ref) or ""
+            from referrer_pro import dominant_platform_from_weights
+            platform = dominant_platform_from_weights(referrer.get("platform_weights"))
         except Exception:
             platform = ""
-    if platform:
+    if not platform:
+        return ua
+
+    try:
+        from referrer_pro import (
+            APP_SUPPORT_MATRIX,
+            _PLATFORM_TO_APP,
+            _is_mobile_ua,
+            coerce_ua_for_platform,
+            ensure_inapp_platform_ua,
+        )
+        from real_user_traffic import _mobile_ua_for_inapp
+    except Exception:
+        return ua
+
+    _MOBILE_ONLY_PLATFORMS = {
+        "tiktok", "instagram", "snapchat", "facebook", "pinterest",
+        "linkedin", "twitter", "reddit", "whatsapp", "telegram",
+        "google", "gsearch", "youtube",
+    }
+    current = ua or ""
+    if platform in _MOBILE_ONLY_PLATFORMS and not _is_mobile_ua(current):
         try:
-            from referrer_pro import coerce_ua_for_platform
-            return coerce_ua_for_platform(ua, platform)
+            _new_mob = _mobile_ua_for_inapp()
+            if _new_mob:
+                current = _new_mob
+                logger.info(
+                    f"[profile-launch] desktop UA replaced with mobile for {platform}"
+                )
         except Exception:
             pass
-    return ua
+
+    _app_key = _PLATFORM_TO_APP.get(platform.lower())
+    _family = _is_mobile_ua(current) or ""
+    _needs_strict = bool(
+        _app_key
+        and _family in {"android", "ios"}
+        and APP_SUPPORT_MATRIX.get(_app_key, {}).get(_family) == "supported"
+    )
+    if _needs_strict:
+        coerced = ensure_inapp_platform_ua(
+            current,
+            platform,
+            locale,
+            mobile_ua_factory=_mobile_ua_for_inapp,
+            attempts=4,
+        )
+    else:
+        coerced = coerce_ua_for_platform(current, platform, locale)
+
+    if coerced:
+        logger.info(
+            f"[profile-launch] UA coerced platform={platform} strict_inapp={_needs_strict}"
+        )
+        return coerced
+    logger.warning(
+        f"[profile-launch] UA coercion failed for platform={platform}; keeping base UA"
+    )
+    return current
 
 
 def _compute_fingerprint_hash(
@@ -688,6 +741,12 @@ class _ProfileReferrerState:
     session_id: str = ""
     pass_to_offer: bool = True
     allow_risky_wrapper: bool = False
+    brand: str = ""
+    traffic_type: str = "auto"
+    campaign_type: str = "auto"
+    user_agent: str = ""
+    click_id: str = ""
+    ua_platform: str = ""
 
 
 def _profile_referrer_effective(referrer: Dict[str, Any]) -> Dict[str, Any]:
@@ -806,6 +865,64 @@ def _resolve_profile_referrer_state(
         sf = (extras or {}).get("sec_fetch") or {}
         if isinstance(sf, dict):
             sec_fetch = {str(k): str(v) for k, v in sf.items()}
+        import uuid as _uuid_mod
+        _click_id = str(_uuid_mod.uuid4()).replace("-", "")[:24]
+        _extras = dict(extras or {})
+        _extras.setdefault("click_id", _click_id)
+        _extras.setdefault("clickid", _click_id)
+        if str(referrer.get("custom_click_id") or "").strip():
+            _extras["custom_click_id"] = str(referrer.get("custom_click_id") or "").strip()
+        try:
+            from referrer_pro import resolve_profile_custom_utms as _prof_utms
+            _extras = _prof_utms(
+                referrer,
+                _extras,
+                {
+                    "click_id": _click_id,
+                    "clickid": _click_id,
+                    "platform": plat or "",
+                    "source": plat or "",
+                    "brand": str(referrer.get("brand") or ""),
+                    "campaign": str(_extras.get("utm_campaign") or ""),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            from referrer_pro import normalize_referer_url as _norm_ref_url
+            ref_url = _norm_ref_url(ref_url or "")
+            if not ref_url and str(referrer.get("value") or "").strip():
+                ref_url = _norm_ref_url(str(referrer.get("value")))
+        except Exception:
+            pass
+        if not ref_url and referrer.get("enabled"):
+            try:
+                from referrer_pro import (
+                    build_inapp_deep_referer as _deep_ref,
+                    dominant_platform_from_weights as _dom_pw,
+                    detect_is_paid as _dip,
+                )
+                from real_user_traffic import _INAPP_PRESET_REFERER
+
+                _dom = _dom_pw(referrer.get("platform_weights"))
+                if _dom:
+                    plat = plat or _dom
+                    _paid = _dip(
+                        str(referrer.get("traffic_type") or "auto"),
+                        str(referrer.get("campaign_type") or "auto"),
+                        _dom,
+                    )
+                    ref_url = _deep_ref(_dom, target_url or "", is_paid=_paid) or ""
+                    if not ref_url:
+                        ref_url = str(_INAPP_PRESET_REFERER.get(_dom) or "")
+            except Exception:
+                pass
+        if not plat and ref_url:
+            try:
+                from real_user_traffic import _platform_from_referer_url
+                plat = (_platform_from_referer_url(ref_url) or plat or "").strip().lower()
+            except Exception:
+                pass
         return _ProfileReferrerState(
             enabled=True,
             referer_url=ref_url or "",
@@ -814,9 +931,13 @@ def _resolve_profile_referrer_state(
             wrapper_redirect=wrapper_redirect,
             wrapper_template=wrapper_template,
             platform=plat or "",
-            pro_extras=extras or {},
+            pro_extras=_extras,
             pass_to_offer=referrer.get("pass_to_offer", True) is not False,
             allow_risky_wrapper=bool(referrer.get("allow_risky_wrapper", False)),
+            brand=str(referrer.get("brand") or ""),
+            traffic_type=str(referrer.get("traffic_type") or "auto"),
+            campaign_type=str(referrer.get("campaign_type") or "auto"),
+            click_id=_click_id,
         )
     except Exception as _ref_err:
         logger.debug(f"profile referer state resolve skipped: {_ref_err}")
@@ -865,12 +986,213 @@ def _should_profile_wrapper_bounce(url: str, state: _ProfileReferrerState, ua: s
     return True
 
 
+def _profile_enrich_platform(state: _ProfileReferrerState) -> str:
+    """Resolve platform for URL enrichment — never return empty when referer implies one."""
+    plat = (state.platform or "").strip().lower()
+    if plat:
+        return plat
+    ref = (state.referer_url or "").strip()
+    if ref:
+        try:
+            from real_user_traffic import _platform_from_referer_url
+            plat = (_platform_from_referer_url(ref) or "").strip().lower()
+            if plat:
+                return plat
+        except Exception:
+            pass
+    pe = state.pro_extras or {}
+    plat = str(pe.get("platform") or "").strip().lower()
+    return plat
+
+
+def _is_neutral_profile_home(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "/").strip("/")
+        neutral_homes = {
+            "www.google.com", "google.com", "www.bing.com", "bing.com",
+            "duckduckgo.com", "www.duckduckgo.com", "search.yahoo.com",
+            "www.facebook.com", "facebook.com", "m.facebook.com",
+            "www.instagram.com", "instagram.com", "www.tiktok.com", "tiktok.com",
+            "www.youtube.com", "youtube.com", "m.youtube.com",
+        }
+        return host in neutral_homes and (not path or path in ("", "search", "home", "watch", "shorts"))
+    except Exception:
+        return False
+
+
+def _is_affiliate_tracker_url(url: str) -> bool:
+    low = (url or "").lower()
+    return any(
+        tok in low
+        for tok in (
+            "aff_c", "aff_click", "offer_id", "click_id", "clickid",
+            "everflow", "evyy.net", "go2cloud", "voluum", "binom",
+            "trk.", "track.", "redirect", "affiliate", "aff_",
+            "hasoffers", "cake.", "affise", "redtrack", "subid",
+            "utm_source", "utm_medium", "fbclid", "gclid", "ttclid",
+        )
+    )
+
+
+def _should_enrich_profile_offer_url(url: str, *, referrer_enabled: bool = False) -> bool:
+    """Skip neutral homepages — enrich offer/tracker navigations."""
+    if not url or not str(url).startswith(("http://", "https://")):
+        return False
+    if _is_neutral_profile_home(url):
+        return False
+    if referrer_enabled:
+        return True
+    try:
+        from referrer_pro import is_krexion_short_link_url
+
+        if is_krexion_short_link_url(url):
+            return True
+        if _is_affiliate_tracker_url(url):
+            return True
+    except Exception:
+        pass
+    return not _is_neutral_profile_home(url)
+
+
+def _ensure_sticky_profile_params(state: _ProfileReferrerState) -> Dict[str, str]:
+    """Build once per session — same clickid/utm on every enriched navigation."""
+    pe = dict(state.pro_extras or {})
+    sticky = pe.get("_sticky_url_params")
+    if isinstance(sticky, dict) and sticky:
+        return {str(k): str(v) for k, v in sticky.items() if v is not None}
+
+    plat = _profile_enrich_platform(state)
+    if plat and not state.platform:
+        state.platform = plat
+    try:
+        from referrer_pro import build_profile_platform_params
+        params = build_profile_platform_params(
+            plat or "generic",
+            brand=state.brand,
+            traffic_type=state.traffic_type,
+            campaign_type=state.campaign_type,
+            session_id=state.session_id,
+            pro_extras=pe,
+        )
+    except Exception as exc:
+        logger.warning(f"[profile-launch] sticky params build failed: {exc}")
+        params = {}
+    if params:
+        pe["_sticky_url_params"] = params
+        state.pro_extras = pe
+    return params
+
+
+def _profile_enrich_nav_url(url: str, state: _ProfileReferrerState) -> str:
+    """RUT parity — append platform params (fbclid/utm/clickid) on profile navigations."""
+    if not state.enabled or not url or not str(url).startswith(("http://", "https://")):
+        return url or ""
+    if not _should_enrich_profile_offer_url(url, referrer_enabled=state.enabled):
+        return url
+    plat = _profile_enrich_platform(state)
+    if plat and not state.platform:
+        state.platform = plat
+    sticky = _ensure_sticky_profile_params(state)
+    try:
+        from referrer_pro import enrich_profile_offer_url, is_krexion_short_link_url
+        from real_user_traffic import _rut_append_kx_qs, _rut_build_kx_src_qs
+
+        out = url
+        if is_krexion_short_link_url(out) and plat:
+            _kx = _rut_build_kx_src_qs(
+                plat,
+                brand=state.brand,
+                traffic_type=str((state.pro_extras or {}).get("traffic_type") or state.traffic_type),
+            )
+            out = _rut_append_kx_qs(out, _kx)
+        out = enrich_profile_offer_url(
+            out,
+            platform=plat or "generic",
+            brand=state.brand,
+            pro_extras=state.pro_extras,
+            traffic_type=state.traffic_type,
+            campaign_type=state.campaign_type,
+            session_id=state.session_id,
+            referer_url=state.referer_url,
+            preset_params=sticky or None,
+        )
+        if out != url:
+            logger.info(
+                f"[profile-launch] enriched offer url platform={plat or 'generic'} "
+                f"session={str(state.session_id or '')[:8]}"
+            )
+        return out or url
+    except Exception as exc:
+        logger.warning(f"[profile-launch] nav url enrich failed: {exc}")
+        return url
+
+
+async def _apply_cdp_user_agent_override(context: Any, ua: str, page: Any = None) -> None:
+    """Network-layer UA override so trackers (Everflow) always receive the coerced string."""
+    if not ua or not context:
+        return
+    try:
+        _page = page
+        if _page is None and getattr(context, "pages", None):
+            _page = context.pages[0] if context.pages else None
+        if _page is None:
+            return
+        cdp = await context.new_cdp_session(_page)
+        await cdp.send("Network.enable", {})
+        _plat = "Android" if "android" in ua.lower() else (
+            "iOS" if ("iphone" in ua.lower() or "ipad" in ua.lower()) else ""
+        )
+        payload: Dict[str, Any] = {"userAgent": ua}
+        if _plat:
+            payload["platform"] = _plat
+        await cdp.send("Network.setUserAgentOverride", payload)
+        logger.info(f"[profile-launch] CDP User-Agent override ON ({len(ua)} chars)")
+    except Exception as exc:
+        logger.debug(f"[profile-launch] CDP UA override skipped: {exc}")
+
+
+async def _install_profile_cdp_ua_all_pages(context: Any, ua_supplier: Any) -> None:
+    """Re-apply CDP UA override on every new tab (multi-tab manual browsing)."""
+    _done: set = set()
+
+    async def _bind(page: Any) -> None:
+        pid = id(page)
+        if pid in _done:
+            return
+        _done.add(pid)
+        ua = ""
+        try:
+            ua = str(ua_supplier() or "")
+        except Exception:
+            ua = ""
+        if ua:
+            await _apply_cdp_user_agent_override(context, ua, page=page)
+
+    def _on_page(page: Any) -> None:
+        asyncio.create_task(_bind(page))
+
+    context.on("page", _on_page)
+    for pg in list(getattr(context, "pages", []) or []):
+        await _bind(pg)
+
+
 def make_profile_referrer_route_handler(state: _ProfileReferrerState):
     """Combined Sec-CH-UA + sticky Referer injection for ALL tabs/navigations."""
     async def _handler(route, request):
         try:
             headers = dict(request.headers or {})
-            ua = headers.get("user-agent") or headers.get("User-Agent") or ""
+            ua = (
+                state.user_agent
+                or headers.get("user-agent")
+                or headers.get("User-Agent")
+                or ""
+            )
+            if ua:
+                headers["user-agent"] = ua
+                headers["User-Agent"] = ua
             headers = {
                 key: value for key, value in headers.items()
                 if not key.lower().startswith("sec-ch-ua")
@@ -911,8 +1233,12 @@ def make_profile_referrer_route_handler(state: _ProfileReferrerState):
 
             if state.enabled and state.referer_url and request.resource_type == "document":
                 headers["referer"] = state.referer_url
+                headers["Referer"] = state.referer_url
                 if state.sec_fetch:
                     headers.update(state.sec_fetch)
+            nav_url = request.url
+            if state.enabled and request.resource_type == "document":
+                nav_url = _profile_enrich_nav_url(nav_url, state)
             if (
                 state.enabled
                 and state.session_id
@@ -927,6 +1253,12 @@ def make_profile_referrer_route_handler(state: _ProfileReferrerState):
                         headers[KREXION_PROFILE_SESSION_HEADER.lower()] = state.session_id
                 except Exception:
                     pass
+            if nav_url != request.url:
+                logger.info(
+                    f"[profile-launch] route enrich {request.url[:80]} -> {nav_url[:120]}"
+                )
+                await route.continue_(url=nav_url, headers=headers)
+                return
             await route.continue_(headers=headers)
         except Exception:
             try:
@@ -1219,14 +1551,6 @@ async def _launch_profile_session_inner(
         except Exception:
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
-    if _profile_engine != "webkit":
-        try:
-            from anti_detect_v230 import align_ua_to_chromium as _align_chrome
-            _aligned = _align_chrome(ua)
-            if _aligned:
-                ua = _aligned
-        except Exception:
-            pass
     # v2.7.52 — Resolve referer ONCE per launch (sticky_session parity).
     # Previously _coerce_profile_ua and route setup each called the resolver
     # independently, so platform_pool could pick Facebook for the UA and
@@ -1237,7 +1561,42 @@ async def _launch_profile_session_inner(
         start_url or "https://www.google.com/",
     )
     _profile_referrer_state.session_id = session_id
-    ua = _coerce_profile_ua(ua, profile_config, referrer_state=_profile_referrer_state)
+    try:
+        _ensure_sticky_profile_params(_profile_referrer_state)
+    except Exception:
+        pass
+    try:
+        from referrer_pro import dominant_platform_from_weights as _dom_pw
+        _ref_cfg = profile_config.get("referrer") or {}
+        _uw = _dom_pw(_ref_cfg.get("platform_weights"))
+        _profile_referrer_state.ua_platform = (
+            _uw or _profile_referrer_state.platform or ""
+        )
+    except Exception:
+        _profile_referrer_state.ua_platform = _profile_referrer_state.platform or ""
+    _locale_for_ua = ""
+    try:
+        _al = str(_profile_referrer_state.accept_language or "").split(",")[0].strip()
+        _locale_for_ua = _al.split(";")[0].strip().replace("_", "-") if _al else ""
+    except Exception:
+        _locale_for_ua = ""
+    ua = _coerce_profile_ua(
+        ua,
+        profile_config,
+        referrer_state=_profile_referrer_state,
+        locale=_locale_for_ua,
+    )
+    # v2.7.58 — Sync Chrome major AFTER platform coercion so in-app markers
+    # stay intact while the declared version matches the launched binary.
+    if _profile_engine != "webkit":
+        try:
+            from anti_detect_v230 import align_ua_to_chromium as _align_chrome
+            _aligned = _align_chrome(ua)
+            if _aligned:
+                ua = _aligned
+        except Exception:
+            pass
+    _profile_referrer_state.user_agent = ua
     # v2.7.9 — Re-infer OS from final UA. WebKit path keeps ios; Chromium
     # honesty may have swapped to Android when WebKit was missing.
     inferred_os = _infer_os_from_ua(ua, fallback="")
@@ -1714,14 +2073,41 @@ async def _launch_profile_session_inner(
                                 pass
                     except Exception:
                         pass
-                if _target_pids:
-                    from krexion_window_icon import apply_krexion_icon_to_pids
-                    apply_krexion_icon_to_pids(
-                        _target_pids,
-                        profile_label=str(_profile_label)[:60] or "Profile",
+                if not _target_pids:
+                    return
+                from krexion_window_icon import (
+                    apply_krexion_icon_to_pids,
+                    collect_profile_process_tree,
+                )
+
+                _family_pids = sorted(
+                    collect_profile_process_tree(
+                        int(_driver_pid) if _driver_pid else None
+                    )
+                    or set(_target_pids)
+                )
+                _poll = 120.0 if _profile_engine == "webkit" else 90.0
+                apply_krexion_icon_to_pids(
+                    _family_pids,
+                    profile_label=str(_profile_label)[:60] or "Profile",
+                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                    poll_seconds=_poll,
+                    profile_slot=int(_taskbar_slot),
+                )
+                # iOS WebKit — Safari shell (hide [WebKit] menus/toolbar; Krexion icon above).
+                if _profile_engine == "webkit" and str(profile_os or "").lower() in (
+                    "ios",
+                    "ipados",
+                ):
+                    from krexion_ios_safari_shell import apply_ios_safari_shell_to_pids
+
+                    apply_ios_safari_shell_to_pids(
+                        _family_pids,
                         parent_pid=int(_driver_pid) if _driver_pid else None,
-                        poll_seconds=90.0,
-                        profile_slot=int(_taskbar_slot),
+                        viewport_width=int(viewport.get("width", 393)),
+                        viewport_height=int(viewport.get("height", 852)),
+                        profile_label=str(_profile_label)[:60] or "Profile",
+                        poll_seconds=_poll,
                     )
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
@@ -1836,8 +2222,21 @@ async def _launch_profile_session_inner(
                 )
                 logger.info(
                     f"[profile-launch] referrer pro ON platform={_profile_referrer_state.platform} "
+                    f"ua_platform={_profile_referrer_state.ua_platform} "
                     f"wrapper={_profile_referrer_state.wrapper_redirect} session={session_id[:8]}"
                 )
+                try:
+                    from profile_network_enrich import install_profile_cdp_fetch_enricher
+                    await install_profile_cdp_fetch_enricher(
+                        context,
+                        lambda: _profile_referrer_state,
+                        enrich_url_fn=_profile_enrich_nav_url,
+                        should_enrich_fn=_should_enrich_profile_offer_url,
+                    )
+                except Exception as _cdp_fetch_err:
+                    logger.warning(
+                        f"[profile-launch] CDP Fetch enricher skipped: {_cdp_fetch_err}"
+                    )
             else:
                 from referrer_pro import make_sec_ch_ua_strip_route_handler
                 await context.route("**/*", make_sec_ch_ua_strip_route_handler())
@@ -2000,6 +2399,14 @@ async def _launch_profile_session_inner(
                 await context.set_extra_http_headers(_extra_hdrs)
             except Exception as _v230_err:
                 logger.debug(f"v2.3.0 anti-detect apply skipped: {_v230_err}")
+
+        try:
+            await _install_profile_cdp_ua_all_pages(
+                context,
+                lambda: _profile_referrer_state.user_agent or ua,
+            )
+        except Exception as _cdp_ua_err:
+            logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
         # HWND exists after first page — re-brand taskbar (Chrome often
@@ -2326,6 +2733,9 @@ async def _launch_profile_session_inner(
             # Chrome "This site can't be reached" screen.
             _goto_err: Optional[str] = None
             _target_url = start_url or "https://www.google.com/"
+            _target_url = _profile_enrich_nav_url(
+                _target_url, _profile_referrer_state
+            )
             _goto_kwargs: Dict[str, Any] = {"timeout": 45000, "wait_until": "domcontentloaded"}
             if _referer_url:
                 _goto_kwargs["referer"] = _referer_url

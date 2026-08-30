@@ -885,6 +885,11 @@ credentials.json
 *.key
 .credentials
 
+# Local one-click dev (LOCAL-START.bat) — never used by CI/deploy
+.installed
+CREDENTIALS.txt
+backend/requirements-local.txt
+
 # Krexion native build intermediates (regenerated each build)
 build/requirements-native.txt
 build/krexion-manifest.json

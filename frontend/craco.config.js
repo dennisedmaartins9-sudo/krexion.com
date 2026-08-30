@@ -45,6 +45,10 @@ const webpackConfig = {
   webpack: {
     alias: {
       '@': path.resolve(__dirname, 'src'),
+      // ESM barrels fail CRA/webpack named-export analysis on some Node versions.
+      'lucide-react': path.resolve(__dirname, 'node_modules/lucide-react/dist/cjs/lucide-react.js'),
+      'motion-utils': path.resolve(__dirname, 'node_modules/motion-utils/dist/cjs/index.js'),
+      'motion-dom': path.resolve(__dirname, 'node_modules/motion-dom/dist/cjs/index.js'),
     },
     configure: (webpackConfig) => {
 

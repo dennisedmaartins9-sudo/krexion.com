@@ -2183,28 +2183,52 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
         # every visit. Preset UA coercion still runs (browser still
         # LOOKS like TikTok in-app) via `preset_platform` fallback.
         _mode_early = (cfg.get("mode") or "auto").strip().lower()
-        _val_early  = (cfg.get("value") or "").strip()
+        _val_early = (cfg.get("value") or "").strip()
         if _mode_early == "custom" and _val_early:
+            try:
+                from referrer_pro import normalize_referer_url as _norm_ref
+                _val_early = _norm_ref(_val_early)
+            except Exception:
+                if not _val_early.startswith(("http://", "https://")):
+                    _val_early = "https://" + _val_early.lstrip("/")
             _plat_early = _platform_from_referer_url(_val_early)
             if not _plat_early:
                 _plat_early = str(cfg.get("preset_platform") or "").strip().lower()
+            if not _plat_early:
+                try:
+                    from referrer_pro import dominant_platform_from_weights as _dom_pw
+                    _plat_early = _dom_pw(cfg.get("platform_weights"))
+                except Exception:
+                    _plat_early = ""
             _esp_early = _esp_from_referer_url(_val_early) if _plat_early == "email" else ""
-            # UTM parameters — respect operator's URL. If the operator's
-            # URL already has utm_source, we return empty utm_* so the
-            # engine won't append/overwrite anything on the outbound URL.
             _has_op_utm = ("utm_source=" in _val_early.lower())
             _extras_early: Dict[str, Any] = {}
             if not _has_op_utm and _plat_early:
-                # Provide sensible utm defaults for the preset platform
-                # so downstream tracker gets utm_source=<platform> even
-                # when the operator forgot to add them.
-                _extras_early = {
-                    "sec_fetch": {},
-                    "utm_source": _plat_early,
-                    "utm_medium": "cpc" if _plat_early in ("tiktok","facebook","instagram","snapchat","twitter","x","pinterest","linkedin","youtube") else "referral",
-                    "utm_campaign": "",
-                    "network_click_referer": "",
-                }
+                try:
+                    from referrer_pro import (
+                        build_sec_fetch_headers as _bsf,
+                        pick_utm_campaign as _puc,
+                        pick_utm_variation as _puv,
+                    )
+                    _us, _um = _puv(_plat_early, str(cfg.get("brand") or ""))
+                    _extras_early = {
+                        "sec_fetch": _bsf(_val_early, is_navigation=True),
+                        "utm_source": _us or _plat_early,
+                        "utm_medium": _um or "cpc",
+                        "utm_campaign": _puc(_plat_early, str(cfg.get("brand") or "")),
+                        "network_click_referer": "",
+                    }
+                except Exception:
+                    _extras_early = {
+                        "sec_fetch": {},
+                        "utm_source": _plat_early,
+                        "utm_medium": "cpc" if _plat_early in (
+                            "tiktok", "facebook", "instagram", "snapchat",
+                            "twitter", "x", "pinterest", "linkedin", "youtube",
+                        ) else "referral",
+                        "utm_campaign": "",
+                        "network_click_referer": "",
+                    }
             return _val_early, _plat_early or "", _esp_early, _with_traffic_type_extras(
                 cfg, _plat_early or "", _extras_early, referer_url=_val_early,
             )
@@ -2214,6 +2238,12 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
             _lines = [ln.strip() for ln in (cfg.get("value") or "").splitlines() if ln.strip()]
             if _lines:
                 _pick = random.choice(_lines)
+                try:
+                    from referrer_pro import normalize_referer_url as _norm_ref2
+                    _pick = _norm_ref2(_pick)
+                except Exception:
+                    if _pick and not _pick.startswith(("http://", "https://")):
+                        _pick = "https://" + _pick.lstrip("/")
                 _p = _platform_from_referer_url(_pick) or str(cfg.get("preset_platform") or "").strip().lower()
                 _e = _esp_from_referer_url(_pick) if _p == "email" else ""
                 _has_op_utm2 = ("utm_source=" in _pick.lower())

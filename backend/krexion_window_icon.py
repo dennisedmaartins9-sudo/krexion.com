@@ -472,6 +472,44 @@ def _walk_descendants(parent_pid: int) -> Set[int]:
     return out
 
 
+def collect_profile_process_tree(driver_pid: Optional[int]) -> Set[int]:
+    """Playwright browser + driver PIDs (WebKit MiniBrowser, node, Chromium)."""
+    out: Set[int] = set()
+    if not driver_pid:
+        return out
+    try:
+        import psutil as _psu
+
+        try:
+            proc = _psu.Process(int(driver_pid))
+        except Exception:
+            return out
+        out.add(int(driver_pid))
+        out |= _walk_descendants(int(driver_pid))
+        cur = proc
+        for _ in range(8):
+            try:
+                parent = cur.parent()
+            except Exception:
+                break
+            if not parent:
+                break
+            out.add(int(parent.pid))
+            out |= _walk_descendants(int(parent.pid))
+            pname = (parent.name() or "").lower()
+            cur = parent
+            if pname in (
+                "python.exe",
+                "pythonw.exe",
+                "krexion-coreapp.exe",
+                "krexion.exe",
+            ):
+                break
+    except Exception:
+        pass
+    return out
+
+
 def _icon_apply_loop_multi(
     seed_pids: list,
     parent_pid: Optional[int],
@@ -515,7 +553,7 @@ def _icon_apply_loop_multi(
 
         while time.time() < deadline:
             if parent_pid:
-                pid_set |= _walk_descendants(int(parent_pid))
+                pid_set |= collect_profile_process_tree(int(parent_pid))
 
             found_hwnds = []
 
@@ -523,8 +561,19 @@ def _icon_apply_loop_multi(
                 try:
                     win_pid = wintypes.DWORD(0)
                     GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
-                    if win_pid.value in pid_set and user32.IsWindowVisible(hwnd):
-                        found_hwnds.append(int(hwnd))
+                    if win_pid.value not in pid_set:
+                        return True
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    title_buf = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(hwnd, title_buf, 512)
+                    title = title_buf.value or ""
+                    # Playwright driver helper — hide so only Krexion-branded
+                    # browser window stays on the taskbar.
+                    if title.strip().lower() == "playwright":
+                        user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                        return True
+                    found_hwnds.append(int(hwnd))
                 except Exception:
                     pass
                 return True

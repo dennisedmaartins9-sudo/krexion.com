@@ -828,6 +828,13 @@ class ReferrerProConfig(BaseModel):
     # RUT pass_to_offer parity — inject platform Referer on offer docs; skip wrapper hops.
     pass_to_offer: bool = True
     allow_risky_wrapper: bool = False
+    custom_utm_enabled: bool = False
+    custom_utm_source: str = ""
+    custom_utm_medium: str = ""
+    custom_utm_campaign: str = ""
+    custom_utm_content: str = ""
+    custom_utm_term: str = ""
+    custom_click_id: str = Field(default="", max_length=256)
 
 
 class ProfileBody(BaseModel):

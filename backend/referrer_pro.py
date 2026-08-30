@@ -2005,11 +2005,17 @@ def _generic_mobile_browser(ua: str) -> str:
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
             "Mobile/15E148 Safari/604.1"
         )
-    major_match = re.search(r"\bChrome/(\d+)", ua or "", re.I)
-    major = major_match.group(1) if major_match else "149"
+    parts = _android_parts(ua)
+    model = str(parts.get("model") or "").strip()
+    if not model or model.upper() == "K":
+        parts = _verified_android_parts()
+    chrome = str(parts.get("chrome") or "149.0.7827.114")
+    if chrome.count(".") < 3:
+        chrome = f"{chrome.split('.', 1)[0]}.0.0.0"
     return (
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36"
+        f"Mozilla/5.0 (Linux; Android {parts['version']}; {parts['model']} "
+        f"Build/{parts['build']}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{chrome} Mobile Safari/537.36"
     )
 
 
@@ -2023,6 +2029,9 @@ def _generic_browser_fallback(ua: str) -> str:
         and not verdict["identities"]
         and verdict["profile_type"] == "browser"
     ):
+        # Privacy-reduced "K" token — Everflow shows "Unknown Generic Android".
+        if re.search(r"\bAndroid\s+[\d.]+\s*;\s*K\b", original, re.I):
+            return _generic_mobile_browser(original)
         return original
     return _generic_mobile_browser(original)
 
@@ -4054,6 +4063,29 @@ def resolve_link_custom_utms(
     return resolved
 
 
+def resolve_profile_custom_utms(
+    referrer: Dict[str, Any],
+    pro_result: Optional[Dict[str, Any]] = None,
+    macro_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Apply profile-level custom UTMs (Browser Profile ↔ Links parity)."""
+    ref = referrer or {}
+    pro: Dict[str, Any] = dict(pro_result or {})
+    if not ref.get("custom_utm_enabled"):
+        return pro
+    link_shaped = {
+        "referrer_pro_custom_utm_enabled": True,
+        "referrer_pro_custom_utm_source": ref.get("custom_utm_source") or "",
+        "referrer_pro_custom_utm_medium": ref.get("custom_utm_medium") or "",
+        "referrer_pro_custom_utm_campaign": ref.get("custom_utm_campaign") or "",
+        "referrer_pro_custom_utm_content": ref.get("custom_utm_content") or "",
+        "referrer_pro_custom_utm_term": ref.get("custom_utm_term") or "",
+        "referrer_pro_brand": ref.get("brand") or "",
+    }
+    resolve_link_custom_utms(link_shaped, pro, macro_ctx)
+    return pro
+
+
 def normalize_link_pro_settings(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Clear classic/pro conflicts and enable wrapper for social-heavy pools."""
     out = dict(doc or {})
@@ -4088,6 +4120,234 @@ def effective_link_wrapper_redirect(link: Dict[str, Any], platform: str) -> bool
     if bool(link.get("referrer_pro_wrapper_redirect")):
         return True
     return platform_wants_auto_wrapper(platform)
+
+
+def normalize_referer_url(url: str) -> str:
+    """Ensure operator custom referers are valid absolute URLs (https://)."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if not u.startswith(("http://", "https://")):
+        return "https://" + u.lstrip("/")
+    return u
+
+
+def dominant_platform_from_weights(weights_value: Any) -> str:
+    """Pick highest-weight platform key from profile/RUT platform_weights."""
+    try:
+        raw = weights_value
+        if isinstance(raw, str):
+            raw = json.loads(raw or "{}")
+        if not isinstance(raw, dict) or not raw:
+            return ""
+        return str(
+            max(raw, key=lambda k: float(raw.get(k) or 0))
+        ).strip().lower()
+    except Exception:
+        return ""
+
+
+def merge_url_query_params(base_url: str, params: Dict[str, Any]) -> str:
+    """Merge query params into URL without overwriting existing keys."""
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+    if not base_url or not params:
+        return base_url or ""
+    parsed = urlparse(base_url)
+    existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        k = str(key or "").strip()
+        if not k or k.startswith("__"):
+            continue
+        v = str(value or "").strip()
+        if not v:
+            continue
+        if k not in existing or not str(existing.get(k) or "").strip():
+            existing[k] = v
+    return urlunparse(parsed._replace(query=urlencode(existing, doseq=True)))
+
+
+def build_profile_platform_params(
+    platform: str,
+    *,
+    brand: str = "",
+    traffic_type: str = "auto",
+    campaign_type: str = "auto",
+    session_id: str = "",
+    pro_extras: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Lightweight platform params for profile navigations (no server.py import)."""
+    import uuid as _uuid
+
+    plat = (platform or "").strip().lower()
+    out: Dict[str, str] = {}
+
+    if plat and plat != "generic":
+        try:
+            us, um = pick_utm_variation(plat, brand)
+            uc = pick_utm_campaign(plat, brand)
+        except Exception:
+            us, um, uc = plat, "cpc", ""
+
+        out["utm_source"] = us or plat
+        out["utm_medium"] = um or "cpc"
+        if uc:
+            out["utm_campaign"] = uc
+    elif plat == "generic":
+        out["utm_source"] = brand or "direct"
+        out["utm_medium"] = "referral"
+
+    is_paid = detect_is_paid(traffic_type, campaign_type, plat) if plat and plat != "generic" else None
+
+    if plat == "facebook":
+        fb = fbclid_with_realistic_timestamp()
+        out["fbclid"] = fb
+        _ts = int(time.time() * 1000) - random.randint(60_000, 7 * 24 * 3600 * 1000)
+        out["fbc"] = f"fb.1.{_ts}.{fb}"
+    elif plat == "instagram":
+        out["igshid"] = f"Mz{_rand_hash(20)}"
+    elif plat == "tiktok":
+        _b64 = (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        )
+        out["ttclid"] = "".join(random.choices(_b64, k=random.randint(60, 80)))
+        out["ttp"] = _rand_hash(28)
+        out["_t"] = str(random.randint(8, 9)) + str(random.randint(10**11, 10**12 - 1))
+        out["_r"] = "1"
+    elif plat in ("google", "youtube"):
+        out["gclid"] = gclid_with_realistic_timestamp()
+        out["gad_source"] = str(random.randint(1, 5))
+        if plat == "youtube":
+            out["utm_medium"] = out.get("utm_medium") or "video"
+    elif plat in ("twitter", "x"):
+        out["twclid"] = _rand_hash(24)
+    elif plat == "bing":
+        out["msclkid"] = _rand_hash(32)
+    elif plat == "linkedin":
+        out["li_fat_id"] = _rand_hash(32)
+    elif plat == "pinterest":
+        out["epik"] = f"dj0y{_rand_hash(32)}"
+    elif plat == "snapchat":
+        _scc = _rand_hash(32)
+        out["sccid"] = _scc
+        out["ScCid"] = _scc
+    elif plat == "reddit":
+        out["utm_medium"] = out.get("utm_medium") or "social"
+    elif plat in ("whatsapp", "telegram"):
+        out["utm_medium"] = out.get("utm_medium") or "social"
+    elif plat == "duckduckgo":
+        out["utm_medium"] = out.get("utm_medium") or "organic"
+    elif plat == "yahoo":
+        out["utm_medium"] = out.get("utm_medium") or "organic"
+    elif plat == "discord":
+        out["utm_medium"] = out.get("utm_medium") or "social"
+        out["utm_source"] = out.get("utm_source") or "discord"
+
+    if is_paid is False and plat and plat != "generic":
+        out = {
+            str(k): str(v)
+            for k, v in apply_organic_platform_param_override(out, plat).items()
+            if v is not None and str(v).strip()
+        }
+
+    extras = pro_extras or {}
+    for key in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"):
+        val = str(extras.get(key) or "").strip()
+        if val:
+            out[key] = val
+
+    click_token = str(
+        extras.get("click_id") or extras.get("clickid") or ""
+    ).strip()
+    if not click_token:
+        click_token = str(_uuid.uuid4()).replace("-", "")[:24]
+
+    custom_cid = str(extras.get("custom_click_id") or "").strip()
+    if custom_cid:
+        _macro_ctx = {
+            "click_id": click_token,
+            "clickid": click_token,
+            "platform": plat,
+            "brand": brand,
+            **{k: str(v) for k, v in extras.items() if v is not None},
+        }
+        resolved_cid = (
+            expand_link_macros(custom_cid, _macro_ctx)
+            if "{" in custom_cid
+            else custom_cid
+        )
+        if resolved_cid.strip():
+            click_token = resolved_cid.strip()
+
+    for cid_key in (
+        "clickid", "click_id", "cid", "transaction_id",
+        "tid", "txid", "trans_id",
+    ):
+        out[cid_key] = click_token
+    _sub1 = str(session_id or click_token).replace("-", "")[:32]
+    out.setdefault("sub1", _sub1)
+    out.setdefault("s1", _sub1)
+    out.setdefault("aff_sub", _sub1)
+    if brand:
+        out.setdefault("sub2", str(brand)[:32])
+        out.setdefault("s2", str(brand)[:32])
+        out.setdefault("aff_sub2", str(brand)[:32])
+    if plat and plat != "generic":
+        out.setdefault("sub3", plat)
+        out.setdefault("s3", plat)
+        out.setdefault("aff_sub3", plat)
+    if out.get("utm_campaign"):
+        out.setdefault("aff_sub4", str(out["utm_campaign"])[:32])
+    out.setdefault("source_id", click_token[:16])
+    return out
+
+
+def enrich_profile_offer_url(
+    url: str,
+    *,
+    platform: str = "",
+    brand: str = "",
+    pro_extras: Optional[Dict[str, Any]] = None,
+    traffic_type: str = "auto",
+    campaign_type: str = "auto",
+    session_id: str = "",
+    referer_url: str = "",
+    preset_params: Optional[Dict[str, str]] = None,
+) -> str:
+    """Append RUT-grade platform params (fbclid/utm/clickid) for profile navigations."""
+    base = (url or "").strip()
+    if not base.startswith(("http://", "https://")):
+        return base
+    plat = (platform or "").strip().lower()
+    if not plat and referer_url:
+        try:
+            from real_user_traffic import _platform_from_referer_url
+            plat = (_platform_from_referer_url(referer_url) or "").strip().lower()
+        except Exception:
+            plat = ""
+    if not plat and pro_extras:
+        plat = str(pro_extras.get("platform") or "").strip().lower()
+    try:
+        if preset_params:
+            params = dict(preset_params)
+        else:
+            params = build_profile_platform_params(
+                plat or "generic",
+                brand=str(brand or ""),
+                traffic_type=traffic_type,
+                campaign_type=campaign_type,
+                session_id=session_id,
+                pro_extras=pro_extras,
+            )
+        if not params:
+            return base
+        out = merge_url_query_params(base, params)
+        return out or base
+    except Exception as exc:
+        logger.warning(f"[referrer_pro] enrich_profile_offer_url failed: {exc}")
+        return base
 
 
 def enrich_destination_link_realism(
@@ -4456,6 +4716,7 @@ __all__ = [
     "LINK_CUSTOM_UTM_KEYS",
     "LINK_CUSTOM_UTM_FIELD_MAP",
     "resolve_link_custom_utms",
+    "resolve_profile_custom_utms",
     "normalize_link_pro_settings",
     "effective_link_wrapper_redirect",
     "resolve_referer_mode_for_link",

@@ -1608,7 +1608,7 @@ export default function BrowserProfilesPage() {
                         </div>
                       )}
                       <p className="text-[11px] text-zinc-500">
-                        iOS → WebKit (bundled in Setup). Android / Desktop → Chromium. Each profile gets a unique UA + device model.
+                        iOS → Safari engine (real iPhone browsing). Android / Desktop → Chromium. Each profile gets a unique UA + device model.
                       </p>
                     </div>
                   )}
