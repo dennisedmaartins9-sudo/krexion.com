@@ -15,6 +15,8 @@ import {
   buildLinkProPatchFromPreset,
   buildLinkPatchFromSavedPreset,
 } from "../lib/trafficSourcePresets";
+import ReferrerProModePanel from "../components/ReferrerProModePanel";
+import { linkToReferrerConfig, patchLinkFromReferrerConfig } from "../lib/referrerProFormUtils";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -318,6 +320,17 @@ const defaultProLinkFields = () => ({
   referrer_pro_inapp_preset: "",
   referrer_pro_pass_to_offer: false,
   referrer_pro_allow_risky_wrapper: false,
+  referrer_pro_referer_mode: "platform_pool",
+  referrer_pro_pro_mode: true,
+  referrer_pro_match_ua_to_platform: true,
+  referrer_pro_cold_referer_fallback: true,
+  referrer_pro_html_hop: true,
+  referrer_pro_custom_utm_enabled: false,
+  referrer_pro_custom_utm_source: "",
+  referrer_pro_custom_utm_medium: "",
+  referrer_pro_custom_utm_campaign: "",
+  referrer_pro_custom_utm_content: "",
+  referrer_pro_custom_utm_term: "",
   url_params: {},
 });
 
@@ -689,6 +702,12 @@ export default function LinksPage() {
         referrer_pro_device_mode: formData.referrer_pro_device_mode || "auto",
         referrer_pro_tod_enabled: formData.referrer_pro_tod_enabled,
         referrer_pro_campaign_type: formData.referrer_pro_campaign_type || "auto",
+        referrer_pro_custom_utm_enabled: !!formData.referrer_pro_custom_utm_enabled,
+        referrer_pro_custom_utm_source: formData.referrer_pro_custom_utm_source || "",
+        referrer_pro_custom_utm_medium: formData.referrer_pro_custom_utm_medium || "",
+        referrer_pro_custom_utm_campaign: formData.referrer_pro_custom_utm_campaign || "",
+        referrer_pro_custom_utm_content: formData.referrer_pro_custom_utm_content || "",
+        referrer_pro_custom_utm_term: formData.referrer_pro_custom_utm_term || "",
         sample_count: 20
       }, { headers: { Authorization: `Bearer ${token}` } });
       setPreviewData(res.data);
@@ -830,6 +849,11 @@ export default function LinksPage() {
       referrer_pro_inapp_preset: link.referrer_pro_inapp_preset || "",
       referrer_pro_pass_to_offer: link.referrer_pro_pass_to_offer || false,
       referrer_pro_allow_risky_wrapper: link.referrer_pro_allow_risky_wrapper || false,
+      referrer_pro_referer_mode: link.referrer_pro_referer_mode || "platform_pool",
+      referrer_pro_pro_mode: link.referrer_pro_pro_mode !== false,
+      referrer_pro_match_ua_to_platform: link.referrer_pro_match_ua_to_platform !== false,
+      referrer_pro_cold_referer_fallback: link.referrer_pro_cold_referer_fallback !== false,
+      referrer_pro_html_hop: link.referrer_pro_html_hop !== false,
       // v2.1.83 fields
       referrer_pro_lang_match: link.referrer_pro_lang_match !== undefined ? link.referrer_pro_lang_match : true,
       referrer_pro_device_mode: link.referrer_pro_device_mode || "auto",
@@ -841,7 +865,13 @@ export default function LinksPage() {
       referrer_pro_offer_urls: link.referrer_pro_offer_urls || "",
       postback_url: link.postback_url || "",
       referrer_pro_auto_pause_enabled: link.referrer_pro_auto_pause_enabled || false,
-      referrer_pro_auto_pause_threshold: link.referrer_pro_auto_pause_threshold || 10
+      referrer_pro_auto_pause_threshold: link.referrer_pro_auto_pause_threshold || 10,
+      referrer_pro_custom_utm_enabled: link.referrer_pro_custom_utm_enabled || false,
+      referrer_pro_custom_utm_source: link.referrer_pro_custom_utm_source || "",
+      referrer_pro_custom_utm_medium: link.referrer_pro_custom_utm_medium || "",
+      referrer_pro_custom_utm_campaign: link.referrer_pro_custom_utm_campaign || "",
+      referrer_pro_custom_utm_content: link.referrer_pro_custom_utm_content || "",
+      referrer_pro_custom_utm_term: link.referrer_pro_custom_utm_term || "",
     });
     // Auto-expand the Pro-Referrer section when editing a link that
     // already has it enabled — customer immediately sees their settings.
@@ -1482,10 +1512,10 @@ export default function LinksPage() {
                                   icon: "🎨",
                                   color: "#06B6D4",
                                   title: "UTM parameters banao (real campaign jaisa)",
-                                  what: "utm_source=facebook, utm_medium=paid_social, utm_content=video_a, utm_campaign=irestore_lookalike_m35 — sab dynamic. Aap Campaign Type dropdown se choose kar sakte hain.",
+                                  what: "utm_source, utm_medium, utm_campaign — auto realistic YA aap Custom UTM Tags ON karke apni exact values likh sakte hain (real ad jaisa). Campaign Type dropdown se presets bhi choose kar sakte hain.",
                                   why: "Voluum, Everflow, HasOffers dashboards yeh dikhate hain. Bina proper UTMs ke conversions attribute nahi hoti.",
-                                  benefit: "Aap ka tracker (Voluum) proper campaign source dikhata hai. Analytics saaf. A/B testing ke liye ready.",
-                                  setting: "Campaign Type dropdown (10 presets)",
+                                  benefit: "Aap ka tracker proper campaign source dikhata hai. Apni marzi ka campaign name + auto fbclid/ttclid mix.",
+                                  setting: "Custom UTM Tags toggle + Campaign Type dropdown",
                                 },
                                 {
                                   n: 7,
@@ -1617,350 +1647,15 @@ export default function LinksPage() {
                           )}
                         </div>
 
-                        {/* Platform Pool (weighted) — v2.1.83: visual builder replaces the raw text field */}
-                        <div>
-                          <Label className="text-xs text-[#A1A1AA]">Platform Pool (weighted)</Label>
-                          <div className="mt-1 p-2 rounded border border-[var(--brand-border)] bg-[var(--brand-bg)]">
-                            {(() => {
-                              const pool = parsePlatformPool(formData.referrer_pro_platform_pool || "");
-                              const poolMap = Object.fromEntries(pool.map(p => [p.key, p.weight]));
-                              const totalWeight = pool.reduce((s, p) => s + (p.weight || 0), 0) || 0;
-                              const togglePlatform = (key) => {
-                                const next = { ...poolMap };
-                                if (next[key] !== undefined) delete next[key];
-                                else next[key] = 20;
-                                setFormData({
-                                  ...formData,
-                                  referrer_pro_platform_pool: stringifyPlatformPool(
-                                    Object.entries(next).map(([k, w]) => ({ key: k, weight: w }))
-                                  )
-                                });
-                              };
-                              const setWeight = (key, w) => {
-                                const next = { ...poolMap, [key]: Math.max(1, parseInt(w) || 1) };
-                                setFormData({
-                                  ...formData,
-                                  referrer_pro_platform_pool: stringifyPlatformPool(
-                                    Object.entries(next).map(([k, w2]) => ({ key: k, weight: w2 }))
-                                  )
-                                });
-                              };
-                              return (
-                                <>
-                                  <div className="grid grid-cols-2 md:grid-cols-3 gap-1.5">
-                                    {PLATFORM_OPTIONS.map((p) => {
-                                      const selected = poolMap[p.key] !== undefined;
-                                      const w = poolMap[p.key] || 0;
-                                      const pct = totalWeight > 0 && selected ? Math.round((w / totalWeight) * 100) : 0;
-                                      return (
-                                        <div
-                                          key={p.key}
-                                          className={`p-1.5 rounded border text-xs transition-all ${
-                                            selected
-                                              ? "border-[#F59E0B] bg-[#F59E0B10]"
-                                              : "border-[var(--brand-border)] hover:border-[#F59E0B60] opacity-70"
-                                          }`}
-                                        >
-                                          <label className="flex items-center gap-1.5 cursor-pointer">
-                                            <input
-                                              type="checkbox"
-                                              checked={selected}
-                                              onChange={() => togglePlatform(p.key)}
-                                              className="w-3.5 h-3.5"
-                                              data-testid={`platform-toggle-${p.key}`}
-                                            />
-                                            <span className="text-sm">{p.emoji}</span>
-                                            <span className="flex-1 truncate font-medium">{p.label}</span>
-                                            {selected && (
-                                              <span className="text-[10px] text-[#F59E0B] font-mono">
-                                                {pct}%
-                                              </span>
-                                            )}
-                                          </label>
-                                          {selected && (
-                                            <div className="mt-1 flex items-center gap-1.5">
-                                              <input
-                                                type="range"
-                                                min={1}
-                                                max={100}
-                                                value={w}
-                                                onChange={(e) => setWeight(p.key, e.target.value)}
-                                                className="flex-1 h-1.5"
-                                                data-testid={`platform-weight-${p.key}`}
-                                              />
-                                              <input
-                                                type="number"
-                                                min={1}
-                                                max={100}
-                                                value={w}
-                                                onChange={(e) => setWeight(p.key, e.target.value)}
-                                                className="w-12 px-1 py-0 text-[10px] rounded bg-[var(--brand-card)] border border-[var(--brand-border)] text-white"
-                                              />
-                                            </div>
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                  <div className="mt-2 flex items-center justify-between text-[10px] text-[#52525B]">
-                                    <span>
-                                      {pool.length === 0
-                                        ? "Tick platforms above — set weight for each"
-                                        : `${pool.length} platform(s) selected · Total weight: ${totalWeight}`}
-                                    </span>
-                                    {pool.length > 0 && (
-                                      <button
-                                        type="button"
-                                        onClick={() => setFormData({ ...formData, referrer_pro_platform_pool: "" })}
-                                        className="text-[#EF4444] hover:underline"
-                                      >
-                                        Clear all
-                                      </button>
-                                    )}
-                                  </div>
-                                </>
-                              );
-                            })()}
-                          </div>
-                        </div>
-
-                        {/* Brand */}
-                        <div>
-                          <Label className="text-xs text-[#A1A1AA]">Brand Tag (for UTM campaigns)</Label>
-                          <Input
-                            value={formData.referrer_pro_brand}
-                            onChange={(e) => setFormData({ ...formData, referrer_pro_brand: e.target.value })}
-                            placeholder="acme, mybrand, offer42..."
-                            className="mt-1"
-                          />
-                          <p className="text-xs text-[#52525B] mt-1">Feeds into utm_campaign naming (e.g. <code>acme_lookalike_m35_video_a</code>)</p>
-                        </div>
-
-                        {/* Search Engine + Keywords */}
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <Label className="text-xs text-[#A1A1AA]">Search Engine</Label>
-                            <select
-                              value={formData.referrer_pro_search_engine}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_search_engine: e.target.value })}
-                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1"
-                            >
-                              <option value="google">Google</option>
-                              <option value="bing">Bing</option>
-                              <option value="duckduckgo">DuckDuckGo</option>
-                              <option value="yahoo">Yahoo</option>
-                              <option value="yandex">Yandex</option>
-                            </select>
-                          </div>
-                          <div>
-                            <Label className="text-xs text-[#A1A1AA]">Country (auto-matches language)</Label>
-                            <select
-                              value={formData.referrer_pro_country || ""}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_country: e.target.value })}
-                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm"
-                              data-testid="pro-country"
-                            >
-                              <option value="">— Any country (no geo-lock) —</option>
-                              {PRO_COUNTRY_OPTIONS.map((c) => (
-                                <option key={c.code} value={c.code}>
-                                  {c.flag} {c.name} ({c.code.toUpperCase()})
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-
-                        <div>
-                          <Label className="text-xs text-[#A1A1AA]">Search Keywords (one per line)</Label>
-                          <textarea
-                            value={formData.referrer_pro_search_keywords}
-                            onChange={(e) => setFormData({ ...formData, referrer_pro_search_keywords: e.target.value })}
-                            rows={3}
-                            placeholder={"best diet plan 2026\nketo meals for beginners\ngluten free recipes"}
-                            className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm"
-                          />
-                          <p className="text-xs text-[#52525B] mt-1">Used when the pool picks a search engine (google, bing, etc.)</p>
-                        </div>
-
-                        {/* Email Weights (visual sliders replace raw JSON) */}
-                        <div>
-                          <Label className="text-xs text-[#A1A1AA]">Email ESP Mix (used when pool picks &quot;email&quot;)</Label>
-                          <div className="mt-1 p-2 rounded border border-[var(--brand-border)] bg-[var(--brand-bg)]">
-                            {(() => {
-                              const espMap = parseEmailWeights(formData.referrer_pro_email_weights || "");
-                              const totalW = Object.values(espMap).reduce((s, v) => s + (parseFloat(v) || 0), 0) || 0;
-                              const toggleEsp = (key) => {
-                                const next = { ...espMap };
-                                if (next[key] !== undefined) delete next[key];
-                                else next[key] = 20;
-                                setFormData({ ...formData, referrer_pro_email_weights: stringifyEmailWeights(next) });
-                              };
-                              const setEspW = (key, w) => {
-                                const next = { ...espMap, [key]: Math.max(1, parseInt(w) || 1) };
-                                setFormData({ ...formData, referrer_pro_email_weights: stringifyEmailWeights(next) });
-                              };
-                              return (
-                                <>
-                                  <div className="grid grid-cols-2 gap-1.5">
-                                    {ESP_OPTIONS.map((e) => {
-                                      const selected = espMap[e.key] !== undefined;
-                                      const w = espMap[e.key] || 0;
-                                      const pct = totalW > 0 && selected ? Math.round((w / totalW) * 100) : 0;
-                                      return (
-                                        <div
-                                          key={e.key}
-                                          className={`p-1.5 rounded border text-xs transition-all ${
-                                            selected
-                                              ? "border-[#F59E0B] bg-[#F59E0B10]"
-                                              : "border-[var(--brand-border)] hover:border-[#F59E0B60] opacity-70"
-                                          }`}
-                                        >
-                                          <label className="flex items-center gap-1.5 cursor-pointer">
-                                            <input
-                                              type="checkbox"
-                                              checked={selected}
-                                              onChange={() => toggleEsp(e.key)}
-                                              className="w-3.5 h-3.5"
-                                              data-testid={`esp-toggle-${e.key}`}
-                                            />
-                                            <span className="text-sm">{e.emoji}</span>
-                                            <span className="flex-1 truncate font-medium">{e.label}</span>
-                                            {selected && (
-                                              <span className="text-[10px] text-[#F59E0B] font-mono">{pct}%</span>
-                                            )}
-                                          </label>
-                                          {selected && (
-                                            <div className="mt-1 flex items-center gap-1.5">
-                                              <input
-                                                type="range"
-                                                min={1}
-                                                max={100}
-                                                value={w}
-                                                onChange={(ev) => setEspW(e.key, ev.target.value)}
-                                                className="flex-1 h-1.5"
-                                              />
-                                              <input
-                                                type="number"
-                                                min={1}
-                                                max={100}
-                                                value={w}
-                                                onChange={(ev) => setEspW(e.key, ev.target.value)}
-                                                className="w-12 px-1 py-0 text-[10px] rounded bg-[var(--brand-card)] border border-[var(--brand-border)] text-white"
-                                              />
-                                            </div>
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                  <p className="text-[10px] text-[#52525B] mt-2">Tick ESPs above · rotates them on email visits with these weights</p>
-                                </>
-                              );
-                            })()}
-                          </div>
-                        </div>
-
-                        {/* Toggles */}
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className="flex items-center gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                            <input
-                              type="checkbox"
-                              checked={formData.referrer_pro_social_wrapper}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_social_wrapper: e.target.checked })}
-                              className="w-4 h-4"
-                            />
-                            <span className="text-xs">Social wrappers (l.fb.com, etc.)</span>
-                          </label>
-                          <label className="flex items-center gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                            <input
-                              type="checkbox"
-                              checked={formData.referrer_pro_inapp_deep_path}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_inapp_deep_path: e.target.checked })}
-                              className="w-4 h-4"
-                            />
-                            <span className="text-xs">In-app deep paths (FB/IG webview)</span>
-                          </label>
-                          <label className="flex items-center gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                            <input
-                              type="checkbox"
-                              checked={formData.referrer_pro_strip_search_path}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_strip_search_path: e.target.checked })}
-                              className="w-4 h-4"
-                            />
-                            <span className="text-xs">Strip search-engine paths</span>
-                          </label>
-                        </div>
-
-                        {/* Wrapper redirect — the powerful one */}
-                        <label className="flex items-start gap-2 cursor-pointer p-3 rounded border-2 border-[#F59E0B] bg-[#F59E0B08]">
-                          <input
-                            type="checkbox"
-                            checked={formData.referrer_pro_wrapper_redirect}
-                            onChange={(e) => setFormData({ ...formData, referrer_pro_wrapper_redirect: e.target.checked })}
-                            className="w-4 h-4 mt-0.5"
-                            data-testid="pro-wrapper-redirect"
-                          />
-                          <div>
-                            <span className="text-sm font-medium">Wrapper redirect chain (recommended)</span>
-                            <p className="text-xs text-[#A1A1AA] mt-1">
-                              Bounces every click through the real platform wrapper (<code>l.facebook.com/l.php?u=...</code>, <code>google.com/url?q=...</code>, <code>t.co/...</code> etc.). The offer sees a REAL platform domain as Referer — most powerful anti-detect. Adds ~50ms per click.
-                            </p>
-                            <p className="text-[10px] text-[#22C55E] mt-1.5 font-medium">
-                              ✨ v2.2.0 Smart Wrapper — Cold external clicks (WhatsApp share, direct paste) automatically SKIP warning-trigger wrappers. In-app FB/IG/TT clicks still use the wrapper (silently bypassed). No more &quot;Leaving Facebook&quot; warnings for end users.
-                            </p>
-                          </div>
-                        </label>
-
-                        {/* v2.7.46 — Custom referer + in-app preset (manual link perfection) */}
-                        <div className="p-3 rounded border border-[#3B82F6] bg-[#3B82F608] space-y-3">
-                          <p className="text-xs font-medium text-[#3B82F6]">Perfect Referrer (manual links)</p>
-                          <div>
-                            <Label className="text-xs text-[#A1A1AA]">Custom referer / landing URL</Label>
-                            <Input
-                              value={formData.referrer_pro_custom_referer || ""}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_custom_referer: e.target.value })}
-                              placeholder="https://mylanding.com/promo or ...?redirect={offer_url}"
-                              className="mt-1 font-mono text-xs"
-                            />
-                            <p className="text-[10px] text-[#52525B] mt-1">
-                              Use <code>{`{offer_url}`}</code> macro + Pass to Offer for operator redirect pages.
-                            </p>
-                          </div>
-                          <div>
-                            <Label className="text-xs text-[#A1A1AA]">In-app browser preset</Label>
-                            <select
-                              value={formData.referrer_pro_inapp_preset || ""}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_inapp_preset: e.target.value })}
-                              className="mt-1 w-full h-9 rounded-md border border-[var(--brand-border)] bg-[var(--brand-bg)] px-2 text-xs"
-                            >
-                              <option value="">Auto (from pool / UA)</option>
-                              {["facebook", "instagram", "tiktok", "twitter", "linkedin", "pinterest", "youtube", "snapchat", "reddit", "google", "bing"].map((p) => (
-                                <option key={p} value={p}>{p}</option>
-                              ))}
-                            </select>
-                            <p className="text-[10px] text-[#52525B] mt-1">
-                              Customer in-app UA lagaye — wrapper unlocks for TT/X/LI when preset match ho.
-                            </p>
-                          </div>
-                          <label className="flex items-start gap-2 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={!!formData.referrer_pro_pass_to_offer}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_pass_to_offer: e.target.checked })}
-                              className="w-4 h-4 mt-0.5"
-                            />
-                            <span className="text-xs">Pass referer to offer (custom URL with <code>{`{offer_url}`}</code> hop)</span>
-                          </label>
-                          <label className="flex items-start gap-2 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={!!formData.referrer_pro_allow_risky_wrapper}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_allow_risky_wrapper: e.target.checked })}
-                              className="w-4 h-4 mt-0.5"
-                            />
-                            <span className="text-xs">Allow TikTok link/v2 wrapper (in-app UA only — risky on Chrome)</span>
-                          </label>
-                        </div>
+                        <ReferrerProModePanel
+                          config={linkToReferrerConfig(formData)}
+                          onChange={(cfg) => setFormData((prev) => ({ ...prev, ...patchLinkFromReferrerConfig(cfg) }))}
+                          countryOptions={PRO_COUNTRY_OPTIONS}
+                          testIdPrefix="link-referrer"
+                          showLinkExtras
+                          title="Referrer Settings (same as RUT)"
+                          subtitle="Referrer Mode, Pro platform mix, custom URL list, Google keywords — Real User Traffic jaisa interface."
+                        />
 
                         {/* ─────────────────────────────────────────────────
                             Network Compliance Guardrails
@@ -2002,106 +1697,9 @@ export default function LinksPage() {
                             </p>
                           </div>
 
-                          <div className="grid grid-cols-2 gap-3">
-                            {/* Feature 1 — Accept-Language country match */}
-                            <label className="flex items-start gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                              <input
-                                type="checkbox"
-                                checked={formData.referrer_pro_lang_match}
-                                onChange={(e) => setFormData({ ...formData, referrer_pro_lang_match: e.target.checked })}
-                                className="w-4 h-4 mt-0.5"
-                                data-testid="pro-lang-match"
-                              />
-                              <div>
-                                <div className="text-xs font-medium">Match Accept-Language to country</div>
-                                <p className="text-[10px] text-[#52525B] mt-0.5">
-                                  Germany proxy sends <code>de-DE,de;q=0.9</code> not <code>en-US</code>. Boosts EU/Asia offer accept rate 20-40%.
-                                </p>
-                              </div>
-                            </label>
+                          {/* Duplicate guardrails removed — now in ReferrerProModePanel above */}
 
-                            {/* Feature 4 — Time-of-day realism */}
-                            <label className="flex items-start gap-2 cursor-pointer p-2 rounded border border-[var(--brand-border)]">
-                              <input
-                                type="checkbox"
-                                checked={formData.referrer_pro_tod_enabled}
-                                onChange={(e) => setFormData({ ...formData, referrer_pro_tod_enabled: e.target.checked })}
-                                className="w-4 h-4 mt-0.5"
-                                data-testid="pro-tod-enabled"
-                              />
-                              <div>
-                                <div className="text-xs font-medium">Time-of-day realism weighting</div>
-                                <p className="text-[10px] text-[#52525B] mt-0.5">
-                                  FB peaks 7-9am / 7-10pm, TikTok 6-11pm, LinkedIn business hours. Avoids &quot;suspicious 3am spike&quot; flags.
-                                </p>
-                              </div>
-                            </label>
-                          </div>
-
-                          {/* Feature 3 — Device Type per Platform */}
-                          <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">Device Distribution</Label>
-                            <select
-                              value={formData.referrer_pro_device_mode}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_device_mode: e.target.value })}
-                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm"
-                              data-testid="pro-device-mode"
-                            >
-                              <option value="auto">Auto — any device fits any platform (legacy)</option>
-                              <option value="match_platform">Strict — TikTok/IG only on mobile UA, LinkedIn on desktop UA</option>
-                              <option value="mobile_only">Mobile-only pool (drop desktop-leaning platforms)</option>
-                              <option value="desktop_only">Desktop-only pool (drop mobile-only platforms)</option>
-                            </select>
-                            <p className="text-[10px] text-[#52525B] mt-1">
-                              Prevents red-flag combinations like &quot;TikTok click from Windows desktop&quot; that fraud detectors instantly reject.
-                            </p>
-                          </div>
-
-                          {/* Feature 5 — Campaign Type Preset */}
-                          <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">Campaign Type / UTM Preset</Label>
-                            <select
-                              value={formData.referrer_pro_campaign_type}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_campaign_type: e.target.value })}
-                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm"
-                              data-testid="pro-campaign-type"
-                            >
-                              <option value="auto">Auto — random per-visit rotation (legacy)</option>
-                              <option value="static_image">Static Image Ad — utm_content=static_image</option>
-                              <option value="video_ad">Video Ad — utm_content=video_a</option>
-                              <option value="carousel_ad">Carousel Ad — utm_content=carousel_v2</option>
-                              <option value="story_ad">Story Ad — utm_content=story_9x16</option>
-                              <option value="lookalike_prospect">Lookalike Prospecting — utm_term=lookalike_m35</option>
-                              <option value="retargeting_warm">Retargeting (Warm Audience)</option>
-                              <option value="retargeting_cold">Retargeting (Cold Audience)</option>
-                              <option value="cold_email">Cold Email Outreach</option>
-                              <option value="search_cpc">Search / CPC (Google Ads)</option>
-                            </select>
-                            <p className="text-[10px] text-[#52525B] mt-1">
-                              Sets utm_medium / utm_content / utm_term to a realistic campaign combo — Meta / Google / Voluum dashboards render properly.
-                            </p>
-                          </div>
-
-                          {/* Traffic Type: Paid vs Organic */}
-                          <div className="mt-3">
-                            <Label className="text-xs text-[#A1A1AA]">Traffic Type (Paid vs Organic)</Label>
-                            <select
-                              value={formData.referrer_pro_traffic_type || 'auto'}
-                              onChange={(e) => setFormData({ ...formData, referrer_pro_traffic_type: e.target.value })}
-                              className="w-full p-2 rounded-md bg-[var(--brand-card)] border border-[var(--brand-border)] text-white mt-1 text-sm"
-                              data-testid="pro-traffic-type"
-                            >
-                              <option value="auto">Auto — detect from Campaign Type + platform (safest default)</option>
-                              <option value="paid">Paid Ads — use paid-ad referer pool (l.facebook.com w/ __cft__, googleads.g.doubleclick.net, t.co, empty for TikTok, etc.)</option>
-                              <option value="organic">Organic — use organic-click referer pool (google.tld origin only, pfbid post URLs, no ad tracking params)</option>
-                              <option value="mixed">Mixed — 60% paid / 40% organic (realistic real-world blend)</option>
-                            </select>
-                            <p className="text-[10px] text-[#52525B] mt-1">
-                              Applies platform-specific real-capture referer patterns for all 10 supported platforms. &quot;Auto&quot; preserves legacy behaviour for existing links — pick Paid / Organic / Mixed to force a specific mode.
-                            </p>
-                          </div>
-
-                          {/* v2.6.29 — Custom tracker param key for paid/organic inject */}
+                                                    {/* v2.6.29 — Custom tracker param key for paid/organic inject */}
                           <div className="mt-3">
                             <Label className="text-xs text-[#A1A1AA]">📊 Traffic Type Param Key</Label>
                             <input

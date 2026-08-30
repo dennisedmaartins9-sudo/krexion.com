@@ -2257,6 +2257,8 @@ def _resolve_visit_referer(ua: str, cfg: Optional[Dict[str, Any]]) -> Tuple[str,
                     tod_enabled=bool(cfg.get("tod_enabled", False)),
                     traffic_type=str(cfg.get("traffic_type") or "auto"),
                     campaign_type=str(cfg.get("campaign_type") or "auto"),
+                    require_non_empty_referer=bool(cfg.get("require_non_empty_referer", False)),
+                    wrapper_redirect=bool(cfg.get("wrapper_redirect", False)),
                 )
                 ref = pro.get("referer", "") or ""
                 plat = pro.get("platform", "") or ""

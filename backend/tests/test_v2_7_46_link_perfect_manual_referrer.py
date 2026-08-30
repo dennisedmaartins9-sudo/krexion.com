@@ -68,8 +68,7 @@ def test_custom_referer_and_inapp_preset_in_prepare():
     rp = _rp()
     link = {
         "referrer_pro_enabled": True,
-        "referrer_pro_platform_pool": "tiktok:100",
-        "referrer_pro_wrapper_redirect": True,
+        "referrer_pro_referer_mode": "custom",
         "referrer_pro_custom_referer": "https://mybrand.com/promo",
         "referrer_pro_inapp_preset": "tiktok",
         "referrer_pro_social_wrapper": True,
@@ -83,11 +82,36 @@ def test_custom_referer_and_inapp_preset_in_prepare():
     assert prep.get("platform") == "tiktok"
 
 
+def test_tiktok_risky_wrapper_never_on_desktop_chrome_even_if_coerced():
+    """Desktop Chrome must never get link/v2 even with risky ON + tiktok pool."""
+    rp = _rp()
+    link = {
+        "referrer_pro_enabled": True,
+        "referrer_pro_platform_pool": "tiktok:100",
+        "referrer_pro_referer_mode": "platform_pool",
+        "referrer_pro_wrapper_redirect": True,
+        "referrer_pro_allow_risky_wrapper": True,
+        "referrer_pro_social_wrapper": True,
+        "referrer_pro_inapp_deep_path": True,
+        "referrer_pro_traffic_type": "paid",
+    }
+    prep = rp.prepare_link_pro_click(
+        link,
+        user_agent=_DESKTOP_UA,
+        destination_url=_DEST,
+        country="US",
+    )
+    wt = str(prep.get("wrapper_target") or "")
+    assert "link/v2" not in wt.lower(), "Cold Chrome must not use TikTok link/v2 wrapper"
+    assert prep.get("platform") == "tiktok" or (prep.get("pro_result") or {}).get("platform") == "tiktok"
+
+
 def test_custom_referer_hop_macro_expanded():
     rp = _rp()
     link = {
         "referrer_pro_enabled": True,
         "referrer_pro_platform_pool": "facebook:100",
+        "referrer_pro_referer_mode": "platform_pool",
         "referrer_pro_wrapper_redirect": False,
         "referrer_pro_custom_referer": _CUSTOM_LANDING,
         "referrer_pro_pass_to_offer": True,
@@ -100,6 +124,56 @@ def test_custom_referer_hop_macro_expanded():
     assert hop.startswith("https://mylanding.com/")
     assert "offer.example.com" in hop
     assert prep.get("pass_to_offer") is True
+
+
+def test_link_custom_referer_mode():
+    rp = _rp()
+    link = {
+        "referrer_pro_enabled": True,
+        "referrer_pro_referer_mode": "custom",
+        "referrer_pro_custom_referer": "https://www.facebook.com/groups/test123/",
+        "referrer_pro_traffic_type": "paid",
+    }
+    prep = rp.prepare_link_pro_click(
+        link, user_agent=_DESKTOP_UA, destination_url=_DEST, country="US"
+    )
+    assert "facebook.com/groups" in str(prep.get("referer") or "")
+    assert prep.get("platform") == "facebook"
+
+
+def test_link_google_search_mode():
+    rp = _rp()
+    link = {
+        "referrer_pro_enabled": True,
+        "referrer_pro_referer_mode": "google_search",
+        "referrer_pro_custom_referer": "best vpn 2026",
+        "referrer_pro_search_engine": "google",
+    }
+    prep = rp.prepare_link_pro_click(
+        link, user_agent=_DESKTOP_UA, destination_url=_DEST, country="US"
+    )
+    ref = str(prep.get("referer") or "")
+    assert "google" in ref.lower()
+    assert "q=" in ref.lower() or "search" in ref.lower()
+
+
+def test_facebook_wrapper_skipped_on_desktop_chrome():
+    """Cold Chrome must not bounce through l.php → m.facebook.com/flx/warn."""
+    rp = _rp()
+    link = {
+        "referrer_pro_enabled": True,
+        "referrer_pro_platform_pool": "facebook:100",
+        "referrer_pro_wrapper_redirect": True,
+        "referrer_pro_social_wrapper": True,
+        "referrer_pro_inapp_deep_path": True,
+        "referrer_pro_traffic_type": "paid",
+    }
+    prep = rp.prepare_link_pro_click(
+        link, user_agent=_DESKTOP_UA, destination_url=_DEST, country="US"
+    )
+    wt = str(prep.get("wrapper_target") or "")
+    assert not wt
+    assert "flx" not in str(prep.get("referer") or "").lower()
 
 
 def test_linkedin_wrapper_inapp_only():

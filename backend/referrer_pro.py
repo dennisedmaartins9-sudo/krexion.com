@@ -2565,6 +2565,8 @@ _QUALITY_TIER_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "referrer_pro_wrapper_redirect":      True,
         "referrer_pro_tod_enabled":           True,
         "referrer_pro_device_mode":           "match_platform",
+        "referrer_pro_cold_referer_fallback": True,
+        "referrer_pro_html_hop":            True,
     },
     "standard": {
         # Balanced defaults — same as pre-v2.1.83 behaviour so existing
@@ -3200,6 +3202,66 @@ def is_cold_external_link_click(user_agent: str, platform: str) -> bool:
     return inapp != plat
 
 
+def build_cold_click_referer_wrapper(
+    user_agent: str,
+    platform: str,
+    destination_url: str,
+    *,
+    is_paid: bool = True,
+) -> str:
+    """When Meta/TikTok wrappers warn on cold browsers, use a safe Google shim.
+
+    Offer receives ``google.com`` as HTTP Referer (not ``krexion.com``) plus
+    platform params (fbclid/ttclid/utm) already on the destination URL.
+    """
+    dest = (destination_url or "").strip()
+    if not dest:
+        return ""
+    if not is_cold_external_link_click(user_agent, platform):
+        return ""
+    plat = (platform or "").lower().strip()
+    if plat == "x":
+        plat = "twitter"
+    if plat in ("google", "bing"):
+        return build_link_explicit_wrapper_url(plat, dest, is_paid=is_paid)
+    if plat in _LINK_SOCIAL_PLATFORMS or plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
+        return f"https://www.google.com/url?q={quote_plus(dest)}"
+    if plat in _LINK_INAPP_WRAPPER_PLATFORMS:
+        return f"https://www.google.com/url?q={quote_plus(dest)}"
+    return ""
+
+
+def build_perfect_manual_hop_html(
+    target_url: str,
+    *,
+    referer_policy: str = "unsafe-url",
+) -> str:
+    """HTML hop page — Referrer-Policy meta + instant JS redirect.
+
+    Preserves full Referer through long affiliate redirect chains better
+    than a bare 302 on some Chromium builds (intermediate tracker hops).
+    """
+    dest = (target_url or "").strip()
+    if not dest:
+        dest = "about:blank"
+    policy = (referer_policy or "unsafe-url").strip() or "unsafe-url"
+    js_dest = json.dumps(dest)
+    esc_attr = (
+        dest.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="referrer" content="{policy}">
+<meta http-equiv="Referrer-Policy" content="{policy}">
+<meta http-equiv="refresh" content="0;url={esc_attr}">
+<title>Redirecting…</title>
+<script>window.location.replace({js_dest});</script>
+</head><body></body></html>"""
+
+
 def is_safe_http_wrapper_bounce(url: str) -> bool:
     """Whitelist-only: only proven-safe search shims may HTTP-bounce."""
     if not (url or "").strip():
@@ -3302,6 +3364,23 @@ _REFERER_HOST_TO_PLATFORM: Dict[str, str] = {
 }
 
 
+def is_krexion_short_link_url(url: str) -> bool:
+    """True for Krexion manual short-link paths (/r/{code}, /t/{code}, /api/t/…)."""
+    try:
+        parsed = urlparse(url or "")
+        parts = [p for p in (parsed.path or "").strip("/").split("/") if p]
+        if len(parts) >= 2 and parts[0] in ("r", "t") and parts[1]:
+            return True
+        if len(parts) >= 3 and parts[0] == "api" and parts[1] in ("r", "t") and parts[2]:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+KREXION_PROFILE_SESSION_HEADER = "X-Krexion-Profile-Session"
+
+
 def platform_from_referer_url(referer_url: str) -> str:
     """Best-effort platform tag from a referer / landing URL host."""
     try:
@@ -3342,7 +3421,11 @@ def should_link_wrapper_bounce(
     if plat in ("google", "bing"):
         return True
     if plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
-        return bool(wrapper_redirect_enabled)
+        if not wrapper_redirect_enabled:
+            return False
+        # Meta l.php / flx/warn shows "Leaving Facebook" on cold Chrome — direct
+        # 302 + fbclid/fbc/utm instead. Wrapper only in real FB/IG in-app WebView.
+        return not cold
     if plat in _LINK_INAPP_WRAPPER_PLATFORMS:
         if not wrapper_redirect_enabled:
             return False
@@ -3871,6 +3954,72 @@ def pool_is_social_heavy(platform_pool_value: str, threshold: float = 0.34) -> b
     return total > 0 and (heavy / total) >= threshold
 
 
+# v2.7.51 — Manual link custom UTM fields (real-ad style operator input).
+LINK_CUSTOM_UTM_KEYS: Tuple[str, ...] = (
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+)
+
+LINK_CUSTOM_UTM_FIELD_MAP: Dict[str, str] = {
+    "utm_source": "referrer_pro_custom_utm_source",
+    "utm_medium": "referrer_pro_custom_utm_medium",
+    "utm_campaign": "referrer_pro_custom_utm_campaign",
+    "utm_content": "referrer_pro_custom_utm_content",
+    "utm_term": "referrer_pro_custom_utm_term",
+}
+
+
+def _sanitize_utm_value(raw: str, *, max_len: int = 256) -> str:
+    v = (raw or "").strip().replace("\n", " ").replace("\r", " ")
+    if len(v) > max_len:
+        v = v[:max_len]
+    return v
+
+
+def resolve_link_custom_utms(
+    link: Dict[str, Any],
+    pro_result: Optional[Dict[str, Any]] = None,
+    macro_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Apply operator-defined UTMs when custom mode is ON.
+
+    Filled fields override auto-generated values from the Pro engine.
+    Empty fields keep the auto-generated value (if any). Values support
+    ``{click_id}``, ``{source}``, ``{brand}``, ``{platform}``, ``{campaign}``
+    macros. Returns the resolved utm_* dict and mutates ``pro_result``.
+    """
+    if not link.get("referrer_pro_custom_utm_enabled"):
+        return {}
+    pro: Dict[str, Any] = pro_result if isinstance(pro_result, dict) else {}
+    ctx: Dict[str, Any] = dict(macro_ctx or {})
+    ctx.setdefault("brand", str(link.get("referrer_pro_brand") or ""))
+    ctx.setdefault("source", str(pro.get("platform") or ctx.get("source") or ""))
+    ctx.setdefault("platform", str(pro.get("platform") or ctx.get("platform") or ""))
+    ctx.setdefault("campaign", str(pro.get("utm_campaign") or ctx.get("campaign") or ""))
+    for _k in LINK_CUSTOM_UTM_KEYS:
+        if pro.get(_k):
+            ctx.setdefault(_k, pro[_k])
+
+    resolved: Dict[str, str] = {}
+    for utm_key in LINK_CUSTOM_UTM_KEYS:
+        field = LINK_CUSTOM_UTM_FIELD_MAP[utm_key]
+        raw = str(link.get(field) or "").strip()
+        if raw:
+            val = expand_link_macros(raw, ctx) if "{" in raw else raw
+            val = _sanitize_utm_value(val)
+            if val:
+                resolved[utm_key] = val
+        elif pro.get(utm_key):
+            resolved[utm_key] = _sanitize_utm_value(str(pro[utm_key]))
+
+    for k, v in resolved.items():
+        pro[k] = v
+    return resolved
+
+
 def normalize_link_pro_settings(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Clear classic/pro conflicts and enable wrapper for social-heavy pools."""
     out = dict(doc or {})
@@ -3886,6 +4035,16 @@ def normalize_link_pro_settings(doc: Dict[str, Any]) -> Dict[str, Any]:
     if pool and not bool(out.get("referrer_pro_wrapper_redirect")):
         if pool_is_social_heavy(pool):
             out["referrer_pro_wrapper_redirect"] = True
+    if out.get("referrer_pro_cold_referer_fallback") is None:
+        out["referrer_pro_cold_referer_fallback"] = True
+    if out.get("referrer_pro_html_hop") is None:
+        out["referrer_pro_html_hop"] = True
+    custom = str(out.get("referrer_pro_custom_referer") or "")
+    if "{offer_url}" in custom:
+        out["referrer_pro_pass_to_offer"] = True
+        _rm = str(out.get("referrer_pro_referer_mode") or "").strip().lower()
+        if _rm in ("", "platform_pool", "pro"):
+            out["referrer_pro_referer_mode"] = "custom"
     return out
 
 
@@ -3913,6 +4072,117 @@ def enrich_destination_link_realism(
     Kept for backwards-compatible imports/tests; returns URL unchanged.
     """
     return (destination_url or "").strip()
+
+
+def resolve_referer_mode_for_link(
+    link: Dict[str, Any],
+    *,
+    ua: str = "",
+    destination_url: str = "",
+    country: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """RUT-parity referer modes for manual links (custom / random_list / google_search / auto / direct)."""
+    mode = str(link.get("referrer_pro_referer_mode") or "platform_pool").strip().lower()
+    if mode in ("platform_pool", "pro", ""):
+        return None
+    value = str(link.get("referrer_pro_custom_referer") or "").strip()
+    if mode == "google_search" and not value:
+        value = str(link.get("referrer_pro_search_keywords") or "").strip()
+    preset = str(link.get("referrer_pro_inapp_preset") or "").strip().lower()
+    if preset == "x":
+        preset = "twitter"
+    inapp_deep = bool(link.get("referrer_pro_inapp_deep_path", True))
+    strip_path = bool(link.get("referrer_pro_strip_search_path", True))
+    search_engine = str(link.get("referrer_pro_search_engine") or "google")
+    cc = link.get("referrer_pro_country") or country
+    traffic_type = str(link.get("referrer_pro_traffic_type") or "auto")
+    campaign_type = str(link.get("referrer_pro_campaign_type") or "auto")
+    brand = str(link.get("referrer_pro_brand") or "")
+
+    referer = ""
+    plat = ""
+
+    def _deepen(ref: str, p: str) -> str:
+        if not inapp_deep or not ref or not p:
+            return ref
+        try:
+            _paid = detect_is_paid(traffic_type, campaign_type, p)
+            deep = build_inapp_deep_referer(p, destination_url or "", is_paid=_paid)
+            return deep or ref
+        except Exception:
+            return ref
+
+    if mode in ("direct", "none"):
+        referer, plat = "", ""
+    elif mode == "auto":
+        inapp = is_inapp_browser_ua(ua or "")
+        if inapp:
+            plat = inapp
+            referer = _platform_homepage(inapp) or ""
+            referer = _deepen(referer, plat)
+        else:
+            referer, plat = "", ""
+    elif mode == "custom" and value:
+        referer = value
+        plat = platform_from_referer_url(referer) or preset
+    elif mode == "random_list":
+        lines = [ln.strip() for ln in value.splitlines() if ln.strip()]
+        if lines:
+            referer = random.choice(lines)
+            plat = platform_from_referer_url(referer) or preset
+        else:
+            inapp = is_inapp_browser_ua(ua or "")
+            plat = inapp or preset
+            referer = _deepen(_platform_homepage(plat) if plat else "", plat) if plat else ""
+    elif mode == "google_search":
+        kws = [ln.strip() for ln in value.splitlines() if ln.strip()]
+        kw = random.choice(kws) if kws else ""
+        try:
+            referer = build_search_referer(search_engine, kw, country=cc, strip_path=strip_path)
+        except Exception:
+            from urllib.parse import quote_plus
+            referer = (
+                f"https://www.google.com/search?q={quote_plus(kw)}"
+                if kw else "https://www.google.com/"
+            )
+        plat = platform_from_referer_url(referer) or search_engine
+    else:
+        return None
+
+    if preset and not plat:
+        plat = preset
+
+    out: Dict[str, Any] = {
+        "referer": referer,
+        "platform": plat,
+        "esp": "",
+        "sec_fetch": build_sec_fetch_headers(referer, is_navigation=True) if referer else {},
+        "utm_source": "",
+        "utm_medium": "",
+        "utm_campaign": "",
+        "utm_content": "",
+        "utm_term": "",
+        "accept_language": accept_language_for_country(cc) if link.get("referrer_pro_lang_match", True) else "",
+        "device_type": "mobile" if ("mobi" in (ua or "").lower()) else "desktop",
+        "network_click_referer": "",
+    }
+    if plat:
+        try:
+            out["utm_source"], out["utm_medium"] = pick_utm_variation(plat, brand)
+            out["utm_campaign"] = pick_utm_campaign(plat, brand)
+            _preset = campaign_type_preset(campaign_type)
+            _is_paid = detect_is_paid(traffic_type, campaign_type, plat)
+            if _preset and _is_paid is not False:
+                out["utm_medium"] = _preset.get("medium", out["utm_medium"])
+                out["utm_content"] = _preset.get("content", "")
+                out["utm_term"] = _preset.get("term", "")
+            out["is_paid"] = _is_paid
+            out["traffic_type"] = (
+                "paid" if _is_paid is True else "organic" if _is_paid is False else "auto"
+            )
+        except Exception:
+            pass
+    return out
 
 
 def prepare_link_pro_click(
@@ -3960,30 +4230,41 @@ def prepare_link_pro_click(
     visitor_mobile = ("mobi" in _ua_low or "iphone" in _ua_low or "android" in _ua_low)
     pool = str(link.get("referrer_pro_platform_pool") or "").strip()
     use_wrapper_flag = bool(link.get("referrer_pro_wrapper_redirect")) or pool_is_social_heavy(pool)
+    referer_mode = str(link.get("referrer_pro_referer_mode") or "platform_pool").strip().lower()
+    pro: Dict[str, Any] = {}
     try:
-        pro = resolve_pro_visit(
-            ua=ua,
-            platform_pool_value=pool,
-            email_weights_value=str(link.get("referrer_pro_email_weights") or ""),
-            brand=str(link.get("referrer_pro_brand") or ""),
-            target_url=destination_url or "",
-            country=(link.get("referrer_pro_country") or country or None),
-            search_engine=str(link.get("referrer_pro_search_engine") or "google"),
-            search_keywords=str(link.get("referrer_pro_search_keywords") or ""),
-            social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
-            inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
-            strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
-            network_click_chain_enabled=False,
-            network_click_host=None,
-            lang_match=bool(link.get("referrer_pro_lang_match", True)),
-            visitor_is_mobile=visitor_mobile,
-            device_mode=str(link.get("referrer_pro_device_mode") or "auto"),
-            tod_enabled=bool(link.get("referrer_pro_tod_enabled", False)),
-            campaign_type=str(link.get("referrer_pro_campaign_type") or "auto"),
-            traffic_type=str(link.get("referrer_pro_traffic_type") or "auto"),
-            require_non_empty_referer=True,
-            wrapper_redirect=use_wrapper_flag,
+        mode_pro = resolve_referer_mode_for_link(
+            link, ua=ua, destination_url=destination_url, country=country
         )
+        if mode_pro is not None:
+            pro = mode_pro
+        elif referer_mode not in ("platform_pool", "pro", "") and not pool:
+            # Explicit non-pool mode but resolver returned nothing — safe empty
+            pro = {}
+        else:
+            pro = resolve_pro_visit(
+                ua=ua,
+                platform_pool_value=pool,
+                email_weights_value=str(link.get("referrer_pro_email_weights") or ""),
+                brand=str(link.get("referrer_pro_brand") or ""),
+                target_url=destination_url or "",
+                country=(link.get("referrer_pro_country") or country or None),
+                search_engine=str(link.get("referrer_pro_search_engine") or "google"),
+                search_keywords=str(link.get("referrer_pro_search_keywords") or ""),
+                social_wrapper_enabled=bool(link.get("referrer_pro_social_wrapper", True)),
+                inapp_deep_path_enabled=bool(link.get("referrer_pro_inapp_deep_path", True)),
+                strip_search_path=bool(link.get("referrer_pro_strip_search_path", True)),
+                network_click_chain_enabled=False,
+                network_click_host=None,
+                lang_match=bool(link.get("referrer_pro_lang_match", True)),
+                visitor_is_mobile=visitor_mobile,
+                device_mode=str(link.get("referrer_pro_device_mode") or "auto"),
+                tod_enabled=bool(link.get("referrer_pro_tod_enabled", False)),
+                campaign_type=str(link.get("referrer_pro_campaign_type") or "auto"),
+                traffic_type=str(link.get("referrer_pro_traffic_type") or "auto"),
+                require_non_empty_referer=True,
+                wrapper_redirect=use_wrapper_flag,
+            ) or {}
     except Exception:
         return out
     out["pro_result"] = pro or {}
@@ -3993,18 +4274,25 @@ def prepare_link_pro_click(
     out["allow_risky_wrapper"] = allow_risky
     out["pass_to_offer"] = bool(link.get("referrer_pro_pass_to_offer"))
     custom_ref = str(link.get("referrer_pro_custom_referer") or "").strip()
+    if "{offer_url}" in custom_ref:
+        out["pass_to_offer"] = True
     preset = str(link.get("referrer_pro_inapp_preset") or "").strip().lower()
     if preset == "x":
         preset = "twitter"
     if preset:
-        plat = preset
-    if custom_ref.startswith(("http://", "https://")):
-        referer = custom_ref
-        derived = platform_from_referer_url(custom_ref)
+        plat = preset or plat
+    # Custom referer override only for explicit modes (not platform_pool).
+    if referer_mode in ("custom", "random_list") and custom_ref.startswith(("http://", "https://")):
+        if referer_mode == "custom":
+            referer = custom_ref
+        derived = platform_from_referer_url(referer)
         if derived:
             plat = preset or derived
         elif preset:
             plat = preset
+    elif custom_ref and "{offer_url}" in custom_ref:
+        # Operator macro hop — keep referer from mode resolver unless macro-only field
+        pass
     out["platform"] = plat
     out["referer"] = referer
     out["accept_language"] = str((pro or {}).get("accept_language") or "")
@@ -4056,9 +4344,11 @@ def prepare_link_pro_click(
                     is_paid=bool((pro or {}).get("is_paid")),
                     allow_risky=allow_risky,
                 )
-            _bounce_ua = out.get("user_agent") or ua
+            # Wrapper safety MUST use the visitor's real UA — never coerced
+            # in-app UA. Coerced UA made cold Chrome look "in-app" and sent
+            # users to tiktok.com/link/v2 → "Something Wrong" (screenshot bug).
             if bounce and should_link_wrapper_bounce(
-                _bounce_ua,
+                ua,
                 plat,
                 bounce,
                 wrapper_redirect_enabled=_wrapper_on,
@@ -4117,16 +4407,24 @@ __all__ = [
     "build_wrapper_bounce_url",
     "is_safe_http_wrapper_bounce",
     "is_warning_trigger_wrapper_url",
+    "build_cold_click_referer_wrapper",
+    "build_perfect_manual_hop_html",
     "is_cold_external_link_click",
     "should_http_wrapper_bounce",
     "should_link_wrapper_bounce",
     "build_link_explicit_wrapper_url",
+    "is_krexion_short_link_url",
+    "KREXION_PROFILE_SESSION_HEADER",
     "platform_from_referer_url",
     "platform_supports_http_wrapper_bounce",
     "detect_is_paid",
     "apply_organic_platform_param_override",
+    "LINK_CUSTOM_UTM_KEYS",
+    "LINK_CUSTOM_UTM_FIELD_MAP",
+    "resolve_link_custom_utms",
     "normalize_link_pro_settings",
     "effective_link_wrapper_redirect",
+    "resolve_referer_mode_for_link",
     "prepare_link_pro_click",
     "enrich_destination_link_realism",
     "platform_wants_auto_wrapper",

@@ -19,10 +19,27 @@ _SOCIAL_PLATFORMS = (
     "facebook", "instagram", "tiktok", "twitter", "x", "linkedin",
     "reddit", "youtube", "snapchat", "pinterest", "messenger",
 )
-_META_WRAPPER_PLATFORMS = ("facebook", "instagram", "messenger")
-_COLD_NO_WRAPPER_PLATFORMS = tuple(
-    p for p in _SOCIAL_PLATFORMS if p not in _META_WRAPPER_PLATFORMS
+_COLD_NO_WRAPPER_PLATFORMS = _SOCIAL_PLATFORMS
+_FB_INAPP_UA = (
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile "
+    "Safari/537.36 [FB_IAB/FB4A;FBAV/450.0.0.0.0;]"
 )
+_IG_INAPP_UA = (
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile "
+    "Safari/537.36 Instagram 312.0.0.0 Android"
+)
+_MSG_INAPP_UA = (
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile "
+    "Safari/537.36 [FB_IAB/MESSENGER;FBAV/450.0.0.0.0;]"
+)
+_META_INAPP_UAS = {
+    "facebook": _FB_INAPP_UA,
+    "instagram": _IG_INAPP_UA,
+    "messenger": _MSG_INAPP_UA,
+}
 
 
 def _rp():
@@ -58,9 +75,9 @@ def test_prepare_link_pro_click_no_wrapper_on_cold_social(platform):
     assert (prep.get("referer") or "").strip(), f"{platform} referer must still be set"
 
 
-@pytest.mark.parametrize("platform", _META_WRAPPER_PLATFORMS)
-def test_prepare_link_pro_click_meta_wrapper_when_enabled(platform):
-    """v2.7.45 — Meta HTTP wrapper bounce when operator opted in."""
+@pytest.mark.parametrize("platform", ("facebook", "instagram", "messenger"))
+def test_prepare_link_pro_click_meta_wrapper_when_inapp(platform):
+    """Meta HTTP wrapper bounce only inside real in-app WebView."""
     rp = _rp()
     link = {
         "referrer_pro_enabled": True,
@@ -72,15 +89,15 @@ def test_prepare_link_pro_click_meta_wrapper_when_enabled(platform):
     }
     prep = rp.prepare_link_pro_click(
         link,
-        user_agent=_DESKTOP_UA,
+        user_agent=_META_INAPP_UAS[platform],
         destination_url=_DEST,
         country="US",
     )
     wt = str(prep.get("wrapper_target") or "")
-    assert wt, f"{platform} with wrapper ON should set wrapper_target"
+    assert wt, f"{platform} in-app with wrapper ON should set wrapper_target"
     assert rp._referer_is_bounce_capable(wt)
     assert rp.should_link_wrapper_bounce(
-        _DESKTOP_UA, platform, wt, wrapper_redirect_enabled=True
+        _META_INAPP_UAS[platform], platform, wt, wrapper_redirect_enabled=True
     )
     assert (prep.get("referer") or "").strip()
 

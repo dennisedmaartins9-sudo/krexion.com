@@ -611,18 +611,26 @@ async def _align_profile_geo_from_proxy(
         return geo
 
 
-def _coerce_profile_ua(ua: str, profile_config: Dict[str, Any]) -> str:
+def _coerce_profile_ua(
+    ua: str,
+    profile_config: Dict[str, Any],
+    *,
+    referrer_state: Optional[_ProfileReferrerState] = None,
+) -> str:
     referrer = profile_config.get("referrer") or {}
     if not referrer.get("enabled"):
         return ua
     if referrer.get("match_ua_to_platform") is False:
         return ua
     platform = ""
-    try:
-        state = _resolve_profile_referrer_state(ua, profile_config, "")
-        platform = state.platform or ""
-    except Exception:
-        platform = ""
+    if referrer_state and referrer_state.enabled:
+        platform = referrer_state.platform or ""
+    if not platform:
+        try:
+            state = _resolve_profile_referrer_state(ua, profile_config, "")
+            platform = state.platform or ""
+        except Exception:
+            platform = ""
     if not platform:
         pw = referrer.get("platform_weights") or {}
         if isinstance(pw, dict) and pw:
@@ -677,6 +685,9 @@ class _ProfileReferrerState:
     wrapper_template: str = ""
     platform: str = ""
     pro_extras: Dict[str, Any] = field(default_factory=dict)
+    session_id: str = ""
+    pass_to_offer: bool = True
+    allow_risky_wrapper: bool = False
 
 
 def _profile_referrer_effective(referrer: Dict[str, Any]) -> Dict[str, Any]:
@@ -752,6 +763,10 @@ def _profile_referrer_resolve_cfg(
         "device_mode": str(ref.get("device_mode") or "auto"),
         "tod_enabled": bool(ref.get("tod_enabled", False)),
         "visitor_is_mobile": _visitor_mobile,
+        "require_non_empty_referer": True,
+        # pass_to_offer uses direct platform Referer inject — not wrapper URL as referer.
+        "wrapper_redirect": bool(ref.get("wrapper_redirect", False))
+        and ref.get("pass_to_offer", True) is False,
     }
     if mode == "google_search" and not cfg["search_keywords"]:
         cfg["search_keywords"] = str(ref.get("value") or "")
@@ -800,6 +815,8 @@ def _resolve_profile_referrer_state(
             wrapper_template=wrapper_template,
             platform=plat or "",
             pro_extras=extras or {},
+            pass_to_offer=referrer.get("pass_to_offer", True) is not False,
+            allow_risky_wrapper=bool(referrer.get("allow_risky_wrapper", False)),
         )
     except Exception as _ref_err:
         logger.debug(f"profile referer state resolve skipped: {_ref_err}")
@@ -824,6 +841,9 @@ def _is_wrapper_domain(url: str) -> bool:
 
 
 def _should_profile_wrapper_bounce(url: str, state: _ProfileReferrerState, ua: str) -> bool:
+    # RUT pass_to_offer: direct platform Referer inject — no HTTP wrapper hop.
+    if state.pass_to_offer:
+        return False
     if not state.wrapper_redirect or not state.wrapper_template:
         return False
     if not url or not url.startswith(("http://", "https://")):
@@ -831,14 +851,17 @@ def _should_profile_wrapper_bounce(url: str, state: _ProfileReferrerState, ua: s
     if _is_wrapper_domain(url):
         return False
     try:
-        from referrer_pro import should_http_wrapper_bounce
-        if not should_http_wrapper_bounce(ua, state.platform, state.wrapper_template):
-            return False
+        from referrer_pro import should_link_wrapper_bounce
+        return should_link_wrapper_bounce(
+            ua,
+            state.platform,
+            state.wrapper_template,
+            wrapper_redirect_enabled=True,
+            allow_risky_wrapper=state.allow_risky_wrapper,
+        )
     except Exception:
         if "tiktok.com/link/v2" in (state.wrapper_template or "").lower():
             return False
-    # Headed profile sessions are not cold external link clicks — always
-    # honour wrapper_redirect when navigating to a new offer/document URL.
     return True
 
 
@@ -890,6 +913,20 @@ def make_profile_referrer_route_handler(state: _ProfileReferrerState):
                 headers["referer"] = state.referer_url
                 if state.sec_fetch:
                     headers.update(state.sec_fetch)
+            if (
+                state.enabled
+                and state.session_id
+                and request.resource_type == "document"
+            ):
+                try:
+                    from referrer_pro import (
+                        KREXION_PROFILE_SESSION_HEADER,
+                        is_krexion_short_link_url,
+                    )
+                    if is_krexion_short_link_url(request.url):
+                        headers[KREXION_PROFILE_SESSION_HEADER.lower()] = state.session_id
+                except Exception:
+                    pass
             await route.continue_(headers=headers)
         except Exception:
             try:
@@ -903,9 +940,11 @@ async def _resolve_referer_for_goto(
     ua: str,
     profile_config: Dict[str, Any],
     target_url: str,
+    *,
+    referrer_state: Optional[_ProfileReferrerState] = None,
 ) -> tuple:
     """Return (referer_url, extra_headers) for the first navigation."""
-    state = _resolve_profile_referrer_state(ua, profile_config, target_url)
+    state = referrer_state or _resolve_profile_referrer_state(ua, profile_config, target_url)
     if not state.enabled:
         return "", {}
     extra_headers: Dict[str, str] = {}
@@ -1169,7 +1208,6 @@ async def _launch_profile_session_inner(
     proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail", False))
     use_persistent_context = bool(anti.get("use_persistent_context", False))
 
-    ua = _coerce_profile_ua(ua, profile_config)
     try:
         from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
         ua, _ua_meta = _norm_ua(ua)
@@ -1189,6 +1227,17 @@ async def _launch_profile_session_inner(
                 ua = _aligned
         except Exception:
             pass
+    # v2.7.52 — Resolve referer ONCE per launch (sticky_session parity).
+    # Previously _coerce_profile_ua and route setup each called the resolver
+    # independently, so platform_pool could pick Facebook for the UA and
+    # TikTok for the Referer on the same session.
+    _profile_referrer_state = _resolve_profile_referrer_state(
+        ua,
+        profile_config,
+        start_url or "https://www.google.com/",
+    )
+    _profile_referrer_state.session_id = session_id
+    ua = _coerce_profile_ua(ua, profile_config, referrer_state=_profile_referrer_state)
     # v2.7.9 — Re-infer OS from final UA. WebKit path keeps ios; Chromium
     # honesty may have swapped to Android when WebKit was missing.
     inferred_os = _infer_os_from_ua(ua, fallback="")
@@ -1778,11 +1827,7 @@ async def _launch_profile_session_inner(
         except Exception as _ch_err:
             logger.debug(f"profile client-hint build skipped: {_ch_err}")
 
-        _profile_referrer_state = _resolve_profile_referrer_state(
-            ua,
-            profile_config,
-            start_url or "https://www.google.com/",
-        )
+        # _profile_referrer_state resolved once above (v2.7.52 sticky session).
         try:
             if _profile_referrer_state.enabled:
                 await context.route(
@@ -2006,7 +2051,10 @@ async def _launch_profile_session_inner(
                 logger.debug(f"[profile-launch] ip_warmup skipped: {_wu_err}")
 
         _referer_url, _referer_hdrs = await _resolve_referer_for_goto(
-            ua, profile_config, start_url or "https://www.google.com/"
+            ua,
+            profile_config,
+            start_url or "https://www.google.com/",
+            referrer_state=_profile_referrer_state,
         )
         if _referer_hdrs:
             try:

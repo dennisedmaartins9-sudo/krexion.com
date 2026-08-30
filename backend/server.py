@@ -2522,6 +2522,10 @@ class LinkCreate(BaseModel):
     referrer_pro_inapp_preset: Optional[str] = None        # Force in-app platform tag (tiktok, facebook, …) when UA is generic
     referrer_pro_pass_to_offer: bool = False               # Use custom referer hop URL when {offer_url} macro present
     referrer_pro_allow_risky_wrapper: bool = False         # Allow TikTok link/v2 wrapper (in-app UA only)
+    referrer_pro_referer_mode: str = "platform_pool"     # RUT-parity: auto|platform_pool|custom|random_list|google_search|direct
+    referrer_pro_pro_mode: bool = True                     # Weighted platform pool (Pro Mode toggle)
+    referrer_pro_cold_referer_fallback: bool = True        # Cold Chrome: Google shim Referer (not krexion.com)
+    referrer_pro_html_hop: bool = True                     # HTML hop page for long affiliate chains
     # ── v2.1.83 — International fraud-detector guardrails (10-feature
     # pack). Every field is optional + defaults to the pre-existing
     # behaviour so links created before v2.1.83 continue to redirect
@@ -2538,6 +2542,13 @@ class LinkCreate(BaseModel):
     postback_url: Optional[str] = None                     # Feature 8 — outbound S2S postback (forwarded on conversion, supports {click_id}/{payout} macros)
     referrer_pro_auto_pause_enabled: bool = False          # Feature 10 — auto-pause after N consecutive non-converting clicks
     referrer_pro_auto_pause_threshold: int = 10            # Feature 10 — bounce threshold before pause fires
+    # v2.7.51 — Custom UTM builder (real-ad style manual utm_* on each click)
+    referrer_pro_custom_utm_enabled: bool = False
+    referrer_pro_custom_utm_source: Optional[str] = None
+    referrer_pro_custom_utm_medium: Optional[str] = None
+    referrer_pro_custom_utm_campaign: Optional[str] = None
+    referrer_pro_custom_utm_content: Optional[str] = None
+    referrer_pro_custom_utm_term: Optional[str] = None
 
 class LinkUpdate(BaseModel):
     offer_url: Optional[str] = None
@@ -2573,6 +2584,10 @@ class LinkUpdate(BaseModel):
     referrer_pro_inapp_preset: Optional[str] = None
     referrer_pro_pass_to_offer: Optional[bool] = None
     referrer_pro_allow_risky_wrapper: Optional[bool] = None
+    referrer_pro_referer_mode: Optional[str] = None
+    referrer_pro_pro_mode: Optional[bool] = None
+    referrer_pro_cold_referer_fallback: Optional[bool] = None
+    referrer_pro_html_hop: Optional[bool] = None
     # v2.1.83 — International guardrail knobs (all optional so partial
     # updates work — the customer can toggle one at a time without
     # blowing away the rest).
@@ -2587,6 +2602,12 @@ class LinkUpdate(BaseModel):
     postback_url: Optional[str] = None
     referrer_pro_auto_pause_enabled: Optional[bool] = None
     referrer_pro_auto_pause_threshold: Optional[int] = None
+    referrer_pro_custom_utm_enabled: Optional[bool] = None
+    referrer_pro_custom_utm_source: Optional[str] = None
+    referrer_pro_custom_utm_medium: Optional[str] = None
+    referrer_pro_custom_utm_campaign: Optional[str] = None
+    referrer_pro_custom_utm_content: Optional[str] = None
+    referrer_pro_custom_utm_term: Optional[str] = None
 
 class LinkResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -2625,7 +2646,11 @@ class LinkResponse(BaseModel):
     referrer_pro_inapp_preset: Optional[str] = None
     referrer_pro_pass_to_offer: bool = False
     referrer_pro_allow_risky_wrapper: bool = False
-    # v2.1.83 — International guardrail defaults. Older link docs (no
+    referrer_pro_referer_mode: str = "platform_pool"
+    referrer_pro_pro_mode: bool = True
+    referrer_pro_cold_referer_fallback: bool = True
+    referrer_pro_html_hop: bool = True
+    # v2.1.83 — International guardrail defaults.
     # v2.1.83 keys) satisfy this schema because every field has a safe
     # default equal to the pre-v2.1.83 behaviour.
     referrer_pro_lang_match: bool = True
@@ -2639,6 +2664,12 @@ class LinkResponse(BaseModel):
     postback_url: Optional[str] = None
     referrer_pro_auto_pause_enabled: bool = False
     referrer_pro_auto_pause_threshold: int = 10
+    referrer_pro_custom_utm_enabled: bool = False
+    referrer_pro_custom_utm_source: Optional[str] = None
+    referrer_pro_custom_utm_medium: Optional[str] = None
+    referrer_pro_custom_utm_campaign: Optional[str] = None
+    referrer_pro_custom_utm_content: Optional[str] = None
+    referrer_pro_custom_utm_term: Optional[str] = None
     # Bounce/pause telemetry — read-only counters echoed to the UI so
     # the customer can see how close the link is to being auto-paused.
     consecutive_no_conversions: int = 0
@@ -15734,6 +15765,14 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "referrer_pro_inapp_preset": link.referrer_pro_inapp_preset,
         "referrer_pro_pass_to_offer": bool(link.referrer_pro_pass_to_offer),
         "referrer_pro_allow_risky_wrapper": bool(link.referrer_pro_allow_risky_wrapper),
+        "referrer_pro_referer_mode": (link.referrer_pro_referer_mode or "platform_pool"),
+        "referrer_pro_pro_mode": bool(link.referrer_pro_pro_mode if link.referrer_pro_pro_mode is not None else True),
+        "referrer_pro_cold_referer_fallback": bool(
+            link.referrer_pro_cold_referer_fallback if link.referrer_pro_cold_referer_fallback is not None else True
+        ),
+        "referrer_pro_html_hop": bool(
+            link.referrer_pro_html_hop if link.referrer_pro_html_hop is not None else True
+        ),
         # v2.1.83 — International guardrail persistence. Quality tier
         # is applied as a *default template* here: if the customer set
         # tier="premium" but left other toggles at their model defaults,
@@ -15751,6 +15790,12 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "postback_url":                       link.postback_url,
         "referrer_pro_auto_pause_enabled":    bool(link.referrer_pro_auto_pause_enabled),
         "referrer_pro_auto_pause_threshold":  int(link.referrer_pro_auto_pause_threshold or 10),
+        "referrer_pro_custom_utm_enabled":    bool(link.referrer_pro_custom_utm_enabled),
+        "referrer_pro_custom_utm_source":     link.referrer_pro_custom_utm_source,
+        "referrer_pro_custom_utm_medium":     link.referrer_pro_custom_utm_medium,
+        "referrer_pro_custom_utm_campaign":   link.referrer_pro_custom_utm_campaign,
+        "referrer_pro_custom_utm_content":    link.referrer_pro_custom_utm_content,
+        "referrer_pro_custom_utm_term":       link.referrer_pro_custom_utm_term,
         # Auto-pause / bounce telemetry — always initialised to zero on
         # create so the counters render cleanly in the UI from day one.
         "consecutive_no_conversions": 0,
@@ -15890,12 +15935,20 @@ class LinkPreviewRequest(BaseModel):
     referrer_pro_inapp_preset: Optional[str] = None
     referrer_pro_pass_to_offer: bool = False
     referrer_pro_allow_risky_wrapper: bool = False
+    referrer_pro_referer_mode: str = "platform_pool"
+    referrer_pro_pro_mode: bool = True
     referrer_pro_traffic_type: str = "auto"  # v2.6.24 — auto|paid|organic|mixed
     referrer_pro_lang_match: bool = True
     referrer_pro_device_mode: str = "auto"
     referrer_pro_tod_enabled: bool = False
     referrer_pro_campaign_type: str = "auto"
     sample_count: int = 20
+    referrer_pro_custom_utm_enabled: bool = False
+    referrer_pro_custom_utm_source: Optional[str] = None
+    referrer_pro_custom_utm_medium: Optional[str] = None
+    referrer_pro_custom_utm_campaign: Optional[str] = None
+    referrer_pro_custom_utm_content: Optional[str] = None
+    referrer_pro_custom_utm_term: Optional[str] = None
 
 
 @api_router.post("/links/preview-referrer")
@@ -15967,6 +16020,31 @@ async def preview_referrer_settings(
         except Exception as e:
             samples.append({"index": i + 1, "error": str(e)})
             continue
+
+        if req.referrer_pro_custom_utm_enabled:
+            try:
+                from referrer_pro import resolve_link_custom_utms as _rlcu_preview
+                _preview_link = {
+                    "referrer_pro_custom_utm_enabled": True,
+                    "referrer_pro_custom_utm_source": req.referrer_pro_custom_utm_source,
+                    "referrer_pro_custom_utm_medium": req.referrer_pro_custom_utm_medium,
+                    "referrer_pro_custom_utm_campaign": req.referrer_pro_custom_utm_campaign,
+                    "referrer_pro_custom_utm_content": req.referrer_pro_custom_utm_content,
+                    "referrer_pro_custom_utm_term": req.referrer_pro_custom_utm_term,
+                    "referrer_pro_brand": req.referrer_pro_brand,
+                }
+                _rlcu_preview(
+                    _preview_link,
+                    pro,
+                    {
+                        "click_id": f"preview_{i + 1}",
+                        "brand": str(req.referrer_pro_brand or ""),
+                        "source": str(pro.get("platform") or ""),
+                        "platform": str(pro.get("platform") or ""),
+                    },
+                )
+            except Exception:
+                pass
 
         plat = pro.get("platform") or "unknown"
         platform_counts[plat] = platform_counts.get(plat, 0) + 1
@@ -20251,6 +20329,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     _pro_referer = ""
     _raw_ua = user_agent or ""
     _pro_platform = ""
+    _profile_perfect_click = False
 
     if _kx_src_was_verified:
         try:
@@ -20290,6 +20369,24 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 custom_params.update(_params_patch)
         except Exception as _pro_err:
             logger.debug(f"[link-pro-referrer] prepare failed (safe fallback): {_pro_err}")
+
+    if bool(link.get("referrer_pro_enabled")):
+        try:
+            from browser_profile_module import validate_profile_perfect_session as _vpps
+            _bp_sid = (request.headers.get("x-krexion-profile-session") or "").strip()
+            if _bp_sid:
+                _bp_val = await _vpps(db, _bp_sid)
+                _profile_perfect_click = bool(_bp_val.get("ok"))
+                if _profile_perfect_click:
+                    try:
+                        logger.info(
+                            f"[/r/{short_code}] browser-profile perfect mode "
+                            f"(session={_bp_sid[:8]}…) — direct offer + client referer"
+                        )
+                    except Exception:
+                        pass
+        except Exception as _bpp_err:
+            logger.debug(f"[link-pro-referrer] profile perfect check skipped: {_bpp_err}")
 
     _click_referrer = _pro_referer or referrer
     if link.get("referrer_pro_enabled") and _pro_platform:
@@ -20434,6 +20531,37 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         asyncio.create_task(manager.broadcast_click(main_user_id, click_doc))
     
     # destination / kx / pro resolved above (v2.7.36 — before click insert)
+
+    # v2.7.51 — Custom UTM override before macro ctx + platform params merge.
+    try:
+        from referrer_pro import resolve_link_custom_utms as _rlcu
+        _custom_utm_overrides = _rlcu(
+            link,
+            _pro_result if isinstance(_pro_result, dict) else {},
+            {
+                "click_id": click_id or "",
+                "clickid": click_id or "",
+                "brand": str(link.get("referrer_pro_brand") or ""),
+                "source": str(
+                    (_pro_result or {}).get("platform")
+                    or simulate_platform
+                    or link.get("forced_source")
+                    or ""
+                ),
+                "platform": str(
+                    (_pro_result or {}).get("platform") or simulate_platform or ""
+                ),
+                "country": country or "",
+                "city": city or "",
+                "region": region or "",
+                "ip": primary_ip_for_storage or client_ip or "",
+                "ua": user_agent or "",
+            },
+        )
+        if _custom_utm_overrides and isinstance(custom_params, dict):
+            custom_params.update(_custom_utm_overrides)
+    except Exception as _utm_ovr_err:
+        logger.debug(f"[/r/{short_code}] custom UTM override skipped: {_utm_ovr_err}")
 
     # ── v2.1.83 Feature 2 — Rich macro expansion (server-wide) ────────
     # We now build ONE macro context dict and expand it in TWO places:
@@ -20716,6 +20844,9 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         # v2.6.26 default — preserve full Referer through redirect chain
         headers["Referrer-Policy"] = "unsafe-url"
 
+    if _profile_perfect_click:
+        headers["X-Krexion-Profile-Perfect"] = "1"
+
     # v2.1.80 — Pro-Referrer wrapper redirect. When the link enables
     # `referrer_pro_wrapper_redirect` AND resolve_pro_visit produced a
     # wrapper URL (l.facebook.com/l.php?u=..., google.com/url?q=...,
@@ -20738,14 +20869,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             )
         except Exception:
             pass
-    elif pro_wrapper_target:
+    elif pro_wrapper_target and not _profile_perfect_click:
         try:
             from referrer_pro import (
                 effective_link_wrapper_redirect as _elwr,
                 rebuild_referer_with_target as _rrwt,
                 should_link_wrapper_bounce,
             )
-            _wrap_ua = (_sim_ua or user_agent or _raw_ua or "")
+            _wrap_ua = (user_agent or _raw_ua or "")
             _wrapper_enabled = _elwr(link, _pro_platform or str(simulate_platform or ""))
             if should_link_wrapper_bounce(
                 _wrap_ua,
@@ -20770,11 +20901,52 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                     f"[/r/{short_code}] unsafe wrapper skipped "
                     f"— direct 302 with platform params (platform={_pro_platform or '?'})"
                 )
+                if _wrapper_enabled and link.get("referrer_pro_cold_referer_fallback", True) is not False:
+                    try:
+                        from referrer_pro import build_cold_click_referer_wrapper as _bccrw
+                        _cold_wrap = _bccrw(
+                            _wrap_ua,
+                            _pro_platform or str(simulate_platform or ""),
+                            destination_url,
+                            is_paid=bool((_pro_result or {}).get("is_paid")),
+                        )
+                        if _cold_wrap:
+                            _final_redirect_url = _cold_wrap
+                            headers["Referrer-Policy"] = "unsafe-url"
+                            try:
+                                logger.info(
+                                    f"[/r/{short_code}] cold-click safe referer shim "
+                                    f"(google.com/url → offer)"
+                                )
+                            except Exception:
+                                pass
+                    except Exception as _cold_wrap_err:
+                        logger.debug(f"[link-pro-referrer] cold shim skipped: {_cold_wrap_err}")
         except Exception as _wrap_err:
             logger.debug(f"[link-pro-referrer] wrapper rebuild failed (safe fallback to direct 302): {_wrap_err}")
             _final_redirect_url = destination_url
 
-    resp = RedirectResponse(url=_final_redirect_url, status_code=302, headers=headers)
+    _use_html_hop = (
+        bool(link.get("referrer_pro_enabled"))
+        and link.get("referrer_pro_html_hop", True) is not False
+        and not _profile_perfect_click
+        and not (
+            _custom_referer_hop.startswith(("http://", "https://"))
+            and bool(link.get("referrer_pro_pass_to_offer"))
+        )
+        and referrer_mode not in ("no_referrer", "none")
+    )
+    if _use_html_hop:
+        try:
+            from referrer_pro import build_perfect_manual_hop_html as _bpmhh
+            from fastapi.responses import HTMLResponse as _HTMLResponse
+            _hop_html = _bpmhh(_final_redirect_url, referer_policy="unsafe-url")
+            resp = _HTMLResponse(content=_hop_html, status_code=200, headers=headers)
+        except Exception as _hop_err:
+            logger.debug(f"[link-pro-referrer] html hop fallback to 302: {_hop_err}")
+            resp = RedirectResponse(url=_final_redirect_url, status_code=302, headers=headers)
+    else:
+        resp = RedirectResponse(url=_final_redirect_url, status_code=302, headers=headers)
 
     # ──────────────────────────────────────────────────────────────────
     # 2026-01: Set the signed duplicate-protection cookie. On every

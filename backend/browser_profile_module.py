@@ -667,6 +667,44 @@ async def resolve_profile_proxy_for_launch(
     return cfg
 
 
+async def validate_profile_perfect_session(db, session_id: str) -> Dict[str, Any]:
+    """Active Browser Profile + Referrer Pro ON → manual link perfect mode.
+
+    When valid, Krexion link clicks skip server-side wrapper hops; the profile
+    Playwright route injects the platform Referer on the offer document (RUT
+    pass_to_offer parity).
+    """
+    out: Dict[str, Any] = {"ok": False, "session_id": "", "profile_id": "", "platform": ""}
+    sid = (session_id or "").strip()
+    if not sid or len(sid) > 64 or db is None:
+        return out
+    try:
+        sess = await db.browser_profile_sessions.find_one({
+            "id": sid,
+            "status": {"$in": ["running", "launching", "queued"]},
+        })
+        if not sess:
+            return out
+        pid = str(sess.get("profile_id") or "").strip()
+        if not pid:
+            return out
+        prof = await db.browser_profiles.find_one({"id": pid})
+        if not prof:
+            return out
+        ref = prof.get("referrer") or {}
+        if not ref.get("enabled"):
+            return out
+        if ref.get("pass_to_offer") is False:
+            return out
+        out["ok"] = True
+        out["session_id"] = sid
+        out["profile_id"] = pid
+        out["platform"] = str(ref.get("preset_platform") or "").strip().lower()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"validate_profile_perfect_session skipped: {exc}")
+    return out
+
+
 async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, body: dict) -> None:
     """Shared local/cloud session-update mirror for profile cards."""
     sid = str(body.get("session_id") or session_id)
@@ -787,6 +825,9 @@ class ReferrerProConfig(BaseModel):
     traffic_type: str = "auto"  # auto | paid | organic | mixed
     match_ua_to_platform: bool = True
     sticky_session: bool = True  # one resolved referer for whole launch session
+    # RUT pass_to_offer parity — inject platform Referer on offer docs; skip wrapper hops.
+    pass_to_offer: bool = True
+    allow_risky_wrapper: bool = False
 
 
 class ProfileBody(BaseModel):

@@ -28,6 +28,8 @@ export const DEFAULT_PROFILE_REFERRER = {
   traffic_type: "auto",
   match_ua_to_platform: true,
   sticky_session: true,
+  pass_to_offer: true,
+  allow_risky_wrapper: false,
 };
 
 function ReferrerProMultiSelect({ title, description, keys, weights, onChange, accent = "fuchsia", testIdPrefix }) {
@@ -380,13 +382,15 @@ export default function ReferrerProProfilePanel({
             <div className="text-xs text-fuchsia-300 font-semibold">🎚️ Realism layers</div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-zinc-300">
               {[
+                ["pass_to_offer", "Pass Referer to Offer (RUT-grade — direct platform Referer on offer)"],
                 ["social_wrapper", "Social link wrappers (l.facebook.com / t.co)"],
                 ["inapp_deep_path", "Mobile in-app deep paths"],
-                ["wrapper_redirect", "Wrapper redirect hop (Premium networks)"],
+                ["wrapper_redirect", "Wrapper redirect hop (when Pass-to-Offer OFF)"],
                 ["lang_match", "Accept-Language ↔ country match"],
                 ["tod_enabled", "Time-of-day realism weighting"],
                 ["match_ua_to_platform", "Match UA to referer platform"],
                 ["sticky_session", "Same referer for whole session (recommended)"],
+                ["allow_risky_wrapper", "Allow TikTok link/v2 wrapper (in-app only)"],
               ].map(([key, label]) => (
                 <label key={key} className="flex items-start gap-2 cursor-pointer">
                   <input type="checkbox" checked={ref[key] !== false}

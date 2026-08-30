@@ -17,16 +17,30 @@ def _rp():
     return importlib.import_module("referrer_pro")
 
 
-def test_should_link_wrapper_bounce_meta_when_enabled():
+_FB_INAPP_UA = (
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile "
+    "Safari/537.36 [FB_IAB/FB4A;FBAV/450.0.0.0.0;]"
+)
+
+
+def test_should_link_wrapper_bounce_meta_skips_cold_desktop():
     rp = _rp()
-    assert rp.should_link_wrapper_bounce(
+    assert not rp.should_link_wrapper_bounce(
         _DESKTOP_UA, "facebook", _FB_SHIM, wrapper_redirect_enabled=True
     )
-    assert rp.should_link_wrapper_bounce(
+    assert not rp.should_link_wrapper_bounce(
         _DESKTOP_UA, "instagram", _IG_SHIM, wrapper_redirect_enabled=True
     )
     assert not rp.should_link_wrapper_bounce(
         _DESKTOP_UA, "facebook", _FB_SHIM, wrapper_redirect_enabled=False
+    )
+
+
+def test_should_link_wrapper_bounce_meta_when_inapp():
+    rp = _rp()
+    assert rp.should_link_wrapper_bounce(
+        _FB_INAPP_UA, "facebook", _FB_SHIM, wrapper_redirect_enabled=True
     )
 
 
