@@ -20222,6 +20222,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         pass
 
     pro_wrapper_target = ""
+    _sim_ua: Optional[str] = None
     _pro_result: Dict[str, Any] = {}
     _visit_accept_language = ""
     _pro_referer = ""
@@ -20258,9 +20259,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             _pro_platform = str(_pro_result.get("platform") or _prep.get("platform") or "").strip()
             if _prep.get("simulate_platform"):
                 simulate_platform = _prep["simulate_platform"]
-            if _prep.get("user_agent") and _prep["user_agent"] != _raw_ua:
-                user_agent = _prep["user_agent"]
-                device_info = detect_device(user_agent)
+            _sim_ua = _prep.get("user_agent") if (_prep.get("user_agent") or "") != _raw_ua else None
             _params_patch = _prep.get("custom_params_patch") or {}
             if isinstance(_params_patch, dict) and _params_patch:
                 custom_params.update(_params_patch)
@@ -20649,18 +20648,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
         except Exception:
             pass
 
-    # v2.7.36 — RUT-parity passthrough params on destination URL
-    try:
-        from referrer_pro import enrich_destination_link_realism as _edlr
-        destination_url = _edlr(
-            destination_url,
-            user_agent=user_agent or "",
-            referer=str(_pro_result.get("referer") or _pro_referer or referrer or ""),
-            accept_language=_visit_accept_language or "",
-            platform=str(_pro_result.get("platform") or simulate_platform or ""),
-        )
-    except Exception:
-        pass
+    # v2.7.45 — Do not inject ua/referer/platform/lang query params on manual
+    # link clicks (affiliate reads HTTP headers, not those params).
 
     # Set referrer policy based on referrer_mode
     # v2.6.26 — DEFAULT policy is now `unsafe-url` (was: unset → browser
@@ -20707,10 +20696,18 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     if pro_wrapper_target:
         try:
             from referrer_pro import (
+                effective_link_wrapper_redirect as _elwr,
                 rebuild_referer_with_target as _rrwt,
-                should_http_wrapper_bounce,
+                should_link_wrapper_bounce,
             )
-            if should_http_wrapper_bounce(user_agent, _pro_platform, pro_wrapper_target):
+            _wrap_ua = (_sim_ua or user_agent or _raw_ua or "")
+            _wrapper_enabled = _elwr(link, _pro_platform or str(simulate_platform or ""))
+            if should_link_wrapper_bounce(
+                _wrap_ua,
+                _pro_platform or str(simulate_platform or ""),
+                pro_wrapper_target,
+                wrapper_redirect_enabled=_wrapper_enabled,
+            ):
                 # Re-write the wrapper's inner target to the FULLY
                 # decorated destination_url (with fbclid/gclid/utm_* etc.
                 # already merged in above) so the offer sees params AND a

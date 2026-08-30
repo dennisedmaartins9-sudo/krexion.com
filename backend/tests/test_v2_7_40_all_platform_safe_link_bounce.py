@@ -19,6 +19,10 @@ _SOCIAL_PLATFORMS = (
     "facebook", "instagram", "tiktok", "twitter", "x", "linkedin",
     "reddit", "youtube", "snapchat", "pinterest", "messenger",
 )
+_META_WRAPPER_PLATFORMS = ("facebook", "instagram", "messenger")
+_COLD_NO_WRAPPER_PLATFORMS = tuple(
+    p for p in _SOCIAL_PLATFORMS if p not in _META_WRAPPER_PLATFORMS
+)
 
 
 def _rp():
@@ -32,7 +36,7 @@ def test_social_platforms_never_build_http_bounce(platform):
     assert bounce == "", f"{platform} must not HTTP-bounce through platform shim"
 
 
-@pytest.mark.parametrize("platform", _SOCIAL_PLATFORMS)
+@pytest.mark.parametrize("platform", _COLD_NO_WRAPPER_PLATFORMS)
 def test_prepare_link_pro_click_no_wrapper_on_cold_social(platform):
     rp = _rp()
     link = {
@@ -52,6 +56,33 @@ def test_prepare_link_pro_click_no_wrapper_on_cold_social(platform):
     wt = str(prep.get("wrapper_target") or "")
     assert not wt, f"{platform} cold click must not set wrapper_target"
     assert (prep.get("referer") or "").strip(), f"{platform} referer must still be set"
+
+
+@pytest.mark.parametrize("platform", _META_WRAPPER_PLATFORMS)
+def test_prepare_link_pro_click_meta_wrapper_when_enabled(platform):
+    """v2.7.45 — Meta HTTP wrapper bounce when operator opted in."""
+    rp = _rp()
+    link = {
+        "referrer_pro_enabled": True,
+        "referrer_pro_platform_pool": f"{platform}:100",
+        "referrer_pro_wrapper_redirect": True,
+        "referrer_pro_social_wrapper": True,
+        "referrer_pro_inapp_deep_path": True,
+        "referrer_pro_traffic_type": "paid",
+    }
+    prep = rp.prepare_link_pro_click(
+        link,
+        user_agent=_DESKTOP_UA,
+        destination_url=_DEST,
+        country="US",
+    )
+    wt = str(prep.get("wrapper_target") or "")
+    assert wt, f"{platform} with wrapper ON should set wrapper_target"
+    assert rp._referer_is_bounce_capable(wt)
+    assert rp.should_link_wrapper_bounce(
+        _DESKTOP_UA, platform, wt, wrapper_redirect_enabled=True
+    )
+    assert (prep.get("referer") or "").strip()
 
 
 def test_google_cold_click_allows_safe_bounce():

@@ -58,13 +58,17 @@ def test_twitter_wrapper_no_http_bounce():
     assert bounce == "", "Twitter/X i/redirect breaks on cold clicks — direct 302 only"
 
 
-def test_enrich_destination_adds_realism_params():
+def test_enrich_destination_no_synthetic_query_params():
+    """v2.7.45 — manual clicks must not inject ua/referer/platform/lang on the offer URL."""
     rp = _rp()
+    base = "https://offer.example.com/?clickid=1"
     url = rp.enrich_destination_link_realism(
-        "https://offer.example.com/?clickid=1",
+        base,
         user_agent="Mozilla/5.0 TikTok",
         referer="https://www.tiktok.com/",
         accept_language="en-US,en;q=0.9",
         platform="tiktok",
     )
-    assert "ua=" in url or "referer=" in url or "lang=" in url or "platform=" in url
+    assert url == base
+    for bad in ("ua=", "referer=", "lang=", "platform="):
+        assert bad not in url

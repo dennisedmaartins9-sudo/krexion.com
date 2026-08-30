@@ -3231,8 +3231,8 @@ def _referer_is_bounce_capable(referer: str) -> bool:
     """True when navigating to `referer` can forward the user via u=/url=/q=."""
     if not (referer or "").strip():
         return False
-    if not is_safe_http_wrapper_bounce(referer):
-        return False
+    if is_safe_http_wrapper_bounce(referer):
+        return True
     try:
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(referer)
@@ -3252,6 +3252,70 @@ def _referer_is_bounce_capable(referer: str) -> bool:
     except Exception:
         return False
     return False
+
+
+# Meta shims — allowed on manual link clicks when operator enables wrapper redirect.
+# TikTok / X / LinkedIn etc. stay direct-302 only (broken or flagged on cold clicks).
+_LINK_EXPLICIT_WRAPPER_PLATFORMS = frozenset({"facebook", "instagram", "messenger"})
+
+
+def should_link_wrapper_bounce(
+    user_agent: str,
+    platform: str,
+    url: str,
+    *,
+    wrapper_redirect_enabled: bool = False,
+) -> bool:
+    """Manual link clicks: allow Meta HTTP wrapper when operator opted in.
+
+    Unlike RUT cold-click safety, link operators who enable
+    ``referrer_pro_wrapper_redirect`` accept the FB/IG interstitial trade-off
+    so the offer sees a real platform domain as HTTP Referer (not query params).
+    """
+    if not (url or "").strip():
+        return False
+    if not _referer_is_bounce_capable(url):
+        return False
+    plat = (platform or "").lower().strip()
+    if plat == "x":
+        plat = "twitter"
+    low = (url or "").lower()
+    if "tiktok.com/link/v2" in low:
+        return False
+    if plat in ("google", "bing"):
+        return True
+    if plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
+        return bool(wrapper_redirect_enabled)
+    if is_warning_trigger_wrapper_url(url) and is_cold_external_link_click(user_agent, platform):
+        return False
+    return False
+
+
+def build_link_explicit_wrapper_url(
+    platform: str,
+    destination_url: str,
+    *,
+    is_paid: bool = True,
+) -> str:
+    """Deterministic Meta link-shim for manual link HTTP wrapper bounce."""
+    p = (platform or "").lower().strip()
+    if p not in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
+        return ""
+    dest = (destination_url or "").strip()
+    if not dest:
+        return ""
+    if p == "facebook":
+        return _build_fb_linkshim(dest, include_paid_markers=is_paid)
+    if p == "instagram":
+        return _build_ig_linkshim(dest, include_paid_marker=is_paid)
+    if p == "messenger":
+        enc_u = quote_plus(dest)
+        hash_body = _rand_alnum(
+            random.randint(58, 104),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+        )
+        return f"https://l.messenger.com/l.php?u={enc_u}&h=AT{hash_body}"
+    return ""
 
 
 def build_wrapper_bounce_url(
@@ -3759,26 +3823,14 @@ def enrich_destination_link_realism(
     accept_language: str = "",
     platform: str = "",
 ) -> str:
-    """Append common tracker passthrough params networks read (RUT parity)."""
-    url = (destination_url or "").strip()
-    if not url:
-        return url
-    try:
-        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
-        parsed = urlparse(url)
-        qs = {k: v for k, v in parse_qsl(parsed.query, keep_blank_values=True)}
-        low_keys = {str(k).lower() for k in qs.keys()}
-        if user_agent and "ua" not in low_keys and "user_agent" not in low_keys:
-            qs["ua"] = str(user_agent)[:512]
-        if referer and "referer" not in low_keys and "referrer" not in low_keys:
-            qs["referer"] = str(referer)[:512]
-        if accept_language and "lang" not in low_keys and "accept_language" not in low_keys:
-            qs["lang"] = str(accept_language).split(",")[0][:32]
-        if platform and "platform" not in low_keys:
-            qs.setdefault("platform", str(platform)[:40])
-        return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
-    except Exception:
-        return url
+    """Legacy helper — manual link clicks no longer inject ua/referer/platform/lang.
+
+    Those query params do NOT become the HTTP Referer / User-Agent the affiliate
+    network reads; they only create synthetic clusters on the offer URL. Real
+    platform attribution on link clicks uses wrapper HTTP bounce + fbclid/utm.
+    Kept for backwards-compatible imports/tests; returns URL unchanged.
+    """
+    return (destination_url or "").strip()
 
 
 def prepare_link_pro_click(
@@ -3871,7 +3923,8 @@ def prepare_link_pro_click(
             out["custom_params_patch"]["__brand"] = brand[:64]
         if plat == "email" and (pro or {}).get("esp"):
             out["custom_params_patch"]["__force_esp"] = str(pro.get("esp") or "")
-    if effective_link_wrapper_redirect(link, plat) and (destination_url or "").strip():
+    _wrapper_on = effective_link_wrapper_redirect(link, plat)
+    if _wrapper_on and (destination_url or "").strip():
         try:
             bounce = ensure_wrapper_bounce_url(
                 referer,
@@ -3879,8 +3932,18 @@ def prepare_link_pro_click(
                 destination_url,
                 is_paid=bool((pro or {}).get("is_paid")),
             )
+            if not bounce and _referer_is_bounce_capable(referer):
+                bounce = referer
+            if not bounce and plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS and _wrapper_on:
+                bounce = build_link_explicit_wrapper_url(
+                    plat,
+                    destination_url,
+                    is_paid=bool((pro or {}).get("is_paid")),
+                )
             _bounce_ua = out.get("user_agent") or ua
-            if bounce and should_http_wrapper_bounce(_bounce_ua, plat, bounce):
+            if bounce and should_link_wrapper_bounce(
+                _bounce_ua, plat, bounce, wrapper_redirect_enabled=_wrapper_on
+            ):
                 referer = bounce
                 out["referer"] = referer
                 out["wrapper_target"] = bounce
@@ -3936,6 +3999,8 @@ __all__ = [
     "is_warning_trigger_wrapper_url",
     "is_cold_external_link_click",
     "should_http_wrapper_bounce",
+    "should_link_wrapper_bounce",
+    "build_link_explicit_wrapper_url",
     "platform_supports_http_wrapper_bounce",
     "detect_is_paid",
     "apply_organic_platform_param_override",
