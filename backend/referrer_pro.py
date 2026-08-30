@@ -2753,6 +2753,8 @@ def expand_link_macros(text: str, ctx: Dict[str, Any]) -> str:
         "external_id":     str(ctx.get("external_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
         "aff_click_id":    str(ctx.get("aff_click_id") or ctx.get("click_id") or ctx.get("clickid") or ""),
         "subid":           str(ctx.get("subid") or ctx.get("sub1") or ctx.get("click_id") or ""),
+        "offer_url":       str(ctx.get("offer_url") or ctx.get("destination_url") or ""),
+        "destination_url": str(ctx.get("destination_url") or ctx.get("offer_url") or ""),
     }
     # Do a per-key encoded replace so callers get URL-safe substitution
     # regardless of where in the URL the macro sits (path / query / frag).
@@ -3255,8 +3257,66 @@ def _referer_is_bounce_capable(referer: str) -> bool:
 
 
 # Meta shims — allowed on manual link clicks when operator enables wrapper redirect.
-# TikTok / X / LinkedIn etc. stay direct-302 only (broken or flagged on cold clicks).
 _LINK_EXPLICIT_WRAPPER_PLATFORMS = frozenset({"facebook", "instagram", "messenger"})
+# In-app-only shims — require matching in-app UA (cold Chrome blocked).
+_LINK_INAPP_WRAPPER_PLATFORMS = frozenset({
+    "twitter", "x", "linkedin", "pinterest", "reddit", "youtube", "snapchat", "tiktok",
+})
+_LINK_WRAPPER_BUILD_PLATFORMS = _LINK_EXPLICIT_WRAPPER_PLATFORMS | _LINK_INAPP_WRAPPER_PLATFORMS
+
+_REFERER_HOST_TO_PLATFORM: Dict[str, str] = {
+    "facebook.com": "facebook",
+    "www.facebook.com": "facebook",
+    "m.facebook.com": "facebook",
+    "l.facebook.com": "facebook",
+    "instagram.com": "instagram",
+    "www.instagram.com": "instagram",
+    "l.instagram.com": "instagram",
+    "tiktok.com": "tiktok",
+    "www.tiktok.com": "tiktok",
+    "m.tiktok.com": "tiktok",
+    "twitter.com": "twitter",
+    "www.twitter.com": "twitter",
+    "x.com": "twitter",
+    "www.x.com": "twitter",
+    "t.co": "twitter",
+    "linkedin.com": "linkedin",
+    "www.linkedin.com": "linkedin",
+    "pinterest.com": "pinterest",
+    "www.pinterest.com": "pinterest",
+    "reddit.com": "reddit",
+    "www.reddit.com": "reddit",
+    "out.reddit.com": "reddit",
+    "youtube.com": "youtube",
+    "www.youtube.com": "youtube",
+    "google.com": "google",
+    "www.google.com": "google",
+    "bing.com": "bing",
+    "www.bing.com": "bing",
+    "snapchat.com": "snapchat",
+    "www.snapchat.com": "snapchat",
+    "l.snapchat.com": "snapchat",
+    "messenger.com": "messenger",
+    "www.messenger.com": "messenger",
+    "l.messenger.com": "messenger",
+}
+
+
+def platform_from_referer_url(referer_url: str) -> str:
+    """Best-effort platform tag from a referer / landing URL host."""
+    try:
+        host = (urlparse(referer_url or "").netloc or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        if host in _REFERER_HOST_TO_PLATFORM:
+            return _REFERER_HOST_TO_PLATFORM[host]
+        if host.endswith(".facebook.com"):
+            return "facebook"
+        if host.endswith(".google."):
+            return "google"
+    except Exception:
+        pass
+    return ""
 
 
 def should_link_wrapper_bounce(
@@ -3265,13 +3325,9 @@ def should_link_wrapper_bounce(
     url: str,
     *,
     wrapper_redirect_enabled: bool = False,
+    allow_risky_wrapper: bool = False,
 ) -> bool:
-    """Manual link clicks: allow Meta HTTP wrapper when operator opted in.
-
-    Unlike RUT cold-click safety, link operators who enable
-    ``referrer_pro_wrapper_redirect`` accept the FB/IG interstitial trade-off
-    so the offer sees a real platform domain as HTTP Referer (not query params).
-    """
+    """Manual link clicks: platform HTTP wrapper when safe or operator opted in."""
     if not (url or "").strip():
         return False
     if not _referer_is_bounce_capable(url):
@@ -3280,15 +3336,20 @@ def should_link_wrapper_bounce(
     if plat == "x":
         plat = "twitter"
     low = (url or "").lower()
+    cold = is_cold_external_link_click(user_agent, platform)
     if "tiktok.com/link/v2" in low:
-        return False
+        return bool(allow_risky_wrapper and not cold)
     if plat in ("google", "bing"):
         return True
     if plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
         return bool(wrapper_redirect_enabled)
-    if is_warning_trigger_wrapper_url(url) and is_cold_external_link_click(user_agent, platform):
+    if plat in _LINK_INAPP_WRAPPER_PLATFORMS:
+        if not wrapper_redirect_enabled:
+            return False
+        return not cold
+    if is_warning_trigger_wrapper_url(url) and cold:
         return False
-    return False
+    return bool(wrapper_redirect_enabled and not cold)
 
 
 def build_link_explicit_wrapper_url(
@@ -3296,10 +3357,13 @@ def build_link_explicit_wrapper_url(
     destination_url: str,
     *,
     is_paid: bool = True,
+    allow_risky: bool = False,
 ) -> str:
-    """Deterministic Meta link-shim for manual link HTTP wrapper bounce."""
+    """Deterministic platform link-shim for manual link HTTP wrapper bounce."""
     p = (platform or "").lower().strip()
-    if p not in _LINK_EXPLICIT_WRAPPER_PLATFORMS:
+    if p == "x":
+        p = "twitter"
+    if p not in _LINK_WRAPPER_BUILD_PLATFORMS and p not in ("google", "bing"):
         return ""
     dest = (destination_url or "").strip()
     if not dest:
@@ -3315,6 +3379,24 @@ def build_link_explicit_wrapper_url(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
         )
         return f"https://l.messenger.com/l.php?u={enc_u}&h=AT{hash_body}"
+    if p == "twitter":
+        return _build_x_redirect(dest)
+    if p == "linkedin":
+        return _build_linkedin_redir(dest, include_paid_trk=is_paid)
+    if p == "pinterest":
+        return _build_pin_offsite(dest, include_paid_sig=is_paid)
+    if p == "reddit":
+        return _build_out_reddit(dest, include_paid_token=is_paid)
+    if p == "youtube":
+        return _build_youtube_redirect(dest, "video_ad" if is_paid else "video_description")
+    if p == "snapchat":
+        return f"https://l.snapchat.com/?u={quote_plus(dest)}"
+    if p == "tiktok" and allow_risky:
+        return f"https://www.tiktok.com/link/v2?u={quote_plus(dest)}"
+    if p == "google":
+        return f"https://www.google.com/url?q={quote_plus(dest)}"
+    if p == "bing":
+        return f"https://www.bing.com/aclick?u={quote_plus(dest)}"
     return ""
 
 
@@ -3855,6 +3937,9 @@ def prepare_link_pro_click(
         "accept_language": "",
         "use_wrapper": False,
         "custom_params_patch": {},
+        "pass_to_offer": False,
+        "custom_referer_hop": "",
+        "allow_risky_wrapper": False,
     }
     if kx_src_verified:
         plat = (kx_platform or "").strip().lower()
@@ -3904,9 +3989,39 @@ def prepare_link_pro_click(
     out["pro_result"] = pro or {}
     plat = str((pro or {}).get("platform") or "").strip()
     referer = str((pro or {}).get("referer") or "").strip()
+    allow_risky = bool(link.get("referrer_pro_allow_risky_wrapper"))
+    out["allow_risky_wrapper"] = allow_risky
+    out["pass_to_offer"] = bool(link.get("referrer_pro_pass_to_offer"))
+    custom_ref = str(link.get("referrer_pro_custom_referer") or "").strip()
+    preset = str(link.get("referrer_pro_inapp_preset") or "").strip().lower()
+    if preset == "x":
+        preset = "twitter"
+    if preset:
+        plat = preset
+    if custom_ref.startswith(("http://", "https://")):
+        referer = custom_ref
+        derived = platform_from_referer_url(custom_ref)
+        if derived:
+            plat = preset or derived
+        elif preset:
+            plat = preset
     out["platform"] = plat
     out["referer"] = referer
     out["accept_language"] = str((pro or {}).get("accept_language") or "")
+    if custom_ref and "{offer_url}" in custom_ref and (destination_url or "").strip():
+        try:
+            out["custom_referer_hop"] = expand_link_macros(
+                custom_ref,
+                {
+                    "offer_url": destination_url,
+                    "destination_url": destination_url,
+                    "referer": referer,
+                    "referrer": referer,
+                    "platform": plat,
+                },
+            )
+        except Exception:
+            out["custom_referer_hop"] = ""
     if plat:
         out["simulate_platform"] = plat
         raw = ua
@@ -3934,15 +4049,20 @@ def prepare_link_pro_click(
             )
             if not bounce and _referer_is_bounce_capable(referer):
                 bounce = referer
-            if not bounce and plat in _LINK_EXPLICIT_WRAPPER_PLATFORMS and _wrapper_on:
+            if not bounce and plat in _LINK_WRAPPER_BUILD_PLATFORMS and _wrapper_on:
                 bounce = build_link_explicit_wrapper_url(
                     plat,
                     destination_url,
                     is_paid=bool((pro or {}).get("is_paid")),
+                    allow_risky=allow_risky,
                 )
             _bounce_ua = out.get("user_agent") or ua
             if bounce and should_link_wrapper_bounce(
-                _bounce_ua, plat, bounce, wrapper_redirect_enabled=_wrapper_on
+                _bounce_ua,
+                plat,
+                bounce,
+                wrapper_redirect_enabled=_wrapper_on,
+                allow_risky_wrapper=allow_risky,
             ):
                 referer = bounce
                 out["referer"] = referer
@@ -4001,6 +4121,7 @@ __all__ = [
     "should_http_wrapper_bounce",
     "should_link_wrapper_bounce",
     "build_link_explicit_wrapper_url",
+    "platform_from_referer_url",
     "platform_supports_http_wrapper_bounce",
     "detect_is_paid",
     "apply_organic_platform_param_override",

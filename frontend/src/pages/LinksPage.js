@@ -314,6 +314,10 @@ const defaultProLinkFields = () => ({
   postback_url: "",
   referrer_pro_auto_pause_enabled: false,
   referrer_pro_auto_pause_threshold: 10,
+  referrer_pro_custom_referer: "",
+  referrer_pro_inapp_preset: "",
+  referrer_pro_pass_to_offer: false,
+  referrer_pro_allow_risky_wrapper: false,
   url_params: {},
 });
 
@@ -822,6 +826,10 @@ export default function LinksPage() {
       referrer_pro_network_click_chain: false,
       referrer_pro_network_click_host: "",
       referrer_pro_wrapper_redirect: link.referrer_pro_wrapper_redirect || false,
+      referrer_pro_custom_referer: link.referrer_pro_custom_referer || "",
+      referrer_pro_inapp_preset: link.referrer_pro_inapp_preset || "",
+      referrer_pro_pass_to_offer: link.referrer_pro_pass_to_offer || false,
+      referrer_pro_allow_risky_wrapper: link.referrer_pro_allow_risky_wrapper || false,
       // v2.1.83 fields
       referrer_pro_lang_match: link.referrer_pro_lang_match !== undefined ? link.referrer_pro_lang_match : true,
       referrer_pro_device_mode: link.referrer_pro_device_mode || "auto",
@@ -1902,6 +1910,57 @@ export default function LinksPage() {
                             </p>
                           </div>
                         </label>
+
+                        {/* v2.7.46 — Custom referer + in-app preset (manual link perfection) */}
+                        <div className="p-3 rounded border border-[#3B82F6] bg-[#3B82F608] space-y-3">
+                          <p className="text-xs font-medium text-[#3B82F6]">Perfect Referrer (manual links)</p>
+                          <div>
+                            <Label className="text-xs text-[#A1A1AA]">Custom referer / landing URL</Label>
+                            <Input
+                              value={formData.referrer_pro_custom_referer || ""}
+                              onChange={(e) => setFormData({ ...formData, referrer_pro_custom_referer: e.target.value })}
+                              placeholder="https://mylanding.com/promo or ...?redirect={offer_url}"
+                              className="mt-1 font-mono text-xs"
+                            />
+                            <p className="text-[10px] text-[#52525B] mt-1">
+                              Use <code>{`{offer_url}`}</code> macro + Pass to Offer for operator redirect pages.
+                            </p>
+                          </div>
+                          <div>
+                            <Label className="text-xs text-[#A1A1AA]">In-app browser preset</Label>
+                            <select
+                              value={formData.referrer_pro_inapp_preset || ""}
+                              onChange={(e) => setFormData({ ...formData, referrer_pro_inapp_preset: e.target.value })}
+                              className="mt-1 w-full h-9 rounded-md border border-[var(--brand-border)] bg-[var(--brand-bg)] px-2 text-xs"
+                            >
+                              <option value="">Auto (from pool / UA)</option>
+                              {["facebook", "instagram", "tiktok", "twitter", "linkedin", "pinterest", "youtube", "snapchat", "reddit", "google", "bing"].map((p) => (
+                                <option key={p} value={p}>{p}</option>
+                              ))}
+                            </select>
+                            <p className="text-[10px] text-[#52525B] mt-1">
+                              Customer in-app UA lagaye — wrapper unlocks for TT/X/LI when preset match ho.
+                            </p>
+                          </div>
+                          <label className="flex items-start gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={!!formData.referrer_pro_pass_to_offer}
+                              onChange={(e) => setFormData({ ...formData, referrer_pro_pass_to_offer: e.target.checked })}
+                              className="w-4 h-4 mt-0.5"
+                            />
+                            <span className="text-xs">Pass referer to offer (custom URL with <code>{`{offer_url}`}</code> hop)</span>
+                          </label>
+                          <label className="flex items-start gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={!!formData.referrer_pro_allow_risky_wrapper}
+                              onChange={(e) => setFormData({ ...formData, referrer_pro_allow_risky_wrapper: e.target.checked })}
+                              className="w-4 h-4 mt-0.5"
+                            />
+                            <span className="text-xs">Allow TikTok link/v2 wrapper (in-app UA only — risky on Chrome)</span>
+                          </label>
+                        </div>
 
                         {/* ─────────────────────────────────────────────────
                             Network Compliance Guardrails

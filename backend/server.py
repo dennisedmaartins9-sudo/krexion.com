@@ -2517,6 +2517,11 @@ class LinkCreate(BaseModel):
     referrer_pro_network_click_chain: bool = False
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: bool = False            # OFF by default — safer. When ON, bounces through l.facebook.com / google.com/url etc. so the final target sees a real wrapper Referer.
+    # v2.7.46 — Manual link referrer perfection (RUT-parity knobs)
+    referrer_pro_custom_referer: Optional[str] = None      # Operator landing / referer URL ({offer_url} macro supported)
+    referrer_pro_inapp_preset: Optional[str] = None        # Force in-app platform tag (tiktok, facebook, …) when UA is generic
+    referrer_pro_pass_to_offer: bool = False               # Use custom referer hop URL when {offer_url} macro present
+    referrer_pro_allow_risky_wrapper: bool = False         # Allow TikTok link/v2 wrapper (in-app UA only)
     # ── v2.1.83 — International fraud-detector guardrails (10-feature
     # pack). Every field is optional + defaults to the pre-existing
     # behaviour so links created before v2.1.83 continue to redirect
@@ -2564,6 +2569,10 @@ class LinkUpdate(BaseModel):
     referrer_pro_network_click_chain: Optional[bool] = None
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: Optional[bool] = None
+    referrer_pro_custom_referer: Optional[str] = None
+    referrer_pro_inapp_preset: Optional[str] = None
+    referrer_pro_pass_to_offer: Optional[bool] = None
+    referrer_pro_allow_risky_wrapper: Optional[bool] = None
     # v2.1.83 — International guardrail knobs (all optional so partial
     # updates work — the customer can toggle one at a time without
     # blowing away the rest).
@@ -2612,6 +2621,10 @@ class LinkResponse(BaseModel):
     referrer_pro_network_click_chain: bool = False
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: bool = False
+    referrer_pro_custom_referer: Optional[str] = None
+    referrer_pro_inapp_preset: Optional[str] = None
+    referrer_pro_pass_to_offer: bool = False
+    referrer_pro_allow_risky_wrapper: bool = False
     # v2.1.83 — International guardrail defaults. Older link docs (no
     # v2.1.83 keys) satisfy this schema because every field has a safe
     # default equal to the pre-v2.1.83 behaviour.
@@ -15717,6 +15730,10 @@ async def create_link(link: LinkCreate, user: dict = Depends(get_current_user_wi
         "referrer_pro_network_click_chain": False,
         "referrer_pro_network_click_host": None,
         "referrer_pro_wrapper_redirect": bool(link.referrer_pro_wrapper_redirect),
+        "referrer_pro_custom_referer": link.referrer_pro_custom_referer,
+        "referrer_pro_inapp_preset": link.referrer_pro_inapp_preset,
+        "referrer_pro_pass_to_offer": bool(link.referrer_pro_pass_to_offer),
+        "referrer_pro_allow_risky_wrapper": bool(link.referrer_pro_allow_risky_wrapper),
         # v2.1.83 — International guardrail persistence. Quality tier
         # is applied as a *default template* here: if the customer set
         # tier="premium" but left other toggles at their model defaults,
@@ -15869,6 +15886,10 @@ class LinkPreviewRequest(BaseModel):
     referrer_pro_network_click_chain: bool = False
     referrer_pro_network_click_host: Optional[str] = None
     referrer_pro_wrapper_redirect: bool = False
+    referrer_pro_custom_referer: Optional[str] = None
+    referrer_pro_inapp_preset: Optional[str] = None
+    referrer_pro_pass_to_offer: bool = False
+    referrer_pro_allow_risky_wrapper: bool = False
     referrer_pro_traffic_type: str = "auto"  # v2.6.24 — auto|paid|organic|mixed
     referrer_pro_lang_match: bool = True
     referrer_pro_device_mode: str = "auto"
@@ -20223,6 +20244,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
 
     pro_wrapper_target = ""
     _sim_ua: Optional[str] = None
+    _custom_referer_hop = ""
+    _allow_risky_wrapper = False
     _pro_result: Dict[str, Any] = {}
     _visit_accept_language = ""
     _pro_referer = ""
@@ -20260,6 +20283,8 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
             if _prep.get("simulate_platform"):
                 simulate_platform = _prep["simulate_platform"]
             _sim_ua = _prep.get("user_agent") if (_prep.get("user_agent") or "") != _raw_ua else None
+            _custom_referer_hop = str(_prep.get("custom_referer_hop") or "")
+            _allow_risky_wrapper = bool(_prep.get("allow_risky_wrapper"))
             _params_patch = _prep.get("custom_params_patch") or {}
             if isinstance(_params_patch, dict) and _params_patch:
                 custom_params.update(_params_patch)
@@ -20669,6 +20694,14 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     headers = {}
     if _visit_accept_language:
         headers["Accept-Language"] = _visit_accept_language
+    try:
+        _sec_fetch = (_pro_result or {}).get("sec_fetch") if isinstance(_pro_result, dict) else None
+        if isinstance(_sec_fetch, dict):
+            for _sf_k, _sf_v in _sec_fetch.items():
+                if _sf_v and str(_sf_k).lower().startswith("sec-fetch"):
+                    headers[str(_sf_k)] = str(_sf_v)
+    except Exception:
+        pass
     if referrer_mode == "no_referrer":
         headers["Referrer-Policy"] = "no-referrer"
     elif referrer_mode == "origin":
@@ -20693,7 +20726,19 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
     # exactly what the offer network wants to see. One extra hop of
     # ~50 ms; ~zero anti-detect surface exposed.
     _final_redirect_url = destination_url
-    if pro_wrapper_target:
+    if (
+        _custom_referer_hop.startswith(("http://", "https://"))
+        and bool(link.get("referrer_pro_pass_to_offer"))
+    ):
+        _final_redirect_url = _custom_referer_hop
+        try:
+            logger.info(
+                f"[/r/{short_code}] custom referer hop → operator landing "
+                f"(pass_to_offer ON)"
+            )
+        except Exception:
+            pass
+    elif pro_wrapper_target:
         try:
             from referrer_pro import (
                 effective_link_wrapper_redirect as _elwr,
@@ -20707,6 +20752,7 @@ async def redirect_link(short_code: str, request: Request, sub1: str = "", sub2:
                 _pro_platform or str(simulate_platform or ""),
                 pro_wrapper_target,
                 wrapper_redirect_enabled=_wrapper_enabled,
+                allow_risky_wrapper=_allow_risky_wrapper or bool(link.get("referrer_pro_allow_risky_wrapper")),
             ):
                 # Re-write the wrapper's inner target to the FULLY
                 # decorated destination_url (with fbclid/gclid/utm_* etc.
