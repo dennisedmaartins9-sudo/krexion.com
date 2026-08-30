@@ -47,3 +47,14 @@ def test_perfect_hop_html_contains_policy_and_target():
     assert 'content="unsafe-url"' in html
     assert "google.com/url" in html
     assert "window.location.replace" in html
+    assert "kx-continue" in html
+
+
+def test_hop_html_encodes_plus_in_utm_for_meta_refresh():
+    """UTM values with spaces/plus must not break meta refresh (Redirecting… hang)."""
+    html = build_perfect_manual_hop_html(
+        "https://tracker.example/click?utm_source=facebook+test&utm_content=video+ad",
+    )
+    assert "facebook+test" not in html or "facebook%20test" in html or "facebook%2Btest" in html
+    assert "video+ad" not in html or "video%20ad" in html or "video%2Bad" in html
+    assert "Continue to offer" in html

@@ -3246,20 +3246,54 @@ def build_perfect_manual_hop_html(
         dest = "about:blank"
     policy = (referer_policy or "unsafe-url").strip() or "unsafe-url"
     js_dest = json.dumps(dest)
-    esc_attr = (
-        dest.replace("&", "&amp;")
-        .replace('"', "&quot;")
-        .replace("<", "&lt;")
-    )
+
+    def _encode_url_for_meta_refresh(url: str) -> str:
+        """Meta refresh breaks when query values contain ``+`` or spaces."""
+        try:
+            from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+            parts = urlsplit(url)
+            query = parts.query
+            if query:
+                pairs = parse_qsl(query, keep_blank_values=True)
+                query = urlencode(pairs, quote_via=quote)
+            encoded = urlunsplit((
+                parts.scheme, parts.netloc, parts.path, query, parts.fragment,
+            ))
+        except Exception:
+            encoded = url
+        return (
+            encoded.replace("&", "&amp;")
+            .replace('"', "&quot;")
+            .replace("<", "&lt;")
+        )
+
+    meta_url = _encode_url_for_meta_refresh(dest)
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="referrer" content="{policy}">
 <meta http-equiv="Referrer-Policy" content="{policy}">
-<meta http-equiv="refresh" content="0;url={esc_attr}">
+<meta http-equiv="refresh" content="0;url={meta_url}">
 <title>Redirecting…</title>
-<script>window.location.replace({js_dest});</script>
-</head><body></body></html>"""
+</head><body>
+<p style="font-family:system-ui,sans-serif;text-align:center;margin-top:2rem;color:#444">
+Redirecting… <a id="kx-continue" href="{meta_url}">Continue to offer</a>
+</p>
+<script>
+(function() {{
+  var d = {js_dest};
+  try {{ window.location.replace(d); }} catch (e) {{ window.location.href = d; }}
+  setTimeout(function() {{
+    try {{
+      if (window.location.href.indexOf("krexion.com") !== -1) {{
+        var a = document.getElementById("kx-continue");
+        if (a) {{ a.style.fontWeight = "bold"; a.style.color = "#2563eb"; }}
+      }}
+    }} catch (e2) {{}}
+  }}, 1200);
+}})();
+</script>
+</body></html>"""
 
 
 def is_safe_http_wrapper_bounce(url: str) -> bool:

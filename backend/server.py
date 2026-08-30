@@ -3616,9 +3616,13 @@ def generate_platform_params(
         params["utm_source"] = platform
         params["utm_medium"] = "referral"
 
-    # Add custom params if provided
+    # Add custom params if provided (never leak internal __ keys to offer URL).
     if custom_params:
-        params.update(custom_params)
+        _cp = {
+            k: v for k, v in custom_params.items()
+            if not str(k).startswith("__")
+        }
+        params.update(_cp)
 
     # ── v2.6.88 — Organic traffic must NOT look like a paid ad click ──
     # Root cause: Traffic Type=Organic only switched the Referer pool;
