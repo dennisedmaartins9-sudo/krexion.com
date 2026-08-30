@@ -13,7 +13,8 @@ ENV REACT_APP_BACKEND_URL=$REACT_APP_BACKEND_URL \
     DISABLE_ESLINT_PLUGIN=true \
     GENERATE_SOURCEMAP=false \
     CI=false \
-    KREXION_VERSION=$KREXION_VERSION
+    KREXION_VERSION=$KREXION_VERSION \
+    NODE_OPTIONS=--max-old-space-size=4096
 
 WORKDIR /app
 
@@ -24,9 +25,9 @@ COPY package.json package-lock.json* yarn.lock* ./
 # Use yarn.lock when present (frozen), else install fresh (will
 # generate yarn.lock inside the image).
 RUN if [ -f yarn.lock ]; then \
-        yarn install --frozen-lockfile --network-timeout 600000; \
+        yarn install --frozen-lockfile --ignore-engines --network-timeout 600000; \
     else \
-        yarn install --network-timeout 600000; \
+        yarn install --ignore-engines --network-timeout 600000; \
     fi
 
 # Copy sources and build

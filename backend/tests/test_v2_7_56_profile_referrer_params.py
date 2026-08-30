@@ -18,7 +18,7 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_56():
-    assert _read("VERSION").strip() == "2.7.63"
+    assert _read("VERSION").strip() == "2.7.64"
 
 
 def test_normalize_referer_url_adds_https():

@@ -1,6 +1,12 @@
 // craco.config.js
+const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
+
+function pkgAlias(relativePath) {
+  const resolved = path.resolve(__dirname, relativePath);
+  return fs.existsSync(resolved) ? resolved : null;
+}
 
 // Check if we're in development/preview mode (not production build)
 // Craco sets NODE_ENV=development for start, NODE_ENV=production for build
@@ -46,9 +52,15 @@ const webpackConfig = {
     alias: {
       '@': path.resolve(__dirname, 'src'),
       // ESM barrels fail CRA/webpack named-export analysis on some Node versions.
-      'lucide-react': path.resolve(__dirname, 'node_modules/lucide-react/dist/cjs/lucide-react.js'),
-      'motion-utils': path.resolve(__dirname, 'node_modules/motion-utils/dist/cjs/index.js'),
-      'motion-dom': path.resolve(__dirname, 'node_modules/motion-dom/dist/cjs/index.js'),
+      ...(pkgAlias('node_modules/lucide-react/dist/cjs/lucide-react.js')
+        ? { 'lucide-react': pkgAlias('node_modules/lucide-react/dist/cjs/lucide-react.js') }
+        : {}),
+      ...(pkgAlias('node_modules/motion-utils/dist/cjs/index.js')
+        ? { 'motion-utils': pkgAlias('node_modules/motion-utils/dist/cjs/index.js') }
+        : {}),
+      ...(pkgAlias('node_modules/motion-dom/dist/cjs/index.js')
+        ? { 'motion-dom': pkgAlias('node_modules/motion-dom/dist/cjs/index.js') }
+        : {}),
     },
     configure: (webpackConfig) => {
 

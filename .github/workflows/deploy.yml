@@ -145,7 +145,8 @@ jobs:
           cd /opt/krexion
           export KREXION_VERSION="$(tr -d ' \n\r' < backend/VERSION)"
           echo ">> Building backend + frontend with --no-cache (UI version=$KREXION_VERSION)..."
-          docker compose -f "$COMPOSE_FILE" build --no-cache backend frontend
+          docker compose -f "$COMPOSE_FILE" build --no-cache backend
+          docker compose -f "$COMPOSE_FILE" build --no-cache frontend
 
       - name: Docker up
         env:

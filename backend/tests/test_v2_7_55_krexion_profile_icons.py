@@ -18,7 +18,7 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_55():
-    assert _read("VERSION").strip() == "2.7.63"
+    assert _read("VERSION").strip() == "2.7.64"
 
 
 def test_collect_profile_process_tree_exists_in_source():

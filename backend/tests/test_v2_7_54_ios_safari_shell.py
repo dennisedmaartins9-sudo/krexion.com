@@ -26,7 +26,7 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_54():
-    assert _read("VERSION").strip() == "2.7.63"
+    assert _read("VERSION").strip() == "2.7.64"
 
 
 def test_ios_safari_shell_module_exports():

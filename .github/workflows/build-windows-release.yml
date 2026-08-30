@@ -279,10 +279,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
+        # GitHub-hosted ubuntu-latest may force Node 24; package.json
+        # engines allow 20/22/24 and yarn uses --ignore-engines below.
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Enable yarn via corepack
         # 2026-01-09 — self-hosted krexion-vps runner doesn't ship yarn
@@ -294,9 +296,9 @@ jobs:
       - name: Build production bundle
         run: |
           cd frontend
-          yarn install --frozen-lockfile
+          yarn install --frozen-lockfile --ignore-engines
           echo "REACT_APP_BACKEND_URL=http://127.0.0.1:8001" > .env.production
-          yarn build
+          CI=false yarn build
           cd ..
           python3 scripts/stamp-frontend-build.py
 
@@ -437,7 +439,7 @@ jobs:
           }
           Write-Host "Frontend missing from cache AND artifact - rebuilding locally..."
           cd frontend
-          yarn install --frozen-lockfile
+          yarn install --frozen-lockfile --ignore-engines
           if ($LASTEXITCODE -ne 0) { throw "yarn install failed with exit $LASTEXITCODE" }
           "REACT_APP_BACKEND_URL=http://127.0.0.1:8001" | Out-File -FilePath .env.production -Encoding ASCII
           # v2.5.1 — DO NOT use `yarn build`. The build script in

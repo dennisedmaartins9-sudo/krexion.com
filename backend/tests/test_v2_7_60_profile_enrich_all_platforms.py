@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_version_is_2_7_60():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.63"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.64"
 
 
 def test_enrich_when_referrer_enabled_skips_only_neutral_home():
