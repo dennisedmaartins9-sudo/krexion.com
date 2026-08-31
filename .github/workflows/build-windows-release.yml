@@ -1093,7 +1093,7 @@ jobs:
 
       - name: Download installer (workflow artifact, else GitHub Release)
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           VER: ${{ steps.ver.outputs.ver }}
           TARGET: Krexion-Setup-${{ steps.ver.outputs.ver }}.exe
           GITHUB_RUN_ID: ${{ github.run_id }}

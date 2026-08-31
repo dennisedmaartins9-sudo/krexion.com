@@ -1,0 +1,100 @@
+name: Mirror Native Installer to VPS
+
+# Manual / recovery workflow — mirrors an existing GitHub Release installer
+# to /opt/krexion/downloads/windows/ without rebuilding the native bundle.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v2.7.77)'
+        required: true
+        default: 'v2.7.77'
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-windows-to-vps:
+    name: Mirror Windows installer to krexion.com VPS
+    runs-on: [self-hosted, linux, krexion-vps]
+    steps:
+      - name: Resolve release version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER='${{ github.event.inputs.release_tag }}'
+          VER="${VER#"${VER%%[![:space:]]*}"}"
+          VER="${VER%"${VER##*[![:space:]]}"}"
+          case "$VER" in
+            v*) ;;
+            *) VER="v$VER" ;;
+          esac
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "Mirror version: $VER"
+
+      - name: VPS disk self-heal (runner diag + docker)
+        run: |
+          set -e
+          df -h / /opt/krexion/downloads 2>/dev/null | head -6 || df -h /
+          if [ -d /opt/krexion-runner/_diag ]; then
+            find /opt/krexion-runner/_diag -type f -name '*.log' -mtime +1 -delete 2>/dev/null || true
+          fi
+          rm -rf /opt/krexion-runner/_work/_temp/* 2>/dev/null || true
+          docker image prune -f 2>&1 | tail -2 || true
+
+      - name: Download installer from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.ver.outputs.ver }}
+          TARGET: Krexion-Setup-${{ steps.ver.outputs.ver }}.exe
+        run: |
+          set -e
+          mkdir -p dist
+          REPO="${{ github.repository }}"
+          echo "Downloading $TARGET from release $VER"
+          for i in $(seq 1 10); do
+            HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases/tags/$VER")
+            if [ "$HTTP" = "200" ]; then break; fi
+            echo "attempt $i: HTTP $HTTP"
+            sleep 10
+          done
+          test "$HTTP" = "200"
+          python3 - <<PY > /tmp/assets.tsv
+          import json, os, sys
+          target = os.environ["TARGET"]
+          with open("/tmp/rel.json") as f:
+              d = json.load(f)
+          matches = [a for a in d.get("assets", []) if a.get("name") == target]
+          if not matches:
+              print("::error::Missing asset", target, "have", [a.get("name") for a in d.get("assets", [])])
+              sys.exit(1)
+          a = matches[0]
+          print(f"{a['url']}\t{a['name']}\t{a.get('size', 0)}")
+          PY
+          while IFS=$'\t' read -r URL NAME EXPECTED; do
+            curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "dist/$NAME" "$URL"
+            GOT=$(stat -c%s "dist/$NAME")
+            echo "Downloaded $NAME ($GOT bytes, expected $EXPECTED)"
+            test "$GOT" = "$EXPECTED" || test "$GOT" -gt 1000000
+          done < /tmp/assets.tsv
+          ls -lah dist/
+
+      - name: Copy installer to VPS downloads dir
+        env:
+          VER: ${{ steps.ver.outputs.ver }}
+        run: |
+          set -e
+          mkdir -p /opt/krexion/downloads/windows
+          cp -f dist/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
+          cd /opt/krexion/downloads/windows
+          cp -f "Krexion-Setup-${VER}.exe" "Krexion-Setup-latest.exe"
+          ls -la
+          test -f Krexion-Setup-latest.exe
+          echo "https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"
