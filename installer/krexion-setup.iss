@@ -123,22 +123,17 @@ Source: "..\build\krexion-manifest.json"; DestDir: "{app}"; Flags: ignoreversion
 ; Microsoft Visual C++ 2015-2022 Redistributable (x64) — REQUIRED by MongoDB
 ; 7.0.x. Without it mongod.exe silently crashes with VCRUNTIME140_1.dll
 ; missing. We ship it inline and run silently if not already present.
-Source: "..\build\vcredist\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
+; v2.7.66 — install from {app}\prereqs (NOT {tmp}). SAC/WDAC often blocks
+; execution from the user temp folder (Inno Error 4551).
+Source: "..\build\vcredist\vc_redist.x64.exe"; DestDir: "{app}\prereqs"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; Microsoft Edge WebView2 Runtime — REQUIRED by PyWebView on Windows.
-; Win11 ships it pre-installed, but a clean Win10 PC (especially LTSC
-; / Server 2019 / older N-edition) often lacks it → pywebview's
-; EdgeChromium backend silently fails to initialise and the Krexion
-; dashboard window never appears (customer only sees krexion.com open
-; in browser). We ship Microsoft's official Evergreen bootstrapper
-; (~1.6 MB) which is idempotent: it checks if WebView2 is already
-; present and exits 0 immediately if so.
-Source: "..\build\webview2\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
+Source: "..\build\webview2\MicrosoftEdgeWebview2Setup.exe"; DestDir: "{app}\prereqs"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; Adaptive system-specs detector — invoked from the [Run] section to
 ; write %PROGRAMDATA%\Krexion\system-specs.json the backend reads on
-; startup to size its heavy-job semaphore. Deleted after install.
-Source: "detect-system-specs.ps1"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; startup to size its heavy-job semaphore.
+Source: "detect-system-specs.ps1"; DestDir: "{app}\prereqs"; Flags: ignoreversion
 
 
 [Dirs]
@@ -209,23 +204,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 ; MongoDB 7.0 needs VCRUNTIME140_1.dll which only ships with this runtime.
 ; /install /quiet /norestart returns exit code 1638 when the runtime is
 ; already installed (a NEWER version) — that's fine, we accept it.
-Filename: "{tmp}\vc_redist.x64.exe"; \
+Filename: "{app}\prereqs\vc_redist.x64.exe"; \
   Parameters: "/install /quiet /norestart"; \
   Flags: runhidden waituntilterminated skipifdoesntexist; \
   StatusMsg: "Installing prerequisites (Visual C++ Runtime)..."
 
 ; ─── Install Microsoft Edge WebView2 Runtime (silent, idempotent) ──
-; This is the runtime PyWebView uses to render the Krexion dashboard
-; window. The MicrosoftEdgeWebview2Setup.exe bootstrapper is a small
-; (~1.6 MB) Evergreen installer that:
-;   1. Detects if WebView2 is already on this PC → exits 0 instantly
-;   2. Otherwise downloads + installs the latest runtime silently
-; /silent /install are Microsoft's documented switches. If the
-; bootstrapper is missing from the bundle (older build) we skip
-; gracefully — the Krexion dashboard has a Tkinter fallback that
-; covers this case too, but having WebView2 means the customer sees
-; the FULL dashboard, not the compatibility window.
-Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; \
+Filename: "{app}\prereqs\MicrosoftEdgeWebview2Setup.exe"; \
   Parameters: "/silent /install"; \
   Flags: runhidden waituntilterminated skipifdoesntexist; \
   StatusMsg: "Installing prerequisites (Microsoft Edge WebView2)..."
@@ -246,7 +231,7 @@ Filename: "{cmd}"; \
 ; PowerShell script handles its own errors and never fails the
 ; installer — worst case it writes a safe medium-tier fallback.
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{tmp}\detect-system-specs.ps1"" -OutDir ""{commonappdata}\Krexion"""; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\prereqs\detect-system-specs.ps1"" -OutDir ""{commonappdata}\Krexion"""; \
   Flags: runhidden waituntilterminated; StatusMsg: "Detecting your PC capacity..."
 
 ; ─── Install + start Krexion Database service ──────────────────────────

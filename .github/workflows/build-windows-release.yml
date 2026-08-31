@@ -721,6 +721,76 @@ jobs:
         run: |
           choco install innosetup -y --no-progress
 
+      - name: Prepare code signing credentials
+        shell: powershell
+        env:
+          KREXION_CODESIGN_PFX_BASE64: ${{ secrets.KREXION_CODESIGN_PFX_BASE64 }}
+          KREXION_CODESIGN_PFX_PASSWORD: ${{ secrets.KREXION_CODESIGN_PFX_PASSWORD }}
+          KREXION_CODESIGN_THUMBPRINT: ${{ secrets.KREXION_CODESIGN_THUMBPRINT }}
+          AZURE_CODESIGN_METADATA_JSON: ${{ secrets.AZURE_CODESIGN_METADATA_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cache = 'C:\krexion-ci-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $configured = $false
+          if ($env:KREXION_CODESIGN_PFX_BASE64) {
+            $pfx = Join-Path $cache 'krexion-codesign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:KREXION_CODESIGN_PFX_BASE64))
+            Add-Content -Path $env:GITHUB_ENV -Value ('KREXION_CODESIGN_PFX_PATH=' + $pfx)
+            if (-not $env:KREXION_CODESIGN_PFX_PASSWORD) {
+              throw 'KREXION_CODESIGN_PFX_PASSWORD secret is required with KREXION_CODESIGN_PFX_BASE64'
+            }
+            $configured = $true
+            Write-Host 'Code signing: PFX secret loaded'
+          }
+          if ($env:KREXION_CODESIGN_THUMBPRINT) {
+            Add-Content -Path $env:GITHUB_ENV -Value ('KREXION_CODESIGN_THUMBPRINT=' + $env:KREXION_CODESIGN_THUMBPRINT)
+            $configured = $true
+            Write-Host 'Code signing: cert thumbprint configured'
+          }
+          if ($env:AZURE_CODESIGN_METADATA_JSON) {
+            $dlib = Join-Path $cache 'Azure.CodeSigning.Dlib.dll'
+            if (-not (Test-Path $dlib)) {
+              Write-Host 'Downloading Azure.CodeSigning.Dlib.dll ...'
+              Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Azure.CodeSigning.Dlib/1.0.68' -OutFile (Join-Path $cache 'azure-dlib.zip') -UseBasicParsing
+              Expand-Archive -Path (Join-Path $cache 'azure-dlib.zip') -DestinationPath (Join-Path $cache 'azure-dlib') -Force
+              $found = Get-ChildItem -Path (Join-Path $cache 'azure-dlib') -Recurse -Filter 'Azure.CodeSigning.Dlib.dll' | Select-Object -First 1
+              if (-not $found) { throw 'Azure.CodeSigning.Dlib.dll not found in NuGet package' }
+              Copy-Item $found.FullName $dlib -Force
+            }
+            Add-Content -Path $env:GITHUB_ENV -Value ('AZURE_CODESIGN_DLIB=' + $dlib)
+            $configured = $true
+            Write-Host 'Code signing: Azure Artifact Signing metadata configured'
+          }
+          if (-not $configured) {
+            Write-Host '::warning::No code-signing secrets configured — Smart App Control may block unsigned installs on Windows 11. See deployment/CODESIGN-SETUP.md'
+            Add-Content -Path $env:GITHUB_ENV -Value 'KREXION_SKIP_CODESIGN=1'
+          }
+
+      - name: Install Windows SDK signtool (if missing)
+        shell: powershell
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($signtool) {
+            Write-Host "signtool already present: $($signtool.FullName)"
+            exit 0
+          }
+          Write-Host 'Installing Windows SDK Signing Tools...'
+          choco install windows-sdk-10-version -y --no-progress --version=10.0.22621.755
+
+      - name: Sign bundled executables (Smart App Control)
+        if: env.KREXION_SKIP_CODESIGN != '1'
+        shell: powershell
+        env:
+          KREXION_CODESIGN_PFX_PATH: ${{ env.KREXION_CODESIGN_PFX_PATH }}
+          KREXION_CODESIGN_PFX_PASSWORD: ${{ secrets.KREXION_CODESIGN_PFX_PASSWORD }}
+          KREXION_CODESIGN_THUMBPRINT: ${{ secrets.KREXION_CODESIGN_THUMBPRINT }}
+          AZURE_CODESIGN_DLIB: ${{ env.AZURE_CODESIGN_DLIB }}
+          AZURE_CODESIGN_METADATA_JSON: ${{ secrets.AZURE_CODESIGN_METADATA_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/sign-krexion-release.ps1
+
       - name: Compile installer
         shell: powershell
         run: |
@@ -732,6 +802,28 @@ jobs:
               /DAppVersionNumeric=${{ needs.build-backend.outputs.numeric_version }}
           Write-Host "=== installer/Output contents ==="
           Get-ChildItem installer/Output -ErrorAction SilentlyContinue
+
+      - name: Sign Krexion-Setup.exe
+        if: env.KREXION_SKIP_CODESIGN != '1'
+        shell: powershell
+        env:
+          KREXION_CODESIGN_PFX_PATH: ${{ env.KREXION_CODESIGN_PFX_PATH }}
+          KREXION_CODESIGN_PFX_PASSWORD: ${{ secrets.KREXION_CODESIGN_PFX_PASSWORD }}
+          KREXION_CODESIGN_THUMBPRINT: ${{ secrets.KREXION_CODESIGN_THUMBPRINT }}
+          AZURE_CODESIGN_DLIB: ${{ env.AZURE_CODESIGN_DLIB }}
+          AZURE_CODESIGN_METADATA_JSON: ${{ secrets.AZURE_CODESIGN_METADATA_JSON }}
+          VER: ${{ needs.build-backend.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = "installer/Output/Krexion-Setup-$($env:VER).exe"
+          if (-not (Test-Path $setup)) {
+            $setup = (Get-ChildItem installer/Output/Krexion-Setup-*.exe | Select-Object -First 1).FullName
+          }
+          if (-not $setup -or -not (Test-Path $setup)) { throw 'Krexion-Setup exe not found after ISCC' }
+          & ./scripts/sign-krexion-release.ps1 $setup
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Host "Installer signature status: $($sig.Status) · Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "Installer signature not Valid: $($sig.Status)" }
 
       - name: Create GitHub Release + upload installer
         # No marketplace actions (429 on self-hosted). Creates the
