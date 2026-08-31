@@ -90,26 +90,24 @@ jobs:
         env:
           VER: ${{ steps.ver.outputs.ver }}
         run: |
-          set -e
-          AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
-          if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
-            echo "Low disk — pruning old Windows installers before copy..."
-            cd /opt/krexion/downloads/windows 2>/dev/null || true
-            ls -1t Krexion-Setup-v*.exe 2>/dev/null | tail -n +2 | xargs -r rm -f --
-            df -h /opt/krexion/downloads || true
-          fi
+          set -eux
+          df -h / /opt/krexion/downloads 2>/dev/null || df -h /
           mkdir -p /opt/krexion/downloads/windows
-          cp -f dist/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
           cd /opt/krexion/downloads/windows
+          echo "Before cleanup:"; ls -lah || true
+          # Free space: drop all versioned installers (latest alias refreshed below).
+          rm -f Krexion-Setup-v*.exe 2>/dev/null || true
+          df -h / /opt/krexion/downloads 2>/dev/null || df -h /
+          SRC=$(ls -1 "$GITHUB_WORKSPACE"/dist/Krexion-Setup-*.exe 2>/dev/null | head -1)
+          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
+            echo "::error::Downloaded installer missing in dist/"
+            ls -la "$GITHUB_WORKSPACE"/dist || true
+            exit 1
+          fi
+          mv -f "$SRC" "Krexion-Setup-${VER}.exe"
           cp -f "Krexion-Setup-${VER}.exe" "Krexion-Setup-latest.exe"
-          KEEP_N=2
-          mapfile -t KEEP_VER < <(ls -1t Krexion-Setup-v*.exe 2>/dev/null | head -n "$KEEP_N")
-          for f in Krexion-Setup-v*.exe; do
-            [ -f "$f" ] || continue
-            keep=0
-            for k in "${KEEP_VER[@]}"; do [ "$f" = "$k" ] && keep=1 && break; done
-            [ "$keep" = "0" ] && rm -f -- "$f" && echo "pruned $f"
-          done
-          ls -la
-          test -f Krexion-Setup-latest.exe
+          chmod a+r Krexion-Setup-*.exe
+          ls -lah
+          test -s "Krexion-Setup-latest.exe"
+          test -s "Krexion-Setup-${VER}.exe"
           echo "https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"
