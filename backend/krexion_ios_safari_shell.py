@@ -185,6 +185,8 @@ def _apply_shell_once(
     win_h: int,
     *,
     force: bool,
+    profile_slot: int = 1,
+    profile_label: str = "",
 ) -> None:
     with _LOCK:
         seen = hwnd in _SHELL_HWNDS
@@ -202,6 +204,17 @@ def _apply_shell_once(
         _hide_toolbar_children(hwnd)
         user32.SetWindowTextW(hwnd, _SAFARI_DISPLAY)
         _center_window(hwnd, win_w, win_h)
+        try:
+            from krexion_window_icon import brand_single_hwnd_krexion
+
+            brand_single_hwnd_krexion(
+                int(hwnd),
+                profile_slot=int(profile_slot or 1),
+                profile_label=str(profile_label or "Profile")[:60],
+                platform="ios",
+            )
+        except Exception as _ico_err:
+            logger.debug(f"[ios-safari-shell] icon brand skipped: {_ico_err}")
         with _LOCK:
             _SHELL_HWNDS.add(hwnd)
     except Exception as e:
@@ -216,15 +229,21 @@ def _shell_apply_loop(
     profile_label: str,
     deadline_s: float,
     interval_s: float,
+    profile_slot: int = 1,
 ) -> None:
     try:
         import ctypes
         from ctypes import wintypes
 
-        from krexion_window_icon import collect_profile_process_tree
+        from krexion_window_icon import (
+            collect_profile_process_tree,
+            find_pids_by_window_title_substrings,
+            find_webkit_browser_pids,
+        )
 
         user32 = ctypes.windll.user32
         win_w, win_h = _phone_window_size(viewport_w, viewport_h)
+        _title_markers = ("[WebKit]", "Safari")
 
         EnumWindowsProc = ctypes.WINFUNCTYPE(
             wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
@@ -240,19 +259,28 @@ def _shell_apply_loop(
         pid_set: Set[int] = {int(p) for p in seed_pids or []}
         if parent_pid:
             pid_set |= collect_profile_process_tree(int(parent_pid))
+        pid_set |= find_webkit_browser_pids(parent_pid)
+        pid_set |= find_pids_by_window_title_substrings(*_title_markers)
         last_force = 0.0
 
         while time.time() < deadline:
             if parent_pid:
                 pid_set |= collect_profile_process_tree(int(parent_pid))
+            pid_set |= find_webkit_browser_pids(parent_pid)
+            pid_set |= find_pids_by_window_title_substrings(*_title_markers)
 
             found: List[int] = []
 
             def _cb(hwnd, _lparam):
                 try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    title = _window_title(int(hwnd))
                     win_pid = wintypes.DWORD(0)
                     GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
-                    if win_pid.value in pid_set and user32.IsWindowVisible(hwnd):
+                    pid_match = win_pid.value in pid_set
+                    title_match = any(m in title for m in _title_markers)
+                    if pid_match or title_match:
                         found.append(int(hwnd))
                 except Exception:
                     pass
@@ -268,7 +296,14 @@ def _shell_apply_loop(
                 last_force = now
 
             for hwnd in found:
-                _apply_shell_once(hwnd, win_w, win_h, force=force_all)
+                _apply_shell_once(
+                    hwnd,
+                    win_w,
+                    win_h,
+                    force=force_all,
+                    profile_slot=profile_slot,
+                    profile_label=profile_label,
+                )
 
             if parent_pid:
                 try:
@@ -295,12 +330,23 @@ def apply_ios_safari_shell_to_pids(
     profile_label: str = "",
     poll_seconds: float = 120.0,
     poll_interval: float = 0.5,
+    profile_slot: int = 1,
 ) -> Optional[threading.Thread]:
     """Polish Playwright WebKit windows to feel like iPhone Safari."""
     if not _IS_WINDOWS:
         return None
     try:
+        from krexion_window_icon import (
+            find_pids_by_window_title_substrings,
+            find_webkit_browser_pids,
+        )
+
         _clean = sorted({int(p) for p in (pids or []) if p})
+        _clean = sorted(
+            set(_clean)
+            | find_webkit_browser_pids(parent_pid)
+            | find_pids_by_window_title_substrings("[WebKit]", "Safari")
+        )
         if not _clean and not parent_pid:
             return None
         t = threading.Thread(
@@ -313,6 +359,7 @@ def apply_ios_safari_shell_to_pids(
                 str(profile_label or "")[:60],
                 float(poll_seconds),
                 float(poll_interval),
+                int(profile_slot or 1),
             ),
             daemon=True,
             name=f"KrexionSafariShell-{parent_pid or (_clean[0] if _clean else 0)}",

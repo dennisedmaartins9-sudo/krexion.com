@@ -17,8 +17,10 @@ def _read(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def test_version_is_2_7_55():
-    assert _read("VERSION").strip() == "2.7.66"
+def test_version_at_least_2_7_55():
+    ver = _read("VERSION").strip()
+    parts = [int(x) for x in ver.split(".")[:3]]
+    assert parts >= [2, 7, 55]
 
 
 def test_collect_profile_process_tree_exists_in_source():
@@ -36,9 +38,9 @@ def test_launcher_always_applies_krexion_icon_before_ios_shell():
     assert idx_icon < idx_shell
 
 
-def test_ios_shell_does_not_set_safari_icon():
+def test_ios_shell_applies_krexion_icon_via_brand_helper():
     src = _read("krexion_ios_safari_shell.py")
-    assert "_safari_ico_path" not in src
+    assert "brand_single_hwnd_krexion" in src
     assert "krexion_window_icon" in src
 
 

@@ -26,6 +26,12 @@ import {
   Folder,
   Link,
   Cookie,
+  MoreVertical,
+  LayoutGrid,
+  Table2,
+  Star,
+  RotateCcw,
+  ChevronDown,
 } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api/browser-profiles`;
@@ -125,6 +131,41 @@ const DEFAULT_NEW = {
     fingerprint_win_prefer_real: true,
   },
   referrer: { ...DEFAULT_PROFILE_REFERRER },
+};
+
+const CREATE_DRAFT_KEY = "krexion_bp_create_draft_v1";
+
+const ADV_CREATE_DEFAULTS = {
+  advCount: 1,
+  advNamePrefix: "",
+  advUA: { app: "browser", platform: "any", brand: "", region: "US" },
+  advProxy: {
+    mode: "none",
+    country: "US",
+    state: "",
+    sticky_minutes: 0,
+    server: "",
+    protocol: "http",
+    host: "",
+    port: "",
+    username: "",
+    password: "",
+    paste_input: "",
+    provider_id: "",
+  },
+  advAntiDetect: true,
+  advMix: { ios: 0, android: 0, desktop: 100 },
+  advDeviceMode: "random",
+  advDeviceId: "",
+  advResolutionMode: "match_device",
+  advTags: "",
+  advFolder: "",
+  advTimezone: "",
+  advLocale: "",
+  advGeoFollow: true,
+  advQuickLinks: "",
+  advProxyLines: "",
+  showFpAdvanced: false,
 };
 
 /** Relative or ISO timestamp for storage_state sync chip */
@@ -234,6 +275,18 @@ export default function BrowserProfilesPage() {
   const [fpModal, setFpModal] = useState({ open: false, id: null, loading: false, data: null, error: null });
   const [docsModal, setDocsModal] = useState({ open: false, loading: false, data: null, error: null });
   const [cookieRobotBusy, setCookieRobotBusy] = useState(null);
+  const [profileTemplates, setProfileTemplates] = useState([]);
+  const [templateBusy, setTemplateBusy] = useState(false);
+  // v2.7.76 — Agency UX: sort, view modes, trash, launch checklist, clone opts
+  const [viewMode, setViewMode] = useState("cards");
+  const [sortBy, setSortBy] = useState("updated_at");
+  const [maxConcurrent, setMaxConcurrent] = useState(5);
+  const [showTrash, setShowTrash] = useState(false);
+  const [launchChecklist, setLaunchChecklist] = useState({ open: false, id: null, data: null, startUrl: undefined });
+  const [cloneDialog, setCloneDialog] = useState({
+    open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false },
+  });
+  const [cardMenuId, setCardMenuId] = useState(null);
 
   const authHeaders = useMemo(() => {
     const t = localStorage.getItem("token");
@@ -253,12 +306,20 @@ export default function BrowserProfilesPage() {
   const fetchProfiles = async () => {
     setLoading(true);
     try {
+      if (showTrash) {
+        const r = await fetch(`${API}/trash`, { headers: authHeaders });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        setProfiles(d.profiles || []);
+        return;
+      }
       const params = new URLSearchParams();
+      params.set("sort", sortBy);
       if (filterQ.trim()) params.set("q", filterQ.trim());
       if (filterTag.trim()) params.set("tag", filterTag.trim());
       if (filterFolder) params.set("folder", filterFolder);
       const qs = params.toString();
-      const r = await fetch(`${API}/${qs ? `?${qs}` : ""}`, { headers: authHeaders });
+      const r = await fetch(`${API}/?${qs}`, { headers: authHeaders });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       setProfiles(d.profiles || []);
@@ -281,10 +342,215 @@ export default function BrowserProfilesPage() {
     })();
   }, []);
 
+  const fetchTemplates = async () => {
+    try {
+      const r = await fetch(`${API}/templates`, { headers: authHeaders });
+      if (!r.ok) return;
+      const d = await r.json();
+      setProfileTemplates(d.templates || []);
+    } catch (_) { /* templates optional */ }
+  };
+
+  useEffect(() => {
+    fetchTemplates();
+  }, []);
+
+  const serializeCreateState = () => ({
+    form,
+    advCount,
+    advNamePrefix,
+    advUA,
+    advProxy,
+    advAntiDetect,
+    advMix,
+    advDeviceMode,
+    advDeviceId,
+    advResolutionMode,
+    advTags,
+    advFolder,
+    advTimezone,
+    advLocale,
+    advGeoFollow,
+    advQuickLinks,
+    advProxyLines,
+    showFpAdvanced,
+  });
+
+  const applyCreateDraft = (draft) => {
+    if (!draft || typeof draft !== "object") return;
+    if (draft.form) {
+      setForm({
+        ...DEFAULT_NEW,
+        ...draft.form,
+        proxy: { ...DEFAULT_NEW.proxy, ...(draft.form.proxy || {}) },
+        anti_detect: { ...DEFAULT_NEW.anti_detect, ...(draft.form.anti_detect || {}) },
+        referrer: { ...DEFAULT_NEW.referrer, ...(draft.form.referrer || {}) },
+        viewport: draft.form.viewport || DEFAULT_NEW.viewport,
+      });
+    }
+    if (draft.advCount != null) setAdvCount(draft.advCount);
+    if (draft.advNamePrefix != null) setAdvNamePrefix(draft.advNamePrefix);
+    if (draft.advUA) setAdvUA({ ...ADV_CREATE_DEFAULTS.advUA, ...draft.advUA });
+    if (draft.advProxy) setAdvProxy({ ...ADV_CREATE_DEFAULTS.advProxy, ...draft.advProxy });
+    if (draft.advAntiDetect != null) setAdvAntiDetect(!!draft.advAntiDetect);
+    if (draft.advMix) setAdvMix({ ...ADV_CREATE_DEFAULTS.advMix, ...draft.advMix });
+    if (draft.advDeviceMode) setAdvDeviceMode(draft.advDeviceMode);
+    if (draft.advDeviceId != null) setAdvDeviceId(draft.advDeviceId);
+    if (draft.advResolutionMode) setAdvResolutionMode(draft.advResolutionMode);
+    if (draft.advTags != null) setAdvTags(draft.advTags);
+    if (draft.advFolder != null) setAdvFolder(draft.advFolder);
+    if (draft.advTimezone != null) setAdvTimezone(draft.advTimezone);
+    if (draft.advLocale != null) setAdvLocale(draft.advLocale);
+    if (draft.advGeoFollow != null) setAdvGeoFollow(!!draft.advGeoFollow);
+    if (draft.advQuickLinks != null) setAdvQuickLinks(draft.advQuickLinks);
+    if (draft.advProxyLines != null) setAdvProxyLines(draft.advProxyLines);
+    if (draft.showFpAdvanced != null) setShowFpAdvanced(!!draft.showFpAdvanced);
+  };
+
+  const resetAdvCreateForm = () => {
+    setForm(DEFAULT_NEW);
+    setAdvCount(ADV_CREATE_DEFAULTS.advCount);
+    setAdvNamePrefix(ADV_CREATE_DEFAULTS.advNamePrefix);
+    setAdvUA({ ...ADV_CREATE_DEFAULTS.advUA });
+    setAdvProxy({ ...ADV_CREATE_DEFAULTS.advProxy });
+    setAdvAntiDetect(ADV_CREATE_DEFAULTS.advAntiDetect);
+    setAdvMix({ ...ADV_CREATE_DEFAULTS.advMix });
+    setAdvDeviceMode(ADV_CREATE_DEFAULTS.advDeviceMode);
+    setAdvDeviceId(ADV_CREATE_DEFAULTS.advDeviceId);
+    setAdvResolutionMode(ADV_CREATE_DEFAULTS.advResolutionMode);
+    setAdvTags(ADV_CREATE_DEFAULTS.advTags);
+    setAdvFolder(ADV_CREATE_DEFAULTS.advFolder);
+    setAdvTimezone(ADV_CREATE_DEFAULTS.advTimezone);
+    setAdvLocale(ADV_CREATE_DEFAULTS.advLocale);
+    setAdvGeoFollow(ADV_CREATE_DEFAULTS.advGeoFollow);
+    setAdvQuickLinks(ADV_CREATE_DEFAULTS.advQuickLinks);
+    setAdvProxyLines(ADV_CREATE_DEFAULTS.advProxyLines);
+    setShowFpAdvanced(ADV_CREATE_DEFAULTS.showFpAdvanced);
+  };
+
+  const openCustomProfileModal = async () => {
+    setEditingId(null);
+    setShowFpAdvanced(false);
+    try {
+      const raw = sessionStorage.getItem(CREATE_DRAFT_KEY);
+      if (raw) {
+        applyCreateDraft(JSON.parse(raw));
+      } else {
+        try {
+          const r = await fetch(`${API}/templates/default`, { headers: authHeaders });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.template?.settings) {
+              applyCreateDraft(d.template.settings);
+            } else {
+              resetAdvCreateForm();
+            }
+          } else {
+            resetAdvCreateForm();
+          }
+        } catch {
+          resetAdvCreateForm();
+        }
+      }
+    } catch {
+      resetAdvCreateForm();
+    }
+    setShowCreate(true);
+  };
+
+  const closeCreateModal = (clearDraft = true) => {
+    setShowCreate(false);
+    setEditingId(null);
+    if (clearDraft) {
+      try { sessionStorage.removeItem(CREATE_DRAFT_KEY); } catch (_) { /* ignore */ }
+    }
+  };
+
+  const applyProfileTemplate = (settings) => {
+    applyCreateDraft(settings);
+    toast.success("Template applied — adjust name/count then create");
+  };
+
+  const saveProfileTemplate = async () => {
+    const name = window.prompt("Template name (save current settings):");
+    if (!name || !name.trim()) return;
+    setTemplateBusy(true);
+    try {
+      const r = await fetch(`${API}/templates`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ name: name.trim().slice(0, 80), settings: serializeCreateState() }),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        let msg = t;
+        try { msg = JSON.parse(t).detail || t; } catch {}
+        throw new Error(msg);
+      }
+      toast.success(`Template "${name.trim()}" saved`);
+      fetchTemplates();
+    } catch (e) {
+      toast.error(`Save template failed: ${e.message}`);
+    } finally {
+      setTemplateBusy(false);
+    }
+  };
+
+  const deleteProfileTemplate = async (templateId, templateName) => {
+    if (!window.confirm(`Delete template "${templateName}"?`)) return;
+    try {
+      const r = await fetch(`${API}/templates/${templateId}`, {
+        method: "DELETE",
+        headers: authHeaders,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("Template deleted");
+      fetchTemplates();
+    } catch (e) {
+      toast.error(`Delete failed: ${e.message}`);
+    }
+  };
+
+  const setDefaultTemplate = async (templateId) => {
+    try {
+      const r = await fetch(`${API}/templates/${templateId}/default`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("Default template set");
+      fetchTemplates();
+    } catch (e) {
+      toast.error(`Set default failed: ${e.message}`);
+    }
+  };
+
+  // Persist create-form draft so accidental refresh / mis-click does not lose settings.
+  useEffect(() => {
+    if (!showCreate || editingId) return undefined;
+    const timer = setTimeout(() => {
+      try {
+        sessionStorage.setItem(CREATE_DRAFT_KEY, JSON.stringify(serializeCreateState()));
+      } catch (_) { /* quota */ }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [
+    showCreate, editingId, form, advCount, advNamePrefix, advUA, advProxy, advAntiDetect,
+    advMix, advDeviceMode, advDeviceId, advResolutionMode, advTags, advFolder, advTimezone,
+    advLocale, advGeoFollow, advQuickLinks, advProxyLines, showFpAdvanced,
+  ]);
+
   // Re-fetch when filters change (also runs on mount)
   useEffect(() => {
     fetchProfiles();
-  }, [filterQ, filterTag, filterFolder]);
+  }, [filterQ, filterTag, filterFolder, sortBy, showTrash]);
+
+  useEffect(() => {
+    if (!cardMenuId) return undefined;
+    const close = () => setCardMenuId(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [cardMenuId]);
 
   const selectedCount = selectedIds.size;
   const toggleSelect = (id) => {
@@ -325,6 +591,31 @@ export default function BrowserProfilesPage() {
     if (s === "stopping") return "bg-orange-950/40 border-orange-700 text-orange-300";
     if (s === "error") return "bg-red-950/40 border-red-700 text-red-300";
     return "bg-zinc-900 border-zinc-700 text-zinc-400";
+  };
+
+  const healthBadgeClass = (level) => {
+    const l = level || "unknown";
+    if (l === "good") return "bg-emerald-950/40 border-emerald-700 text-emerald-300";
+    if (l === "warn") return "bg-amber-950/40 border-amber-700 text-amber-300";
+    if (l === "bad") return "bg-red-950/40 border-red-700 text-red-300";
+    return "bg-zinc-900 border-zinc-700 text-zinc-400";
+  };
+
+  const truncateNotes = (notes, max = 80) => {
+    if (!notes) return "";
+    const s = String(notes).trim();
+    return s.length > max ? `${s.slice(0, max)}…` : s;
+  };
+
+  const renderHealthBadge = (p) => {
+    const h = p.health || {};
+    const level = h.level || "unknown";
+    const score = h.score != null ? h.score : "—";
+    return (
+      <Badge variant="outline" className={`text-[10px] ${healthBadgeClass(level)}`} title={(h.issues || []).join("; ")}>
+        {level} · {score}
+      </Badge>
+    );
   };
 
   const handleQuickGenerate = async (deviceType = "desktop") => {
@@ -370,7 +661,7 @@ export default function BrowserProfilesPage() {
       });
       if (!r.ok) throw new Error(await r.text());
       toast.success("Profile updated");
-      setShowCreate(false); setEditingId(null); setForm(DEFAULT_NEW);
+      closeCreateModal(true);
       fetchProfiles();
     } catch (e) { toast.error(`Save failed: ${e.message}`); }
   };
@@ -496,14 +787,8 @@ export default function BrowserProfilesPage() {
           ? `Profile "${d.profiles?.[0]?.name || ""}" created`
           : `${n} unique profiles created${mixLabel}`,
       );
-      setShowCreate(false); setEditingId(null); setForm(DEFAULT_NEW);
-      setAdvCount(1); setAdvNamePrefix("");
-      setAdvMix({ ios: 0, android: 0, desktop: 100 });
-      setAdvDeviceMode("random"); setAdvDeviceId("");
-      setAdvResolutionMode("match_device");
-      setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
-      setAdvGeoFollow(true);
-      setAdvQuickLinks(""); setAdvProxyLines("");
+      closeCreateModal(true);
+      resetAdvCreateForm();
       fetchProfiles();
     } catch (e) {
       toast.error(`Create failed: ${e.message}`);
@@ -518,7 +803,7 @@ export default function BrowserProfilesPage() {
     try {
       const r = await fetch(`${API}/bulk-launch`, {
         method: "POST", headers: authHeaders,
-        body: JSON.stringify({ profile_ids: [...selectedIds], max_concurrent: 5 }),
+        body: JSON.stringify({ profile_ids: [...selectedIds], max_concurrent: maxConcurrent }),
       });
       if (!r.ok) throw new Error(await r.text());
       const d = await r.json();
@@ -611,23 +896,42 @@ export default function BrowserProfilesPage() {
   };
 
   const handleDelete = async (id) => {
-    if (!window.confirm("Delete this profile? Storage state will be lost.")) return;
+    if (!window.confirm("Move this profile to recycle bin?")) return;
     try {
       const r = await fetch(`${API}/${id}`, { method: "DELETE", headers: authHeaders });
       if (!r.ok) throw new Error(await r.text());
-      toast.success("Profile deleted"); fetchProfiles();
+      toast.success("Moved to recycle bin");
+      fetchProfiles();
     } catch (e) { toast.error(`Delete failed: ${e.message}`); }
   };
 
-  const handleClone = async (id) => {
-    const includeCookies = window.confirm("Clone with cookies / storage state?");
+  const handleRestore = async (id) => {
+    try {
+      const r = await fetch(`${API}/${id}/restore`, { method: "POST", headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("Profile restored");
+      fetchProfiles();
+    } catch (e) { toast.error(`Restore failed: ${e.message}`); }
+  };
+
+  const openCloneDialog = (id) => {
+    setCloneDialog({
+      open: true, id,
+      opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false },
+    });
+  };
+
+  const confirmClone = async () => {
+    const { id, opts } = cloneDialog;
+    if (!id) return;
     try {
       const r = await fetch(`${API}/${id}/clone`, {
         method: "POST", headers: authHeaders,
-        body: JSON.stringify({ include_cookies: includeCookies }),
+        body: JSON.stringify(opts),
       });
       if (!r.ok) throw new Error(await r.text());
-      toast.success(includeCookies ? "Profile cloned (with cookies)" : "Profile cloned");
+      toast.success(opts.include_cookies ? "Profile cloned (with cookies)" : "Profile cloned");
+      setCloneDialog({ open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false } });
       fetchProfiles();
     } catch (e) { toast.error(`Clone failed: ${e.message}`); }
   };
@@ -662,11 +966,33 @@ export default function BrowserProfilesPage() {
         ? parsed
         : (Array.isArray(parsed?.profiles) ? parsed.profiles : null);
       if (!list || !list.length) {
-        toast.error("JSON must be an array or { profiles: [...] }");
+        // Vendor exports may not be a flat list — still try vendor import with raw payload
+        const includeCookies = window.confirm("Import cookies/storage_state when present?");
+        let r = await fetch(`${API}/import-vendors`, {
+          method: "POST", headers: authHeaders,
+          body: JSON.stringify({ data: parsed, include_cookies: includeCookies }),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          toast.success(`Imported ${d.created || 0} profile(s)`);
+          fetchProfiles();
+          return;
+        }
+        toast.error("JSON must be an array, { profiles: [...] }, or a vendor export");
         return;
       }
       const includeCookies = window.confirm("Import cookies/storage_state when present?");
-      const r = await fetch(`${API}/import`, {
+      let r = await fetch(`${API}/import-vendors`, {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({ data: parsed, include_cookies: includeCookies }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        toast.success(`Imported ${d.created || 0} profile(s)`);
+        fetchProfiles();
+        return;
+      }
+      r = await fetch(`${API}/import`, {
         method: "POST", headers: authHeaders,
         body: JSON.stringify({ profiles: list, include_cookies: includeCookies }),
       });
@@ -688,9 +1014,10 @@ export default function BrowserProfilesPage() {
       const d = await r.json();
       const ip = d.ip || d.exit_ip || d.public_ip || "";
       const ok = d.ok !== false && !d.error;
+      const fraudBit = d.fraud_score != null ? ` · fraud: ${d.fraud_score}` : "";
       toast[ok ? "success" : "error"](
         ok
-          ? `Proxy OK${ip ? `: ${ip}` : ""}${d.country ? ` (${d.country})` : ""}`
+          ? `Proxy OK${ip ? `: ${ip}` : ""}${d.country ? ` (${d.country})` : ""}${fraudBit}`
           : `Proxy check failed: ${d.error || d.message || "unknown"}`,
       );
       fetchProfiles();
@@ -984,10 +1311,10 @@ export default function BrowserProfilesPage() {
     if (!id) return;
     const u = (url || "").trim();
     setLaunchUrlPrompt({ id: null, url: "" });
-    handleLaunch(id, u || undefined);
+    requestLaunch(id, u || undefined);
   };
 
-  const handleLaunch = async (id, startUrl) => {
+  const executeLaunch = async (id, startUrl) => {
     try {
       const r = await fetch(`${API}/${id}/launch`, {
         method: "POST", headers: authHeaders,
@@ -1008,6 +1335,25 @@ export default function BrowserProfilesPage() {
       fetchProfiles();
     } catch (e) { toast.error(`Launch failed: ${e.message}`); }
   };
+
+  const requestLaunch = async (id, startUrl) => {
+    try {
+      const r = await fetch(`${API}/${id}/launch-preview`, { headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setLaunchChecklist({ open: true, id, data, startUrl });
+    } catch (e) {
+      toast.error(`Launch preview failed: ${e.message}`);
+    }
+  };
+
+  const confirmLaunchFromChecklist = () => {
+    const { id, startUrl } = launchChecklist;
+    setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined });
+    if (id) executeLaunch(id, startUrl);
+  };
+
+  const handleLaunch = (id, startUrl) => requestLaunch(id, startUrl);
 
   const handleStop = async (id) => {
     try {
@@ -1031,6 +1377,71 @@ export default function BrowserProfilesPage() {
       link.click();
       toast.success(`Exported ${d.count} profiles`);
     } catch (e) { toast.error(`Export failed: ${e.message}`); }
+  };
+
+  const profileIsBusy = (p) => ["running", "launching", "stopping", "queued"].includes(p.status);
+
+  const renderProfileMoreMenu = (p) => {
+    const busy = profileIsBusy(p);
+    const itemClass = "w-full text-left px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-800 hover:text-fuchsia-200 disabled:opacity-40 disabled:pointer-events-none";
+    return (
+      <div
+        className="absolute right-0 top-full mt-1 z-30 min-w-[10rem] rounded-md border border-zinc-700 bg-zinc-950 shadow-xl py-1"
+        data-no-dbl-launch
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button type="button" className={itemClass} disabled={busy || showTrash}
+          onClick={() => { setLaunchUrlPrompt({ id: p.id, url: p.start_url || "https://" }); setCardMenuId(null); }}>
+          URL
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { openFingerprintModal(p.id); setCardMenuId(null); }}>
+          Fingerprint
+        </button>
+        <button type="button" className={itemClass} disabled={busy || showTrash || cookieRobotBusy === p.id}
+          onClick={() => { handleCookieRobot(p.id); setCardMenuId(null); }}>
+          Cookie Robot
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => {
+            window.location.href = `/rpa-studio?browser_profile_id=${encodeURIComponent(p.id)}&name=${encodeURIComponent(p.name || "")}`;
+            setCardMenuId(null);
+          }}>
+          RPA
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash || proxyBusy === p.id}
+          onClick={() => { handleProxyCheck(p.id); setCardMenuId(null); }}>
+          Proxy
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { openCookieDialog(p.id); setCardMenuId(null); }}>
+          Cookies
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => {
+            setShareDialog({ id: p.id, email: "", includeCookies: false, mode: "acl", role: "editor" });
+            setCardMenuId(null);
+          }}>
+          Share
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { openCloudPhoneDialog(p.id, p); setCardMenuId(null); }}>
+          Cloud Phone
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { handleEdit(p.id); setCardMenuId(null); }}>
+          Edit
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { openCloneDialog(p.id); setCardMenuId(null); }}>
+          Clone
+        </button>
+        <button type="button" className={`${itemClass} text-red-400 hover:text-red-300`} disabled={showTrash}
+          onClick={() => { handleDelete(p.id); setCardMenuId(null); }}>
+          Delete
+        </button>
+      </div>
+    );
   };
 
   return (
@@ -1063,13 +1474,7 @@ export default function BrowserProfilesPage() {
             </Button>
             <Button
               data-testid="bp-open-create"
-              onClick={() => {
-                setEditingId(null); setForm(DEFAULT_NEW); setShowCreate(true);
-                setShowFpAdvanced(false);
-                setAdvTags(""); setAdvFolder(""); setAdvTimezone(""); setAdvLocale("");
-                setAdvGeoFollow(true);
-                setAdvQuickLinks(""); setAdvProxyLines("");
-              }}
+              onClick={openCustomProfileModal}
               variant="outline" className="border-zinc-700 text-zinc-300"
             >
               <Plus className="w-4 h-4 mr-1" /> Custom Profile
@@ -1121,6 +1526,7 @@ export default function BrowserProfilesPage() {
               onChange={(e) => setFilterQ(e.target.value)}
               placeholder="Search name, notes, tags…"
               className="bg-zinc-950 border-zinc-700 text-zinc-100 h-8 text-xs pl-8"
+              disabled={showTrash}
             />
           </div>
           <div className="flex items-center gap-1.5">
@@ -1129,6 +1535,7 @@ export default function BrowserProfilesPage() {
               data-testid="bp-filter-folder"
               value={filterFolder}
               onChange={(e) => setFilterFolder(e.target.value)}
+              disabled={showTrash}
               className="bg-zinc-950 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs h-8"
             >
               <option value="">All folders</option>
@@ -1143,10 +1550,51 @@ export default function BrowserProfilesPage() {
             onChange={(e) => setFilterTag(e.target.value)}
             placeholder="Filter tag"
             className="bg-zinc-950 border-zinc-700 text-zinc-100 h-8 text-xs w-32"
+            disabled={showTrash}
           />
+          <select
+            data-testid="bp-sort"
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+            disabled={showTrash}
+            className="bg-zinc-950 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs h-8"
+          >
+            <option value="updated_at">Sort: Updated</option>
+            <option value="last_launched_at">Sort: Last launched</option>
+            <option value="name">Sort: Name</option>
+            <option value="total_launches">Sort: Launches</option>
+          </select>
+          <div className="flex items-center rounded-md border border-zinc-700 overflow-hidden h-8">
+            <button
+              type="button"
+              data-testid="bp-view-cards"
+              onClick={() => setViewMode("cards")}
+              className={`px-2 py-1 text-xs flex items-center gap-1 ${viewMode === "cards" ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-400 hover:bg-zinc-900"}`}
+            >
+              <LayoutGrid className="w-3.5 h-3.5" /> Cards
+            </button>
+            <button
+              type="button"
+              data-testid="bp-view-table"
+              onClick={() => setViewMode("table")}
+              className={`px-2 py-1 text-xs flex items-center gap-1 border-l border-zinc-700 ${viewMode === "table" ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-400 hover:bg-zinc-900"}`}
+            >
+              <Table2 className="w-3.5 h-3.5" /> Table
+            </button>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            data-testid="bp-trash-toggle"
+            onClick={() => { setShowTrash((v) => !v); clearSelection(); }}
+            className={`h-8 text-xs ${showTrash ? "border-fuchsia-600 text-fuchsia-300 bg-fuchsia-950/30" : "border-zinc-700 text-zinc-300"}`}
+          >
+            <Trash2 className="w-3.5 h-3.5 mr-1" />
+            {showTrash ? "Back to profiles" : "Recycle bin"}
+          </Button>
         </div>
 
-        {profiles.length > 0 && (
+        {profiles.length > 0 && !showTrash && (
           <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
             <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" onClick={selectAllVisible} data-testid="bp-select-all">
               Select all
@@ -1155,6 +1603,19 @@ export default function BrowserProfilesPage() {
               Clear
             </Button>
             <span className="text-xs text-zinc-400">{selectedCount} selected</span>
+            <div className="flex items-center gap-2 text-xs text-zinc-400">
+              <span>Max concurrent</span>
+              <input
+                type="range"
+                min={1}
+                max={20}
+                value={maxConcurrent}
+                onChange={(e) => setMaxConcurrent(Number(e.target.value))}
+                className="w-24 accent-fuchsia-500"
+                data-testid="bp-max-concurrent"
+              />
+              <span className="text-fuchsia-300 w-4">{maxConcurrent}</span>
+            </div>
             <div className="flex-1" />
             {selectedCount > 0 && (
               <div className="flex items-center gap-1.5">
@@ -1205,16 +1666,80 @@ export default function BrowserProfilesPage() {
           <Card className="bg-zinc-900/50 border-zinc-800 mt-4">
             <CardContent className="py-12 text-center text-zinc-500">
               <Globe className="w-12 h-12 mx-auto mb-3 text-zinc-700" />
-              <p>No profiles yet. Click <span className="text-fuchsia-400 font-semibold">Quick Desktop</span> or <span className="text-cyan-400 font-semibold">Quick Mobile</span> for a one-click profile.</p>
+              {showTrash ? (
+                <p>Recycle bin is empty.</p>
+              ) : (
+                <p>No profiles yet. Click <span className="text-fuchsia-400 font-semibold">Quick Desktop</span> or <span className="text-cyan-400 font-semibold">Quick Mobile</span> for a one-click profile.</p>
+              )}
             </CardContent>
           </Card>
+        ) : viewMode === "table" ? (
+          <div className="rounded-lg border border-zinc-800 overflow-hidden">
+            <table className="w-full text-xs text-zinc-300" data-testid="bp-table">
+              <thead className="bg-zinc-900/80 text-zinc-500 uppercase tracking-wide">
+                <tr>
+                  {!showTrash && <th className="px-3 py-2 text-left w-8" />}
+                  <th className="px-3 py-2 text-left">Name</th>
+                  <th className="px-3 py-2 text-left">Status</th>
+                  <th className="px-3 py-2 text-left">Health</th>
+                  <th className="px-3 py-2 text-left">Country</th>
+                  <th className="px-3 py-2 text-left">Cookies</th>
+                  <th className="px-3 py-2 text-left">Last used</th>
+                  <th className="px-3 py-2 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {profiles.map((p) => (
+                  <tr key={p.id} className="border-t border-zinc-800 hover:bg-zinc-900/50" data-testid={`bp-row-${p.id}`}>
+                    {!showTrash && (
+                      <td className="px-3 py-2">
+                        <input type="checkbox" className="accent-fuchsia-500" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} />
+                      </td>
+                    )}
+                    <td className="px-3 py-2 font-medium text-zinc-100 truncate max-w-[12rem]">{p.name}</td>
+                    <td className="px-3 py-2">
+                      <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>{p.status || "idle"}</Badge>
+                    </td>
+                    <td className="px-3 py-2">{renderHealthBadge(p)}</td>
+                    <td className="px-3 py-2">{(p.country || "?").toUpperCase()}</td>
+                    <td className="px-3 py-2">{p.storage_state_stats?.cookie_count || 0}</td>
+                    <td className="px-3 py-2 text-zinc-500">{p.last_used_label || "—"}</td>
+                    <td className="px-3 py-2 text-right">
+                      {showTrash ? (
+                        <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
+                          onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
+                          <RotateCcw className="w-3 h-3 mr-1" /> Restore
+                        </Button>
+                      ) : profileIsBusy(p) ? (
+                        <Button size="sm" onClick={() => handleStop(p.id)} className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
+                          <StopCircle className="w-3 h-3 mr-1" /> Stop
+                        </Button>
+                      ) : (
+                        <Button size="sm" onClick={() => handleLaunch(p.id)} className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid={`bp-launch-${p.id}`}>
+                          <Play className="w-3 h-3 mr-1" /> Launch
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {profiles.map((p) => (
-              <Card key={p.id} className={`bg-zinc-900/60 border-zinc-800 hover:border-fuchsia-700/40 transition ${selectedIds.has(p.id) ? "ring-1 ring-fuchsia-500/50 border-fuchsia-700/50" : ""}`} data-testid={`bp-card-${p.id}`}>
+              <Card
+                key={p.id}
+                className={`bg-zinc-900/60 border-zinc-800 hover:border-fuchsia-700/40 transition cursor-default ${selectedIds.has(p.id) ? "ring-1 ring-fuchsia-500/50 border-fuchsia-700/50" : ""}`}
+                data-testid={`bp-card-${p.id}`}
+                onDoubleClick={(e) => {
+                  if (e.target.closest("button, input, a, [data-no-dbl-launch]")) return;
+                  if (!showTrash && !profileIsBusy(p)) handleLaunch(p.id);
+                }}
+              >
                 <CardHeader className="pb-3">
                   <div className="flex items-start justify-between gap-2">
-                    <label className="mt-1 flex-shrink-0 cursor-pointer">
+                    <label className={`mt-1 flex-shrink-0 cursor-pointer ${showTrash ? "hidden" : ""}`}>
                       <input
                         type="checkbox"
                         className="w-4 h-4 accent-fuchsia-500"
@@ -1244,7 +1769,14 @@ export default function BrowserProfilesPage() {
                         <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>
                           {p.status || "idle"}
                         </Badge>
+                        {renderHealthBadge(p)}
                       </div>
+                      {p.last_used_label && (
+                        <p className="text-[10px] text-zinc-500 mt-1">Last used: {p.last_used_label}</p>
+                      )}
+                      {p.notes && (
+                        <p className="text-[10px] text-zinc-600 mt-0.5 truncate" title={p.notes}>{truncateNotes(p.notes)}</p>
+                      )}
                     </div>
                   </div>
                 </CardHeader>
@@ -1328,8 +1860,13 @@ export default function BrowserProfilesPage() {
                       ))}
                     </div>
                   )}
-                  <div className="flex flex-wrap gap-1">
-                    {["running", "launching", "stopping", "queued"].includes(p.status) ? (
+                  <div className="flex flex-wrap gap-1 items-center">
+                    {showTrash ? (
+                      <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
+                        onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
+                        <RotateCcw className="w-3 h-3 mr-1" /> Restore
+                      </Button>
+                    ) : profileIsBusy(p) ? (
                       <Button data-testid={`bp-stop-${p.id}`} onClick={() => handleStop(p.id)} size="sm" className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
                         <StopCircle className="w-3 h-3 mr-1" /> Stop
                       </Button>
@@ -1338,80 +1875,23 @@ export default function BrowserProfilesPage() {
                         <Play className="w-3 h-3 mr-1" /> Launch
                       </Button>
                     )}
-                    <Button
-                      data-testid={`bp-launch-url-${p.id}`}
-                      onClick={() => setLaunchUrlPrompt({ id: p.id, url: p.start_url || "https://" })}
-                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
-                      disabled={["running", "launching", "stopping", "queued"].includes(p.status)}
-                    >
-                      <Link className="w-3 h-3 mr-1" /> URL
-                    </Button>
-                    <Button
-                      data-testid={`bp-fingerprint-${p.id}`}
-                      onClick={() => openFingerprintModal(p.id)}
-                      variant="outline" size="sm" className="border-fuchsia-800/60 text-fuchsia-300 h-7 text-xs"
-                    >
-                      Fingerprint
-                    </Button>
-                    <Button
-                      data-testid={`bp-cookie-robot-${p.id}`}
-                      onClick={() => handleCookieRobot(p.id)}
-                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
-                      disabled={cookieRobotBusy === p.id}
-                    >
-                      {cookieRobotBusy === p.id ? "…" : "Cookie Robot"}
-                    </Button>
-                    <Button
-                      data-testid={`bp-rpa-${p.id}`}
-                      onClick={() => {
-                        window.location.href = `/rpa-studio?browser_profile_id=${encodeURIComponent(p.id)}&name=${encodeURIComponent(p.name || "")}`;
-                      }}
-                      variant="outline" size="sm" className="border-zinc-700 text-cyan-300 h-7 text-xs"
-                      title="Open RPA Studio with this profile id"
-                    >
-                      RPA
-                    </Button>
-                    <Button
-                      data-testid={`bp-proxy-check-${p.id}`}
-                      onClick={() => handleProxyCheck(p.id)}
-                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
-                      disabled={proxyBusy === p.id}
-                    >
-                      {proxyBusy === p.id ? "…" : "Proxy"}
-                    </Button>
-                    <Button
-                      data-testid={`bp-cookies-${p.id}`}
-                      onClick={() => openCookieDialog(p.id)}
-                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
-                    >
-                      <Cookie className="w-3 h-3" />
-                    </Button>
-                    <Button
-                      data-testid={`bp-share-${p.id}`}
-                      onClick={() => setShareDialog({
-                        id: p.id, email: "", includeCookies: false, mode: "acl", role: "editor",
-                      })}
-                      variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs"
-                    >
-                      Share
-                    </Button>
-                    <Button
-                      data-testid={`bp-cloud-phone-${p.id}`}
-                      onClick={() => openCloudPhoneDialog(p.id, p)}
-                      variant="outline" size="sm" className="border-zinc-700 text-emerald-300 h-7 text-xs"
-                      title="Cloud phone / Krexion Android"
-                    >
-                      <Smartphone className="w-3 h-3" />
-                    </Button>
-                    <Button data-testid={`bp-edit-${p.id}`} onClick={() => handleEdit(p.id)} variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs">
-                      Edit
-                    </Button>
-                    <Button data-testid={`bp-clone-${p.id}`} onClick={() => handleClone(p.id)} variant="outline" size="sm" className="border-zinc-700 text-zinc-300 h-7 text-xs">
-                      <Copy className="w-3 h-3" />
-                    </Button>
-                    <Button data-testid={`bp-delete-${p.id}`} onClick={() => handleDelete(p.id)} variant="outline" size="sm" className="border-red-900/60 text-red-400 hover:bg-red-950/40 h-7 text-xs">
-                      <Trash2 className="w-3 h-3" />
-                    </Button>
+                    {!showTrash && (
+                      <div className="relative" data-no-dbl-launch>
+                        <Button
+                          data-testid={`bp-more-${p.id}`}
+                          variant="outline"
+                          size="sm"
+                          className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setCardMenuId(cardMenuId === p.id ? null : p.id);
+                          }}
+                        >
+                          <MoreVertical className="w-3 h-3 mr-1" /> More <ChevronDown className="w-3 h-3" />
+                        </Button>
+                        {cardMenuId === p.id && renderProfileMoreMenu(p)}
+                      </div>
+                    )}
                   </div>
                   {statusMap[p.id]?.message && (
                     <div className="mt-2 text-[10px] text-amber-300/80 italic">{statusMap[p.id].message}</div>
@@ -1434,7 +1914,7 @@ export default function BrowserProfilesPage() {
 
         {/* Create / Edit dialog */}
         {showCreate && (
-          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowCreate(false)}>
+          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
             <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
               <div className="p-5 border-b border-zinc-800 sticky top-0 bg-zinc-950 z-10">
                 <h2 className="text-xl font-semibold text-zinc-100">{editingId ? "Edit Profile" : "New Browser Profile"}</h2>
@@ -1442,6 +1922,61 @@ export default function BrowserProfilesPage() {
                   <p className="text-[11px] text-zinc-500 mt-1">
                     Each profile gets a UNIQUE user-agent (live generator) + UNIQUE proxy from your selected Proxy Provider — anti-detect ready. Leave name blank for auto-naming.
                   </p>
+                )}
+                {!editingId && (
+                  <div className="mt-3 space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[10px] uppercase tracking-wide text-zinc-500">Templates</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={templateBusy}
+                        className="h-7 text-[11px] border-fuchsia-700/50 text-fuchsia-300"
+                        onClick={saveProfileTemplate}
+                      >
+                        {templateBusy ? "Saving…" : "Save current as template"}
+                      </Button>
+                    </div>
+                    {profileTemplates.length > 0 ? (
+                      <div className="flex flex-wrap gap-2">
+                        {profileTemplates.map((t) => (
+                          <div key={t.id} className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              data-testid={`bp-template-${t.id}`}
+                              className="px-2.5 py-1 rounded-md text-[11px] bg-zinc-900 border border-zinc-700 text-zinc-200 hover:border-fuchsia-600 hover:text-fuchsia-200"
+                              onClick={() => applyProfileTemplate(t.settings)}
+                            >
+                              {t.name}
+                              {t.is_default && (
+                                <Badge variant="outline" className="ml-1 text-[9px] px-1 py-0 h-4 border-fuchsia-700 text-fuchsia-300">default</Badge>
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Set ${t.name} as default`}
+                              className={`text-xs px-1 ${t.is_default ? "text-fuchsia-400" : "text-zinc-600 hover:text-fuchsia-300"}`}
+                              onClick={() => setDefaultTemplate(t.id)}
+                              data-testid={`bp-template-default-${t.id}`}
+                            >
+                              <Star className={`w-3 h-3 ${t.is_default ? "fill-fuchsia-400" : ""}`} />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Delete template ${t.name}`}
+                              className="text-zinc-600 hover:text-red-400 text-xs px-1"
+                              onClick={() => deleteProfileTemplate(t.id, t.name)}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-zinc-600">No saved templates yet — configure settings once, then click Save.</p>
+                    )}
+                  </div>
                 )}
               </div>
               <div className="p-5 space-y-4">
@@ -2387,7 +2922,7 @@ export default function BrowserProfilesPage() {
                 )}
               </div>
               <div className="p-4 border-t border-zinc-800 flex justify-end gap-2 sticky bottom-0 bg-zinc-950">
-                <Button onClick={() => { setShowCreate(false); setEditingId(null); }} variant="outline" className="border-zinc-700 text-zinc-300">Cancel</Button>
+                <Button onClick={() => closeCreateModal(true)} variant="outline" className="border-zinc-700 text-zinc-300">Cancel</Button>
                 <Button data-testid="bp-form-save" onClick={handleCreate} disabled={advCreating}
                   className="bg-fuchsia-600 hover:bg-fuchsia-700 text-white disabled:opacity-60">
                   {editingId
@@ -2563,6 +3098,90 @@ export default function BrowserProfilesPage() {
                     Open now
                   </Button>
                 )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Launch checklist modal (v2.7.76) */}
+        {launchChecklist.open && launchChecklist.data && (
+          <div className="fixed inset-0 z-[65] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
+              onClick={(e) => e.stopPropagation()} data-testid="bp-launch-checklist">
+              <h3 className="text-sm font-semibold text-zinc-100 mb-1">Launch preview</h3>
+              <p className="text-xs text-zinc-500 mb-4">{launchChecklist.data.name}</p>
+              <ul className="space-y-2 text-xs text-zinc-300 mb-4">
+                <li className="flex items-start gap-2">
+                  <span className={launchChecklist.data.proxy_enabled ? "text-emerald-400" : "text-zinc-500"}>●</span>
+                  <span>Proxy: {launchChecklist.data.proxy_enabled ? (launchChecklist.data.exit_ip || "configured") : "none"}</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={launchChecklist.data.cookie_count > 0 ? "text-emerald-400" : "text-amber-400"}>●</span>
+                  <span>Cookies: {launchChecklist.data.cookie_count || 0}</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className={healthBadgeClass(launchChecklist.data.health?.level).includes("emerald") ? "text-emerald-400" : launchChecklist.data.health?.level === "bad" ? "text-red-400" : "text-amber-400"}>●</span>
+                  <span>
+                    Health: {launchChecklist.data.health?.level || "unknown"} ({launchChecklist.data.health?.score ?? "—"})
+                    {(launchChecklist.data.health?.issues || []).length > 0 && (
+                      <span className="block text-zinc-500 mt-0.5">{(launchChecklist.data.health.issues || []).join(" · ")}</span>
+                    )}
+                  </span>
+                </li>
+              </ul>
+              <div className="flex justify-end gap-2">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined })}>
+                  Cancel
+                </Button>
+                <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                  onClick={confirmLaunchFromChecklist} data-testid="bp-launch-anyway">
+                  Launch anyway
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Clone options modal (v2.7.76) */}
+        {cloneDialog.open && (
+          <div className="fixed inset-0 z-[65] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setCloneDialog({ open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false } })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-sm w-full p-5"
+              onClick={(e) => e.stopPropagation()} data-testid="bp-clone-dialog">
+              <h3 className="text-sm font-semibold text-zinc-100 mb-3 flex items-center gap-2">
+                <Copy className="w-4 h-4 text-fuchsia-400" /> Clone profile
+              </h3>
+              <div className="space-y-2 mb-4 text-xs text-zinc-300">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" className="accent-fuchsia-500"
+                    checked={cloneDialog.opts.include_cookies}
+                    onChange={(e) => setCloneDialog((d) => ({ ...d, opts: { ...d.opts, include_cookies: e.target.checked } }))} />
+                  Include cookies / storage state
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" className="accent-fuchsia-500"
+                    checked={cloneDialog.opts.fresh_proxy}
+                    onChange={(e) => setCloneDialog((d) => ({ ...d, opts: { ...d.opts, fresh_proxy: e.target.checked } }))} />
+                  Fresh proxy allocation
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" className="accent-fuchsia-500"
+                    checked={cloneDialog.opts.fresh_ua}
+                    onChange={(e) => setCloneDialog((d) => ({ ...d, opts: { ...d.opts, fresh_ua: e.target.checked } }))} />
+                  Fresh user-agent
+                </label>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setCloneDialog({ open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false } })}>
+                  Cancel
+                </Button>
+                <Button size="sm" className="bg-fuchsia-600 hover:bg-fuchsia-700 text-white h-7 text-xs"
+                  onClick={confirmClone} data-testid="bp-clone-confirm">
+                  Clone
+                </Button>
               </div>
             </div>
           </div>

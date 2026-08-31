@@ -28,7 +28,7 @@ Architecture:
 
 Storage:
   • Mongo collection: `browser_profiles`   (per-user records)
-  • Mongo collection: `browser_profile_sessions`  (running launches)
+  • Mongo collection: `browser_profile_templates`  (saved create-form presets)
   • Bridge jobs of kind="browser_profile_launch" relay to desktop.
 
 Endpoints (all under /api/browser-profiles/*):
@@ -132,6 +132,12 @@ _DEVICE_CATALOG: List[Dict[str, Any]] = [
      "label": "iPhone 16 Pro Max", "viewport": {"width": 440, "height": 956}, "dpr": 3.0},
     {"id": "iphone16pro", "slug": "iPhone16Pro", "platform": "ios", "brand": "iphone",
      "label": "iPhone 16 Pro", "viewport": {"width": 402, "height": 874}, "dpr": 3.0},
+    {"id": "iphone15promax", "slug": "iPhone15ProMax", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 15 Pro Max", "viewport": {"width": 430, "height": 932}, "dpr": 3.0},
+    {"id": "iphone15pro", "slug": "iPhone15Pro", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 15 Pro", "viewport": {"width": 393, "height": 852}, "dpr": 3.0},
+    {"id": "iphone15plus", "slug": "iPhone15Plus", "platform": "ios", "brand": "iphone",
+     "label": "iPhone 15 Plus", "viewport": {"width": 430, "height": 932}, "dpr": 3.0},
     {"id": "iphone15", "slug": "iPhone15", "platform": "ios", "brand": "iphone",
      "label": "iPhone 15", "viewport": {"width": 390, "height": 844}, "dpr": 3.0},
     {"id": "iphone14pro", "slug": "iPhone14Pro", "platform": "ios", "brand": "iphone",
@@ -149,6 +155,8 @@ _DEVICE_CATALOG: List[Dict[str, Any]] = [
      "label": "Pixel 8", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
     {"id": "pixel7", "slug": "Pixel7", "platform": "android", "brand": "google",
      "label": "Pixel 7", "viewport": {"width": 412, "height": 915}, "dpr": 2.625},
+    {"id": "galaxys24ultra", "slug": "GalaxyS24Ultra", "platform": "android", "brand": "samsung",
+     "label": "Galaxy S24 Ultra", "viewport": {"width": 384, "height": 824}, "dpr": 3.0},
     {"id": "galaxys24", "slug": "GalaxyS24", "platform": "android", "brand": "samsung",
      "label": "Galaxy S24", "viewport": {"width": 360, "height": 780}, "dpr": 3.0},
     {"id": "galaxys23", "slug": "GalaxyS23", "platform": "android", "brand": "samsung",
@@ -468,6 +476,71 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
     return {"server": server, "username": username, "password": password}
 
 
+def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill missing proxy username/password from raw_line or embedded server URL."""
+    out = dict(cfg or {})
+    server = str(out.get("server") or "").strip()
+    username = str(out.get("username") or "").strip()
+    password = str(out.get("password") or "").strip()
+    if not server and not str(out.get("raw_line") or out.get("raw") or "").strip():
+        return out
+
+    raw_line = str(out.get("raw_line") or out.get("raw") or "").strip()
+    if raw_line:
+        parsed = _parse_proxy_line(raw_line)
+        if not server and parsed.get("server"):
+            server = str(parsed["server"]).strip()
+        if not username and parsed.get("username"):
+            username = str(parsed["username"]).strip()
+        if not password and parsed.get("password"):
+            password = str(parsed["password"]).strip()
+
+    if server and (not username or not password):
+        probe = server if "://" in server else f"http://{server}"
+        parsed = _parse_proxy_line(probe)
+        if parsed.get("server"):
+            server = str(parsed["server"]).strip()
+        if not username and parsed.get("username"):
+            username = str(parsed["username"]).strip()
+        if not password and parsed.get("password"):
+            password = str(parsed["password"]).strip()
+
+    if server:
+        out["server"] = server
+    if username:
+        out["username"] = username
+    if password:
+        out["password"] = password
+    return out
+
+
+async def hydrate_proxy_credentials_for_launch(
+    uid: str,
+    user: Optional[dict],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ensure rotating/manual profile proxies have auth before Playwright launch."""
+    out = hydrate_proxy_credentials(cfg)
+    if str(out.get("password") or "").strip():
+        return out
+
+    provider_id = str(out.get("provider_id") or "").strip()
+    if not provider_id or not uid:
+        return out
+
+    try:
+        from proxy_provider_module import get_proxy_from_provider
+
+        pp_res = await get_proxy_from_provider(uid, provider_id)
+        line = str(pp_res.get("proxy") or "").strip()
+        if line:
+            merged = _apply_resolved_line_to_proxy_cfg(out, line, provider_id=provider_id)
+            return hydrate_proxy_credentials(merged)
+    except Exception as exc:
+        logger.debug(f"[browser-profile] provider cred hydrate skipped: {exc}")
+    return out
+
+
 def _profile_provider_targeting(
     proxy_cfg: Dict[str, Any],
     profile_country: Optional[str] = None,
@@ -581,8 +654,9 @@ async def resolve_profile_proxy_for_launch(
     profile_country: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Ensure profile proxy dict has a usable `server` when provider/proxyjet is set."""
-    cfg = dict(proxy_cfg or {})
+    cfg = hydrate_proxy_credentials(dict(proxy_cfg or {}))
     if str(cfg.get("server") or "").strip():
+        cfg = await hydrate_proxy_credentials_for_launch(uid, user, cfg)
         cfg["enabled"] = True
         return cfg
 
@@ -1035,11 +1109,24 @@ class OpenOnDeviceBody(BaseModel):
 
 class CloneOptsBody(BaseModel):
     include_cookies: bool = False
+    fresh_proxy: bool = True
+    fresh_ua: bool = False
+
+
+class UpdateProfileTemplateBody(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=80)
+    settings: Optional[Dict[str, Any]] = None
 
 
 class BulkIdsBody(BaseModel):
     profile_ids: List[str] = Field(default_factory=list)
     max_concurrent: int = Field(default=5, ge=1, le=20)
+
+
+class SaveProfileTemplateBody(BaseModel):
+    """Save current create-form settings as a reusable profile template."""
+    name: str = Field(..., min_length=1, max_length=80)
+    settings: Dict[str, Any] = Field(default_factory=dict)
 
 
 _ROLE_RANK = {"viewer": 1, "editor": 2, "admin": 3, "owner": 4}
@@ -1100,7 +1187,10 @@ async def _get_profile_for_user(
 ) -> Dict[str, Any]:
     doc = await _DB.browser_profiles.find_one({
         "id": profile_id,
-        "$or": [{"user_id": uid}, {"acl.user_id": uid}],
+        "$and": [
+            {"$or": [{"user_id": uid}, {"acl.user_id": uid}]},
+            _not_deleted_filter(),
+        ],
     })
     if not doc:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -1223,6 +1313,16 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     }
 
 
+def _not_deleted_filter() -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"deleted_at": {"$exists": False}},
+            {"deleted_at": None},
+            {"deleted_at": ""},
+        ]
+    }
+
+
 def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Strip internal-only fields for API responses."""
     d = dict(doc or {})
@@ -1235,6 +1335,16 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
         "origin_count": len(ss.get("origins") or []),
         "synced_at": d.get("storage_synced_at") or "",
     }
+    try:
+        from browser_profile_health import compute_profile_health, format_last_used
+
+        _hd = dict(d)
+        _hd["storage_state"] = ss
+        d["health"] = compute_profile_health(_hd)
+        d["last_used_label"] = format_last_used(str(d.get("last_launched_at") or ""))
+    except Exception:
+        d["health"] = {"level": "unknown", "score": 0, "issues": []}
+        d["last_used_label"] = ""
     d.pop("storage_state", None)
     d["folder"] = (d.get("folder") or "").strip()
     d["geo_follow_proxy"] = bool(d.get("geo_follow_proxy", True))
@@ -1674,6 +1784,8 @@ def _resolve_user_or_401(user: dict) -> str:
 async def list_profiles(
     request: Request,
     limit: int = Query(default=200, ge=1, le=1000),
+    skip: int = Query(default=0, ge=0, le=10000),
+    sort: str = Query(default="updated_at"),
     tag: Optional[str] = None,
     folder: Optional[str] = None,
     q: Optional[str] = None,
@@ -1682,22 +1794,37 @@ async def list_profiles(
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     filt: Dict[str, Any] = {
-        "$or": [{"user_id": uid}, {"acl.user_id": uid}],
+        "$and": [
+            {"$or": [{"user_id": uid}, {"acl.user_id": uid}]},
+            _not_deleted_filter(),
+        ],
     }
     if tag:
         filt["tags"] = tag
     if folder is not None and str(folder).strip() != "":
         if str(folder).strip().lower() in ("__", "none", "(none)", "unsorted"):
-            filt["$and"] = [
-                {"$or": [
+            filt["$and"].append({
+                "$or": [
                     {"folder": {"$exists": False}},
                     {"folder": ""},
                     {"folder": None},
-                ]},
-            ]
+                ],
+            })
         else:
             filt["folder"] = str(folder).strip()[:80]
-    cur = _DB.browser_profiles.find(filt).sort("updated_at", -1).limit(limit)
+    sort_key = (sort or "updated_at").strip().lower()
+    sort_field = {
+        "name": "name",
+        "last_launched_at": "last_launched_at",
+        "total_launches": "total_launches",
+        "updated_at": "updated_at",
+    }.get(sort_key, "updated_at")
+    cur = (
+        _DB.browser_profiles.find(filt)
+        .sort(sort_field, -1)
+        .skip(int(skip))
+        .limit(limit)
+    )
     docs = await cur.to_list(length=limit)
     needle = (q or "").strip().lower()
     if needle:
@@ -1710,7 +1837,20 @@ async def list_profiles(
             or needle in str(d.get("user_agent") or "").lower()
             or needle in str(d.get("start_url") or "").lower()
         ]
-    return {"profiles": [_public_view_for(d, uid) for d in docs], "count": len(docs)}
+    return {"profiles": [_public_view_for(d, uid) for d in docs], "count": len(docs), "skip": skip, "sort": sort_field}
+
+
+@router.get("/trash")
+async def list_trash_profiles(request: Request, limit: int = Query(default=200, ge=1, le=500)):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    filt = {
+        "user_id": uid,
+        "deleted_at": {"$exists": True, "$nin": [None, ""]},
+    }
+    cur = _DB.browser_profiles.find(filt).sort("deleted_at", -1).limit(limit)
+    docs = await cur.to_list(length=limit)
+    return {"profiles": [_public_view(d) for d in docs], "count": len(docs)}
 
 
 @router.post("/")
@@ -2135,6 +2275,159 @@ async def cloud_phone_providers(request: Request):
             },
         ]
     }
+
+
+@router.get("/templates")
+async def list_profile_templates(request: Request):
+    """List saved browser-profile create templates for the current user."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    items: List[Dict[str, Any]] = []
+    cur = _DB.browser_profile_templates.find({"user_id": uid}).sort("updated_at", -1).limit(50)
+    async for doc in cur:
+        items.append({
+            "id": doc.get("id"),
+            "name": doc.get("name"),
+            "settings": doc.get("settings") or {},
+            "created_at": doc.get("created_at"),
+            "updated_at": doc.get("updated_at"),
+            "is_default": bool(doc.get("is_default")),
+        })
+    return {"templates": items}
+
+
+@router.post("/templates")
+async def save_profile_template(request: Request, body: SaveProfileTemplateBody):
+    """Save create-form settings as a named template (one-click reuse)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    name = (body.name or "").strip()[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="Template name required")
+    settings = body.settings if isinstance(body.settings, dict) else {}
+    tid = "bpt_" + secrets.token_hex(8)
+    now = _now_iso()
+    doc = {
+        "id": tid,
+        "user_id": uid,
+        "name": name,
+        "settings": settings,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await _DB.browser_profile_templates.insert_one(doc)
+    return {
+        "ok": True,
+        "template": {"id": tid, "name": name, "settings": settings, "created_at": now},
+    }
+
+
+@router.put("/templates/{template_id}")
+async def update_profile_template(
+    request: Request, template_id: str, body: UpdateProfileTemplateBody,
+):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    patch: Dict[str, Any] = {"updated_at": _now_iso()}
+    if body.name and body.name.strip():
+        patch["name"] = body.name.strip()[:80]
+    if body.settings is not None and isinstance(body.settings, dict):
+        patch["settings"] = body.settings
+    res = await _DB.browser_profile_templates.update_one(
+        {"id": template_id, "user_id": uid}, {"$set": patch},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Template not found")
+    doc = await _DB.browser_profile_templates.find_one({"id": template_id, "user_id": uid})
+    return {"ok": True, "template": {
+        "id": doc.get("id"), "name": doc.get("name"), "settings": doc.get("settings") or {},
+        "is_default": bool(doc.get("is_default")),
+    }}
+
+
+@router.post("/templates/{template_id}/default")
+async def set_default_profile_template(request: Request, template_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profile_templates.find_one({"id": template_id, "user_id": uid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await _DB.browser_profile_templates.update_many(
+        {"user_id": uid}, {"$set": {"is_default": False}},
+    )
+    await _DB.browser_profile_templates.update_one(
+        {"id": template_id, "user_id": uid},
+        {"$set": {"is_default": True, "updated_at": _now_iso()}},
+    )
+    return {"ok": True, "default_template_id": template_id}
+
+
+@router.get("/templates/default")
+async def get_default_profile_template(request: Request):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _DB.browser_profile_templates.find_one({"user_id": uid, "is_default": True})
+    if not doc:
+        return {"template": None}
+    return {"template": {
+        "id": doc.get("id"), "name": doc.get("name"), "settings": doc.get("settings") or {},
+    }}
+
+
+@router.post("/import-vendors")
+async def import_vendor_profiles(
+    request: Request, body: Dict[str, Any] = Body(default_factory=dict),
+):
+    """Import profiles from AdsPower / GoLogin / Dolphin JSON exports."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_import_vendors import parse_vendor_import_payload
+
+    payload = body.get("data") or body.get("profiles") or body
+    include_cookies = bool(body.get("include_cookies"))
+    parsed = parse_vendor_import_payload(payload)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="No recognizable vendor profiles in payload")
+    created = 0
+    for raw in parsed[:200]:
+        try:
+            pb = ProfileBody(
+                name=str(raw.get("name") or "Imported")[:120],
+                notes=str(raw.get("notes") or "")[:2000],
+                country=str(raw.get("country") or "us")[:8],
+                user_agent=str(raw.get("user_agent") or ""),
+                viewport=raw.get("viewport") or {"width": 1920, "height": 1080},
+                device_type=str(raw.get("device_type") or "desktop"),
+                is_mobile=bool(raw.get("is_mobile")),
+                has_touch=bool(raw.get("has_touch")),
+                start_url=str(raw.get("start_url") or "https://www.google.com/")[:512],
+                tags=list(raw.get("tags") or [])[:20],
+                folder=str(raw.get("folder") or "")[:80],
+            )
+            doc = _profile_doc(uid, pb)
+            if raw.get("proxy"):
+                doc["proxy"] = {**(doc.get("proxy") or {}), **raw["proxy"]}
+            if include_cookies and isinstance(raw.get("storage_state"), dict):
+                doc["storage_state"] = raw["storage_state"]
+            proxy = doc.get("proxy") or {}
+            if proxy.get("enabled") or proxy.get("server") or proxy.get("provider_id"):
+                used = await _load_team_profile_used_ips(uid)
+                await _finalize_doc_proxy_and_ip(uid, user, doc, used)
+            await _DB.browser_profiles.insert_one(doc)
+            created += 1
+        except Exception as exc:
+            logger.warning(f"vendor import row skipped: {exc}")
+    return {"created": created, "parsed": len(parsed)}
+
+
+@router.delete("/templates/{template_id}")
+async def delete_profile_template(request: Request, template_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    res = await _DB.browser_profile_templates.delete_one({"id": template_id, "user_id": uid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"deleted": True, "id": template_id}
 
 
 @router.get("/{profile_id}")
@@ -2701,16 +2994,66 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
 
 
 @router.delete("/{profile_id}")
-async def delete_profile(request: Request, profile_id: str):
-    """Delete a profile + any related sessions."""
+async def delete_profile(request: Request, profile_id: str, permanent: bool = Query(default=False)):
+    """Soft-delete a profile (recycle bin). Use permanent=true to hard-delete."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    res = await _DB.browser_profiles.delete_one({"id": profile_id, "user_id": uid})
-    if res.deleted_count == 0:
+    if permanent:
+        res = await _DB.browser_profiles.delete_one({"id": profile_id, "user_id": uid})
+        if res.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        await _DB.browser_profile_sessions.delete_many({"profile_id": profile_id, "user_id": uid})
+        return {"deleted": True, "permanent": True}
+    res = await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid, **_not_deleted_filter()},
+        {"$set": {"deleted_at": _now_iso(), "status": "idle", "session_id": ""}},
+    )
+    if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Profile not found")
-    await _DB.browser_profile_sessions.delete_many({"profile_id": profile_id, "user_id": uid})
-    return {"deleted": True}
+    await _DB.browser_profile_sessions.update_many(
+        {"profile_id": profile_id, "user_id": uid},
+        {"$set": {"status": "cancelled"}},
+    )
+    return {"deleted": True, "soft": True}
 
+
+@router.post("/{profile_id}/restore")
+async def restore_profile(request: Request, profile_id: str):
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    res = await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {"$set": {"deleted_at": "", "updated_at": _now_iso()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    return {"restored": True, "profile": _public_view(doc or {})}
+
+
+@router.get("/{profile_id}/launch-preview")
+async def launch_preview(request: Request, profile_id: str):
+    """Pre-launch checklist data for UI."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    view = _public_view(doc)
+    health = view.get("health") or {}
+    proxy = doc.get("proxy") or {}
+    return {
+        "profile_id": profile_id,
+        "name": doc.get("name"),
+        "start_url": doc.get("start_url") or "https://www.google.com/",
+        "health": health,
+        "exit_ip": view.get("exit_ip") or "",
+        "cookie_count": (view.get("storage_state_stats") or {}).get("cookie_count") or 0,
+        "proxy_enabled": bool(
+            proxy.get("enabled") or proxy.get("server") or proxy.get("provider_id")
+        ),
+        "device": doc.get("device_model") or doc.get("device_type") or "",
+        "last_proxy_check": view.get("last_proxy_check") or {},
+        "ready": health.get("level") in ("good", "warn", "unknown"),
+    }
 
 @router.post("/{profile_id}/clone")
 async def clone_profile(
@@ -2745,8 +3088,27 @@ async def clone_profile(
         new_doc["proxy"].pop("exit_ip", None)
     new_doc["created_at"] = _now_iso()
     new_doc["updated_at"] = _now_iso()
+    new_doc["deleted_at"] = ""
     proxy = new_doc.get("proxy") or {}
-    if str(proxy.get("provider_id") or "").strip() or str(proxy.get("server") or "").strip():
+    if body and body.fresh_ua:
+        try:
+            is_mob = bool(new_doc.get("is_mobile"))
+            plat = "android" if str(new_doc.get("os") or "").lower() == "android" else (
+                "ios" if is_mob else "desktop"
+            )
+            uas = await _generate_uas_batch(
+                user, count=1, platform=plat,
+                app="browser", brand=None,
+                region=str(new_doc.get("country") or "US").upper(),
+                is_mobile=is_mob,
+            )
+            if uas:
+                new_doc["user_agent"] = uas[0]
+        except Exception as _ua_err:
+            logger.debug(f"clone fresh_ua skipped: {_ua_err}")
+    if body and body.fresh_proxy and (
+        str(proxy.get("provider_id") or "").strip() or str(proxy.get("server") or "").strip()
+    ):
         used = await _load_team_profile_used_ips(uid)
         if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
             lines = await _allocate_provider_proxy_lines(
@@ -3569,8 +3931,10 @@ async def bulk_delete(request: Request, body: BulkIdsBody):
         if st in ("running", "launching", "queued", "stopping"):
             skipped.append({"id": pid, "reason": f"busy:{st}"})
             continue
-        await _DB.browser_profiles.delete_one({"id": pid, "user_id": uid})
-        await _DB.browser_profile_sessions.delete_many({"profile_id": pid, "user_id": uid})
+        await _DB.browser_profiles.update_one(
+            {"id": pid, "user_id": uid},
+            {"$set": {"deleted_at": _now_iso(), "status": "idle", "session_id": ""}},
+        )
         deleted.append(pid)
     return {"deleted": deleted, "skipped": skipped, "deleted_count": len(deleted)}
 

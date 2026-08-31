@@ -45,7 +45,160 @@ logger = logging.getLogger("browser_profile_launcher")
 # Track running sessions so the UI / stop endpoint can find them
 _RUNNING_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-# ── 2026-06-28 — Windows Service Session-0 isolation workaround ─────
+
+def _profile_user_closed_ui(
+    session_id: str,
+    context: Any,
+    browser: Any,
+    tracked_pages: set,
+) -> bool:
+    """Detect user closed the profile browser (X). Minimize keeps session alive."""
+    try:
+        if browser is not None and hasattr(browser, "is_connected"):
+            if not browser.is_connected():
+                return True
+    except Exception:
+        pass
+
+    try:
+        live_ctx = [
+            p for p in (getattr(context, "pages", None) or []) if not p.is_closed()
+        ]
+        live_tracked = {p for p in tracked_pages if not p.is_closed()}
+        if not live_ctx and not live_tracked:
+            return True
+    except Exception:
+        pass
+
+    if not sys.platform.startswith("win"):
+        return False
+
+    sess = _RUNNING_SESSIONS.get(session_id) or {}
+    driver_pid = sess.get("driver_pid")
+    try:
+        from krexion_window_icon import is_process_alive, profile_engine_window_exists
+
+        if driver_pid and not is_process_alive(int(driver_pid)):
+            return True
+    except Exception:
+        pass
+
+    if sess.get("mobile_shell"):
+        try:
+            from krexion_mobile_browser_shell import is_mobile_shell_alive
+
+            if not is_mobile_shell_alive(session_id):
+                return True
+        except Exception:
+            pass
+    else:
+        try:
+            from krexion_window_icon import profile_engine_window_exists
+
+            if driver_pid and not profile_engine_window_exists(
+                int(driver_pid), webkit=bool(sess.get("webkit"))
+            ):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def _apply_shell_commands(
+    session_id: str,
+    context: Any,
+    page: Any,
+    home_url: str,
+) -> None:
+    """Drain mobile-shell IPC commands and drive Playwright pages."""
+    try:
+        from krexion_mobile_browser_shell import get_shell_cfg_path
+        from krexion_mobile_shell_interactive import drain_shell_commands, write_shell_state
+    except Exception:
+        return
+    cfg_path = get_shell_cfg_path(session_id)
+    if not cfg_path:
+        return
+    cmds = drain_shell_commands(cfg_path)
+    sess = _RUNNING_SESSIONS.get(session_id) or {}
+    tabs_meta: List[Dict[str, str]] = list(sess.get("shell_tabs") or [])
+    active_idx = int(sess.get("shell_active_tab") or 0)
+    pages = [p for p in (getattr(context, "pages", None) or []) if not p.is_closed()]
+    if not pages and page and not page.is_closed():
+        pages = [page]
+
+    async def _sync_state() -> None:
+        live = [p for p in (getattr(context, "pages", None) or []) if not p.is_closed()]
+        tab_list = []
+        for i, pg in enumerate(live):
+            title = tabs_meta[i]["title"] if i < len(tabs_meta) else f"Tab {i + 1}"
+            url = tabs_meta[i]["url"] if i < len(tabs_meta) else ""
+            try:
+                url = pg.url or url
+                title = (await pg.title()) or title
+            except Exception:
+                pass
+            tab_list.append({"title": str(title)[:60], "url": str(url)[:200]})
+        cur_url = ""
+        if live and 0 <= active_idx < len(live):
+            try:
+                cur_url = live[active_idx].url or ""
+            except Exception:
+                pass
+        write_shell_state(cfg_path, {
+            "url": str(cur_url).replace("https://", "").replace("http://", "")[:56],
+            "tabs": tab_list,
+            "active_tab": active_idx,
+            "tab_count": len(live),
+        })
+        sess["shell_tabs"] = tab_list
+        sess["shell_active_tab"] = active_idx
+        _RUNNING_SESSIONS[session_id] = sess
+
+    for cmd in cmds:
+        name = str(cmd.get("cmd") or "")
+        try:
+            if name == "go_back":
+                tgt = pages[active_idx] if pages and active_idx < len(pages) else page
+                if tgt:
+                    await tgt.go_back()
+            elif name == "go_forward":
+                tgt = pages[active_idx] if pages and active_idx < len(pages) else page
+                if tgt:
+                    await tgt.go_forward()
+            elif name == "reload":
+                tgt = pages[active_idx] if pages and active_idx < len(pages) else page
+                if tgt:
+                    await tgt.reload()
+            elif name == "go_home":
+                url = str(cmd.get("url") or home_url or "https://www.google.com/")
+                tgt = pages[active_idx] if pages and active_idx < len(pages) else page
+                if tgt:
+                    await tgt.goto(url, wait_until="domcontentloaded", timeout=60000)
+            elif name == "new_tab":
+                url = str(cmd.get("url") or home_url or "https://www.google.com/")
+                await context.new_page()
+                live = [p for p in context.pages if not p.is_closed()]
+                active_idx = len(live) - 1
+                if live:
+                    await live[-1].goto(url, wait_until="domcontentloaded", timeout=60000)
+            elif name == "switch_tab":
+                idx = max(0, int(cmd.get("index") or 0))
+                live = [p for p in context.pages if not p.is_closed()]
+                if live and idx < len(live):
+                    active_idx = idx
+                    try:
+                        await live[idx].bring_to_front()
+                    except Exception:
+                        pass
+        except Exception as _sc_err:
+            logger.debug(f"[mobile-shell] cmd {name} skipped: {_sc_err}")
+        pages = [p for p in (getattr(context, "pages", None) or []) if not p.is_closed()]
+    sess["shell_active_tab"] = active_idx
+    _RUNNING_SESSIONS[session_id] = sess
+    await _sync_state()
+
 # On the NSSM-installed customer build (`KREXION_BUILD_TYPE=binary`)
 # the backend runs as a Windows Service in Session 0. Services in
 # Session 0 CANNOT show GUI windows on the user's desktop — Chromium
@@ -100,6 +253,19 @@ _PROFILE_HEADED_LAUNCH_ARGS = [
     "--enable-features=AddressSpaceTraversal",
     "--disable-infobars",
 ]
+
+
+def _headed_launch_args(anti: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Build headed Chromium args; allow extensions when configured."""
+    args = list(_PROFILE_HEADED_LAUNCH_ARGS)
+    anti = anti or {}
+    allow_ext = bool(anti.get("allow_extensions"))
+    ext_path = str(anti.get("extensions_dir") or os.environ.get("KREXION_PROFILE_EXTENSIONS") or "").strip()
+    if allow_ext or ext_path:
+        args = [a for a in args if a != "--disable-extensions"]
+        if ext_path and os.path.isdir(ext_path):
+            args.append(f"--load-extension={ext_path}")
+    return args
 
 
 def _should_defer_to_user_session() -> bool:
@@ -1497,6 +1663,31 @@ async def _launch_profile_session_inner(
 
     ua = profile_config.get("user_agent") or ""
     viewport = profile_config.get("viewport") or {"width": 1920, "height": 1080}
+    # v2.7.74 — Real device CSS viewport from catalog (advertiser sees true res).
+    try:
+        from mobile_device_viewport import resolve_profile_device_viewport
+
+        _dev_spec = resolve_profile_device_viewport(profile_config)
+        if _dev_spec.get("from_catalog") or profile_config.get("device_catalog_id"):
+            viewport = {
+                "width": int(_dev_spec["width"]),
+                "height": int(_dev_spec["height"]),
+            }
+            profile_config = dict(profile_config)
+            profile_config["viewport"] = viewport
+            if _dev_spec.get("device_scale_factor"):
+                profile_config["device_scale_factor"] = float(_dev_spec["device_scale_factor"])
+            logger.info(
+                "[profile-launch] device viewport %s → %sx%s (physical ~%sx%s @%s)",
+                _dev_spec.get("device_label") or _dev_spec.get("device_id") or "profile",
+                viewport["width"],
+                viewport["height"],
+                _dev_spec.get("physical_width"),
+                _dev_spec.get("physical_height"),
+                _dev_spec.get("device_scale_factor"),
+            )
+    except Exception as _dvp_err:
+        logger.debug(f"[profile-launch] device viewport resolve skipped: {_dvp_err}")
     is_mobile = bool(profile_config.get("is_mobile"))
     has_touch = bool(profile_config.get("has_touch") or is_mobile)
     dsf = float(profile_config.get("device_scale_factor") or (3.0 if is_mobile else 1.0))
@@ -1642,6 +1833,16 @@ async def _launch_profile_session_inner(
         except Exception as _pr_err:
             logger.warning(f"[profile-launch] inline proxy resolve skipped: {_pr_err}")
 
+    if _uid:
+        try:
+            from browser_profile_module import hydrate_proxy_credentials_for_launch
+
+            proxy_cfg = await hydrate_proxy_credentials_for_launch(_uid, None, proxy_cfg)
+            profile_config = dict(profile_config)
+            profile_config["proxy"] = proxy_cfg
+        except Exception as _hydr_err:
+            logger.warning(f"[profile-launch] proxy cred hydrate skipped: {_hydr_err}")
+
     proxy_arg = None
     proxy_diag: Dict[str, Any] = {"requested": False, "server": "", "ok": None, "error": ""}
     _proxy_enabled = bool(
@@ -1747,6 +1948,11 @@ async def _launch_profile_session_inner(
             proxy_arg["username"] = username
         if password:
             proxy_arg["password"] = password
+        elif username and _proxy_enabled:
+            logger.warning(
+                "[profile-launch] proxy username set but password missing — "
+                "Chromium will show a manual proxy sign-in dialog"
+            )
         proxy_diag["requested"] = True
         proxy_diag["server"] = raw_server
     elif _proxy_enabled and not proxy_cfg.get("server"):
@@ -1804,7 +2010,7 @@ async def _launch_profile_session_inner(
         )
         # v2.7.15 — WebRTC launch flags from webrtc_mode (default proxy = current)
         _WEBRTC_FORCE = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
-        _launch_args = [a for a in _PROFILE_HEADED_LAUNCH_ARGS if a != _WEBRTC_FORCE]
+        _launch_args = [a for a in _headed_launch_args(anti) if a != _WEBRTC_FORCE]
         if webrtc_mode == "disabled":
             _launch_args.append("--disable-webrtc")
             _launch_args.append(_WEBRTC_FORCE)
@@ -1926,9 +2132,12 @@ async def _launch_profile_session_inner(
         if proxy_arg and _profile_engine != "webkit":
             launch_kwargs["proxy"] = proxy_arg
 
+        context = None
+        _persistent_mode = False
+        browser = None  # type: ignore
+
         if _profile_engine == "webkit":
             # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
-            _persistent_mode = False
             wk_kwargs: Dict[str, Any] = {"headless": False}
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
@@ -1961,7 +2170,6 @@ async def _launch_profile_session_inner(
                     launch_kwargs["proxy"] = proxy_arg
                 browser = await _krx_launch_chromium()
         elif _profile_engine == "firefox":
-            _persistent_mode = False
             ff_kwargs: Dict[str, Any] = {"headless": False}
             if proxy_arg:
                 ff_kwargs["proxy"] = proxy_arg
@@ -2052,15 +2260,18 @@ async def _launch_profile_session_inner(
 
         # 2026-07 / v2.7.11 — Krexion taskbar brand (Windows).
         # v2.7.13 — Numbered badge = open-profile slot (top-left).
+        _launch_ui_meta: Dict[str, Any] = {"mobile_shell": False, "webkit": _profile_engine == "webkit"}
+
         def _brand_krexion_taskbar() -> None:
             try:
-                _driver_pid = None
-                try:
-                    _proc = getattr(getattr(browser, "_impl_obj", browser), "_process", None)
-                    if _proc is not None:
-                        _driver_pid = getattr(_proc, "pid", None)
-                except Exception:
-                    _driver_pid = None
+                from krexion_window_icon import (
+                    apply_krexion_icon_to_pids,
+                    collect_profile_process_tree,
+                    resolve_playwright_driver_pid,
+                )
+
+                _driver_pid = resolve_playwright_driver_pid(browser, context)
+                _launch_ui_meta["driver_pid"] = int(_driver_pid) if _driver_pid else None
                 _target_pids: List[int] = []
                 if _driver_pid:
                     _target_pids.append(int(_driver_pid))
@@ -2073,17 +2284,16 @@ async def _launch_profile_session_inner(
                                 pass
                     except Exception:
                         pass
-                if not _target_pids:
-                    return
-                from krexion_window_icon import (
-                    apply_krexion_icon_to_pids,
-                    collect_profile_process_tree,
-                )
-
+                _cmd_markers = None
+                _title_markers = None
+                _include_webkit = False
+                if _profile_engine == "webkit":
+                    _include_webkit = True
+                    _title_markers = ["[WebKit]", "Safari"]
+                else:
+                    _cmd_markers = ["--window-name=Krexion"]
                 _family_pids = sorted(
-                    collect_profile_process_tree(
-                        int(_driver_pid) if _driver_pid else None
-                    )
+                    collect_profile_process_tree(int(_driver_pid) if _driver_pid else None)
                     or set(_target_pids)
                 )
                 _poll = 120.0 if _profile_engine == "webkit" else 90.0
@@ -2093,9 +2303,47 @@ async def _launch_profile_session_inner(
                     parent_pid=int(_driver_pid) if _driver_pid else None,
                     poll_seconds=_poll,
                     profile_slot=int(_taskbar_slot),
+                    cmdline_markers=_cmd_markers,
+                    window_title_markers=_title_markers,
+                    include_webkit=_include_webkit,
+                    platform=str(profile_os or ""),
                 )
-                # iOS WebKit — Safari shell (hide [WebKit] menus/toolbar; Krexion icon above).
-                if _profile_engine == "webkit" and str(profile_os or "").lower() in (
+                # Option B — Krexion unique mobile shell (iOS WebKit + Android Chromium).
+                _use_mobile_shell = False
+                try:
+                    from krexion_mobile_browser_shell import (
+                        apply_krexion_mobile_shell,
+                        should_use_mobile_shell,
+                    )
+
+                    _use_mobile_shell = should_use_mobile_shell(
+                        str(profile_os or ""),
+                        bool(is_mobile),
+                    )
+                except Exception:
+                    _use_mobile_shell = False
+
+                if _use_mobile_shell:
+                    try:
+                        from krexion_mobile_browser_shell import apply_krexion_mobile_shell
+
+                        apply_krexion_mobile_shell(
+                            _family_pids,
+                            session_key=str(session_id),
+                            parent_pid=int(_driver_pid) if _driver_pid else None,
+                            platform=str(profile_os or "android"),
+                            viewport_width=int(viewport.get("width", 393)),
+                            viewport_height=int(viewport.get("height", 852)),
+                            profile_label=str(_profile_label)[:60] or "Profile",
+                            profile_slot=int(_taskbar_slot),
+                            poll_seconds=_poll,
+                            webkit=_profile_engine == "webkit",
+                            home_url=str(start_url or "https://www.google.com/")[:512],
+                        )
+                        _launch_ui_meta["mobile_shell"] = True
+                    except Exception as _ms_err:
+                        logger.debug(f"[profile-launch] mobile shell skipped: {_ms_err}")
+                elif _profile_engine == "webkit" and str(profile_os or "").lower() in (
                     "ios",
                     "ipados",
                 ):
@@ -2108,11 +2356,14 @@ async def _launch_profile_session_inner(
                         viewport_height=int(viewport.get("height", 852)),
                         profile_label=str(_profile_label)[:60] or "Profile",
                         poll_seconds=_poll,
+                        profile_slot=int(_taskbar_slot),
                     )
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
 
         _brand_krexion_taskbar()
+        if session_id in _RUNNING_SESSIONS:
+            _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
 
         # Publish CDP websocket for Local API automation clients
         _cdp_ws = ""
@@ -2836,6 +3087,42 @@ async def _launch_profile_session_inner(
         # to a programmatic stop request from the cloud /stop endpoint.
         closed_event = asyncio.Event()
         _last_storage_flush = time.time()
+        _tracked_pages: set = set()
+
+        def _track_page(pg: Any) -> None:
+            if pg in _tracked_pages:
+                return
+            _tracked_pages.add(pg)
+
+            def _on_pg_close() -> None:
+                _tracked_pages.discard(pg)
+                try:
+                    live_ctx = [
+                        p
+                        for p in (getattr(context, "pages", None) or [])
+                        if not p.is_closed()
+                    ]
+                    live_tracked = {p for p in _tracked_pages if not p.is_closed()}
+                    if not live_ctx and not live_tracked:
+                        closed_event.set()
+                except Exception:
+                    closed_event.set()
+
+            try:
+                pg.on("close", lambda *_: _on_pg_close())
+            except Exception:
+                pass
+
+        for _pg in list(getattr(context, "pages", None) or []):
+            _track_page(_pg)
+        try:
+            context.on("page", lambda pg: _track_page(pg))
+        except Exception:
+            pass
+        try:
+            context.on("close", lambda *_: closed_event.set())
+        except Exception:
+            pass
 
         def _on_disconnected():
             closed_event.set()
@@ -2863,15 +3150,31 @@ async def _launch_profile_session_inner(
                     except Exception:
                         pass
                     break
-                # Persistent without disconnect hook: detect empty pages
-                if _br_for_events is None:
+                # v2.7.75 — Auto-stop when user closes browser (X); minimize is OK.
+                if _profile_user_closed_ui(session_id, context, browser, _tracked_pages):
+                    closed_event.set()
+                    break
+                # v2.7.76 — Interactive mobile shell (back/forward/reload/tabs).
+                if sess.get("mobile_shell"):
                     try:
-                        if not context.pages:
-                            closed_event.set()
-                            break
-                    except Exception:
-                        closed_event.set()
-                        break
+                        _live_pg = [
+                            p for p in (getattr(context, "pages", None) or [])
+                            if not p.is_closed()
+                        ]
+                        _idx = int(sess.get("shell_active_tab") or 0)
+                        _shell_pg = (
+                            _live_pg[_idx]
+                            if _live_pg and _idx < len(_live_pg)
+                            else (_live_pg[0] if _live_pg else page)
+                        )
+                        await _apply_shell_commands(
+                            session_id,
+                            context,
+                            _shell_pg,
+                            start_url or "https://www.google.com/",
+                        )
+                    except Exception as _sh_err:
+                        logger.debug(f"[mobile-shell] command poll skipped: {_sh_err}")
                 # Periodic storage_state flush (crash recovery when identity_persist ON)
                 if identity_persist and (time.time() - _last_storage_flush) >= 120.0:
                     _last_storage_flush = time.time()
@@ -2889,6 +3192,12 @@ async def _launch_profile_session_inner(
                         logger.debug(f"[profile-launch] periodic storage flush skipped: {_sf_err}")
 
         # ── Save storage_state + push to cloud ────────────────────────
+        try:
+            from krexion_mobile_browser_shell import stop_mobile_shell
+
+            stop_mobile_shell(session_id)
+        except Exception:
+            pass
         new_storage: Dict[str, Any] = {}
         try:
             _still = True
@@ -2930,6 +3239,13 @@ def request_stop(session_id: str) -> bool:
     """Mark a running session as stop-requested. Polled by the launch
     loop above; the browser is then closed and storage_state saved.
     """
+    sid = str(session_id or "").strip()
+    try:
+        from krexion_mobile_browser_shell import stop_mobile_shell
+
+        stop_mobile_shell(sid)
+    except Exception:
+        pass
     sess = _RUNNING_SESSIONS.get(session_id)
     if not sess:
         return False

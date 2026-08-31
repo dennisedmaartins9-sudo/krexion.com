@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional, Set
+from typing import Any, Optional, Set
 
 logger = logging.getLogger("krexion.window_icon")
 
@@ -73,19 +73,23 @@ def _find_existing(paths: list) -> str:
     return ""
 
 
-def _load_base_rgba(size: int = 256):
-    """Load browser PNG (cover baked-in sample badge) or fall back to K tile."""
+def _normalize_platform_key(platform: str) -> str:
+    plat = (platform or "").strip().lower()
+    if plat in ("ios", "ipados"):
+        return "ios"
+    if plat == "android":
+        return "android"
+    return ""
+
+
+def _load_base_rgba(size: int = 256, platform: str = ""):
+    """Load official Krexion browser PNG as-is (no platform tint)."""
     from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
     png = _find_existing(_browser_png_candidates())
     if png:
         img = Image.open(png).convert("RGBA")
         img = img.resize((size, size), Image.Resampling.LANCZOS)
-        # Wipe any sample number badge in the source mock (top-left ~22%).
-        draw = ImageDraw.Draw(img)
-        cut = max(8, int(size * 0.24))
-        # Match near-black canvas behind the art.
-        draw.rectangle([(0, 0), (cut, cut)], fill=(5, 8, 16, 255))
         return img
 
     # Fallback: cyan K tile
@@ -121,7 +125,7 @@ def _load_base_rgba(size: int = 256):
     return img
 
 
-def _draw_profile_badge(img, slot: int) -> None:
+def _draw_profile_badge(img, slot: int, platform: str = "") -> None:
     """Chrome-style number badge, top-left corner."""
     from PIL import ImageDraw, ImageFont  # type: ignore
 
@@ -129,6 +133,7 @@ def _draw_profile_badge(img, slot: int) -> None:
     draw = ImageDraw.Draw(img)
     n = max(1, min(99, int(slot or 1)))
     label = str(n)
+    rim = (56, 189, 248, 255)
     # Badge box ~18% of icon, inset slightly
     pad = max(2, size // 48)
     bw = max(14, int(size * 0.20))
@@ -141,11 +146,11 @@ def _draw_profile_badge(img, slot: int) -> None:
             [(x0, y0), (x1, y1)],
             radius=max(3, bw // 5),
             fill=(12, 18, 32, 230),
-            outline=(56, 189, 248, 255),
+            outline=rim,
             width=max(1, size // 64),
         )
     except Exception:
-        draw.rectangle([(x0, y0), (x1, y1)], fill=(12, 18, 32, 230), outline=(56, 189, 248, 255))
+        draw.rectangle([(x0, y0), (x1, y1)], fill=(12, 18, 32, 230), outline=rim)
 
     font = None
     font_size = max(10, int(bh * 0.62))
@@ -182,11 +187,10 @@ def _png_to_ico_bytes(png_bytes: bytes, width: int = 256, height: int = 256) -> 
     return header + entry + png_bytes
 
 
-def build_profile_taskbar_ico(slot: int = 1) -> str:
+def build_profile_taskbar_ico(slot: int = 1, platform: str = "") -> str:
     """Return numbered Krexion-browser ICO path for this profile slot."""
     n = max(1, min(99, int(slot or 1)))
     here = os.path.dirname(os.path.abspath(__file__))
-    # Prefer shipping prebuilt assets (no Pillow required at runtime).
     bundled = os.path.join(here, "assets", f"krexion_browser_p{min(n, 20)}.ico")
     if n <= 20 and os.path.isfile(bundled) and os.path.getsize(bundled) > 2000:
         return bundled
@@ -198,7 +202,6 @@ def build_profile_taskbar_ico(slot: int = 1) -> str:
         out_dir = tempfile.gettempdir()
     out = os.path.join(out_dir, f"krexion_browser_p{n}.ico")
     png_src = _find_existing(_browser_png_candidates())
-    # Rebuild when missing, tiny, or older than source art
     need_build = True
     try:
         if os.path.isfile(out) and os.path.getsize(out) > 2000:
@@ -212,9 +215,8 @@ def build_profile_taskbar_ico(slot: int = 1) -> str:
     try:
         from PIL import Image  # type: ignore
 
-        base = _load_base_rgba(256)
-        _draw_profile_badge(base, n)
-        # Embed 256px PNG inside ICO (Pillow's multi-size ICO often collapses)
+        base = _load_base_rgba(256, platform=platform)
+        _draw_profile_badge(base, n, platform=platform)
         import io
 
         buf = io.BytesIO()
@@ -230,6 +232,40 @@ def build_profile_taskbar_ico(slot: int = 1) -> str:
     if os.path.isfile(bundled) and os.path.getsize(bundled) > 500:
         return bundled
     return _krexion_ico_path_plain()
+
+
+def browser_icon_data_uri(platform: str = "", size: int = 32) -> str:
+    """Inline PNG for mobile shell HTML (official art, unchanged)."""
+    import base64
+    import io
+
+    try:
+        from PIL import Image  # type: ignore
+
+        px = max(16, min(128, int(size or 32)))
+        img = _load_base_rgba(px, platform=platform)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception as exc:
+        logger.debug(f"[krexion-icon] data-uri build skipped: {exc}")
+        return ""
+
+
+def browser_icon_file_uri(platform: str = "") -> str:
+    """file:// URI for pywebview when data-uri is too large."""
+    try:
+        from pathlib import Path
+
+        out_dir = os.path.join(tempfile.gettempdir(), "krexion_profile_icons")
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, "krexion_mark.png")
+        img = _load_base_rgba(64, platform=platform)
+        img.save(out, format="PNG")
+        return Path(out).resolve().as_uri()
+    except Exception:
+        return ""
 
 
 def _krexion_ico_path_plain() -> str:
@@ -389,12 +425,67 @@ def _set_window_app_identity(
         return False
 
 
+def brand_single_hwnd_krexion(
+    hwnd: int,
+    *,
+    profile_slot: int = 1,
+    profile_label: str = "Profile",
+    ico_path: str = "",
+    app_id: str = "",
+    display_name: str = "",
+    platform: str = "",
+) -> bool:
+    """Apply numbered Krexion icon + AppUserModelID to one visible HWND."""
+    if not _IS_WINDOWS or not hwnd:
+        return False
+    try:
+        slot = max(1, min(99, int(profile_slot or 1)))
+        app_id = app_id or _app_id_for_slot(slot)
+        path = ico_path or build_profile_taskbar_ico(slot, platform=platform)
+        if not path or not os.path.exists(path):
+            return False
+        display = display_name or f"Krexion — {profile_label} ({slot})"
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        hicon_small = user32.LoadImageW(None, path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        hicon_large = user32.LoadImageW(None, path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+        _set_window_app_identity(hwnd, path, display, app_id=app_id)
+        if hicon_small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+        if hicon_large:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_large)
+        try:
+            SetClassLongPtrW = getattr(user32, "SetClassLongPtrW", user32.SetClassLongW)
+            GCLP_HICON = -14
+            GCLP_HICONSM = -34
+            if hicon_large:
+                SetClassLongPtrW(hwnd, GCLP_HICON, hicon_large)
+            if hicon_small:
+                SetClassLongPtrW(hwnd, GCLP_HICONSM, hicon_small)
+        except Exception:
+            pass
+        with _LOCK:
+            _ICONED_HWNDS.add(int(hwnd))
+        return True
+    except Exception as e:
+        logger.debug(f"[krexion-icon] single hwnd brand failed: {e}")
+        return False
+
+
 def apply_krexion_icon_to_pid(
     pid: int,
     profile_label: str = "Krexion",
     poll_seconds: float = 90.0,
     poll_interval: float = 0.6,
     profile_slot: int = 1,
+    platform: str = "",
 ) -> Optional[threading.Thread]:
     return apply_krexion_icon_to_pids(
         [pid],
@@ -402,6 +493,7 @@ def apply_krexion_icon_to_pid(
         poll_seconds=poll_seconds,
         poll_interval=poll_interval,
         profile_slot=profile_slot,
+        platform=platform,
     )
 
 
@@ -412,6 +504,10 @@ def apply_krexion_icon_to_pids(
     poll_interval: float = 0.6,
     parent_pid: Optional[int] = None,
     profile_slot: int = 1,
+    cmdline_markers: Optional[list] = None,
+    window_title_markers: Optional[list] = None,
+    include_webkit: bool = False,
+    platform: str = "",
 ) -> Optional[threading.Thread]:
     """Brand Chromium HWNDs as Krexion Browser with profile number badge."""
     if not _IS_WINDOWS:
@@ -426,7 +522,7 @@ def apply_krexion_icon_to_pids(
         except Exception:
             pass
 
-        ico_path = build_profile_taskbar_ico(slot)
+        ico_path = build_profile_taskbar_ico(slot, platform=platform)
         if not ico_path or not os.path.exists(ico_path):
             logger.debug("[krexion-icon] no ICO available — skipping")
             return None
@@ -434,7 +530,20 @@ def apply_krexion_icon_to_pids(
         _ensure_start_menu_shortcut(ico_path, profile_label=profile_label, app_id=app_id)
 
         _clean = sorted({int(p) for p in (pids or []) if p})
-        if not _clean and not parent_pid:
+        if cmdline_markers:
+            _clean = sorted(set(_clean) | find_chromium_pids_by_cmdline_substrings(*cmdline_markers))
+        if include_webkit or window_title_markers:
+            _clean = sorted(set(_clean) | find_webkit_browser_pids(parent_pid))
+        if window_title_markers:
+            _clean = sorted(
+                set(_clean) | find_pids_by_window_title_substrings(*window_title_markers)
+            )
+        if (
+            not _clean
+            and not parent_pid
+            and not cmdline_markers
+            and not window_title_markers
+        ):
             return None
 
         display = f"Krexion Browser ({slot})"
@@ -442,9 +551,20 @@ def apply_krexion_icon_to_pids(
             display = f"Krexion — {profile_label} ({slot})"
         t = threading.Thread(
             target=_icon_apply_loop_multi,
-            args=(_clean, parent_pid, ico_path, display, app_id, poll_seconds, poll_interval),
+            args=(
+                _clean,
+                parent_pid,
+                ico_path,
+                display,
+                app_id,
+                poll_seconds,
+                poll_interval,
+                list(cmdline_markers or []),
+                list(window_title_markers or []),
+                bool(include_webkit),
+            ),
             daemon=True,
-            name=f"KrexionIcon-{slot}-{parent_pid or _clean[0]}",
+            name=f"KrexionIcon-{slot}-{parent_pid or (_clean[0] if _clean else slot)}",
         )
         t.start()
         return t
@@ -465,6 +585,135 @@ def _walk_descendants(parent_pid: int) -> Set[int]:
         for child in proc.children(recursive=True):
             try:
                 out.add(int(child.pid))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def resolve_playwright_driver_pid(browser: Any = None, context: Any = None) -> Optional[int]:
+    """Best-effort PID for Playwright Browser / persistent BrowserContext."""
+    for obj in (browser, context):
+        if obj is None:
+            continue
+        try:
+            impl = getattr(obj, "_impl_obj", obj)
+            proc = getattr(impl, "_process", None)
+            if proc is not None:
+                pid = getattr(proc, "pid", None)
+                if pid:
+                    return int(pid)
+        except Exception:
+            pass
+        try:
+            impl = getattr(obj, "_impl_obj", obj)
+            inner = getattr(impl, "_browser", None) or getattr(impl, "browser", None)
+            if inner is not None:
+                proc = getattr(getattr(inner, "_impl_obj", inner), "_process", None)
+                if proc is not None:
+                    pid = getattr(proc, "pid", None)
+                    if pid:
+                        return int(pid)
+        except Exception:
+            pass
+    return None
+
+
+def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
+    """Locate Playwright WebKit MiniBrowser PIDs (Windows headed iOS profiles)."""
+    out: Set[int] = set()
+    _webkit_names = {
+        "minibrowser.exe",
+        "webkitwebprocess.exe",
+        "webkitnetworkprocess.exe",
+        "webkit.exe",
+    }
+    try:
+        import psutil as _psu
+
+        if parent_pid:
+            out |= collect_profile_process_tree(int(parent_pid))
+        for proc in _psu.process_iter(["pid", "name"]):
+            try:
+                pname = (proc.info.get("name") or "").lower()
+                if pname in _webkit_names:
+                    out.add(int(proc.info["pid"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def find_pids_by_window_title_substrings(*needles: str) -> Set[int]:
+    """Map visible top-level HWND titles → owning PIDs (WebKit ``[WebKit]`` titles)."""
+    clean = [str(n).strip() for n in needles if str(n or "").strip()]
+    if not _IS_WINDOWS or not clean:
+        return set()
+    out: Set[int] = set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        def _cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                title_buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title_buf, 512)
+                title = title_buf.value or ""
+                if not any(n in title for n in clean):
+                    return True
+                win_pid = wintypes.DWORD(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if win_pid.value:
+                    out.add(int(win_pid.value))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    except Exception:
+        pass
+    return out
+
+
+def find_chromium_pids_by_cmdline_substrings(*needles: str) -> Set[int]:
+    """Locate chrome/chromium PIDs whose command line contains all needles."""
+    clean = [str(n).strip() for n in needles if str(n or "").strip()]
+    if not clean:
+        return set()
+    out: Set[int] = set()
+    try:
+        import psutil as _psu
+
+        for proc in _psu.process_iter(["pid", "name", "cmdline"]):
+            try:
+                pname = (proc.info.get("name") or "").lower()
+                if pname not in (
+                    "chrome.exe",
+                    "chromium.exe",
+                    "msedge.exe",
+                    "chrome",
+                    "chromium",
+                ):
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                joined = " ".join(str(x) for x in cmdline)
+                if all(n in joined for n in clean):
+                    out.add(int(proc.info["pid"]))
             except Exception:
                 pass
     except Exception:
@@ -518,6 +767,9 @@ def _icon_apply_loop_multi(
     app_id: str,
     deadline_s: float,
     interval_s: float,
+    cmdline_markers: Optional[list] = None,
+    window_title_markers: Optional[list] = None,
+    include_webkit: bool = False,
 ) -> None:
     try:
         import ctypes
@@ -554,6 +806,12 @@ def _icon_apply_loop_multi(
         while time.time() < deadline:
             if parent_pid:
                 pid_set |= collect_profile_process_tree(int(parent_pid))
+            if cmdline_markers:
+                pid_set |= find_chromium_pids_by_cmdline_substrings(*cmdline_markers)
+            if include_webkit or window_title_markers:
+                pid_set |= find_webkit_browser_pids(parent_pid)
+            if window_title_markers:
+                pid_set |= find_pids_by_window_title_substrings(*window_title_markers)
 
             found_hwnds = []
 
@@ -561,13 +819,18 @@ def _icon_apply_loop_multi(
                 try:
                     win_pid = wintypes.DWORD(0)
                     GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
-                    if win_pid.value not in pid_set:
-                        return True
-                    if not user32.IsWindowVisible(hwnd):
-                        return True
                     title_buf = ctypes.create_unicode_buffer(512)
                     user32.GetWindowTextW(hwnd, title_buf, 512)
                     title = title_buf.value or ""
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    pid_match = win_pid.value in pid_set
+                    title_match = bool(
+                        window_title_markers
+                        and any(n in title for n in window_title_markers)
+                    )
+                    if not pid_match and not title_match:
+                        return True
                     # Playwright driver helper — hide so only Krexion-branded
                     # browser window stays on the taskbar.
                     if title.strip().lower() == "playwright":
@@ -625,4 +888,105 @@ def _icon_apply_loop_multi(
             time.sleep(interval_s)
     except Exception as e:
         logger.debug(f"[krexion-icon] loop crashed: {e}")
+
+
+def is_process_alive(pid: Optional[int]) -> bool:
+    """True if OS process exists (used for profile auto-stop on window close)."""
+    if not pid:
+        return True
+    try:
+        import psutil as _psu
+
+        return bool(_psu.pid_exists(int(pid)))
+    except Exception:
+        try:
+            import ctypes
+
+            SYNCHRONIZE = 0x00100000
+            h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return True
+
+
+def _is_profile_engine_hwnd(hwnd: int, *, webkit: bool) -> bool:
+    """Engine content window — includes minimized (IsWindow), not only visible."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd):
+            return False
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value or ""
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        cname = (cls.value or "").lower()
+        if title.strip().lower() == "playwright":
+            return False
+        if webkit:
+            return (
+                "[webkit]" in title.lower()
+                or "safari" in title.lower()
+                or "webkit" in cname
+                or "minibrowser" in cname
+            )
+        return (
+            "chrome" in cname
+            or "chromium" in cname
+            or title.startswith("Krexion")
+            or "krexion orbit" in title.lower()
+        )
+    except Exception:
+        return False
+
+
+def profile_engine_window_exists(driver_pid: Optional[int], *, webkit: bool = False) -> bool:
+    """True while the headed profile engine window still exists (minimize OK)."""
+    if not driver_pid:
+        return True
+    pid_set = collect_profile_process_tree(int(driver_pid))
+    if webkit:
+        pid_set |= find_webkit_browser_pids(int(driver_pid))
+    if not pid_set:
+        return False
+    found = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        def _cb(hwnd, _lparam):
+            nonlocal found
+            if found:
+                return True
+            try:
+                win_pid = wintypes.DWORD(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if win_pid.value not in pid_set:
+                    return True
+                if _is_profile_engine_hwnd(int(hwnd), webkit=webkit):
+                    found = True
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    except Exception:
+        return True
+    return found
 
