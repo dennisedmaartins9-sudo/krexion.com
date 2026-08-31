@@ -1230,12 +1230,20 @@ jobs:
           VER: ${{ steps.ver.outputs.ver }}
         run: |
           set -e
-          # Fail early if disk is critically low (mirror used to die mid-write).
+          # Fail early if disk is critically low — prune old installers first.
           AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
           if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2500000 ]; then
-            echo "::error::Not enough free disk on VPS (<2.5GB). Run safe installer cleanup first."
-            df -h / /opt/krexion/downloads || true
-            exit 1
+            echo "Low disk on /opt/krexion/downloads — pruning old Windows installers..."
+            mkdir -p /opt/krexion/downloads/windows
+            cd /opt/krexion/downloads/windows
+            ls -1t Krexion-Setup-v*.exe 2>/dev/null | tail -n +2 | xargs -r rm -f --
+            docker system prune -f 2>/dev/null || true
+            AVAIL_KB=$(df -Pk /opt/krexion/downloads 2>/dev/null | awk 'NR==2{print $4}')
+            if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 700000 ]; then
+              echo "::error::Not enough free disk on VPS after cleanup (<700MB)."
+              df -h / /opt/krexion/downloads || true
+              exit 1
+            fi
           fi
           mkdir -p /opt/krexion/downloads/windows
           cp -f dist/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
