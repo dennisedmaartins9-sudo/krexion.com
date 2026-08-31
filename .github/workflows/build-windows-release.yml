@@ -970,6 +970,29 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: VPS disk self-heal (runner diag + docker)
+        run: |
+          set -e
+          echo ">> Disk BEFORE mirror cleanup"
+          df -h / /opt/krexion/downloads /opt/krexion-runner 2>/dev/null | head -8 || df -h /
+          if [ -d /opt/krexion-runner/_diag ]; then
+            echo ">> Trimming krexion-runner _diag logs (No space left on device fix)..."
+            find /opt/krexion-runner/_diag -type f -name '*.log' -mtime +1 -delete 2>/dev/null || true
+            find /opt/krexion-runner/_diag -type f -name '*.log' -size +20M -delete 2>/dev/null || true
+            du -sh /opt/krexion-runner/_diag 2>/dev/null || true
+          fi
+          rm -rf /opt/krexion-runner/_work/_temp/* 2>/dev/null || true
+          docker image prune -f 2>&1 | tail -2 || true
+          docker builder prune -f --keep-storage 5GB 2>&1 | tail -2 || true
+          journalctl --vacuum-size=200M 2>/dev/null || true
+          echo ">> Disk AFTER mirror cleanup"
+          df -h / /opt/krexion/downloads 2>/dev/null | head -6 || df -h /
+          AVAIL_KB=$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')
+          if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 500000 ]; then
+            echo "::error::Root disk still under 500MB free after cleanup — mirror cannot proceed safely"
+            exit 1
+          fi
+
       - name: Download installer from GitHub Release (via curl)
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}

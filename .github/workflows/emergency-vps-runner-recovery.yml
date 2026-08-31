@@ -88,6 +88,15 @@ jobs:
               docker builder prune -af --keep-storage 5GB 2>&1 | tail -3 || true
               docker system prune -f 2>&1 | tail -3 || true
               echo ""
+              echo "===== GitHub runner diag cleanup ====="
+              if [ -d /opt/krexion-runner/_diag ]; then
+                find /opt/krexion-runner/_diag -type f -name '*.log' -mtime +1 -delete 2>/dev/null || true
+                find /opt/krexion-runner/_diag -type f -name '*.log' -size +20M -delete 2>/dev/null || true
+                du -sh /opt/krexion-runner/_diag 2>/dev/null || true
+              fi
+              rm -rf /opt/krexion-runner/_work/_temp/* 2>/dev/null || true
+              journalctl --vacuum-size=200M 2>/dev/null || true
+              echo ""
               echo "===== Disk AFTER cleanup ====="
               df -h / /var/lib/docker 2>/dev/null | head -5
             else

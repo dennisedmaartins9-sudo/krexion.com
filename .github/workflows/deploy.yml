@@ -98,6 +98,12 @@ jobs:
           rm -rf /opt/krexion/backend/real_user_traffic_results/*.mp4 2>/dev/null || true
           rm -rf /opt/krexion/backend/form_filler_screenshots/* 2>/dev/null || true
           rm -rf /opt/krexion/backend/visual_recorder_sessions/*/screenshots 2>/dev/null || true
+          if [ -d /opt/krexion-runner/_diag ]; then
+            echo ">> Trimming krexion-runner _diag logs..."
+            find /opt/krexion-runner/_diag -type f -name '*.log' -mtime +1 -delete 2>/dev/null || true
+            find /opt/krexion-runner/_diag -type f -name '*.log' -size +20M -delete 2>/dev/null || true
+          fi
+          rm -rf /opt/krexion-runner/_work/_temp/* 2>/dev/null || true
           docker image prune -f 2>&1 | tail -2 || true
           docker builder prune -f 2>&1 | tail -2 || true
           # 2026-02 v2.6.21 — aggressive builder cache trim when the
