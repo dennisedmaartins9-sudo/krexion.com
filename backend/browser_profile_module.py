@@ -869,6 +869,9 @@ class AntiDetectConfig(BaseModel):
     fingerprint_win: bool = True
     # When True + Stealth kernel: prefer real modes (less JS noise)
     fingerprint_win_prefer_real: bool = True
+    # v2.7.77 — Optional Chromium extensions (unpacked dir)
+    allow_extensions: bool = False
+    extensions_dir: str = Field(default="", max_length=512)
 
 
 class ReferrerProConfig(BaseModel):
@@ -1121,6 +1124,7 @@ class UpdateProfileTemplateBody(BaseModel):
 class BulkIdsBody(BaseModel):
     profile_ids: List[str] = Field(default_factory=list)
     max_concurrent: int = Field(default=5, ge=1, le=20)
+    permanent: bool = False
 
 
 class SaveProfileTemplateBody(BaseModel):
@@ -1837,7 +1841,14 @@ async def list_profiles(
             or needle in str(d.get("user_agent") or "").lower()
             or needle in str(d.get("start_url") or "").lower()
         ]
-    return {"profiles": [_public_view_for(d, uid) for d in docs], "count": len(docs), "skip": skip, "sort": sort_field}
+    return {
+        "profiles": [_public_view_for(d, uid) for d in docs],
+        "count": len(docs),
+        "skip": skip,
+        "limit": limit,
+        "has_more": len(docs) >= limit,
+        "sort": sort_field,
+    }
 
 
 @router.get("/trash")
@@ -2846,6 +2857,69 @@ async def clear_cookies(request: Request, profile_id: str):
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Profile not found")
     return {"ok": True, "cleared": True}
+
+
+@router.post("/{profile_id}/refresh-proxy")
+async def refresh_profile_proxy(request: Request, profile_id: str):
+    """Rotate provider/proxyjet line or re-probe manual proxy; clears launch error."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    if str(doc.get("user_id") or uid) != uid:
+        raise HTTPException(status_code=403, detail="Only the profile owner can refresh proxy")
+    cur_status = str(doc.get("status") or "idle").lower()
+    if cur_status in ("running", "launching", "stopping", "queued"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Profile is {cur_status}. Stop it before rotating proxy.",
+        )
+    proxy = dict(doc.get("proxy") or {})
+    if not (
+        proxy.get("enabled")
+        or str(proxy.get("provider_id") or "").strip()
+        or proxy.get("use_proxyjet")
+        or str(proxy.get("server") or "").strip()
+    ):
+        raise HTTPException(status_code=400, detail="Profile has no proxy configured")
+    patch_doc = dict(doc)
+    proxy.pop("exit_ip", None)
+    patch_doc["exit_ip"] = ""
+    provider_id = str(proxy.get("provider_id") or "").strip()
+    if provider_id or proxy.get("use_proxyjet"):
+        proxy["server"] = ""
+        patch_doc["proxy"] = proxy
+        patch_doc["proxy"] = await resolve_profile_proxy_for_launch(
+            uid, user, patch_doc["proxy"], profile_country=patch_doc.get("country"),
+        )
+    else:
+        patch_doc["proxy"] = proxy
+    used = await _load_team_profile_used_ips(uid)
+    try:
+        from cross_user_ip_isolation import canonicalize_ip
+        cur = canonicalize_ip(doc.get("exit_ip") or "")
+        if cur:
+            used.discard(cur)
+    except Exception:
+        pass
+    await _finalize_doc_proxy_and_ip(uid, user, patch_doc, used)
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {
+            "$set": {
+                "proxy": patch_doc["proxy"],
+                "exit_ip": patch_doc.get("exit_ip") or "",
+                "status": "idle",
+                "last_error": "",
+                "updated_at": _now_iso(),
+            }
+        },
+    )
+    updated = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    return {
+        "ok": True,
+        "profile": _public_view(updated or {}),
+        "exit_ip": patch_doc.get("exit_ip") or "",
+    }
 
 
 @router.post("/{profile_id}/check-proxy")
@@ -3922,8 +3996,9 @@ async def bulk_delete(request: Request, body: BulkIdsBody):
     # delete of non-running; running ones are skipped with reason.
     deleted: List[str] = []
     skipped: List[Dict[str, str]] = []
+    permanent = bool(getattr(body, "permanent", False))
     for pid in ids:
-        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid}, {"status": 1})
+        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid}, {"status": 1, "deleted_at": 1})
         if not doc:
             skipped.append({"id": pid, "reason": "not_found"})
             continue
@@ -3931,12 +4006,23 @@ async def bulk_delete(request: Request, body: BulkIdsBody):
         if st in ("running", "launching", "queued", "stopping"):
             skipped.append({"id": pid, "reason": f"busy:{st}"})
             continue
+        if permanent:
+            if not str(doc.get("deleted_at") or "").strip():
+                skipped.append({"id": pid, "reason": "not_in_trash"})
+                continue
+            res = await _DB.browser_profiles.delete_one({"id": pid, "user_id": uid})
+            if res.deleted_count:
+                await _DB.browser_profile_sessions.delete_many({"profile_id": pid, "user_id": uid})
+                deleted.append(pid)
+            else:
+                skipped.append({"id": pid, "reason": "delete_failed"})
+            continue
         await _DB.browser_profiles.update_one(
             {"id": pid, "user_id": uid},
             {"$set": {"deleted_at": _now_iso(), "status": "idle", "session_id": ""}},
         )
         deleted.append(pid)
-    return {"deleted": deleted, "skipped": skipped, "deleted_count": len(deleted)}
+    return {"deleted": deleted, "skipped": skipped, "deleted_count": len(deleted), "permanent": permanent}
 
 
 @router.post("/bulk-stop")

@@ -32,9 +32,11 @@ import {
   Star,
   RotateCcw,
   ChevronDown,
+  Pencil,
 } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api/browser-profiles`;
+const PAGE_SIZE = 50;
 
 const COUNTRY_OPTIONS = [
   "US","GB","CA","AU","DE","FR","ES","IT","NL","BR","MX","IN","PK","BD","ID","PH","JP","KR","TR","AE","SA","ZA","NG","KE","RU","UA","PL","PT","SE","NO","DK","FI",
@@ -129,6 +131,8 @@ const DEFAULT_NEW = {
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
+    allow_extensions: false,
+    extensions_dir: "",
   },
   referrer: { ...DEFAULT_PROFILE_REFERRER },
 };
@@ -287,6 +291,10 @@ export default function BrowserProfilesPage() {
     open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false },
   });
   const [cardMenuId, setCardMenuId] = useState(null);
+  // v2.7.77 — pagination, proxy retry
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [proxyRetryBusy, setProxyRetryBusy] = useState(null);
 
   const authHeaders = useMemo(() => {
     const t = localStorage.getItem("token");
@@ -303,18 +311,24 @@ export default function BrowserProfilesPage() {
     } catch (_) { /* folders optional */ }
   };
 
-  const fetchProfiles = async () => {
-    setLoading(true);
+  const fetchProfiles = async (opts = {}) => {
+    const append = !!opts.append;
+    const skip = append ? (opts.skip ?? 0) : 0;
+    if (append) setLoadingMore(true);
+    else setLoading(true);
     try {
       if (showTrash) {
         const r = await fetch(`${API}/trash`, { headers: authHeaders });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
         setProfiles(d.profiles || []);
+        setHasMore(false);
         return;
       }
       const params = new URLSearchParams();
       params.set("sort", sortBy);
+      params.set("limit", String(PAGE_SIZE));
+      params.set("skip", String(skip));
       if (filterQ.trim()) params.set("q", filterQ.trim());
       if (filterTag.trim()) params.set("tag", filterTag.trim());
       if (filterFolder) params.set("folder", filterFolder);
@@ -322,13 +336,21 @@ export default function BrowserProfilesPage() {
       const r = await fetch(`${API}/?${qs}`, { headers: authHeaders });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
-      setProfiles(d.profiles || []);
+      const batch = d.profiles || [];
+      setProfiles((prev) => (append ? [...prev, ...batch] : batch));
+      setHasMore(!!d.has_more || batch.length >= PAGE_SIZE);
       fetchFolders();
     } catch (e) {
       toast.error(`Failed to load profiles: ${e.message}`);
     } finally {
-      setLoading(false);
+      if (append) setLoadingMore(false);
+      else setLoading(false);
     }
+  };
+
+  const loadMoreProfiles = () => {
+    if (loadingMore || !hasMore || showTrash) return;
+    fetchProfiles({ append: true, skip: profiles.length });
   };
 
   useEffect(() => {
@@ -508,6 +530,37 @@ export default function BrowserProfilesPage() {
       fetchTemplates();
     } catch (e) {
       toast.error(`Delete failed: ${e.message}`);
+    }
+  };
+
+  const updateProfileTemplate = async (templateId, templateName) => {
+    const overwrite = window.confirm(
+      `Overwrite template "${templateName}" with current form settings?`,
+    );
+    if (!overwrite) return;
+    const rename = window.prompt("Template name (leave blank to keep current):", templateName);
+    if (rename === null) return;
+    setTemplateBusy(true);
+    try {
+      const body = { settings: serializeCreateState() };
+      if (rename.trim()) body.name = rename.trim().slice(0, 80);
+      const r = await fetch(`${API}/templates/${templateId}`, {
+        method: "PUT",
+        headers: authHeaders,
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        let msg = t;
+        try { msg = JSON.parse(t).detail || t; } catch {}
+        throw new Error(msg);
+      }
+      toast.success(`Template "${rename.trim() || templateName}" updated`);
+      fetchTemplates();
+    } catch (e) {
+      toast.error(`Update template failed: ${e.message}`);
+    } finally {
+      setTemplateBusy(false);
     }
   };
 
@@ -912,6 +965,61 @@ export default function BrowserProfilesPage() {
       toast.success("Profile restored");
       fetchProfiles();
     } catch (e) { toast.error(`Restore failed: ${e.message}`); }
+  };
+
+  const handlePermanentDelete = async (id, name) => {
+    const label = name ? `"${name}"` : "this profile";
+    if (!window.confirm(`Permanently delete ${label}? This cannot be undone.`)) return;
+    try {
+      const r = await fetch(`${API}/${id}?permanent=true`, { method: "DELETE", headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("Permanently deleted");
+      fetchProfiles();
+    } catch (e) { toast.error(`Permanent delete failed: ${e.message}`); }
+  };
+
+  const handleBulkPermanentDelete = async () => {
+    if (!selectedCount || bulkBusy || !showTrash) return;
+    if (!window.confirm(`Permanently delete ${selectedCount} profile(s)? This cannot be undone.`)) return;
+    setBulkBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-delete`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ profile_ids: [...selectedIds], permanent: true }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      toast.success(`Permanently deleted ${d.deleted_count || 0}` + (d.skipped?.length ? ` · skipped ${d.skipped.length}` : ""));
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Bulk permanent delete failed: ${e.message}`);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const handleRetryWithNewProxy = async (id) => {
+    if (proxyRetryBusy) return;
+    setProxyRetryBusy(id);
+    try {
+      const r = await fetch(`${API}/${id}/refresh-proxy`, { method: "POST", headers: authHeaders });
+      if (!r.ok) {
+        const t = await r.text();
+        let msg = t;
+        try { msg = JSON.parse(t).detail || t; } catch {}
+        throw new Error(msg);
+      }
+      const d = await r.json();
+      toast.success(d.exit_ip ? `New proxy: ${d.exit_ip}` : "Proxy refreshed");
+      fetchProfiles();
+      requestLaunch(id);
+    } catch (e) {
+      toast.error(`Retry with new proxy failed: ${e.message}`);
+    } finally {
+      setProxyRetryBusy(null);
+    }
   };
 
   const openCloneDialog = (id) => {
@@ -1391,6 +1499,7 @@ export default function BrowserProfilesPage() {
         onClick={(e) => e.stopPropagation()}
       >
         <button type="button" className={itemClass} disabled={busy || showTrash}
+          data-testid={`bp-launch-url-${p.id}`}
           onClick={() => { setLaunchUrlPrompt({ id: p.id, url: p.start_url || "https://" }); setCardMenuId(null); }}>
           URL
         </button>
@@ -1410,14 +1519,17 @@ export default function BrowserProfilesPage() {
           RPA
         </button>
         <button type="button" className={itemClass} disabled={showTrash || proxyBusy === p.id}
+          data-testid={`bp-proxy-check-${p.id}`}
           onClick={() => { handleProxyCheck(p.id); setCardMenuId(null); }}>
           Proxy
         </button>
         <button type="button" className={itemClass} disabled={showTrash}
+          data-testid={`bp-cookies-${p.id}`}
           onClick={() => { openCookieDialog(p.id); setCardMenuId(null); }}>
           Cookies
         </button>
         <button type="button" className={itemClass} disabled={showTrash}
+          data-testid={`bp-share-${p.id}`}
           onClick={() => {
             setShareDialog({ id: p.id, email: "", includeCookies: false, mode: "acl", role: "editor" });
             setCardMenuId(null);
@@ -1504,6 +1616,58 @@ export default function BrowserProfilesPage() {
           </div>
         </div>
 
+        <div className="flex gap-4 items-start">
+          {!showTrash && (
+            <aside
+              data-testid="bp-folder-sidebar"
+              className="hidden lg:block w-44 flex-shrink-0 rounded-lg border border-zinc-800 bg-zinc-900/80 p-2 sticky top-4"
+            >
+              <p className="text-[10px] uppercase tracking-wide text-zinc-500 px-2 py-1 mb-1">Folders</p>
+              <button
+                type="button"
+                data-testid="bp-folder-all"
+                onClick={() => setFilterFolder("")}
+                className={`w-full text-left px-2 py-1.5 rounded text-xs mb-0.5 ${
+                  !filterFolder ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-300 hover:bg-zinc-800"
+                }`}
+              >
+                All profiles
+              </button>
+              <button
+                type="button"
+                data-testid="bp-folder-unsorted"
+                onClick={() => setFilterFolder("unsorted")}
+                className={`w-full text-left px-2 py-1.5 rounded text-xs mb-0.5 ${
+                  filterFolder === "unsorted" ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-300 hover:bg-zinc-800"
+                }`}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <Folder className="w-3 h-3" /> Unsorted ({foldersUnsorted})
+                </span>
+              </button>
+              {folders.map((f) => (
+                <button
+                  key={f.name}
+                  type="button"
+                  data-testid={`bp-folder-${f.name}`}
+                  onClick={() => setFilterFolder(f.name)}
+                  className={`w-full text-left px-2 py-1.5 rounded text-xs mb-0.5 truncate ${
+                    filterFolder === f.name ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-300 hover:bg-zinc-800"
+                  }`}
+                  title={f.name}
+                >
+                  <span className="inline-flex items-center gap-1 max-w-full">
+                    <Folder className="w-3 h-3 flex-shrink-0" />
+                    <span className="truncate">{f.name}</span>
+                    <span className="text-zinc-500 flex-shrink-0">({f.count})</span>
+                  </span>
+                </button>
+              ))}
+            </aside>
+          )}
+
+          <div className="flex-1 min-w-0">
+
         {/* Info banner */}
         <div className="mb-6 p-3 rounded-lg bg-amber-950/20 border border-amber-700/40 text-xs text-amber-200 flex items-start gap-2">
           <Shield className="w-4 h-4 mt-0.5 text-amber-300" />
@@ -1529,14 +1693,14 @@ export default function BrowserProfilesPage() {
               disabled={showTrash}
             />
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 lg:hidden">
             <Folder className="w-3.5 h-3.5 text-zinc-500" />
             <select
-              data-testid="bp-filter-folder"
+              data-testid="bp-filter-folder-mobile"
               value={filterFolder}
               onChange={(e) => setFilterFolder(e.target.value)}
               disabled={showTrash}
-              className="bg-zinc-950 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs h-8"
+              className="bg-zinc-950 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs h-8 flex-1 min-w-[120px]"
             >
               <option value="">All folders</option>
               <option value="unsorted">Unsorted ({foldersUnsorted})</option>
@@ -1593,6 +1757,21 @@ export default function BrowserProfilesPage() {
             {showTrash ? "Back to profiles" : "Recycle bin"}
           </Button>
         </div>
+
+        {profiles.length > 0 && showTrash && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
+            <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs" onClick={selectAllVisible} data-testid="bp-trash-select-all">
+              Select all
+            </Button>
+            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={clearSelection} variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs">
+              Clear ({selectedCount})
+            </Button>
+            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkPermanentDelete}
+              variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs" data-testid="bp-bulk-permanent-delete">
+              <Trash2 className="w-3 h-3 mr-1" /> Delete forever
+            </Button>
+          </div>
+        )}
 
         {profiles.length > 0 && !showTrash && (
           <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
@@ -1678,7 +1857,7 @@ export default function BrowserProfilesPage() {
             <table className="w-full text-xs text-zinc-300" data-testid="bp-table">
               <thead className="bg-zinc-900/80 text-zinc-500 uppercase tracking-wide">
                 <tr>
-                  {!showTrash && <th className="px-3 py-2 text-left w-8" />}
+                  <th className="px-3 py-2 text-left w-8" />
                   <th className="px-3 py-2 text-left">Name</th>
                   <th className="px-3 py-2 text-left">Status</th>
                   <th className="px-3 py-2 text-left">Health</th>
@@ -1691,11 +1870,9 @@ export default function BrowserProfilesPage() {
               <tbody>
                 {profiles.map((p) => (
                   <tr key={p.id} className="border-t border-zinc-800 hover:bg-zinc-900/50" data-testid={`bp-row-${p.id}`}>
-                    {!showTrash && (
-                      <td className="px-3 py-2">
-                        <input type="checkbox" className="accent-fuchsia-500" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} />
-                      </td>
-                    )}
+                    <td className="px-3 py-2">
+                      <input type="checkbox" className="accent-fuchsia-500" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} />
+                    </td>
                     <td className="px-3 py-2 font-medium text-zinc-100 truncate max-w-[12rem]">{p.name}</td>
                     <td className="px-3 py-2">
                       <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>{p.status || "idle"}</Badge>
@@ -1706,10 +1883,16 @@ export default function BrowserProfilesPage() {
                     <td className="px-3 py-2 text-zinc-500">{p.last_used_label || "—"}</td>
                     <td className="px-3 py-2 text-right">
                       {showTrash ? (
-                        <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
-                          onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
-                          <RotateCcw className="w-3 h-3 mr-1" /> Restore
-                        </Button>
+                        <div className="flex flex-wrap gap-1 justify-end">
+                          <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
+                            onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
+                            <RotateCcw className="w-3 h-3 mr-1" /> Restore
+                          </Button>
+                          <Button size="sm" variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs"
+                            onClick={() => handlePermanentDelete(p.id, p.name)} data-testid={`bp-permanent-delete-${p.id}`}>
+                            <Trash2 className="w-3 h-3 mr-1" /> Delete forever
+                          </Button>
+                        </div>
                       ) : profileIsBusy(p) ? (
                         <Button size="sm" onClick={() => handleStop(p.id)} className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
                           <StopCircle className="w-3 h-3 mr-1" /> Stop
@@ -1739,7 +1922,7 @@ export default function BrowserProfilesPage() {
               >
                 <CardHeader className="pb-3">
                   <div className="flex items-start justify-between gap-2">
-                    <label className={`mt-1 flex-shrink-0 cursor-pointer ${showTrash ? "hidden" : ""}`}>
+                    <label className={`mt-1 flex-shrink-0 cursor-pointer`}>
                       <input
                         type="checkbox"
                         className="w-4 h-4 accent-fuchsia-500"
@@ -1862,10 +2045,16 @@ export default function BrowserProfilesPage() {
                   )}
                   <div className="flex flex-wrap gap-1 items-center">
                     {showTrash ? (
-                      <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
-                        onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
-                        <RotateCcw className="w-3 h-3 mr-1" /> Restore
-                      </Button>
+                      <div className="flex flex-wrap gap-1">
+                        <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
+                          onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
+                          <RotateCcw className="w-3 h-3 mr-1" /> Restore
+                        </Button>
+                        <Button size="sm" variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs"
+                          onClick={() => handlePermanentDelete(p.id, p.name)} data-testid={`bp-permanent-delete-${p.id}`}>
+                          <Trash2 className="w-3 h-3 mr-1" /> Delete forever
+                        </Button>
+                      </div>
                     ) : profileIsBusy(p) ? (
                       <Button data-testid={`bp-stop-${p.id}`} onClick={() => handleStop(p.id)} size="sm" className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
                         <StopCircle className="w-3 h-3 mr-1" /> Stop
@@ -1897,8 +2086,23 @@ export default function BrowserProfilesPage() {
                     <div className="mt-2 text-[10px] text-amber-300/80 italic">{statusMap[p.id].message}</div>
                   )}
                   {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
-                    <div className="mt-2 text-[10px] text-red-300/90 italic break-words" data-testid={`bp-last-error-${p.id}`}>
-                      ⚠ {p.last_error}
+                    <div className="mt-2 space-y-1">
+                      <div className="text-[10px] text-red-300/90 italic break-words" data-testid={`bp-last-error-${p.id}`}>
+                        ⚠ {p.last_error}
+                      </div>
+                      {p.status === "error" && !showTrash && (p.proxy?.enabled || p.proxy?.provider_id || p.proxy?.server) && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={proxyRetryBusy === p.id}
+                          className="h-6 text-[10px] border-amber-800/60 text-amber-300"
+                          data-testid={`bp-retry-proxy-${p.id}`}
+                          onClick={() => handleRetryWithNewProxy(p.id)}
+                        >
+                          <RefreshCw className={`w-3 h-3 mr-1 ${proxyRetryBusy === p.id ? "animate-spin" : ""}`} />
+                          Retry with new proxy
+                        </Button>
+                      )}
                     </div>
                   )}
                   {p.status === "queued" && !p.last_error && (
@@ -1911,6 +2115,24 @@ export default function BrowserProfilesPage() {
             ))}
           </div>
         )}
+
+        {!showTrash && hasMore && profiles.length > 0 && (
+          <div className="mt-4 flex justify-center">
+            <Button
+              data-testid="bp-load-more"
+              variant="outline"
+              className="border-zinc-700 text-zinc-300"
+              disabled={loadingMore}
+              onClick={loadMoreProfiles}
+            >
+              <RefreshCw className={`w-4 h-4 mr-1 ${loadingMore ? "animate-spin" : ""}`} />
+              {loadingMore ? "Loading…" : "Load more profiles"}
+            </Button>
+          </div>
+        )}
+
+          </div>
+        </div>
 
         {/* Create / Edit dialog */}
         {showCreate && (
@@ -1952,6 +2174,15 @@ export default function BrowserProfilesPage() {
                               {t.is_default && (
                                 <Badge variant="outline" className="ml-1 text-[9px] px-1 py-0 h-4 border-fuchsia-700 text-fuchsia-300">default</Badge>
                               )}
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Edit template ${t.name}`}
+                              className="text-zinc-600 hover:text-fuchsia-300 text-xs px-1"
+                              onClick={() => updateProfileTemplate(t.id, t.name)}
+                              data-testid={`bp-template-edit-${t.id}`}
+                            >
+                              <Pencil className="w-3 h-3" />
                             </button>
                             <button
                               type="button"
@@ -2490,6 +2721,28 @@ export default function BrowserProfilesPage() {
                               <span className="block text-[9px] text-zinc-500">Abort launch if proxy check fails</span>
                             </span>
                           </label>
+                          <label className="flex items-start gap-2">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.allow_extensions}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, allow_extensions: e.target.checked } })} />
+                            <span>
+                              allow_extensions
+                              <span className="block text-[9px] text-zinc-500">Load unpacked Chromium extensions (requires extensions_dir or KREXION_PROFILE_EXTENSIONS env)</span>
+                            </span>
+                          </label>
+                          {form.anti_detect.allow_extensions && (
+                            <div>
+                              <Label className="text-zinc-400 text-[10px]">extensions_dir (optional)</Label>
+                              <Input
+                                value={form.anti_detect.extensions_dir || ""}
+                                onChange={(e) => setForm({
+                                  ...form,
+                                  anti_detect: { ...form.anti_detect, extensions_dir: e.target.value },
+                                })}
+                                placeholder="C:\\path\\to\\unpacked\\extension"
+                                className="bg-zinc-900 border-zinc-700 text-zinc-100 h-8 text-xs mt-1"
+                              />
+                            </div>
+                          )}
                           {editingId && (
                             <p className="text-[10px] text-zinc-500 font-mono">
                               fingerprint: {form.fingerprint_short || "(none yet — set after first launch)"}
@@ -3208,6 +3461,7 @@ export default function BrowserProfilesPage() {
                 <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
                   onClick={() => setLaunchUrlPrompt({ id: null, url: "" })}>Cancel</Button>
                 <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                  data-testid={`bp-launch-url-confirm-${launchUrlPrompt.id}`}
                   onClick={handleLaunchUrlConfirm}>Launch</Button>
               </div>
             </div>
