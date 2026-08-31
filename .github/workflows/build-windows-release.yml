@@ -936,6 +936,63 @@ jobs:
           }
           if ($lastErr) { throw $lastErr }
 
+      - name: Upload native installer via GitHub API (mirror handoff)
+        if: startsWith(needs.build-backend.outputs.version, 'v')
+        continue-on-error: true
+        timeout-minutes: 40
+        shell: powershell
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.build-backend.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $file = Join-Path "installer/Output" "Krexion-Setup-$tag.exe"
+          if (-not (Test-Path $file)) { throw "Missing $file for artifact upload" }
+          $token = if ($env:RELEASE_TOKEN) { $env:RELEASE_TOKEN } else { $env:GITHUB_TOKEN }
+          $repo = $env:GITHUB_REPOSITORY
+          $runId = $env:GITHUB_RUN_ID
+          $zip = "native-installer-$tag.zip"
+          Compress-Archive -Path $file -DestinationPath $zip -Force
+          $size = (Get-Item $zip).Length
+          Write-Host "Uploading workflow artifact krexion-native-installer ($size bytes) for run $runId ..."
+          Add-Type -AssemblyName System.Net.Http
+          $client = New-Object System.Net.Http.HttpClient
+          $client.Timeout = [TimeSpan]::FromMinutes(30)
+          [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', "token $token")
+          [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
+          [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'krexion-native-artifact')
+          $boundary = [System.Guid]::NewGuid().ToString()
+          $enc = [System.Text.Encoding]::UTF8
+          $fileBytes = [System.IO.File]::ReadAllBytes($zip)
+          $bodyStream = New-Object System.IO.MemoryStream
+          $writer = New-Object System.IO.StreamWriter($bodyStream, $enc)
+          $writer.Write("--$boundary`r`n")
+          $writer.Write("Content-Disposition: form-data; name=`"name`"`r`n`r`n")
+          $writer.Write("krexion-native-installer`r`n")
+          $writer.Write("--$boundary`r`n")
+          $writer.Write("Content-Disposition: form-data; name=`"retention_days`"`r`n`r`n")
+          $writer.Write("3`r`n")
+          $writer.Write("--$boundary`r`n")
+          $writer.Write("Content-Disposition: form-data; name=`"file`"; filename=`"$zip`"`r`n")
+          $writer.Write("Content-Type: application/zip`r`n`r`n")
+          $writer.Flush()
+          $headerBytes = $enc.GetBytes($writer.ToString())
+          $bodyStream.Write($headerBytes, 0, $headerBytes.Length)
+          $bodyStream.Write($fileBytes, 0, $fileBytes.Length)
+          $footer = $enc.GetBytes("`r`n--$boundary--`r`n")
+          $bodyStream.Write($footer, 0, $footer.Length)
+          $content = New-Object System.Net.Http.ByteArrayContent($bodyStream.ToArray())
+          $content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("multipart/form-data; boundary=$boundary")
+          $uri = "https://uploads.github.com/repos/$repo/actions/artifacts?name=krexion-native-installer&retention_days=3"
+          $resp = $client.PostAsync($uri, $content).GetAwaiter().GetResult()
+          if (-not $resp.IsSuccessStatusCode) {
+            $err = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            throw "Artifact upload failed: HTTP $([int]$resp.StatusCode) $err"
+          }
+          Write-Host "Artifact krexion-native-installer uploaded for mirror job"
+
   # ─────────────────────────────────────────────────────────────────
   # 2026-06 — SELF-HOSTED MIRROR for the Native (Inno-Setup) installer.
   #
@@ -966,10 +1023,51 @@ jobs:
     # Only mirror when an actual release was created (mirrors the Create
     # GitHub Release gate). Skipping otherwise means a dispatch without
     # a release_tag won't try to mirror a non-existent build.
-    if: ${{ needs.build-installer.result == 'success' && startsWith(needs.build-backend.outputs.version, 'v') }}
+    if: ${{ needs.build-installer.result == 'success' }}
     permissions:
       contents: read
+      actions: read
     steps:
+      - name: Checkout VERSION (rerun-safe version resolve)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          SHA="${{ github.sha }}"
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "$REPO"
+          else
+            git remote set-url origin "$REPO"
+          fi
+          git fetch --depth 1 origin "$SHA"
+          git checkout --force --detach "$SHA"
+          git reset --hard "$SHA"
+
+      - name: Resolve release version (needs output or backend/VERSION)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEEDS_VER='${{ needs.build-backend.outputs.version }}'
+          if [ -n "$NEEDS_VER" ]; then
+            VER="$NEEDS_VER"
+          elif [ -f backend/VERSION ] && [ -s backend/VERSION ]; then
+            FILE_VER=$(tr -d '[:space:]' < backend/VERSION)
+            case "$FILE_VER" in
+              v*) VER="$FILE_VER" ;;
+              *)  VER="v$FILE_VER" ;;
+            esac
+          else
+            echo "::error::Cannot resolve release version for mirror"
+            exit 1
+          fi
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved mirror version: $VER"
+
       - name: VPS disk self-heal (runner diag + docker)
         run: |
           set -e
@@ -993,40 +1091,99 @@ jobs:
             exit 1
           fi
 
-      - name: Download installer from GitHub Release (via curl)
+      - name: Download installer (workflow artifact, else GitHub Release)
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          VER: ${{ needs.build-backend.outputs.version }}
-          TARGET: Krexion-Setup-${{ needs.build-backend.outputs.version }}.exe
+          VER: ${{ steps.ver.outputs.ver }}
+          TARGET: Krexion-Setup-${{ steps.ver.outputs.ver }}.exe
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -e
           mkdir -p dist
           REPO="${{ github.repository }}"
-          echo "Downloading Krexion-Setup-${VER}.exe from release ${VER}..."
-          # 2026-01-09 — replaced 'gh' CLI usage with curl. krexion-vps
-          # self-hosted runner doesn't have GitHub CLI installed.
-          # Retry up to 6 times — release propagation lag from
-          # softprops/action-gh-release@v2 is occasionally up to ~45s.
-          TARGET="Krexion-Setup-${VER}.exe"
+          echo "Mirror target: $TARGET (run $GITHUB_RUN_ID)"
+          GOT=0
           for i in 1 2 3 4 5 6; do
-            HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" \
-              -H "Authorization: Bearer $GH_TOKEN" \
+            HTTP=$(curl -s -o /tmp/arts.json -w "%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/releases/tags/$VER")
+              "https://api.github.com/repos/$REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=50")
             if [ "$HTTP" = "200" ]; then
-              echo "  release visible on attempt $i"
-              break
+              ART_ID=$(python3 - <<'PY'
+          import json
+          with open("/tmp/arts.json") as f:
+              arts = json.load(f).get("artifacts", [])
+          for a in arts:
+              if a.get("name") == "krexion-native-installer" and not a.get("expired"):
+                  print(a["id"])
+                  break
+          PY
+              )
+              if [ -n "$ART_ID" ]; then
+                echo "Downloading workflow artifact id=$ART_ID (attempt $i)..."
+                if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  -o /tmp/native-installer.zip \
+                  "https://api.github.com/repos/$REPO/actions/artifacts/$ART_ID/zip"; then
+                  python3 - <<'PY'
+          import glob, os, zipfile
+          os.makedirs("dist", exist_ok=True)
+          with zipfile.ZipFile("/tmp/native-installer.zip") as z:
+              z.extractall("dist")
+          exes = glob.glob("dist/**/*.exe", recursive=True) + glob.glob("dist/*.exe")
+          if not exes:
+              raise SystemExit("No exe in native-installer artifact zip")
+          print("Extracted:", exes[0])
+          PY
+                  GOT=1
+                  break
+                fi
+              fi
             fi
-            echo "  attempt $i: HTTP $HTTP, sleeping 10s..."
-            sleep 10
+            echo "  artifact attempt $i: not ready, sleeping 15s..."
+            sleep 15
           done
-          if [ "$HTTP" != "200" ]; then
-            echo "::error::Release tag $VER not visible after retries (HTTP $HTTP)"
-            exit 1
-          fi
-          # Mirror ONLY the current release installer — never every historical
-          # Krexion-Setup-*.exe on the release (19+ files / ~12GB caused timeouts).
-          python3 - <<PY > /tmp/assets.tsv
+          if [ "$GOT" != "1" ]; then
+            echo "Workflow artifact unavailable — falling back to GitHub Release $VER"
+            for i in $(seq 1 20); do
+              HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/releases/tags/$VER")
+              if [ "$HTTP" != "200" ]; then
+                HTTP=$(curl -s -o /tmp/rel.json -w "%{http_code}" \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/releases?per_page=30")
+                if [ "$HTTP" = "200" ]; then
+                  python3 - <<PY || true
+          import json, os
+          ver = os.environ["VER"]
+          with open("/tmp/rel.json") as f:
+              rels = json.load(f)
+          match = next((r for r in rels if r.get("tag_name") == ver), None)
+          if match:
+              json.dump(match, open("/tmp/rel.json", "w"))
+              print("found via list")
+          else:
+              raise SystemExit(1)
+          PY
+                  [ -s /tmp/rel.json ] && HTTP=200 || HTTP=404
+                fi
+              fi
+              if [ "$HTTP" = "200" ]; then
+                echo "  release visible on attempt $i"
+                break
+              fi
+              echo "  release attempt $i: HTTP $HTTP, sleeping 15s..."
+              sleep 15
+            done
+            if [ "$HTTP" != "200" ]; then
+              echo "::error::Release tag $VER not visible after retries (HTTP $HTTP)"
+              exit 1
+            fi
+            python3 - <<PY > /tmp/assets.tsv
           import json, os, sys
           target = os.environ["TARGET"]
           with open("/tmp/rel.json") as f:
@@ -1039,37 +1196,38 @@ jobs:
           a = matches[0]
           print(f"{a['url']}\t{a['name']}\t{a.get('size', 0)}")
           PY
-          echo "Asset to download:"
-          cat /tmp/assets.tsv
-          while IFS=$'\t' read -r URL NAME EXPECTED; do
-            [ -z "$URL" ] && continue
-            echo "Downloading $NAME (expected ${EXPECTED} bytes) ..."
-            for attempt in 1 2 3 4 5; do
-              if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/octet-stream" \
-                -o "dist/$NAME" "$URL"; then
-                GOT=$(stat -c%s "dist/$NAME" 2>/dev/null || wc -c < "dist/$NAME")
-                if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "0" ] && [ "$GOT" != "$EXPECTED" ]; then
-                  echo "  attempt $attempt: size mismatch got=$GOT expected=$EXPECTED"
-                  rm -f "dist/$NAME"
-                  sleep 15
-                  continue
+            echo "Asset to download:"
+            cat /tmp/assets.tsv
+            while IFS=$'\t' read -r URL NAME EXPECTED; do
+              [ -z "$URL" ] && continue
+              echo "Downloading $NAME (expected ${EXPECTED} bytes) ..."
+              for attempt in 1 2 3 4 5; do
+                if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 3600 \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" \
+                  -o "dist/$NAME" "$URL"; then
+                  GOT=$(stat -c%s "dist/$NAME" 2>/dev/null || wc -c < "dist/$NAME")
+                  if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "0" ] && [ "$GOT" != "$EXPECTED" ]; then
+                    echo "  attempt $attempt: size mismatch got=$GOT expected=$EXPECTED"
+                    rm -f "dist/$NAME"
+                    sleep 15
+                    continue
+                  fi
+                  echo "  downloaded $NAME ($GOT bytes)"
+                  break
                 fi
-                echo "  downloaded $NAME ($GOT bytes)"
-                break
-              fi
-              echo "  attempt $attempt failed, retrying..."
-              rm -f "dist/$NAME"
-              sleep 15
-            done
-            test -s "dist/$NAME"
-          done < /tmp/assets.tsv
+                echo "  attempt $attempt failed, retrying..."
+                rm -f "dist/$NAME"
+                sleep 15
+              done
+              test -s "dist/$NAME"
+            done < /tmp/assets.tsv
+          fi
           ls -lah dist/
 
       - name: Copy installer to VPS downloads dir (local — runner IS the VPS)
         env:
-          VER: ${{ needs.build-backend.outputs.version }}
+          VER: ${{ steps.ver.outputs.ver }}
         run: |
           set -e
           # Fail early if disk is critically low (mirror used to die mid-write).
