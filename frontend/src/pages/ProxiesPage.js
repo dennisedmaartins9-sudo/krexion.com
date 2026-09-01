@@ -8,7 +8,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { Plus, Play, Trash2, RefreshCw, Copy, Square, Clock, ChevronDown, Check, RotateCcw, Globe, AlertTriangle, CheckCircle } from "lucide-react";
+import { Plus, Play, Trash2, RefreshCw, Copy, Square, Clock, ChevronDown, Check, RotateCcw, Globe, AlertTriangle, CheckCircle, Shield } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "../components/ui/popover";
 import { Checkbox } from "../components/ui/checkbox";
 import MyProxyProvidersCard from "../components/MyProxyProvidersCard";
@@ -81,6 +81,11 @@ export default function ProxiesPage() {
   // Bulk test results summary state
   const [bulkTestResults, setBulkTestResults] = useState(null);
   const [showBulkTestSummary, setShowBulkTestSummary] = useState(false);
+
+  const [ipCheckOpen, setIpCheckOpen] = useState(false);
+  const [ipCheckText, setIpCheckText] = useState("");
+  const [ipCheckLoading, setIpCheckLoading] = useState(false);
+  const [ipCheckResults, setIpCheckResults] = useState(null);
 
   // Poll live progress while a bulk test is running
   useEffect(() => {
@@ -309,6 +314,46 @@ export default function ProxiesPage() {
       console.error("Proxy upload error:", error.response?.data || error.message);
       toast.error(error.response?.data?.detail || "Failed to upload proxies");
     }
+  };
+
+  const handleIpQualityCheck = async (e) => {
+    e.preventDefault();
+    const lines = ipCheckText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    if (lines.length === 0) {
+      toast.error("Kam az kam aik IP likhein");
+      return;
+    }
+    setIpCheckLoading(true);
+    setIpCheckResults(null);
+    try {
+      const token = localStorage.getItem("token");
+      const response = await axios.post(
+        `${API}/proxies/check-ip`,
+        { ips: lines },
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 120000 }
+      );
+      setIpCheckResults(response.data);
+      const { total, clean_count, risky_count, invalid = [] } = response.data;
+      let msg = `Checked ${total} IP — ${clean_count} clean, ${risky_count} risky`;
+      if (invalid.length) msg += ` (${invalid.length} invalid skipped)`;
+      toast.success(msg);
+    } catch (error) {
+      const detail = error.response?.data?.detail;
+      toast.error(typeof detail === "string" ? detail : "IP quality check failed");
+    } finally {
+      setIpCheckLoading(false);
+    }
+  };
+
+  const getIpRiskBadgeClass = (risk) => {
+    const r = (risk || "").toLowerCase();
+    if (r === "high" || r === "very high") return "bg-[#EF4444] text-white";
+    if (r === "medium") return "bg-[#F59E0B] text-black";
+    if (r === "low") return "bg-[#22C55E] text-black";
+    return "bg-zinc-700 text-zinc-200";
   };
 
   const handleTest = async (proxyId) => {
@@ -979,6 +1024,107 @@ export default function ProxiesPage() {
               )}
             </>
           )}
+          <Dialog open={ipCheckOpen} onOpenChange={setIpCheckOpen}>
+            <DialogTrigger asChild>
+              <Button variant="outline" data-testid="check-ip-quality-button" className="border-[#06B6D4] text-[#06B6D4] hover:bg-[#06B6D4]/10">
+                <Shield size={16} className="mr-2" />
+                Check IP Quality
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="bg-[var(--brand-card)] border-[var(--brand-border)] max-w-4xl max-h-[90vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>Check IP Quality</DialogTitle>
+                <DialogDescription className="space-y-1">
+                  <span className="block">Sirf IP paste karein — proxy string ki zaroorat nahi. Scamalytics, IPQualityScore, IPHub ya ProxyCheck se fraud score aur geo details milengi.</span>
+                  <span className="block text-[11px] text-zinc-500">Ek line par aik IP (IPv4 ya IPv6). Max 50 IPs per check.</span>
+                </DialogDescription>
+              </DialogHeader>
+              <form onSubmit={handleIpQualityCheck} className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="ip_check_list">IP List</Label>
+                  <Textarea
+                    id="ip_check_list"
+                    data-testid="ip-check-textarea"
+                    placeholder={"203.0.113.45\n198.51.100.22\n2001:db8::1"}
+                    value={ipCheckText}
+                    onChange={(e) => setIpCheckText(e.target.value)}
+                    className="bg-[var(--brand-card)] border-[var(--brand-border)] font-mono text-xs min-h-[140px]"
+                    required
+                  />
+                </div>
+                <Button type="submit" data-testid="submit-ip-check-button" className="w-full" disabled={ipCheckLoading}>
+                  <Shield size={16} className={`mr-2 ${ipCheckLoading ? "animate-pulse" : ""}`} />
+                  {ipCheckLoading ? "Checking..." : "Check IP Quality"}
+                </Button>
+              </form>
+              {ipCheckResults && (
+                <div className="space-y-3 pt-2 border-t border-[var(--brand-border)]">
+                  <div className="flex flex-wrap gap-3 text-sm">
+                    <span className="text-zinc-400">Total: <span className="text-white font-mono">{ipCheckResults.total}</span></span>
+                    <span className="text-[#22C55E]">Clean: {ipCheckResults.clean_count}</span>
+                    <span className="text-[#F59E0B]">Risky: {ipCheckResults.risky_count}</span>
+                    {ipCheckResults.truncated && (
+                      <span className="text-[#EF4444] text-xs">(first 50 only)</span>
+                    )}
+                  </div>
+                  {ipCheckResults.invalid?.length > 0 && (
+                    <p className="text-xs text-[#EF4444]">
+                      Invalid skipped: {ipCheckResults.invalid.join(", ")}
+                    </p>
+                  )}
+                  <div className="rounded-md border border-[var(--brand-border)] overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>IP</TableHead>
+                          <TableHead>Fraud</TableHead>
+                          <TableHead>Quality</TableHead>
+                          <TableHead>Risk</TableHead>
+                          <TableHead>Country</TableHead>
+                          <TableHead>Flags</TableHead>
+                          <TableHead>Provider</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {(ipCheckResults.results || []).map((row) => (
+                          <TableRow key={row.ip}>
+                            <TableCell className="font-mono text-xs">{row.ip}</TableCell>
+                            <TableCell>
+                              {row.error ? (
+                                <span className="text-[#EF4444] text-xs">Error</span>
+                              ) : (
+                                <span className="font-mono text-xs">{row.fraud_score ?? 0}</span>
+                              )}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-[#06B6D4]">{row.quality_score ?? "-"}</TableCell>
+                            <TableCell>
+                              <Badge className={`text-xs ${getIpRiskBadgeClass(row.risk)}`}>{row.risk || "-"}</Badge>
+                            </TableCell>
+                            <TableCell className="text-xs">{row.country || "-"}</TableCell>
+                            <TableCell>
+                              <div className="flex flex-wrap gap-1">
+                                {row.is_vpn && <Badge className="bg-[#F59E0B] text-black text-[10px]">VPN</Badge>}
+                                {row.is_proxy && <Badge className="bg-[#F59E0B] text-black text-[10px]">Proxy</Badge>}
+                                {row.is_hosting && <Badge variant="outline" className="text-[10px]">Hosting</Badge>}
+                                {row.is_datacenter && <Badge variant="outline" className="text-[10px]">DC</Badge>}
+                                {row.is_tor && <Badge className="bg-[#EF4444] text-white text-[10px]">Tor</Badge>}
+                                {!row.is_vpn && !row.is_proxy && !row.is_hosting && !row.error && (
+                                  <Badge variant="outline" className="border-[#22C55E] text-[#22C55E] text-[10px]">Clean</Badge>
+                                )}
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-[10px] text-zinc-400 max-w-[120px] truncate" title={row.source}>
+                              {row.provider || row.source || "-"}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              )}
+            </DialogContent>
+          </Dialog>
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Button data-testid="upload-proxies-button">

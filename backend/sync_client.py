@@ -403,6 +403,9 @@ async def _execute_job_locally(job: dict, jwt_token: str | None = None) -> dict:
         # browser_profile_launcher.launch_profile_session().
         "browser-profile/launch": ("POST", "__browser_profile_launch__"),
         "browser-profile/stop":   ("POST", "__browser_profile_stop__"),
+        "browser-profile/run-automation": ("POST", "__browser_profile_run_automation__"),
+        "browser-profile/stop-automation": ("POST", "__browser_profile_stop_automation__"),
+        "browser-profile/bulk-run-json": ("POST", "/api/browser-profiles/bulk-run-json"),
     }
     if feature not in feature_routes:
         # v1.0.14 NEW: generic passthrough for the require_local_mode
@@ -773,6 +776,25 @@ async def _execute_job_locally(job: dict, jwt_token: str | None = None) -> dict:
             return {"status": "done", "result": {"stopped": ok, "session_id": session_id}}
         except Exception as e:
             return {"status": "failed", "error": f"browser-profile stop failed: {e}"}
+
+    if route == "__browser_profile_run_automation__":
+        try:
+            from browser_profile_launcher import request_run_automation
+            session_id = str(payload.get("session_id") or "")
+            auto_spec = payload.get("automation") or {}
+            ok = request_run_automation(session_id, auto_spec)
+            return {"status": "done", "result": {"queued": ok, "session_id": session_id}}
+        except Exception as e:
+            return {"status": "failed", "error": f"browser-profile run-automation failed: {e}"}
+
+    if route == "__browser_profile_stop_automation__":
+        try:
+            from browser_profile_launcher import request_stop_automation
+            session_id = str(payload.get("session_id") or "")
+            ok = request_stop_automation(session_id)
+            return {"status": "done", "result": {"stopped": ok, "session_id": session_id}}
+        except Exception as e:
+            return {"status": "failed", "error": f"browser-profile stop-automation failed: {e}"}
 
     url = f"{LOCAL_API_BASE}{route}"
     headers = {"Content-Type": "application/json"}

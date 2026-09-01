@@ -597,7 +597,9 @@ export default function UploadedThingsPage() {
       const baseName = u.file_name || `${u.name || "data_file"}.xlsx`;
       a.download = which === "remaining"
         ? baseName.replace(/(\.[a-zA-Z0-9]+)?$/, "_remaining$1")
-        : baseName;
+        : which === "used"
+          ? baseName.replace(/(\.[a-zA-Z0-9]+)?$/, "_used$1")
+          : baseName;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1317,6 +1319,18 @@ export default function UploadedThingsPage() {
                         className="text-amber-400 hover:text-amber-300 hover:bg-amber-900/20"
                         data-testid={`ut-dl-remaining-${u.id}`}
                         title={`Download REMAINING leads (${u.available_count} of ${u.original_item_count} unused)`}
+                      >
+                        <Download size={16} />
+                      </Button>
+                    )}
+                    {canDownload && u.has_used_file && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => downloadOne(u, "used")}
+                        className="text-violet-400 hover:text-violet-300 hover:bg-violet-900/20"
+                        data-testid={`ut-dl-used-${u.id}`}
+                        title={`Download USED leads sheet (${u.consumed_count || 0} consumed rows)`}
                       >
                         <Download size={16} />
                       </Button>

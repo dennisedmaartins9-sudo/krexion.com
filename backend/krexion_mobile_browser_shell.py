@@ -605,10 +605,10 @@ def _shell_apply_loop(
 
             if parent_pid:
                 try:
-                    proc = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(parent_pid))
-                    if not proc:
+                    from krexion_window_icon import is_process_alive
+
+                    if not is_process_alive(int(parent_pid)):
                         return
-                    ctypes.windll.kernel32.CloseHandle(proc)
                 except Exception:
                     pass
 

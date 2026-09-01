@@ -45,6 +45,9 @@ logger = logging.getLogger("browser_profile_launcher")
 # Track running sessions so the UI / stop endpoint can find them
 _RUNNING_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+# v2.7.78 — Ignore transient missing windows/shell during profile startup.
+_PROFILE_UI_WATCH_GRACE_SEC = 45.0
+
 
 def _profile_user_closed_ui(
     session_id: str,
@@ -53,6 +56,10 @@ def _profile_user_closed_ui(
     tracked_pages: set,
 ) -> bool:
     """Detect user closed the profile browser (X). Minimize keeps session alive."""
+    sess = _RUNNING_SESSIONS.get(session_id) or {}
+    watch_started = float(sess.get("ui_watch_started_mono") or 0.0)
+    in_grace = watch_started > 0 and (time.monotonic() - watch_started) < _PROFILE_UI_WATCH_GRACE_SEC
+
     try:
         if browser is not None and hasattr(browser, "is_connected"):
             if not browser.is_connected():
@@ -66,6 +73,9 @@ def _profile_user_closed_ui(
         ]
         live_tracked = {p for p in tracked_pages if not p.is_closed()}
         if not live_ctx and not live_tracked:
+            # During startup Playwright may briefly have zero pages while WebKit/shell attach.
+            if in_grace:
+                return False
             return True
     except Exception:
         pass
@@ -73,7 +83,9 @@ def _profile_user_closed_ui(
     if not sys.platform.startswith("win"):
         return False
 
-    sess = _RUNNING_SESSIONS.get(session_id) or {}
+    if in_grace:
+        return False
+
     driver_pid = sess.get("driver_pid")
     try:
         from krexion_window_icon import is_process_alive, profile_engine_window_exists
@@ -1843,6 +1855,8 @@ async def _launch_profile_session_inner(
         except Exception as _hydr_err:
             logger.warning(f"[profile-launch] proxy cred hydrate skipped: {_hydr_err}")
 
+    proxy_cfg = profile_config.get("proxy") or proxy_cfg
+
     proxy_arg = None
     proxy_diag: Dict[str, Any] = {"requested": False, "server": "", "ok": None, "error": ""}
     _proxy_enabled = bool(
@@ -2325,7 +2339,10 @@ async def _launch_profile_session_inner(
 
                 if _use_mobile_shell:
                     try:
-                        from krexion_mobile_browser_shell import apply_krexion_mobile_shell
+                        from krexion_mobile_browser_shell import (
+                            apply_krexion_mobile_shell,
+                            is_mobile_shell_alive,
+                        )
 
                         apply_krexion_mobile_shell(
                             _family_pids,
@@ -2340,12 +2357,28 @@ async def _launch_profile_session_inner(
                             webkit=_profile_engine == "webkit",
                             home_url=str(start_url or "https://www.google.com/")[:512],
                         )
-                        _launch_ui_meta["mobile_shell"] = True
+                        _shell_active = False
+                        for _shell_wait in range(20):
+                            if is_mobile_shell_alive(session_id):
+                                _shell_active = True
+                                break
+                            time.sleep(0.15)
+                        if _shell_active:
+                            _launch_ui_meta["mobile_shell"] = True
+                            logger.info(
+                                f"[profile-launch] mobile shell ON session={session_id[:8]}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[profile-launch] mobile shell failed to start "
+                                f"session={session_id[:8]} — using engine window only"
+                            )
                     except Exception as _ms_err:
-                        logger.debug(f"[profile-launch] mobile shell skipped: {_ms_err}")
-                elif _profile_engine == "webkit" and str(profile_os or "").lower() in (
-                    "ios",
-                    "ipados",
+                        logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
+                if (
+                    not _launch_ui_meta.get("mobile_shell")
+                    and _profile_engine == "webkit"
+                    and str(profile_os or "").lower() in ("ios", "ipados")
                 ):
                     from krexion_ios_safari_shell import apply_ios_safari_shell_to_pids
 
@@ -2363,6 +2396,7 @@ async def _launch_profile_session_inner(
 
         _brand_krexion_taskbar()
         if session_id in _RUNNING_SESSIONS:
+            _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
             _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
 
         # Publish CDP websocket for Local API automation clients
@@ -3082,6 +3116,16 @@ async def _launch_profile_session_inner(
             except Exception:
                 pass
 
+        # v2.7.79 — Optional JSON automation (RUT step engine) after first navigation.
+        if profile_config.get("_launch_automation", {}).get("enabled"):
+            await _run_profile_automation_if_configured(
+                page,
+                profile_config,
+                session_id=session_id,
+                profile_id=profile_id,
+                on_session_update=on_session_update,
+            )
+
         # ── Wait until the customer closes the browser ───────────────
         # We poll instead of using a single await so we can also respond
         # to a programmatic stop request from the cloud /stop endpoint.
@@ -3104,6 +3148,10 @@ async def _launch_profile_session_inner(
                     ]
                     live_tracked = {p for p in _tracked_pages if not p.is_closed()}
                     if not live_ctx and not live_tracked:
+                        _sess = _RUNNING_SESSIONS.get(session_id) or {}
+                        _watch = float(_sess.get("ui_watch_started_mono") or 0.0)
+                        if _watch > 0 and (time.monotonic() - _watch) < _PROFILE_UI_WATCH_GRACE_SEC:
+                            return
                         closed_event.set()
                 except Exception:
                     closed_event.set()
@@ -3175,6 +3223,32 @@ async def _launch_profile_session_inner(
                         )
                     except Exception as _sh_err:
                         logger.debug(f"[mobile-shell] command poll skipped: {_sh_err}")
+                # v2.7.79 — Drain queued JSON automation re-runs (profile still open).
+                _auto_q = sess.get("automation_queue") or []
+                if (
+                    _auto_q
+                    and page
+                    and not page.is_closed()
+                    and not sess.get("automation_running")
+                    and not sess.get("automation_cancel_requested")
+                ):
+                    _next_auto = _auto_q.pop(0)
+                    try:
+                        _live_pg = [
+                            p for p in (getattr(context, "pages", None) or [])
+                            if not p.is_closed()
+                        ]
+                        _auto_pg = _live_pg[0] if _live_pg else page
+                        await _run_profile_automation_if_configured(
+                            _auto_pg,
+                            profile_config,
+                            session_id=session_id,
+                            profile_id=profile_id,
+                            on_session_update=on_session_update,
+                            automation_spec=_next_auto,
+                        )
+                    except Exception as _aq_err:
+                        logger.debug(f"[profile-automation] queue run skipped: {_aq_err}")
                 # Periodic storage_state flush (crash recovery when identity_persist ON)
                 if identity_persist and (time.time() - _last_storage_flush) >= 120.0:
                     _last_storage_flush = time.time()
@@ -3251,6 +3325,119 @@ def request_stop(session_id: str) -> bool:
         return False
     sess["stop_requested"] = True
     return True
+
+
+def request_stop_automation(session_id: str) -> bool:
+    """Stop JSON automation only — browser profile stays open for manual use."""
+    sid = str(session_id or "").strip()
+    sess = _RUNNING_SESSIONS.get(sid) or _RUNNING_SESSIONS.get(session_id)
+    if not sess:
+        return False
+    sess["automation_cancel_requested"] = True
+    sess["automation_queue"] = []
+    task = sess.get("automation_task")
+    try:
+        if task is not None and hasattr(task, "done") and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+    return True
+
+
+def request_run_automation(session_id: str, automation_spec: Dict[str, Any]) -> bool:
+    """Queue JSON automation on a live profile session (Phase 4 re-run)."""
+    sid = str(session_id or "").strip()
+    if sid not in _RUNNING_SESSIONS:
+        return False
+    if not isinstance(automation_spec, dict) or not automation_spec.get("enabled"):
+        return False
+    sess = _RUNNING_SESSIONS[sid]
+    queue = sess.setdefault("automation_queue", [])
+    queue.append(dict(automation_spec))
+    return True
+
+
+async def _run_profile_automation_if_configured(
+    page: Any,
+    profile_config: Dict[str, Any],
+    *,
+    session_id: str,
+    profile_id: str,
+    on_session_update: Optional[Any],
+    automation_spec: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Run JSON steps when launch spec or queued re-run requests automation."""
+    spec = dict(automation_spec or profile_config.get("_launch_automation") or {})
+    if not spec.get("enabled") or not spec.get("steps"):
+        return
+    uid = str(profile_config.get("user_id") or "").strip()
+    sess = _RUNNING_SESSIONS.get(session_id)
+    if sess and sess.get("automation_running"):
+        return
+    if sess:
+        sess["automation_running"] = True
+        sess["automation_cancel_requested"] = False
+
+    def _should_cancel() -> bool:
+        s = _RUNNING_SESSIONS.get(session_id) or {}
+        return bool(s.get("automation_cancel_requested"))
+
+    _profile_db = None
+    if uid:
+        try:
+            from server import get_user_db
+
+            _profile_db = get_user_db(uid)
+        except Exception:
+            _profile_db = None
+
+    try:
+        from browser_profile_automation import run_profile_automation
+
+        await run_profile_automation(
+            page,
+            list(spec.get("steps") or []),
+            dict(spec.get("lead_row") or {}),
+            user_id=uid,
+            session_id=session_id,
+            profile_id=profile_id,
+            on_session_update=on_session_update,
+            skip_missing_steps=spec.get("skip_missing_steps", True) is not False,
+            self_heal=bool(spec.get("self_heal")),
+            should_cancel=_should_cancel,
+            data_file_id=str(spec.get("data_file_id") or ""),
+            lead_row_index=spec.get("lead_row_index"),
+            db=_profile_db,
+        )
+    except asyncio.CancelledError:
+        if on_session_update:
+            try:
+                await on_session_update({
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "status": "running",
+                    "automation_status": "stopped",
+                    "automation_error": "",
+                })
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning(f"[profile-automation] run failed: {exc}")
+        if on_session_update:
+            try:
+                await on_session_update({
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "status": "running",
+                    "automation_status": "error",
+                    "automation_error": str(exc)[:512],
+                })
+            except Exception:
+                pass
+    finally:
+        if sess:
+            sess["automation_running"] = False
+            sess.pop("automation_task", None)
 
 
 def list_running() -> Dict[str, Dict[str, Any]]:
@@ -3616,6 +3803,8 @@ async def warm_profile_cookies(
 __all__ = [
     "launch_profile_session",
     "request_stop",
+    "request_stop_automation",
+    "request_run_automation",
     "list_running",
     "process_pending_user_session_launches",
     "expire_stale_user_session_launches",

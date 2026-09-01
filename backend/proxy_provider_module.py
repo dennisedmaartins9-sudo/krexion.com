@@ -1326,6 +1326,22 @@ async def _pick_from_api(cfg: Dict[str, Any], proxy_type: str) -> Optional[str]:
         return None
 
 
+async def get_provider_gateway_credentials(
+    user_id: str, provider_id: str,
+) -> Dict[str, str]:
+    """Return stored gateway username/password for a rotating provider (no rotation)."""
+    provider = await _get(user_id, provider_id)
+    if not provider:
+        return {}
+    cfg = provider.get("config") or {}
+    return {
+        "username": str(cfg.get("username") or "").strip(),
+        "password": str(cfg.get("password") or "").strip(),
+        "gateway_host": str(cfg.get("gateway_host") or "").strip(),
+        "gateway_port": str(cfg.get("gateway_port") or "").strip(),
+    }
+
+
 async def get_proxy_from_provider(user_id: str, provider_id: str) -> Dict[str, Any]:
     """
     Returns {"proxy": "<scheme>://user:pass@host:port", "proxy_type": "...",

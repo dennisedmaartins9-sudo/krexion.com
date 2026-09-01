@@ -33,9 +33,22 @@ import {
   RotateCcw,
   ChevronDown,
   Pencil,
+  Braces,
 } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api/browser-profiles`;
+const UPLOADS_API = `${process.env.REACT_APP_BACKEND_URL}/api/uploads`;
+
+const DEFAULT_LAUNCH_AUTO = {
+  enabled: false,
+  automation_upload_id: "",
+  data_file_id: "",
+  lead_row_index: 0,
+  skip_missing_steps: true,
+  self_heal: false,
+  save_as_default: false,
+  proxy_upload_id: "",
+};
 const PAGE_SIZE = 50;
 
 const COUNTRY_OPTIONS = [
@@ -287,6 +300,16 @@ export default function BrowserProfilesPage() {
   const [maxConcurrent, setMaxConcurrent] = useState(5);
   const [showTrash, setShowTrash] = useState(false);
   const [launchChecklist, setLaunchChecklist] = useState({ open: false, id: null, data: null, startUrl: undefined });
+  const [launchAuto, setLaunchAuto] = useState({ ...DEFAULT_LAUNCH_AUTO });
+  const [bulkLaunchAuto, setBulkLaunchAuto] = useState({ ...DEFAULT_LAUNCH_AUTO });
+  const [automationUploads, setAutomationUploads] = useState([]);
+  const [dataFileUploads, setDataFileUploads] = useState([]);
+  const [proxyUploads, setProxyUploads] = useState([]);
+  const [uploadsLoading, setUploadsLoading] = useState(false);
+  const [runAutoBusy, setRunAutoBusy] = useState(null);
+  const [jsonMenuOpen, setJsonMenuOpen] = useState(false);
+  const [jsonRunBusy, setJsonRunBusy] = useState(false);
+  const [stopAutoBusy, setStopAutoBusy] = useState(null);
   const [cloneDialog, setCloneDialog] = useState({
     open: false, id: null, opts: { include_cookies: false, fresh_proxy: true, fresh_ua: false },
   });
@@ -375,7 +398,15 @@ export default function BrowserProfilesPage() {
 
   useEffect(() => {
     fetchTemplates();
+    fetchAutomationUploads();
   }, []);
+
+  useEffect(() => {
+    if (!jsonMenuOpen) return undefined;
+    const close = () => setJsonMenuOpen(false);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [jsonMenuOpen]);
 
   const serializeCreateState = () => ({
     form,
@@ -854,9 +885,24 @@ export default function BrowserProfilesPage() {
     if (!selectedCount || bulkBusy) return;
     setBulkBusy(true);
     try {
+      const payload = {
+        profile_ids: [...selectedIds],
+        max_concurrent: maxConcurrent,
+      };
+      if (bulkLaunchAuto.enabled && bulkLaunchAuto.automation_upload_id) {
+        payload.automation = {
+          enabled: true,
+          automation_upload_id: bulkLaunchAuto.automation_upload_id,
+          data_file_id: bulkLaunchAuto.data_file_id || "",
+          lead_row_index: Number(bulkLaunchAuto.lead_row_index) || 0,
+          skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
+          self_heal: !!bulkLaunchAuto.self_heal,
+          after_mode: "manual",
+        };
+      }
       const r = await fetch(`${API}/bulk-launch`, {
         method: "POST", headers: authHeaders,
-        body: JSON.stringify({ profile_ids: [...selectedIds], max_concurrent: maxConcurrent }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) throw new Error(await r.text());
       const d = await r.json();
@@ -867,6 +913,59 @@ export default function BrowserProfilesPage() {
       toast.error(`Bulk launch failed: ${e.message}`);
     } finally {
       setBulkBusy(false);
+    }
+  };
+
+  const handleBulkRunJson = async (uploadId) => {
+    if (!selectedCount || jsonRunBusy || !uploadId) return;
+    setJsonMenuOpen(false);
+    setJsonRunBusy(true);
+    try {
+      const r = await fetch(`${API}/bulk-run-json`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          profile_ids: [...selectedIds],
+          automation_upload_id: uploadId,
+          data_file_id: bulkLaunchAuto.data_file_id || "",
+          proxy_upload_id: bulkLaunchAuto.proxy_upload_id || "",
+          max_concurrent: maxConcurrent,
+          skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
+          self_heal: !!bulkLaunchAuto.self_heal,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      const label = automationUploads.find((u) => u.id === uploadId);
+      toast.success(
+        `JSON started on ${d.started_count || 0} profile(s) — ${label?.name || label?.filename || "template"}`,
+      );
+      if (d.skipped?.length) {
+        toast.info(`${d.skipped.length} skipped (busy or cap)`);
+      }
+      clearSelection();
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`JSON run failed: ${e.message}`);
+    } finally {
+      setJsonRunBusy(false);
+    }
+  };
+
+  const handleStopAutomation = async (id) => {
+    setStopAutoBusy(id);
+    try {
+      const r = await fetch(`${API}/${id}/stop-automation`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("JSON automation stopped — profile still open for manual use");
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Stop automation failed: ${e.message}`);
+    } finally {
+      setStopAutoBusy(null);
     }
   };
 
@@ -1422,11 +1521,25 @@ export default function BrowserProfilesPage() {
     requestLaunch(id, u || undefined);
   };
 
-  const executeLaunch = async (id, startUrl) => {
+  const executeLaunch = async (id, startUrl, automationOpts = null) => {
     try {
+      const auto = automationOpts || { ...DEFAULT_LAUNCH_AUTO };
+      const payload = { start_url: startUrl || undefined };
+      if (auto.enabled && auto.automation_upload_id) {
+        payload.automation = {
+          enabled: true,
+          automation_upload_id: auto.automation_upload_id,
+          data_file_id: auto.data_file_id || "",
+          lead_row_index: Number(auto.lead_row_index) || 0,
+          skip_missing_steps: auto.skip_missing_steps !== false,
+          self_heal: !!auto.self_heal,
+          after_mode: "manual",
+          save_as_default: !!auto.save_as_default,
+        };
+      }
       const r = await fetch(`${API}/${id}/launch`, {
         method: "POST", headers: authHeaders,
-        body: JSON.stringify({ start_url: startUrl || undefined }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const txt = await r.text();
@@ -1436,7 +1549,11 @@ export default function BrowserProfilesPage() {
       const d = await r.json();
       setStatusMap((m) => ({ ...m, [id]: { ...d } }));
       if (d.desktop_available) {
-        toast.success("Launch queued — desktop app will open the browser");
+        toast.success(
+          d.automation_enabled
+            ? "Launch + JSON automation queued on this PC"
+            : "Launch queued — desktop app will open the browser",
+        );
       } else {
         toast.warning("Profile saved — install the Krexion desktop app to launch", { duration: 6000 });
       }
@@ -1444,11 +1561,74 @@ export default function BrowserProfilesPage() {
     } catch (e) { toast.error(`Launch failed: ${e.message}`); }
   };
 
+  const fetchAutomationUploads = async () => {
+    setUploadsLoading(true);
+    try {
+      const [ajR, dfR, pxR] = await Promise.all([
+        fetch(`${UPLOADS_API}?type=automation_json`, { headers: authHeaders }),
+        fetch(`${UPLOADS_API}?type=data_file`, { headers: authHeaders }),
+        fetch(`${UPLOADS_API}?type=proxies`, { headers: authHeaders }),
+      ]);
+      if (ajR.ok) {
+        const aj = await ajR.json();
+        setAutomationUploads(Array.isArray(aj) ? aj : []);
+      }
+      if (dfR.ok) {
+        const df = await dfR.json();
+        setDataFileUploads(Array.isArray(df) ? df : []);
+      }
+      if (pxR.ok) {
+        const px = await pxR.json();
+        setProxyUploads(Array.isArray(px) ? px : []);
+      }
+    } catch (_) { /* optional */ }
+    finally { setUploadsLoading(false); }
+  };
+
+  const handleRunAutomationAgain = async (p) => {
+    const uploadId = launchAuto.automation_upload_id
+      || p.default_automation_upload_id
+      || "";
+    if (!uploadId) {
+      toast.error("Select a JSON template in Launch preview first, or save a default.");
+      return;
+    }
+    setRunAutoBusy(p.id);
+    try {
+      const r = await fetch(`${API}/${p.id}/run-automation`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({
+          automation_upload_id: uploadId,
+          data_file_id: launchAuto.data_file_id || p.default_data_file_id || "",
+          lead_row_index: Number(launchAuto.lead_row_index) || 0,
+          skip_missing_steps: launchAuto.skip_missing_steps !== false,
+          self_heal: !!launchAuto.self_heal,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      toast.success("JSON automation queued on open profile");
+      fetchProfiles();
+    } catch (e) {
+      toast.error(`Run automation failed: ${e.message}`);
+    } finally {
+      setRunAutoBusy(null);
+    }
+  };
+
   const requestLaunch = async (id, startUrl) => {
     try {
-      const r = await fetch(`${API}/${id}/launch-preview`, { headers: authHeaders });
-      if (!r.ok) throw new Error(await r.text());
-      const data = await r.json();
+      const [prevR] = await Promise.all([
+        fetch(`${API}/${id}/launch-preview`, { headers: authHeaders }),
+        fetchAutomationUploads(),
+      ]);
+      if (!prevR.ok) throw new Error(await prevR.text());
+      const data = await prevR.json();
+      setLaunchAuto({
+        ...DEFAULT_LAUNCH_AUTO,
+        automation_upload_id: data.default_automation_upload_id || "",
+        data_file_id: data.default_data_file_id || "",
+      });
       setLaunchChecklist({ open: true, id, data, startUrl });
     } catch (e) {
       toast.error(`Launch preview failed: ${e.message}`);
@@ -1457,8 +1637,9 @@ export default function BrowserProfilesPage() {
 
   const confirmLaunchFromChecklist = () => {
     const { id, startUrl } = launchChecklist;
+    const auto = { ...launchAuto };
     setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined });
-    if (id) executeLaunch(id, startUrl);
+    if (id) executeLaunch(id, startUrl, auto);
   };
 
   const handleLaunch = (id, startUrl) => requestLaunch(id, startUrl);
@@ -1488,6 +1669,32 @@ export default function BrowserProfilesPage() {
   };
 
   const profileIsBusy = (p) => ["running", "launching", "stopping", "queued"].includes(p.status);
+  const profileAutomationActive = (p) => ["queued", "running"].includes(String(p.automation_status || "").toLowerCase());
+
+  const renderProfileRunningActions = (p) => (
+    <>
+      {profileAutomationActive(p) && (
+        <Button
+          size="sm"
+          onClick={() => handleStopAutomation(p.id)}
+          disabled={stopAutoBusy === p.id}
+          className="bg-amber-600 hover:bg-amber-700 text-white h-7 text-xs"
+          data-testid={`bp-stop-auto-${p.id}`}
+        >
+          <StopCircle className="w-3 h-3 mr-1" />
+          {stopAutoBusy === p.id ? "Stopping…" : "Stop Auto"}
+        </Button>
+      )}
+      <Button
+        size="sm"
+        onClick={() => handleStop(p.id)}
+        className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs"
+        data-testid={`bp-stop-${p.id}`}
+      >
+        <StopCircle className="w-3 h-3 mr-1" /> Stop
+      </Button>
+    </>
+  );
 
   const renderProfileMoreMenu = (p) => {
     const busy = profileIsBusy(p);
@@ -1503,6 +1710,13 @@ export default function BrowserProfilesPage() {
           onClick={() => { setLaunchUrlPrompt({ id: p.id, url: p.start_url || "https://" }); setCardMenuId(null); }}>
           URL
         </button>
+        {p.status === "running" && (
+          <button type="button" className={itemClass} disabled={runAutoBusy === p.id}
+            data-testid={`bp-run-automation-${p.id}`}
+            onClick={() => { handleRunAutomationAgain(p); setCardMenuId(null); }}>
+            Run JSON again
+          </button>
+        )}
         <button type="button" className={itemClass} disabled={showTrash}
           onClick={() => { openFingerprintModal(p.id); setCardMenuId(null); }}>
           Fingerprint
@@ -1814,10 +2028,111 @@ export default function BrowserProfilesPage() {
                 </Button>
               </div>
             )}
+            <div className="flex items-center gap-2 text-xs text-zinc-400 flex-wrap">
+              <select
+                className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[140px]"
+                value={bulkLaunchAuto.data_file_id}
+                onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, data_file_id: e.target.value }))}
+                data-testid="bp-bulk-auto-leads"
+                title="Uploaded Things lead file — RUT jaisa, use hone par row remove"
+              >
+                <option value="">Lead file…</option>
+                {dataFileUploads.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name || u.filename || u.id.slice(0, 8)} ({u.available_count ?? u.item_count ?? 0})
+                  </option>
+                ))}
+              </select>
+              <select
+                className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[140px]"
+                value={bulkLaunchAuto.proxy_upload_id}
+                onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, proxy_upload_id: e.target.value }))}
+                data-testid="bp-bulk-auto-proxy-upload"
+                title="Proxy batch (Uploaded Things) ya khali = profile provider se fresh unique IP"
+              >
+                <option value="">Provider fresh IP</option>
+                {proxyUploads.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name || u.id.slice(0, 8)} ({u.available_count ?? u.item_count ?? 0})
+                  </option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="accent-fuchsia-500"
+                  checked={bulkLaunchAuto.enabled}
+                  onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, enabled: e.target.checked }))}
+                  data-testid="bp-bulk-auto-enable"
+                />
+                JSON on Launch
+              </label>
+              {bulkLaunchAuto.enabled && (
+                <>
+                  <select
+                    className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[140px]"
+                    value={bulkLaunchAuto.automation_upload_id}
+                    onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, automation_upload_id: e.target.value }))}
+                    data-testid="bp-bulk-auto-json"
+                  >
+                    <option value="">JSON template…</option>
+                    {automationUploads.map((u) => (
+                      <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
+                    ))}
+                  </select>
+                </>
+              )}
+            </div>
             <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
               <Play className="w-3 h-3 mr-1" /> Launch
             </Button>
+            <div className="relative" data-testid="bp-bulk-json-wrap">
+              <Button
+                size="sm"
+                disabled={!selectedCount || jsonRunBusy || uploadsLoading}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!automationUploads.length) {
+                    fetchAutomationUploads();
+                  }
+                  setJsonMenuOpen((v) => !v);
+                }}
+                className="bg-violet-600 hover:bg-violet-700 text-white h-7 text-xs"
+                data-testid="bp-bulk-json"
+              >
+                <Braces className="w-3 h-3 mr-1" />
+                {jsonRunBusy ? "Starting…" : "JSON"}
+                <ChevronDown className="w-3 h-3 ml-1" />
+              </Button>
+              {jsonMenuOpen && (
+                <div
+                  className="absolute left-0 top-full mt-1 z-40 min-w-[14rem] max-h-64 overflow-y-auto rounded-md border border-zinc-700 bg-zinc-950 shadow-xl py-1"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {uploadsLoading ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500">Loading JSON templates…</div>
+                  ) : automationUploads.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500">
+                      No JSON templates — upload in RUT / Visual Recorder first.
+                    </div>
+                  ) : (
+                    automationUploads.map((u) => (
+                      <button
+                        key={u.id}
+                        type="button"
+                        className="w-full text-left px-3 py-2 text-xs text-zinc-200 hover:bg-violet-950/50 hover:text-violet-200 truncate"
+                        data-testid={`bp-json-pick-${u.id}`}
+                        title={u.name || u.filename || u.id}
+                        onClick={() => handleBulkRunJson(u.id)}
+                      >
+                        {u.name || u.filename || u.id.slice(0, 12)}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
             <Button size="sm" disabled={selectedCount < 2 || syncBusy} onClick={handleStartSync}
               className="bg-sky-700 hover:bg-sky-800 text-white h-7 text-xs" data-testid="bp-sync-start"
               title="First selected = master; others = slaves (must be running with CDP)">
@@ -1894,9 +2209,9 @@ export default function BrowserProfilesPage() {
                           </Button>
                         </div>
                       ) : profileIsBusy(p) ? (
-                        <Button size="sm" onClick={() => handleStop(p.id)} className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
-                          <StopCircle className="w-3 h-3 mr-1" /> Stop
-                        </Button>
+                        <div className="flex flex-wrap gap-1 justify-end">
+                          {renderProfileRunningActions(p)}
+                        </div>
                       ) : (
                         <Button size="sm" onClick={() => handleLaunch(p.id)} className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid={`bp-launch-${p.id}`}>
                           <Play className="w-3 h-3 mr-1" /> Launch
@@ -2056,9 +2371,9 @@ export default function BrowserProfilesPage() {
                         </Button>
                       </div>
                     ) : profileIsBusy(p) ? (
-                      <Button data-testid={`bp-stop-${p.id}`} onClick={() => handleStop(p.id)} size="sm" className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs">
-                        <StopCircle className="w-3 h-3 mr-1" /> Stop
-                      </Button>
+                      <div className="flex flex-wrap gap-1">
+                        {renderProfileRunningActions(p)}
+                      </div>
                     ) : (
                       <Button data-testid={`bp-launch-${p.id}`} onClick={() => handleLaunch(p.id)} size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs">
                         <Play className="w-3 h-3 mr-1" /> Launch
@@ -2084,6 +2399,17 @@ export default function BrowserProfilesPage() {
                   </div>
                   {statusMap[p.id]?.message && (
                     <div className="mt-2 text-[10px] text-amber-300/80 italic">{statusMap[p.id].message}</div>
+                  )}
+                  {p.automation_status && p.automation_status !== "idle" && (
+                    <div className="mt-2 text-[10px] text-cyan-300/90" data-testid={`bp-auto-progress-${p.id}`}>
+                      JSON: {p.automation_status}
+                      {p.automation_total_steps > 0 && (
+                        <span> · step {p.automation_step || 0}/{p.automation_total_steps}</span>
+                      )}
+                      {p.automation_error && (
+                        <span className="block text-red-400/90 truncate" title={p.automation_error}>{p.automation_error}</span>
+                      )}
+                    </div>
                   )}
                   {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
                     <div className="mt-2 space-y-1">
@@ -3360,7 +3686,7 @@ export default function BrowserProfilesPage() {
         {launchChecklist.open && launchChecklist.data && (
           <div className="fixed inset-0 z-[65] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
             onClick={() => setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined })}>
-            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-lg w-full p-5 max-h-[90vh] overflow-y-auto"
               onClick={(e) => e.stopPropagation()} data-testid="bp-launch-checklist">
               <h3 className="text-sm font-semibold text-zinc-100 mb-1">Launch preview</h3>
               <p className="text-xs text-zinc-500 mb-4">{launchChecklist.data.name}</p>
@@ -3383,14 +3709,94 @@ export default function BrowserProfilesPage() {
                   </span>
                 </li>
               </ul>
+
+              <div className="mb-4 p-3 rounded-lg border border-zinc-800 bg-zinc-900/50 space-y-2">
+                <label className="flex items-center gap-2 text-xs text-zinc-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="accent-fuchsia-500"
+                    checked={launchAuto.enabled}
+                    onChange={(e) => setLaunchAuto((s) => ({ ...s, enabled: e.target.checked }))}
+                    data-testid="bp-launch-auto-enable"
+                  />
+                  Run JSON automation after launch (RUT-style)
+                </label>
+                {launchAuto.enabled && (
+                  <div className="space-y-2 pl-1">
+                    <div>
+                      <Label className="text-[10px] text-zinc-500">Automation JSON</Label>
+                      <select
+                        className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                        value={launchAuto.automation_upload_id}
+                        onChange={(e) => setLaunchAuto((s) => ({ ...s, automation_upload_id: e.target.value }))}
+                        data-testid="bp-launch-auto-json"
+                      >
+                        <option value="">{uploadsLoading ? "Loading…" : "Select template…"}</option>
+                        {automationUploads.map((u) => (
+                          <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <Label className="text-[10px] text-zinc-500">Lead data file (optional — for {"{{email}}"} etc.)</Label>
+                      <select
+                        className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                        value={launchAuto.data_file_id}
+                        onChange={(e) => setLaunchAuto((s) => ({ ...s, data_file_id: e.target.value }))}
+                        data-testid="bp-launch-auto-leads"
+                      >
+                        <option value="">Static JSON only</option>
+                        {dataFileUploads.map((u) => (
+                          <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    {launchAuto.data_file_id && (
+                      <div>
+                        <Label className="text-[10px] text-zinc-500">Lead row index</Label>
+                        <Input
+                          type="number"
+                          min={0}
+                          className="mt-1 h-7 text-xs bg-zinc-950 border-zinc-700"
+                          value={launchAuto.lead_row_index}
+                          onChange={(e) => setLaunchAuto((s) => ({ ...s, lead_row_index: Number(e.target.value) || 0 }))}
+                        />
+                      </div>
+                    )}
+                    <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="accent-fuchsia-500"
+                        checked={launchAuto.skip_missing_steps}
+                        onChange={(e) => setLaunchAuto((s) => ({ ...s, skip_missing_steps: e.target.checked }))}
+                      />
+                      Skip missing steps
+                    </label>
+                    <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="accent-fuchsia-500"
+                        checked={launchAuto.save_as_default}
+                        onChange={(e) => setLaunchAuto((s) => ({ ...s, save_as_default: e.target.checked }))}
+                      />
+                      Save as profile default (pre-select next time)
+                    </label>
+                  </div>
+                )}
+                {!launchAuto.enabled && (
+                  <p className="text-[10px] text-zinc-500">Default: manual browse — same as before.</p>
+                )}
+              </div>
+
               <div className="flex justify-end gap-2">
                 <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
                   onClick={() => setLaunchChecklist({ open: false, id: null, data: null, startUrl: undefined })}>
                   Cancel
                 </Button>
                 <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs"
+                  disabled={launchAuto.enabled && !launchAuto.automation_upload_id}
                   onClick={confirmLaunchFromChecklist} data-testid="bp-launch-anyway">
-                  Launch anyway
+                  {launchAuto.enabled ? "Launch + run JSON" : "Launch (manual)"}
                 </Button>
               </div>
             </div>

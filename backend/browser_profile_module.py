@@ -535,9 +535,30 @@ async def hydrate_proxy_credentials_for_launch(
         line = str(pp_res.get("proxy") or "").strip()
         if line:
             merged = _apply_resolved_line_to_proxy_cfg(out, line, provider_id=provider_id)
-            return hydrate_proxy_credentials(merged)
+            merged = hydrate_proxy_credentials(merged)
+            if str(merged.get("password") or "").strip():
+                return merged
     except Exception as exc:
         logger.debug(f"[browser-profile] provider cred hydrate skipped: {exc}")
+
+    # Last resort — read gateway password from saved provider settings.
+    try:
+        from proxy_provider_module import get_provider_gateway_credentials
+
+        gw = await get_provider_gateway_credentials(uid, provider_id)
+        pwd = str(gw.get("password") or "").strip()
+        if pwd:
+            if not str(out.get("username") or "").strip() and gw.get("username"):
+                out["username"] = str(gw["username"]).strip()
+            out["password"] = pwd
+            if not str(out.get("server") or "").strip():
+                host = str(gw.get("gateway_host") or "").strip()
+                port = str(gw.get("gateway_port") or "").strip()
+                if host and port:
+                    out["server"] = f"http://{host}:{port}"
+            return hydrate_proxy_credentials(out)
+    except Exception as exc:
+        logger.debug(f"[browser-profile] provider gateway cred fallback skipped: {exc}")
     return out
 
 
@@ -820,6 +841,16 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
         prof_update["debugger_address"] = str(body.get("debugger_address"))[:128]
     if body.get("browser_kernel"):
         prof_update["browser_kernel"] = str(body.get("browser_kernel"))[:64]
+    # v2.7.79 — JSON automation progress on profile card
+    for _ak in (
+        "automation_status",
+        "automation_step",
+        "automation_total_steps",
+        "automation_action",
+        "automation_error",
+    ):
+        if _ak in body:
+            prof_update[_ak] = body[_ak]
     if prof_update:
         await _DB.browser_profiles.update_one(
             {"id": profile_id},
@@ -1127,6 +1158,55 @@ class BulkIdsBody(BaseModel):
     permanent: bool = False
 
 
+class ProfileAutomationLaunch(BaseModel):
+    """Optional JSON automation — only runs when enabled=True."""
+    enabled: bool = False
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
+    lead_row_index: int = Field(default=0, ge=-1, le=100000)
+    skip_missing_steps: bool = True
+    self_heal: bool = False
+    after_mode: str = Field(default="manual", max_length=32)  # manual = keep browser open
+    save_as_default: bool = False
+    proxy_upload_id: str = Field(default="", max_length=64)  # Uploaded Things proxy batch (RUT parity)
+
+
+class LaunchBody(BaseModel):
+    start_url: Optional[str] = Field(default=None, max_length=512)
+    automation: Optional[ProfileAutomationLaunch] = None
+
+
+class BulkLaunchBody(BaseModel):
+    profile_ids: List[str] = Field(default_factory=list)
+    max_concurrent: int = Field(default=5, ge=1, le=20)
+    start_url: Optional[str] = Field(default=None, max_length=512)
+    automation: Optional[ProfileAutomationLaunch] = None
+
+
+class RunAutomationBody(BaseModel):
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
+    lead_row_index: int = Field(default=0, ge=0, le=100000)
+    skip_missing_steps: bool = True
+    self_heal: bool = False
+    proxy_upload_id: str = Field(default="", max_length=64)
+
+
+class BulkRunJsonBody(BaseModel):
+    profile_ids: List[str] = Field(default_factory=list)
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
+    max_concurrent: int = Field(default=5, ge=1, le=20)
+    skip_missing_steps: bool = True
+    self_heal: bool = False
+    proxy_upload_id: str = Field(default="", max_length=64)
+
+
+class SaveAutomationDefaultsBody(BaseModel):
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
+
+
 class SaveProfileTemplateBody(BaseModel):
     """Save current create-form settings as a reusable profile template."""
     name: str = Field(..., min_length=1, max_length=80)
@@ -1365,6 +1445,11 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["acl"] = _acl_entries(d)
     d["cloud_phone"] = d.get("cloud_phone") if isinstance(d.get("cloud_phone"), dict) else {}
     d["browser_kernel_label"] = str(d.get("browser_kernel") or "")
+    d["default_automation_upload_id"] = str(d.get("default_automation_upload_id") or "")
+    d["default_data_file_id"] = str(d.get("default_data_file_id") or "")
+    d["automation_status"] = str(d.get("automation_status") or "")
+    d["automation_step"] = int(d.get("automation_step") or 0)
+    d["automation_total_steps"] = int(d.get("automation_total_steps") or 0)
     return d
 
 
@@ -1679,6 +1764,113 @@ async def _finalize_doc_proxy_and_ip(
     doc["exit_ip"] = canonical
     doc["proxy"]["exit_ip"] = canonical
     doc["proxy"]["sticky_session"] = True
+
+
+async def _pick_proxy_line_from_upload(uid: str, upload_id: str) -> Optional[str]:
+    """Pick next proxy line from Uploaded Things batch (RUT parity)."""
+    up_id = str(upload_id or "").strip()
+    if not up_id or _DB is None:
+        return None
+    doc = await _DB.uploaded_resources.find_one(
+        {"id": up_id, "user_id": uid, "type": "proxies"},
+        {"_id": 0},
+    )
+    if not doc:
+        return None
+    consumed = {str(k).strip() for k in (doc.get("consumed_keys") or []) if str(k).strip()}
+    items = [str(x).strip() for x in (doc.get("items") or []) if str(x).strip()]
+    for raw in items:
+        if raw not in consumed:
+            return raw
+    return None
+
+
+async def _consume_proxy_line_from_upload(uid: str, upload_id: str, raw_line: str) -> bool:
+    """Remove a used proxy line from Uploaded Things (RUT parity)."""
+    up_id = str(upload_id or "").strip()
+    raw = str(raw_line or "").strip()
+    if not up_id or not raw or _DB is None:
+        return False
+    try:
+        res = await _DB.uploaded_resources.update_one(
+            {"id": up_id, "user_id": uid, "type": "proxies"},
+            {
+                "$pull": {"items": raw},
+                "$set": {"updated_at": _now_iso()},
+                "$inc": {"consumed_count": 1, "item_count": -1},
+            },
+        )
+        if not res.modified_count:
+            return False
+        doc = await _DB.uploaded_resources.find_one(
+            {"id": up_id, "user_id": uid},
+            {"_id": 0, "items": 1, "depleted": 1, "gsheet_url": 1},
+        )
+        gsheet_url = str((doc or {}).get("gsheet_url") or "").strip()
+        if gsheet_url:
+            try:
+                import asyncio
+                import gsheet_writer
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    gsheet_writer.delete_rows_by_first_column,
+                    gsheet_url,
+                    [raw],
+                )
+            except Exception as exc:
+                logger.debug(f"[profile-automation] gsheet proxy delete skipped: {exc}")
+        if doc and isinstance(doc.get("items"), list) and len(doc["items"]) == 0 and not doc.get("depleted"):
+            await _DB.uploaded_resources.update_one(
+                {"id": up_id, "user_id": uid},
+                {"$set": {
+                    "depleted": True,
+                    "depleted_at": _now_iso(),
+                    "item_count": 0,
+                }},
+            )
+        return True
+    except Exception as exc:
+        logger.warning(f"[profile-automation] proxy consume failed: {exc}")
+        return False
+
+
+async def _apply_json_run_proxy_from_upload(
+    uid: str,
+    user: dict,
+    doc: Dict[str, Any],
+    auto_spec: Dict[str, Any],
+) -> None:
+    """Use Uploaded Things proxy batch for this JSON run instead of provider dial."""
+    upload_id = str(auto_spec.get("proxy_upload_id") or "").strip()
+    if not upload_id:
+        return
+    raw_line = await _pick_proxy_line_from_upload(uid, upload_id)
+    if not raw_line:
+        raise HTTPException(
+            status_code=400,
+            detail="Proxy upload batch is empty or fully consumed — upload more proxies.",
+        )
+    parsed = _parse_proxy_line(raw_line)
+    if not parsed.get("server"):
+        raise HTTPException(status_code=400, detail="Invalid proxy line in upload batch")
+    proxy_cfg = dict(doc.get("proxy") or {})
+    proxy_cfg["enabled"] = True
+    proxy_cfg["server"] = parsed["server"]
+    if parsed.get("username"):
+        proxy_cfg["username"] = parsed["username"]
+    if parsed.get("password"):
+        proxy_cfg["password"] = parsed["password"]
+    proxy_cfg.pop("provider_id", None)
+    proxy_cfg.pop("use_proxyjet", None)
+    proxy_cfg.pop("exit_ip", None)
+    doc["proxy"] = proxy_cfg
+    auto_spec["_consume_proxy_upload_id"] = upload_id
+    auto_spec["_consume_proxy_raw"] = raw_line
+    used_ips = await _load_team_profile_used_ips(uid)
+    await _finalize_doc_proxy_and_ip(uid, user, doc, used_ips)
+    await _consume_proxy_line_from_upload(uid, upload_id, raw_line)
 
 
 async def _ensure_profile_launch_proxy(
@@ -3127,6 +3319,8 @@ async def launch_preview(request: Request, profile_id: str):
         "device": doc.get("device_model") or doc.get("device_type") or "",
         "last_proxy_check": view.get("last_proxy_check") or {},
         "ready": health.get("level") in ("good", "warn", "unknown"),
+        "default_automation_upload_id": str(doc.get("default_automation_upload_id") or ""),
+        "default_data_file_id": str(doc.get("default_data_file_id") or ""),
     }
 
 @router.post("/{profile_id}/clone")
@@ -3199,8 +3393,13 @@ async def clone_profile(
 
 
 @router.post("/{profile_id}/launch")
-async def launch_profile(request: Request, profile_id: str,
-                          start_url: Optional[str] = Body(default=None, embed=True)):
+async def launch_profile(
+    request: Request,
+    profile_id: str,
+    body: LaunchBody = Body(default_factory=LaunchBody),
+    *,
+    _bulk_row_index: Optional[int] = None,
+):
     """Queue a launch job for the customer's local desktop client."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
@@ -3214,6 +3413,37 @@ async def launch_profile(request: Request, profile_id: str,
             detail=f"Profile is already {cur_status}. Stop it first or wait for the current session to finish.",
         )
 
+    start_url = (body.start_url if body else None) or doc.get("start_url") or "https://www.google.com/"
+
+    auto_payload = None
+    if body and body.automation:
+        auto_payload = body.automation.model_dump()
+    auto_spec: Dict[str, Any] = {"enabled": False}
+    try:
+        from browser_profile_automation import resolve_launch_automation
+
+        auto_spec = await resolve_launch_automation(
+            _DB,
+            uid,
+            auto_payload,
+            doc,
+            bulk_row_index=_bulk_row_index,
+        )
+    except ValueError as _auto_err:
+        raise HTTPException(status_code=400, detail=str(_auto_err)) from _auto_err
+    except Exception as _auto_exc:
+        logger.warning(f"[browser-profile launch] automation resolve skipped: {_auto_exc}")
+
+    if auto_payload and auto_payload.get("save_as_default"):
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": {
+                "default_automation_upload_id": str(auto_spec.get("automation_upload_id") or ""),
+                "default_data_file_id": str(auto_spec.get("data_file_id") or ""),
+                "updated_at": _now_iso(),
+            }},
+        )
+
     session_id = str(uuid.uuid4())
     session = {
         "id": session_id,
@@ -3221,16 +3451,23 @@ async def launch_profile(request: Request, profile_id: str,
         "user_id": owner_uid,
         "started_at": _now_iso(),
         "status": "queued",
-        "start_url": start_url or doc.get("start_url") or "https://www.google.com/",
+        "start_url": start_url,
+        "automation_enabled": bool(auto_spec.get("enabled")),
+        "automation_upload_id": str(auto_spec.get("automation_upload_id") or ""),
+        "automation_total_steps": int(auto_spec.get("total_steps") or 0),
     }
     # v2.7.37 — Resolve proxy + probe team-unique exit IP before every launch.
     _proxy_cfg = doc.get("proxy") or {}
     _provider_id = str(_proxy_cfg.get("provider_id") or "").strip()
     try:
-        _proxy_cfg = await _ensure_profile_launch_proxy(
-            uid, user, doc, profile_country=doc.get("country"),
-        )
-        doc["proxy"] = _proxy_cfg
+        if auto_spec.get("enabled") and str(auto_spec.get("proxy_upload_id") or "").strip():
+            await _apply_json_run_proxy_from_upload(uid, user, doc, auto_spec)
+            _proxy_cfg = doc.get("proxy") or {}
+        else:
+            _proxy_cfg = await _ensure_profile_launch_proxy(
+                uid, user, doc, profile_country=doc.get("country"),
+            )
+            doc["proxy"] = _proxy_cfg
     except HTTPException:
         raise
     except Exception as _pp_err:
@@ -3265,6 +3502,20 @@ async def launch_profile(request: Request, profile_id: str,
             ),
         )
 
+    doc = dict(doc)
+    doc["_launch_automation"] = auto_spec
+    doc["user_id"] = owner_uid
+    if auto_spec.get("enabled"):
+        await _DB.browser_profiles.update_one(
+            {"id": profile_id, "user_id": uid},
+            {"$set": {
+                "automation_status": "queued",
+                "automation_step": 0,
+                "automation_total_steps": int(auto_spec.get("total_steps") or 0),
+                "automation_error": "",
+            }},
+        )
+
     await _DB.browser_profile_sessions.insert_one(session)
 
     await _DB.browser_profiles.update_one(
@@ -3291,6 +3542,8 @@ async def launch_profile(request: Request, profile_id: str,
             # v2.7.17 — enable CDP by default so Synchronizer / Local API can attach
             doc = dict(doc)
             doc["local_api_cdp"] = True
+            doc["_launch_automation"] = auto_spec
+            doc["user_id"] = owner_uid
             await _DB.browser_profiles.update_one(
                 {"id": profile_id},
                 {"$set": {"local_api_cdp": True}},
@@ -3386,7 +3639,11 @@ async def launch_profile(request: Request, profile_id: str,
                 "user_id": uid,
                 "profile_id": profile_id,
                 "session_id": session_id,
-                "profile_config": doc,
+                "profile_config": dict(doc) | {
+                    "_launch_automation": auto_spec,
+                    "user_id": owner_uid,
+                    "local_api_cdp": True,
+                },
                 "start_url": session["start_url"],
                 "queued_at": _now_iso(),
             }
@@ -3427,7 +3684,166 @@ async def launch_profile(request: Request, profile_id: str,
             "Install or start it, then click Launch again."
         ),
         "profile": _public_view(doc),
+        "automation_enabled": bool(auto_spec.get("enabled")),
+        "automation_total_steps": int(auto_spec.get("total_steps") or 0),
     }
+
+
+@router.put("/{profile_id}/automation-defaults")
+async def save_automation_defaults(
+    request: Request,
+    profile_id: str,
+    body: SaveAutomationDefaultsBody,
+):
+    """Save default JSON + lead file for quick re-launch (Phase 4)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    await _get_profile_for_user(profile_id, uid, min_role="editor")
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {"$set": {
+            "default_automation_upload_id": str(body.automation_upload_id or "").strip(),
+            "default_data_file_id": str(body.data_file_id or "").strip(),
+            "updated_at": _now_iso(),
+        }},
+    )
+    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
+    return {"ok": True, "profile": _public_view(doc or {})}
+
+
+@router.post("/{profile_id}/run-automation")
+async def run_profile_automation_endpoint(
+    request: Request,
+    profile_id: str,
+    body: RunAutomationBody = Body(default_factory=RunAutomationBody),
+):
+    """Re-run JSON automation on an already-open profile (no relaunch)."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    st = str(doc.get("status") or "idle").lower()
+    if st not in ("running", "launching", "queued"):
+        raise HTTPException(
+            status_code=409,
+            detail="Profile must be running to re-run automation. Launch it first.",
+        )
+    upload_id = str(
+        body.automation_upload_id or doc.get("default_automation_upload_id") or ""
+    ).strip()
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="automation_upload_id required")
+
+    auto_payload = {
+        "enabled": True,
+        "automation_upload_id": upload_id,
+        "data_file_id": str(
+            body.data_file_id or doc.get("default_data_file_id") or ""
+        ).strip(),
+        "lead_row_index": int(body.lead_row_index or 0),
+        "skip_missing_steps": body.skip_missing_steps,
+        "self_heal": body.self_heal,
+        "proxy_upload_id": str(body.proxy_upload_id or "").strip(),
+    }
+    try:
+        from browser_profile_automation import resolve_launch_automation
+
+        auto_spec = await resolve_launch_automation(_DB, uid, auto_payload, doc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    sid = str(doc.get("session_id") or "")
+    queued = False
+    _mode = (os.environ.get("KREXION_MODE") or "cloud").lower().strip()
+    if _mode in ("native", "local"):
+        try:
+            from browser_profile_launcher import request_run_automation
+
+            queued = request_run_automation(sid, auto_spec)
+        except Exception as exc:
+            logger.warning(f"[profile-automation] local queue failed: {exc}")
+
+    if not queued and _BRIDGE_QUEUE is not None and sid:
+        try:
+            bridge_job_id = await _BRIDGE_QUEUE(uid, {
+                "kind": "browser_profile_run_automation",
+                "profile_id": profile_id,
+                "session_id": sid,
+                "automation": auto_spec,
+                "feature_override": "browser-profile/run-automation",
+                "queued_at": _now_iso(),
+            })
+            queued = bool(bridge_job_id)
+        except Exception as exc:
+            logger.warning(f"[profile-automation] bridge queue failed: {exc}")
+
+    if not queued:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not queue automation — profile session not found on this desktop.",
+        )
+
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {"$set": {
+            "automation_status": "queued",
+            "automation_step": 0,
+            "automation_total_steps": int(auto_spec.get("total_steps") or 0),
+            "automation_error": "",
+        }},
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "session_id": sid,
+        "automation_total_steps": int(auto_spec.get("total_steps") or 0),
+    }
+
+
+@router.post("/{profile_id}/stop-automation")
+async def stop_profile_automation(request: Request, profile_id: str):
+    """Stop JSON automation only — profile browser stays open for manual use."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    sid = str(doc.get("session_id") or "")
+    auto_st = str(doc.get("automation_status") or "").lower()
+    if not sid:
+        raise HTTPException(status_code=409, detail="Profile is not running")
+    if auto_st not in ("queued", "running"):
+        return {"ok": True, "stopped": False, "message": "No active automation"}
+
+    stop_sent = False
+    _mode = (os.environ.get("KREXION_MODE") or "cloud").lower().strip()
+    _is_local_desktop = _mode in ("native", "local")
+    if _is_local_desktop:
+        try:
+            from browser_profile_launcher import request_stop_automation
+
+            stop_sent = bool(request_stop_automation(sid))
+        except Exception as exc:
+            logger.warning(f"[profile-automation] local stop failed: {exc}")
+    elif _BRIDGE_QUEUE is not None and sid:
+        try:
+            bridge_job_id = await _BRIDGE_QUEUE(uid, {
+                "kind": "browser_profile_stop_automation",
+                "profile_id": profile_id,
+                "session_id": sid,
+                "feature_override": "browser-profile/stop-automation",
+                "queued_at": _now_iso(),
+            })
+            stop_sent = bool(bridge_job_id)
+        except Exception as exc:
+            logger.warning(f"[profile-automation] bridge stop failed: {exc}")
+
+    await _DB.browser_profiles.update_one(
+        {"id": profile_id, "user_id": uid},
+        {"$set": {
+            "automation_status": "stopped",
+            "automation_action": "",
+            "automation_error": "",
+        }},
+    )
+    return {"ok": True, "stopped": stop_sent or True, "session_id": sid}
 
 
 @router.post("/{profile_id}/stop")
@@ -4074,7 +4490,7 @@ async def bulk_stop(request: Request, body: BulkIdsBody):
 
 
 @router.post("/bulk-launch")
-async def bulk_launch(request: Request, body: BulkIdsBody):
+async def bulk_launch(request: Request, body: BulkLaunchBody):
     """Launch up to max_concurrent idle profiles (rest skipped with reason)."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
@@ -4086,7 +4502,7 @@ async def bulk_launch(request: Request, body: BulkIdsBody):
     launched: List[Dict[str, Any]] = []
     skipped: List[Dict[str, str]] = []
 
-    for pid in ids:
+    for idx, pid in enumerate(ids):
         if len(launched) >= max_c:
             skipped.append({"id": pid, "reason": "concurrent_cap"})
             continue
@@ -4098,15 +4514,25 @@ async def bulk_launch(request: Request, body: BulkIdsBody):
         if st in ("running", "launching", "queued", "stopping"):
             skipped.append({"id": pid, "reason": f"busy:{st}"})
             continue
-        # Delegate to existing launch endpoint implementation
+        launch_body = LaunchBody(
+            start_url=body.start_url or doc.get("start_url"),
+            automation=body.automation,
+        )
         try:
-            # Build a minimal internal call by reusing launch_profile
             result = await launch_profile(
                 request,
                 pid,
-                start_url=doc.get("start_url") or None,
+                launch_body,
+                _bulk_row_index=idx if (body.automation and body.automation.enabled) else None,
             )
-            launched.append({"id": pid, "ok": True, **{k: result.get(k) for k in ("session_id", "desktop_available", "message") if isinstance(result, dict)}})
+            launched.append({
+                "id": pid,
+                "ok": True,
+                **{k: result.get(k) for k in (
+                    "session_id", "desktop_available", "message",
+                    "automation_enabled", "automation_total_steps",
+                ) if isinstance(result, dict)},
+            })
         except HTTPException as he:
             skipped.append({"id": pid, "reason": str(he.detail)[:160]})
         except Exception as e:
@@ -4117,6 +4543,110 @@ async def bulk_launch(request: Request, body: BulkIdsBody):
         "skipped": skipped,
         "launched_count": len(launched),
         "max_concurrent": max_c,
+    }
+
+
+@router.post("/bulk-run-json")
+async def bulk_run_json(request: Request, body: BulkRunJsonBody):
+    """Launch idle profiles with JSON, or queue JSON on already-running profiles."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    upload_id = str(body.automation_upload_id or "").strip()
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="automation_upload_id required")
+
+    ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()][:50]
+    max_c = max(1, min(int(body.max_concurrent or 5), 20))
+    if not ids:
+        raise HTTPException(status_code=400, detail="profile_ids required")
+
+    default_data_file = str(body.data_file_id or "").strip()
+    default_proxy_upload = str(body.proxy_upload_id or "").strip()
+
+    started: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, str]] = []
+    launched_count = 0
+
+    for idx, pid in enumerate(ids):
+        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
+        if not doc:
+            skipped.append({"id": pid, "reason": "not_found"})
+            continue
+        st = str(doc.get("status") or "idle").lower()
+        row_data_file = default_data_file or str(doc.get("default_data_file_id") or "").strip()
+
+        auto_base = ProfileAutomationLaunch(
+            enabled=True,
+            automation_upload_id=upload_id,
+            data_file_id=row_data_file,
+            lead_row_index=0,
+            skip_missing_steps=body.skip_missing_steps is not False,
+            self_heal=bool(body.self_heal),
+            after_mode="manual",
+            proxy_upload_id=default_proxy_upload,
+        )
+
+        if st in ("running", "launching", "queued"):
+            if st == "launching":
+                skipped.append({"id": pid, "reason": "still_launching"})
+                continue
+            try:
+                run_body = RunAutomationBody(
+                    automation_upload_id=upload_id,
+                    data_file_id=row_data_file,
+                    lead_row_index=idx,
+                    skip_missing_steps=body.skip_missing_steps,
+                    self_heal=body.self_heal,
+                    proxy_upload_id=default_proxy_upload,
+                )
+                result = await run_profile_automation_endpoint(request, pid, run_body)
+                started.append({"id": pid, "mode": "queued_on_running", **result})
+            except HTTPException as he:
+                skipped.append({"id": pid, "reason": str(he.detail)[:160]})
+            except Exception as e:
+                skipped.append({"id": pid, "reason": str(e)[:160]})
+            continue
+
+        if st in ("stopping",):
+            skipped.append({"id": pid, "reason": f"busy:{st}"})
+            continue
+
+        if launched_count >= max_c:
+            skipped.append({"id": pid, "reason": "concurrent_cap"})
+            continue
+
+        launch_body = LaunchBody(
+            start_url=doc.get("start_url"),
+            automation=auto_base,
+        )
+        try:
+            result = await launch_profile(
+                request,
+                pid,
+                launch_body,
+                _bulk_row_index=idx,
+            )
+            launched_count += 1
+            started.append({
+                "id": pid,
+                "mode": "launch_with_json",
+                "ok": True,
+                **{k: result.get(k) for k in (
+                    "session_id", "desktop_available", "message",
+                    "automation_enabled", "automation_total_steps",
+                ) if isinstance(result, dict)},
+            })
+        except HTTPException as he:
+            skipped.append({"id": pid, "reason": str(he.detail)[:160]})
+        except Exception as e:
+            skipped.append({"id": pid, "reason": str(e)[:160]})
+
+    return {
+        "started": started,
+        "skipped": skipped,
+        "started_count": len(started),
+        "max_concurrent": max_c,
+        "automation_upload_id": upload_id,
     }
 
 
@@ -4171,6 +4701,15 @@ async def bridge_session_update(request: Request, body: Dict[str, Any] = Body(..
         update["session_id"] = sid
         if "storage_state" in body and isinstance(body["storage_state"], dict):
             update["storage_state"] = body["storage_state"]
+    for _ak in (
+        "automation_status",
+        "automation_step",
+        "automation_total_steps",
+        "automation_action",
+        "automation_error",
+    ):
+        if _ak in body:
+            update[_ak] = body[_ak]
 
     await _DB.browser_profiles.update_one(
         {"id": pid, "user_id": uid}, {"$set": update}

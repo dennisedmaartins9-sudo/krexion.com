@@ -18119,6 +18119,7 @@ async def _execute_automation_steps(
     skip_missing_steps: bool = True,  # 2026-07 — skip absent steps, try next
     on_lead_submitted: Optional[Callable[[str], Awaitable[None]]] = None,
     click_once_guard: Optional[Dict[str, Any]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Execute a user-provided automation script step-by-step. Returns
     {status, error?, executed_steps, step_results?}.  Each step format:
@@ -18324,6 +18325,14 @@ async def _execute_automation_steps(
         _stage_gate_on = True
         _stage_skip_active = False
         for idx, step in enumerate(steps or []):
+            if should_cancel is not None and should_cancel():
+                return {
+                    "status": "cancelled",
+                    "executed_steps": executed,
+                    "total_steps": len(steps or []),
+                    "error": "Automation stopped by user",
+                    "step_results": step_results if collect_timings else None,
+                }
             if not isinstance(step, dict):
                 continue
             action_peek = (step.get("action") or "").strip().lower()

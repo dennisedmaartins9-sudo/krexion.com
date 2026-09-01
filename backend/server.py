@@ -3043,6 +3043,47 @@ def normalize_ipv6(ip: str) -> str:
     except Exception:
         return ip
 
+def _parse_ip_for_quality_check(raw: str) -> Optional[str]:
+    """Normalize user-pasted IP (optionally host:port) for fraud/quality lookup."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.count(":") == 1 and "." in s.split(":")[0]:
+        host, port = s.rsplit(":", 1)
+        if port.isdigit():
+            s = host.strip()
+    try:
+        import ipaddress
+        return str(ipaddress.ip_address(s))
+    except ValueError:
+        return None
+
+def _format_ip_quality_row(ip: str, result: dict) -> dict:
+    """Shape fraud-provider output for the Proxies IP-check UI."""
+    source = str(result.get("source") or "none")
+    provider = source.split(":")[0] if source else "none"
+    try:
+        score = int(result.get("vpn_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    return {
+        "ip": ip,
+        "fraud_score": score,
+        "quality_score": max(0, 100 - score),
+        "risk": result.get("risk") or "unknown",
+        "is_vpn": bool(result.get("is_vpn")),
+        "is_proxy": bool(result.get("is_proxy")),
+        "is_hosting": bool(result.get("is_hosting")),
+        "is_datacenter": bool(result.get("is_datacenter")),
+        "is_tor": bool(result.get("is_tor")),
+        "country": result.get("country") or result.get("country_code") or "",
+        "asn": result.get("asn") or "",
+        "source": source,
+        "provider": provider,
+        "min_fraud_score": result.get("min_fraud_score"),
+        "vpn_reason": result.get("vpn_reason"),
+    }
+
 def get_all_client_ips(request: Request) -> dict:
     """Get all possible client IPs (IPv4 + IPv6) from request headers.
 
@@ -18648,6 +18689,76 @@ async def bulk_delete_proxies(proxy_ids: List[str], user: dict = Depends(get_cur
     total_deleted = result_user_db.deleted_count + result_main_db.deleted_count
     return {"message": f"Deleted {total_deleted} proxies", "deleted_count": total_deleted}
 
+@api_router.post("/proxies/check-ip")
+async def check_proxy_ip_quality(data: dict, user: dict = Depends(get_current_user_with_fresh_data)):
+    """Check IP quality (Scamalytics / IPQS / IPHub / ProxyCheck) without proxy credentials."""
+    check_user_feature(user, "proxies")
+
+    raw_ips: List[str] = []
+    if data.get("ip"):
+        raw_ips.append(str(data.get("ip")))
+    raw_ips.extend(data.get("ips") or [])
+    if data.get("text"):
+        raw_ips.extend(str(data.get("text")).splitlines())
+
+    parsed: List[str] = []
+    invalid: List[str] = []
+    seen: set = set()
+    for raw in raw_ips:
+        ip = _parse_ip_for_quality_check(raw)
+        if not ip:
+            r = (raw or "").strip()
+            if r:
+                invalid.append(r)
+            continue
+        if ip not in seen:
+            seen.add(ip)
+            parsed.append(ip)
+
+    if not parsed and invalid:
+        raise HTTPException(status_code=400, detail="No valid IP addresses found")
+    if not parsed:
+        raise HTTPException(status_code=400, detail="At least one IP address required")
+
+    max_ips = 50
+    truncated = len(parsed) > max_ips
+    ips_to_check = parsed[:max_ips]
+
+    fraud_fn = globals().get("check_ip_for_user")
+    results: List[dict] = []
+    batch_size = 10
+    for i in range(0, len(ips_to_check), batch_size):
+        batch = ips_to_check[i:i + batch_size]
+        if fraud_fn:
+            tasks = [fraud_fn(user["id"], ip) for ip in batch]
+        else:
+            tasks = [check_vpn_detailed(ip, user_id=user["id"]) for ip in batch]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for ip, res in zip(batch, batch_results):
+            if isinstance(res, Exception):
+                results.append({
+                    "ip": ip,
+                    "error": str(res),
+                    "fraud_score": 0,
+                    "quality_score": 0,
+                    "risk": "error",
+                    "source": "error",
+                    "provider": "error",
+                })
+            else:
+                results.append(_format_ip_quality_row(ip, res or {}))
+
+    clean = sum(1 for r in results if not r.get("is_vpn") and not r.get("error"))
+    risky = sum(1 for r in results if r.get("is_vpn") and not r.get("error"))
+    return {
+        "total": len(results),
+        "clean_count": clean,
+        "risky_count": risky,
+        "invalid": invalid[:20],
+        "truncated": truncated,
+        "results": results,
+    }
+
 @api_router.post("/proxies/refresh-status")
 async def refresh_proxy_status(user: dict = Depends(get_current_user_with_fresh_data)):
     """Re-check all proxies against current click database to update duplicate status"""
@@ -21096,6 +21207,7 @@ class UploadedResourceResponse(BaseModel):
                                              # remaining-leads file ready to
                                              # download (after at least one
                                              # job has consumed rows).
+    has_used_file: bool = False             # v2.7.83 — consumed rows sheet
     created_at: datetime
 
 
@@ -21124,6 +21236,8 @@ def _upload_doc_to_response(doc: dict) -> dict:
     # 2026-06 — flag whether a downloadable remaining-leads file exists
     remaining_fp = (doc.get("remaining_file_path") or "").strip()
     has_remaining_file = bool(remaining_fp) and Path(remaining_fp).exists()
+    used_fp = (doc.get("used_file_path") or "").strip()
+    has_used_file = bool(used_fp) and Path(used_fp).exists()
     return {
         "id": doc["id"],
         "user_id": doc.get("user_id", ""),
@@ -21144,6 +21258,7 @@ def _upload_doc_to_response(doc: dict) -> dict:
         "depleted_at": doc.get("depleted_at"),
         "last_synced_at": doc.get("last_synced_at"),
         "has_remaining_file": has_remaining_file,
+        "has_used_file": has_used_file,
         "created_at": doc.get("created_at", datetime.now(timezone.utc)).isoformat() if isinstance(doc.get("created_at"), datetime) else (doc.get("created_at") or ""),
     }
 
@@ -21841,8 +21956,7 @@ async def bulk_delete_uploads(
 @api_router.get("/uploads/{upload_id}/download")
 async def download_upload(
     upload_id: str,
-    which: str = "original",   # 2026-06 — "original" (default, master upload)
-                               # or "remaining" (auto-maintained unused-leads file)
+    which: str = "original",   # 2026-06 — "original" | "remaining" | "used"
     current_user: dict = Depends(get_current_user_with_fresh_data),
 ):
     check_user_feature(current_user, "real_user_traffic")
@@ -21882,6 +21996,24 @@ async def download_upload(
             dl_name = "data_file_remaining.xlsx"
         return FileResponse(
             path=remaining_fp,
+            filename=dl_name,
+            media_type="application/octet-stream",
+        )
+    if which == "used":
+        used_fp = (doc.get("used_file_path") or "").strip()
+        if not used_fp or not Path(used_fp).exists():
+            raise HTTPException(
+                status_code=410,
+                detail="No used-leads file yet — consume at least one row first.",
+            )
+        base_name = doc.get("file_name") or "data_file.xlsx"
+        try:
+            stem, dot, ext = base_name.rpartition(".")
+            dl_name = f"{stem}_used.{ext}" if dot else f"{base_name}_used.xlsx"
+        except Exception:
+            dl_name = "data_file_used.xlsx"
+        return FileResponse(
+            path=used_fp,
             filename=dl_name,
             media_type="application/octet-stream",
         )
