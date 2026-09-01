@@ -50,6 +50,7 @@ jobs:
           TARGET: Krexion-Setup-${{ steps.ver.outputs.ver }}.exe
         run: |
           set -e
+          rm -rf dist
           mkdir -p dist
           REPO="${{ github.repository }}"
           echo "Downloading $TARGET from release $VER"
@@ -98,12 +99,15 @@ jobs:
           # Free space: drop all versioned installers (latest alias refreshed below).
           rm -f Krexion-Setup-v*.exe 2>/dev/null || true
           df -h / /opt/krexion/downloads 2>/dev/null || df -h /
-          SRC=$(ls -1 "$GITHUB_WORKSPACE"/dist/Krexion-Setup-*.exe 2>/dev/null | head -1)
-          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
-            echo "::error::Downloaded installer missing in dist/"
+          TARGET="Krexion-Setup-${VER}.exe"
+          SRC="$GITHUB_WORKSPACE/dist/$TARGET"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::Downloaded installer missing: $SRC"
             ls -la "$GITHUB_WORKSPACE"/dist || true
             exit 1
           fi
+          GOT=$(stat -c%s "$SRC")
+          echo "Using $SRC ($GOT bytes)"
           mv -f "$SRC" "Krexion-Setup-${VER}.exe"
           cp -f "Krexion-Setup-${VER}.exe" "Krexion-Setup-latest.exe"
           chmod a+r Krexion-Setup-*.exe

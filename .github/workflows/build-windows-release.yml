@@ -1099,6 +1099,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -e
+          rm -rf dist
           mkdir -p dist
           REPO="${{ github.repository }}"
           echo "Mirror target: $TARGET (run $GITHUB_RUN_ID)"
@@ -1246,7 +1247,13 @@ jobs:
             fi
           fi
           mkdir -p /opt/krexion/downloads/windows
-          cp -f dist/Krexion-Setup-*.exe /opt/krexion/downloads/windows/
+          INSTALLER="dist/Krexion-Setup-${VER}.exe"
+          if [ ! -f "$INSTALLER" ]; then
+            echo "::error::Expected installer missing: $INSTALLER"
+            ls -la dist/ || true
+            exit 1
+          fi
+          cp -f "$INSTALLER" /opt/krexion/downloads/windows/
           cd /opt/krexion/downloads/windows
           # Hard-copy (not symlink) so the nginx docker volume mount
           # serves the file identically to versioned ones — matches
