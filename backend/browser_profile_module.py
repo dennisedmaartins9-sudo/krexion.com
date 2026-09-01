@@ -440,6 +440,24 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
     if not line:
         return {"server": "", "username": "", "password": ""}
     try:
+        from urllib.parse import unquote, urlparse
+
+        probe = line if "://" in line else f"http://{line}"
+        if "://" in probe and "@" in probe.split("://", 1)[-1]:
+            parsed = urlparse(probe)
+            if parsed.hostname:
+                scheme = parsed.scheme or "http"
+                host = parsed.hostname
+                port = parsed.port
+                netloc = host if not port else f"{host}:{port}"
+                return {
+                    "server": f"{scheme}://{netloc}",
+                    "username": unquote(parsed.username or ""),
+                    "password": unquote(parsed.password or ""),
+                }
+    except Exception:
+        pass
+    try:
         if "://" in line:
             proto, rest = line.split("://", 1)
             if "@" in rest:
@@ -511,6 +529,32 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["username"] = username
     if password:
         out["password"] = password
+    return out
+
+
+async def _finalize_proxy_cfg_for_launch(
+    uid: str,
+    user: Optional[dict],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve + merge provider gateway password before Playwright/Chromium launch."""
+    out = await hydrate_proxy_credentials_for_launch(uid, user, dict(cfg or {}))
+    if str(out.get("server") or "").strip():
+        out["enabled"] = True
+    if (
+        str(out.get("server") or "").strip()
+        and not str(out.get("password") or "").strip()
+        and (
+            out.get("enabled")
+            or str(out.get("provider_id") or "").strip()
+            or out.get("use_proxyjet")
+        )
+    ):
+        logger.warning(
+            "[browser-profile] proxy password missing after hydrate — "
+            f"provider={str(out.get('provider_id') or '')[:8]} "
+            f"server={str(out.get('server') or '')[:48]}"
+        )
     return out
 
 
@@ -611,7 +655,7 @@ def _apply_resolved_line_to_proxy_cfg(
         else:
             out["server"] = raw if "://" in raw else f"http://{raw}"
     out["use_proxyjet"] = False
-    return out
+    return hydrate_proxy_credentials(out)
 
 
 async def _resolve_proxy_for_launch(
@@ -677,9 +721,7 @@ async def resolve_profile_proxy_for_launch(
     """Ensure profile proxy dict has a usable `server` when provider/proxyjet is set."""
     cfg = hydrate_proxy_credentials(dict(proxy_cfg or {}))
     if str(cfg.get("server") or "").strip():
-        cfg = await hydrate_proxy_credentials_for_launch(uid, user, cfg)
-        cfg["enabled"] = True
-        return cfg
+        return await _finalize_proxy_cfg_for_launch(uid, user, cfg)
 
     provider_id = str(cfg.get("provider_id") or "").strip()
     targeting = _profile_provider_targeting(cfg, profile_country)
@@ -699,7 +741,7 @@ async def resolve_profile_proxy_for_launch(
                 f"[browser-profile] provider {provider_id[:8]} resolved → "
                 f"{str(resolved.get('server') or '')[:48]}"
             )
-            return resolved
+            return await _finalize_proxy_cfg_for_launch(uid, user, resolved)
         except HTTPException as bulk_err:
             try:
                 fb_line = await _fallback_provider_proxy_line(
@@ -713,7 +755,7 @@ async def resolve_profile_proxy_for_launch(
                         f"[browser-profile] provider {provider_id[:8]} fallback → "
                         f"{str(resolved.get('server') or '')[:48]}"
                     )
-                    return resolved
+                    return await _finalize_proxy_cfg_for_launch(uid, user, resolved)
             except HTTPException:
                 raise
             raise bulk_err
@@ -724,9 +766,10 @@ async def resolve_profile_proxy_for_launch(
                     uid, user, provider_id, targeting=targeting,
                 )
                 if fb_line:
-                    return _apply_resolved_line_to_proxy_cfg(
+                    resolved = _apply_resolved_line_to_proxy_cfg(
                         cfg, fb_line, provider_id=provider_id,
                     )
+                    return await _finalize_proxy_cfg_for_launch(uid, user, resolved)
             except HTTPException:
                 raise
             raise HTTPException(
@@ -759,7 +802,7 @@ async def resolve_profile_proxy_for_launch(
                         cfg["password"] = parsed["password"]
         except Exception as e:
             logger.warning(f"[browser-profile] ProxyJet resolve at launch failed: {e}")
-    return cfg
+    return await _finalize_proxy_cfg_for_launch(uid, user, cfg)
 
 
 async def validate_profile_perfect_session(db, session_id: str) -> Dict[str, Any]:
@@ -1534,7 +1577,13 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     """Exit-IP + optional fraud score for Proxy Check UI."""
     import httpx
 
-    proxy = doc.get("proxy") or {}
+    proxy = dict(doc.get("proxy") or {})
+    uid = str(user.get("id") or doc.get("user_id") or "").strip()
+    if uid:
+        try:
+            proxy = await _finalize_proxy_cfg_for_launch(uid, user, proxy)
+        except Exception as _hydr_probe:
+            logger.debug(f"[browser-profile] proxy probe hydrate skipped: {_hydr_probe}")
     result: Dict[str, Any] = {
         "ok": False,
         "checked_at": _now_iso(),
@@ -1932,7 +1981,7 @@ async def _ensure_profile_launch_proxy(
                 f"[browser-profile launch] unique exit_ip={canonical} "
                 f"profile={profile_id[:8]} attempt={attempt + 1}"
             )
-            return proxy_cfg
+            return await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
         except HTTPException as exc:
             last_err = exc
             if exc.status_code != 409 or not provider_id or attempt >= max_retries - 1:

@@ -128,7 +128,14 @@ async def _update(user_id: str, provider_id: str, data: ProxyProviderUpdate) -> 
     if "proxy_type" in updates and updates["proxy_type"] not in SUPPORTED_TYPES:
         raise HTTPException(400, f"proxy_type must be one of {SUPPORTED_TYPES}")
     if "config" in updates:
-        updates["config"] = _sanitize_provider_config(updates["config"] or {})
+        new_cfg = _sanitize_provider_config(updates["config"] or {})
+        existing = await _get(user_id, provider_id)
+        old_cfg = (existing or {}).get("config") or {}
+        if not str(new_cfg.get("password") or "").strip():
+            old_pwd = str(old_cfg.get("password") or "").strip()
+            if old_pwd:
+                new_cfg["password"] = old_pwd
+        updates["config"] = new_cfg
     res = await _db.user_proxy_providers.update_one(
         {"id": provider_id, "user_id": user_id},
         {"$set": updates},
@@ -1235,6 +1242,8 @@ def _apply_targeting_to_username(
 
 def _format_gateway_line(cfg: Dict[str, Any], proxy_type: str,
                         rotate_session: bool = False) -> Optional[str]:
+    from urllib.parse import quote
+
     host = str(cfg.get("gateway_host") or "").strip()
     port = str(cfg.get("gateway_port") or "").strip()
     user = str(cfg.get("username") or "").strip()
@@ -1245,7 +1254,10 @@ def _format_gateway_line(cfg: Dict[str, Any], proxy_type: str,
         user = _rotate_session_in_username(user)
     scheme = proxy_type or "http"
     if user and pwd:
-        return f"{scheme}://{user}:{pwd}@{host}:{port}"
+        return (
+            f"{scheme}://{quote(user, safe='')}:{quote(pwd, safe='')}"
+            f"@{host}:{port}"
+        )
     return f"{scheme}://{host}:{port}"
 
 

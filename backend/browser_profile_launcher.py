@@ -1847,9 +1847,9 @@ async def _launch_profile_session_inner(
 
     if _uid:
         try:
-            from browser_profile_module import hydrate_proxy_credentials_for_launch
+            from browser_profile_module import _finalize_proxy_cfg_for_launch
 
-            proxy_cfg = await hydrate_proxy_credentials_for_launch(_uid, None, proxy_cfg)
+            proxy_cfg = await _finalize_proxy_cfg_for_launch(_uid, None, proxy_cfg)
             profile_config = dict(profile_config)
             profile_config["proxy"] = proxy_cfg
         except Exception as _hydr_err:
@@ -2443,7 +2443,7 @@ async def _launch_profile_session_inner(
             "permissions": ["geolocation"],
             "extra_http_headers": {"Accept-Language": accept_lang},
         }
-        if _profile_engine == "webkit" and proxy_arg:
+        if proxy_arg:
             context_kwargs["proxy"] = proxy_arg
         if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
             context_kwargs["storage_state"] = storage_state
