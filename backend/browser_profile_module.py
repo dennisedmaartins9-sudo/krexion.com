@@ -494,6 +494,55 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
     return {"server": server, "username": username, "password": password}
 
 
+def _build_proxy_probe_url(proxy_string: str, proxy_type: str = "http") -> str:
+    """Proxies-page parity — preserve scheme and `;` in DataImpulse usernames."""
+    ps = (proxy_string or "").strip()
+    if not ps:
+        raise ValueError("empty proxy string")
+    scheme_fallback = "socks5" if str(proxy_type).lower().startswith("socks") else "http"
+    if "://" in ps:
+        return ps
+    if "@" in ps:
+        return f"{scheme_fallback}://{ps}"
+    parts = ps.split(":")
+    if len(parts) == 4:
+        host, port, username, password = parts
+        return f"{scheme_fallback}://{username}:{password}@{host}:{port}"
+    if len(parts) == 2:
+        return f"{scheme_fallback}://{ps}"
+    raise ValueError(f"Invalid proxy format: cannot parse {ps!r}")
+
+
+def _proxy_dict_to_probe_url(proxy: Dict[str, Any], proxy_type: str = "http") -> str:
+    """Build exit-IP probe URL from hydrated proxy fields (server.py parity)."""
+    from urllib.parse import quote
+
+    server = str(proxy.get("server") or "").strip()
+    username = str(proxy.get("username") or "").strip()
+    password = str(proxy.get("password") or "").strip()
+    ptype = str(proxy.get("proxy_type") or proxy_type or "http").strip().lower()
+    scheme_fallback = "socks5" if ptype.startswith("socks") else "http"
+
+    if server:
+        hostpart = server
+        scheme = scheme_fallback
+        if "://" in server:
+            scheme, hostpart = server.split("://", 1)
+        if "@" in hostpart:
+            return server if "://" in server else f"{scheme_fallback}://{hostpart}"
+        if username and password:
+            return (
+                f"{scheme}://{quote(username, safe='')}:"
+                f"{quote(password, safe='')}@{hostpart}"
+            )
+        return server if "://" in server else f"{scheme_fallback}://{hostpart}"
+
+    raw = str(proxy.get("raw_line") or proxy.get("raw") or "").strip()
+    if raw:
+        return _build_proxy_probe_url(raw, ptype)
+    raise ValueError("no_proxy_configured")
+
+
 def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Fill missing proxy username/password from raw_line or embedded server URL."""
     out = dict(cfg or {})
@@ -565,11 +614,33 @@ async def hydrate_proxy_credentials_for_launch(
 ) -> Dict[str, Any]:
     """Ensure rotating/manual profile proxies have auth before Playwright launch."""
     out = hydrate_proxy_credentials(cfg)
-    if str(out.get("password") or "").strip():
-        return out
-
     provider_id = str(out.get("provider_id") or "").strip()
     if not provider_id or not uid:
+        if str(out.get("password") or "").strip():
+            return out
+        return out
+
+    # Rotating gateway: always prefer stored provider password (lines often
+    # ship host-only or URL-encoded creds that advanced-create used to parse wrong).
+    try:
+        from proxy_provider_module import get_provider_gateway_credentials
+
+        gw = await get_provider_gateway_credentials(uid, provider_id)
+        gw_pwd = str(gw.get("password") or "").strip()
+        if gw_pwd:
+            if not str(out.get("username") or "").strip() and gw.get("username"):
+                out["username"] = str(gw["username"]).strip()
+            out["password"] = gw_pwd
+            if not str(out.get("server") or "").strip():
+                host = str(gw.get("gateway_host") or "").strip()
+                port = str(gw.get("gateway_port") or "").strip()
+                if host and port:
+                    out["server"] = f"http://{host}:{port}"
+            return hydrate_proxy_credentials(out)
+    except Exception as exc:
+        logger.debug(f"[browser-profile] provider gateway cred fallback skipped: {exc}")
+
+    if str(out.get("password") or "").strip():
         return out
 
     try:
@@ -585,24 +656,6 @@ async def hydrate_proxy_credentials_for_launch(
     except Exception as exc:
         logger.debug(f"[browser-profile] provider cred hydrate skipped: {exc}")
 
-    # Last resort — read gateway password from saved provider settings.
-    try:
-        from proxy_provider_module import get_provider_gateway_credentials
-
-        gw = await get_provider_gateway_credentials(uid, provider_id)
-        pwd = str(gw.get("password") or "").strip()
-        if pwd:
-            if not str(out.get("username") or "").strip() and gw.get("username"):
-                out["username"] = str(gw["username"]).strip()
-            out["password"] = pwd
-            if not str(out.get("server") or "").strip():
-                host = str(gw.get("gateway_host") or "").strip()
-                port = str(gw.get("gateway_port") or "").strip()
-                if host and port:
-                    out["server"] = f"http://{host}:{port}"
-            return hydrate_proxy_credentials(out)
-    except Exception as exc:
-        logger.debug(f"[browser-profile] provider gateway cred fallback skipped: {exc}")
     return out
 
 
@@ -1614,29 +1667,43 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     if not server:
         result["error"] = "no_proxy_configured"
         return result
-
-    username = proxy.get("username") or ""
-    password = proxy.get("password") or ""
-    proxy_url = server
-    if username and "://" in server and "@" not in server:
-        scheme, rest = server.split("://", 1)
-        from urllib.parse import quote
-        proxy_url = f"{scheme}://{quote(str(username))}:{quote(str(password))}@{rest}"
+    if not str(proxy.get("server") or "").strip():
+        proxy["server"] = server
 
     try:
-        # httpx 0.28+ removed `proxies=` — use transport (same as server.py ipify probe).
-        transport = httpx.AsyncHTTPTransport(proxy=proxy_url, verify=False)
-        async with httpx.AsyncClient(
-            transport=transport,
-            timeout=httpx.Timeout(20.0),
-            follow_redirects=True,
-            verify=False,
-        ) as client:
-            r = await client.get("https://api.ipify.org?format=json")
-            r.raise_for_status()
-            result["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()
-        if result["exit_ip"]:
-            result["ok"] = True
+        proxy_url = _proxy_dict_to_probe_url(
+            proxy, str(proxy.get("proxy_type") or "http"),
+        )
+    except ValueError as e:
+        result["error"] = str(e)
+        return result
+
+    probe_urls = (
+        "http://api.ipify.org?format=json",
+        "https://api.ipify.org?format=json",
+    )
+    last_err = ""
+    try:
+        for ip_url in probe_urls:
+            try:
+                async with httpx.AsyncClient(
+                    proxy=httpx.Proxy(url=proxy_url),
+                    timeout=httpx.Timeout(25.0),
+                    follow_redirects=True,
+                    verify=False,
+                ) as client:
+                    r = await client.get(ip_url)
+                    r.raise_for_status()
+                    if ip_url.endswith("format=json"):
+                        result["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()
+                    else:
+                        result["exit_ip"] = (r.text or "").strip()
+                if result["exit_ip"] and ":" not in result["exit_ip"]:
+                    result["ok"] = True
+                    break
+            except Exception as e:
+                last_err = str(e)[:240]
+        if result["ok"]:
             try:
                 from fraud_provider_module import check_ip_for_user  # type: ignore
                 fr = await check_ip_for_user(user, result["exit_ip"])
@@ -1650,7 +1717,6 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
                     }
             except Exception:
                 pass
-            # Lightweight geo fallback
             if not result["country"]:
                 try:
                     async with httpx.AsyncClient(timeout=10.0) as c2:
@@ -1661,6 +1727,8 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
                             result["timezone"] = gj.get("timezone") or ""
                 except Exception:
                     pass
+        else:
+            result["error"] = last_err or "ipify_probe_failed"
     except Exception as e:
         result["error"] = str(e)[:240]
     return result
@@ -1801,12 +1869,26 @@ async def _finalize_doc_proxy_and_ip(
         or str(proxy.get("server") or "").strip()
     ):
         return
+    proxy = await _finalize_proxy_cfg_for_launch(uid, user, dict(proxy))
+    doc["proxy"] = proxy
     exit_ip = await _probe_proxy_cfg_exit_ip(user, proxy)
     if not exit_ip:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed",
+        probe = await _probe_profile_proxy({"proxy": proxy}, user)
+        err = str(probe.get("error") or "").strip()
+        if not str(proxy.get("password") or "").strip() and proxy.get("provider_id"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed. "
+                    "DataImpulse/provider gateway password missing — open Proxies → edit provider → save password."
+                ),
+            )
+        detail = (
+            f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed"
         )
+        if err:
+            detail += f" ({err[:120]})"
+        raise HTTPException(status_code=502, detail=detail)
     canonical = await _assert_unique_team_profile_ip(
         uid, exit_ip, used_ips, profile_id=str(doc.get("id") or ""),
     )
@@ -4268,50 +4350,12 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         proxyjet_country: str = "US",
         proxyjet_state: str = "",
     ) -> ProxyConfig:
-        server = ""
-        username = ""
-        password = ""
-        try:
-            if "://" in line:
-                proto, rest = line.split("://", 1)
-                if "@" in rest:
-                    creds, hostpart = rest.rsplit("@", 1)
-                    username, _, password = creds.partition(":")
-                    server = f"{proto}://{hostpart}"
-                else:
-                    colon_parts = rest.split(":")
-                    if len(colon_parts) >= 4:
-                        host, port, username = (
-                            colon_parts[0], colon_parts[1], colon_parts[2]
-                        )
-                        password = ":".join(colon_parts[3:])
-                        server = f"{proto}://{host}:{port}"
-                    elif len(colon_parts) == 2:
-                        server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
-                    elif len(colon_parts) == 1:
-                        server = line
-                    else:
-                        server = f"{proto}://{colon_parts[0]}:{colon_parts[1]}"
-            elif "@" in line:
-                creds, hostport = line.rsplit("@", 1)
-                username, _, password = creds.partition(":")
-                server = f"http://{hostport}"
-            else:
-                parts = line.split(":")
-                if len(parts) >= 4:
-                    host, port, username = parts[0], parts[1], parts[2]
-                    password = ":".join(parts[3:])
-                    server = f"http://{host}:{port}"
-                elif len(parts) >= 2:
-                    server = f"http://{parts[0]}:{parts[1]}"
-        except Exception as _pe:
-            logger.warning(f"advanced_create: proxy line parse failed: {_pe}")
-            server = line
+        parsed = _parse_proxy_line(str(line or "").strip())
         return ProxyConfig(
             enabled=True,
-            server=server,
-            username=username,
-            password=password,
+            server=parsed.get("server") or "",
+            username=parsed.get("username") or "",
+            password=parsed.get("password") or "",
             provider_id=str(provider_id or "").strip(),
             use_proxyjet=bool(use_proxyjet),
             proxyjet_country=(proxyjet_country or "US").upper(),
@@ -4430,6 +4474,17 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         doc["device_model"] = str(device.get("slug") or "")
         doc["device_label"] = str(device.get("label") or "")
         doc["device_catalog_id"] = str(device.get("id") or "")
+        _pline = ""
+        if proxy_mode == "provider" and i < len(provider_lines):
+            _pline = provider_lines[i].strip()
+        elif proxy_mode == "proxyjet" and i < len(proxy_lines):
+            _pline = proxy_lines[i].strip()
+        elif proxy_mode == "manual":
+            _mlines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
+            if _mlines:
+                _pline = _mlines[i % len(_mlines)]
+        if _pline:
+            doc.setdefault("proxy", {})["raw_line"] = _pline
         docs.append(doc)
 
     if docs and proxy_mode in ("provider", "proxyjet", "manual"):
