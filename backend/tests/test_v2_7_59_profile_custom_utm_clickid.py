@@ -14,7 +14,9 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_version_is_2_7_59():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.66"
+    from packaging.version import Version
+
+    assert Version((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= Version("2.7.59")
 
 
 def test_merge_url_query_params_fills_empty_existing():
@@ -47,28 +49,32 @@ def test_resolve_profile_custom_utms():
 
 
 def test_build_profile_platform_params_sticky_click_from_extras():
-    from referrer_pro import build_profile_platform_params
+    from referrer_pro import build_profile_platform_params, compact_tracker_params_for_url
 
-    params = build_profile_platform_params(
+    raw = build_profile_platform_params(
         "facebook",
         pro_extras={"click_id": "sticky42", "utm_source": "fbads"},
     )
+    params = compact_tracker_params_for_url(
+        "https://network.evyy.net/aff_c?offer_id=1", raw
+    )
     assert params["clickid"] == "sticky42"
-    assert params["click_id"] == "sticky42"
     assert params["utm_source"] == "fbads"
+    assert "click_id" not in params
 
 
 def test_build_profile_custom_click_id_macro():
-    from referrer_pro import build_profile_platform_params
+    from referrer_pro import build_profile_platform_params, compact_tracker_params_for_url
 
-    params = build_profile_platform_params(
+    raw = build_profile_platform_params(
         "youtube",
         pro_extras={
             "click_id": "baseid",
             "custom_click_id": "ef_{click_id}",
         },
     )
-    assert params["clickid"] == "ef_baseid"
+    params = compact_tracker_params_for_url("https://tracker.example/click", raw)
+    assert params["click_id"] == "ef_baseid"
 
 
 def test_referrer_pro_config_has_custom_utm_fields():

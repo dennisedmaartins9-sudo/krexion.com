@@ -38,6 +38,18 @@ function closeTabSheet() {
   var sheet = document.getElementById('tab-sheet');
   if (sheet) sheet.classList.remove('open');
 }
+function openMenuSheet() {
+  var sheet = document.getElementById('menu-sheet');
+  if (sheet) sheet.classList.add('open');
+}
+function closeMenuSheet() {
+  var sheet = document.getElementById('menu-sheet');
+  if (sheet) sheet.classList.remove('open');
+}
+function setZoomPct(n) {
+  var el = document.getElementById('menu-zoom-pct');
+  if (el) el.textContent = String(n || 100) + '%';
+}
 function setUrlText(text) {
   var el = document.getElementById('url-text');
   if (el) el.textContent = text || '';
@@ -73,6 +85,28 @@ _SHELL_CSS = """
 .tab-actions button {
   flex: 1; padding: 8px; border-radius: 8px; border: 1px solid #3f3f46;
   background: #27272a; color: #e4e4e7; font-size: 12px; cursor: pointer;
+}
+.menu-sheet {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.72);
+  z-index: 100; flex-direction: column; justify-content: flex-end; padding: 10px;
+}
+.menu-sheet.open { display: flex; }
+.menu-panel {
+  background: #18181b; border: 1px solid rgba(124,58,237,.35);
+  border-radius: 14px 14px 0 0; padding: 12px; max-height: 75%; overflow: auto;
+}
+.menu-panel h3 { font-size: 12px; color: #22d3ee; margin-bottom: 10px; letter-spacing: .08em; }
+.menu-row {
+  width: 100%; text-align: left; padding: 11px 12px; margin-bottom: 6px;
+  border-radius: 8px; border: 1px solid #3f3f46; background: #0b0b12;
+  color: #e4e4e7; font-size: 13px; cursor: pointer;
+}
+.menu-row.primary { border-color: rgba(34,211,238,.35); color: #22d3ee; }
+.menu-row.muted { color: #a1a1aa; font-size: 11px; border-style: dashed; }
+.menu-zoom { display: flex; gap: 8px; margin: 8px 0 10px; }
+.menu-zoom button {
+  flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #3f3f46;
+  background: #27272a; color: #eed322; font-size: 16px; cursor: pointer;
 }
 .tool, .nav-btn { cursor: pointer; }
 .tool:active, .nav-btn:active { opacity: .65; }
@@ -131,6 +165,27 @@ def read_shell_state(cfg_path: str) -> Dict[str, Any]:
         return {}
 
 
+def _menu_sheet_html() -> str:
+    return """
+  <div id="menu-sheet" class="menu-sheet" onclick="if(event.target===this)closeMenuSheet()">
+    <div class="menu-panel" onclick="event.stopPropagation()">
+      <h3>KREXION MENU</h3>
+      <div class="menu-row muted">Zoom: <span id="menu-zoom-pct">100%</span></div>
+      <div class="menu-zoom">
+        <button type="button" onclick="callApi('zoom_out')">−</button>
+        <button type="button" onclick="callApi('fit_screen')">Fit screen</button>
+        <button type="button" onclick="callApi('zoom_in')">+</button>
+      </div>
+      <button class="menu-row primary" type="button" onclick="callApi('actual_size')">Actual size (100%)</button>
+      <button class="menu-row" type="button" onclick="callApi('reload_page')">Reload</button>
+      <button class="menu-row" type="button" onclick="callApi('go_home')">Home</button>
+      <button class="menu-row" type="button" onclick="callApi('new_tab')">New tab</button>
+      <button class="menu-row" type="button" onclick="callApi('open_tabs')">Tabs</button>
+      <button class="menu-row" type="button" onclick="closeMenuSheet()">Close</button>
+    </div>
+  </div>"""
+
+
 def interactive_top_html(profile_label: str, slot: int, platform: str) -> str:
     plat = (platform or "").strip().lower()
     if plat in ("ios", "ipados"):
@@ -147,6 +202,7 @@ def interactive_top_html(profile_label: str, slot: int, platform: str) -> str:
   <span class="tab-badge" data-tab-count onclick="event.stopPropagation();callApi('open_tabs')">{slot}</span>
   <span class="menu-dot" onclick="event.stopPropagation();callApi('open_menu')">⋮</span>
 </div></div>
+{_menu_sheet_html()}
 <script>{_SHELL_JS}
 setInterval(function(){{ if(window.pywebview&&pywebview.api&&pywebview.api.poll_state) pywebview.api.poll_state(); }}, 800);
 </script></body></html>"""
@@ -169,6 +225,7 @@ setInterval(function(){ if(window.pywebview&&pywebview.api&&pywebview.api.poll_s
     <button class="tool" type="button" onclick="callApi('reload_page')">↻</button>
     <button class="tool" type="button" onclick="callApi('go_home')">⌂</button>
     <button class="tool tabs" type="button" onclick="callApi('open_tabs')">▢<em data-tab-count>{slot}</em></button>
+    <button class="tool" type="button" onclick="callApi('open_menu')">⋮</button>
   </div>
   <div id="tab-sheet" class="tab-sheet" onclick="if(event.target===this)closeTabSheet()">
     <div class="tab-panel" onclick="event.stopPropagation()">
@@ -180,6 +237,7 @@ setInterval(function(){ if(window.pywebview&&pywebview.api&&pywebview.api.poll_s
       </div>
     </div>
   </div>
+  {_menu_sheet_html()}
 </div>
 <script>{_SHELL_JS}{poll}</script></body></html>"""
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_shell_css_android()}{_SHELL_CSS}</style></head>
@@ -200,6 +258,7 @@ setInterval(function(){ if(window.pywebview&&pywebview.api&&pywebview.api.poll_s
     </div>
   </div>
 </div>
+{_menu_sheet_html()}
 <script>{_SHELL_JS}{poll}</script></body></html>"""
 
 
@@ -212,19 +271,34 @@ class MobileShellHostApi:
         self.profile_label = profile_label
         self._top: Any = None
         self._bottom: Any = None
+        self._session_key = ""
 
-    def bind_windows(self, top: Any, bottom: Any) -> None:
+    def bind_windows(self, top: Any, bottom: Any, *, session_key: str = "") -> None:
         self._top = top
         self._bottom = bottom
+        self._session_key = str(session_key or "")
 
     def _push(self, cmd: str, **kwargs: Any) -> None:
         enqueue_shell_command(self.cfg_path, cmd, **kwargs)
 
+    def _chrome_win(self) -> Any:
+        return self._bottom or self._top
+
+    def _sync_zoom_ui(self) -> None:
+        win = self._chrome_win()
+        if not win:
+            return
+        try:
+            from krexion_mobile_browser_shell import get_shell_frame_scale
+
+            pct = int(round(get_shell_frame_scale(self._session_key) * 100))
+            win.evaluate_js(f"setZoomPct({pct})")
+        except Exception:
+            pass
+
     def poll_state(self) -> None:
         st = read_shell_state(self.cfg_path)
-        if not st:
-            return
-        win = self._bottom or self._top
+        win = self._chrome_win()
         if not win:
             return
         try:
@@ -240,6 +314,11 @@ class MobileShellHostApi:
             tc = st.get("tab_count")
             if tc is not None:
                 win.evaluate_js(f"setTabCount({int(tc)})")
+            zp = st.get("zoom_pct")
+            if zp is not None:
+                win.evaluate_js(f"setZoomPct({int(zp)})")
+            else:
+                self._sync_zoom_ui()
         except Exception:
             pass
 
@@ -265,4 +344,23 @@ class MobileShellHostApi:
         self.poll_state()
 
     def open_menu(self) -> None:
-        self.open_tabs()
+        win = self._chrome_win()
+        if not win:
+            return
+        try:
+            self._sync_zoom_ui()
+            win.evaluate_js("openMenuSheet()")
+        except Exception:
+            pass
+
+    def fit_screen(self) -> None:
+        self._push("fit_screen")
+
+    def actual_size(self) -> None:
+        self._push("actual_size")
+
+    def zoom_in(self) -> None:
+        self._push("zoom_in")
+
+    def zoom_out(self) -> None:
+        self._push("zoom_out")

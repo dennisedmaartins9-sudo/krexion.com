@@ -4169,6 +4169,135 @@ def merge_url_query_params(base_url: str, params: Dict[str, Any]) -> str:
     return urlunparse(parsed._replace(query=urlencode(existing, doseq=True)))
 
 
+_TRACKER_PARAM_GROUPS: Dict[str, tuple] = {
+    "click_id": (
+        "clickid", "click_id", "cid", "transaction_id", "tid", "txid",
+        "trans_id", "ttid", "source_id", "aff_click_id", "subid",
+    ),
+    "sub1": ("sub1", "s1", "aff_sub"),
+    "sub2": ("sub2", "s2", "aff_sub2"),
+    "sub3": ("sub3", "s3", "aff_sub3"),
+    "sub4": ("aff_sub4",),
+}
+
+_TRACKER_STYLE_PREFS: Dict[str, Dict[str, Optional[str]]] = {
+    "everflow": {
+        "click_id": "clickid",
+        "sub1": "aff_sub",
+        "sub2": "aff_sub2",
+        "sub3": "aff_sub3",
+        "sub4": "aff_sub4",
+    },
+    "hasoffers": {
+        "click_id": "aff_click_id",
+        "sub1": "aff_sub",
+        "sub2": "aff_sub2",
+        "sub3": "aff_sub3",
+        "sub4": "aff_sub4",
+    },
+    "standard": {
+        "click_id": "click_id",
+        "sub1": "sub1",
+        "sub2": "sub2",
+        "sub3": None,
+        "sub4": None,
+    },
+}
+
+
+def detect_tracker_param_style(url: str) -> str:
+    """Pick affiliate naming convention from tracker URL shape."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        query = (parsed.query or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return "standard"
+    blob = f"{host} {path} {query}"
+    if any(tok in blob for tok in ("evyy.net", "everflow", "eflow", "aff_c", "aff_click")):
+        return "everflow"
+    if any(tok in blob for tok in ("go2cloud.org", "hasoffers", "hop.click")):
+        return "hasoffers"
+    return "standard"
+
+
+def compact_tracker_params_for_url(
+    url: str,
+    params: Dict[str, Any],
+) -> Dict[str, str]:
+    """One semantic value → one query key (clean Everflow / network click reports)."""
+    if not params:
+        return {}
+    from urllib.parse import parse_qsl, urlparse
+
+    style = detect_tracker_param_style(url)
+    prefs = _TRACKER_STYLE_PREFS.get(style, _TRACKER_STYLE_PREFS["standard"])
+    existing_keys = {
+        str(k).lower()
+        for k, _ in parse_qsl(
+            urlparse(str(url or "")).query or "",
+            keep_blank_values=True,
+        )
+    }
+
+    grouped_all = {alias.lower() for aliases in _TRACKER_PARAM_GROUPS.values() for alias in aliases}
+    out: Dict[str, str] = {}
+
+    for key, value in params.items():
+        k = str(key or "").strip()
+        if not k or k.startswith("_"):
+            continue
+        if k.lower() in grouped_all:
+            continue
+        v = str(value or "").strip()
+        if not v:
+            continue
+        if k.lower() == "fbc":
+            fb = str(params.get("fbclid") or out.get("fbclid") or "").strip()
+            if fb:
+                continue
+        out[k] = v
+
+    for group_name, aliases in _TRACKER_PARAM_GROUPS.items():
+        pref = prefs.get(group_name)
+        if pref is None:
+            if group_name == "sub3" and str(out.get("utm_source") or params.get("utm_source") or "").strip():
+                continue
+            if group_name == "sub4" and str(out.get("utm_campaign") or params.get("utm_campaign") or "").strip():
+                continue
+            pref = aliases[0] if group_name in ("click_id", "sub1", "sub2") else None
+        if not pref:
+            continue
+
+        val = ""
+        for alias in aliases:
+            raw = params.get(alias)
+            if raw is not None and str(raw).strip():
+                val = str(raw).strip()
+                break
+        if not val:
+            continue
+
+        chosen = pref
+        for alias in aliases:
+            if alias.lower() in existing_keys:
+                chosen = alias
+                break
+        out[chosen] = val
+
+    if style == "everflow":
+        sub3 = str(out.get("aff_sub3") or out.get("sub3") or "").strip()
+        if sub3 and str(out.get("utm_source") or "").strip().lower() == sub3.lower():
+            out.pop("utm_source", None)
+        sub4 = str(out.get("aff_sub4") or "").strip()
+        if sub4 and str(out.get("utm_campaign") or "").strip().lower() == sub4.lower():
+            out.pop("utm_campaign", None)
+
+    return out
+
 def build_profile_platform_params(
     platform: str,
     *,
@@ -4301,7 +4430,7 @@ def build_profile_platform_params(
     if out.get("utm_campaign"):
         out.setdefault("aff_sub4", str(out["utm_campaign"])[:32])
     out.setdefault("source_id", click_token[:16])
-    return out
+    return {str(k): str(v) for k, v in out.items() if v is not None and str(v).strip()}
 
 
 def enrich_profile_offer_url(
@@ -4331,7 +4460,7 @@ def enrich_profile_offer_url(
         plat = str(pro_extras.get("platform") or "").strip().lower()
     try:
         if preset_params:
-            params = dict(preset_params)
+            params = compact_tracker_params_for_url(base, dict(preset_params))
         else:
             params = build_profile_platform_params(
                 plat or "generic",
@@ -4341,6 +4470,7 @@ def enrich_profile_offer_url(
                 session_id=session_id,
                 pro_extras=pro_extras,
             )
+            params = compact_tracker_params_for_url(base, params)
         if not params:
             return base
         out = merge_url_query_params(base, params)

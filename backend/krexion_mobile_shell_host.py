@@ -30,6 +30,7 @@ def main() -> int:
     interactive = bool(cfg.get("interactive"))
     home_url = str(cfg.get("home_url") or "https://www.google.com/")
     profile_label = str(cfg.get("profile_label") or "Profile")
+    session_key = str(cfg.get("session_key") or "")
 
     bottom_y = vy + top_h + bezel + vh + bezel
     show_bottom = bool(cfg.get("show_bottom")) and bottom_h > 0
@@ -64,7 +65,7 @@ def main() -> int:
                 pass
         _save_handles()
         if api is not None:
-            api.bind_windows(top, bottom if show_bottom else None)
+            api.bind_windows(top, bottom if show_bottom else None, session_key=session_key)
 
     def _on_bottom_loaded():
         try:
@@ -76,7 +77,7 @@ def main() -> int:
                 pass
         _save_handles()
         if api is not None:
-            api.bind_windows(top, bottom)
+            api.bind_windows(top, bottom, session_key=session_key)
 
     top = webview.create_window(
         title=f"KrexionShell-{slot}-top",
@@ -110,7 +111,10 @@ def main() -> int:
             js_api=api,
         )
         bottom.events.loaded += _on_bottom_loaded
-    webview.start(gui="edgechromium")
+    try:
+        webview.start(gui="edgechromium")
+    except Exception:
+        webview.start()
     return 0
 
 

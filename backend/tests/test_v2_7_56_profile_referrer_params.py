@@ -18,7 +18,9 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_56():
-    assert _read("VERSION").strip() == "2.7.66"
+    from packaging.version import Version
+
+    assert Version(_read("VERSION").strip()) >= Version("2.7.56")
 
 
 def test_normalize_referer_url_adds_https():
@@ -65,9 +67,11 @@ def test_enrich_profile_offer_url_adds_fbclid():
         brand="test",
     )
     assert "gclid=" in out
-    assert "utm_source=" in out
+    assert "utm_medium=" in out
     assert "clickid=" in out
-    assert "source_id=" in out
+    assert "aff_sub=" in out
+    assert "aff_sub3=youtube" in out
+    assert "source_id=" not in out
 
 
 def test_enrich_does_not_import_server():

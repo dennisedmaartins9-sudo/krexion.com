@@ -44,6 +44,7 @@ class MobileShellLayout:
     bezel: int
     outer_w: int
     outer_h: int
+    frame_scale: float = 1.0
 
     @property
     def content_w(self) -> int:
@@ -52,6 +53,99 @@ class MobileShellLayout:
     @property
     def content_h(self) -> int:
         return self.viewport_h
+
+    @property
+    def display_outer_w(self) -> int:
+        fs = max(0.55, min(1.5, float(self.frame_scale or 1.0)))
+        return max(280, int(round(self.outer_w * fs)))
+
+    @property
+    def display_outer_h(self) -> int:
+        fs = max(0.55, min(1.5, float(self.frame_scale or 1.0)))
+        return max(400, int(round(self.outer_h * fs)))
+
+    def with_frame_scale(self, scale: float) -> "MobileShellLayout":
+        fs = max(0.55, min(1.5, float(scale or 1.0)))
+        return MobileShellLayout(
+            platform=self.platform,
+            viewport_w=self.viewport_w,
+            viewport_h=self.viewport_h,
+            top_h=self.top_h,
+            bottom_h=self.bottom_h,
+            bezel=self.bezel,
+            outer_w=self.outer_w,
+            outer_h=self.outer_h,
+            frame_scale=fs,
+        )
+
+
+def compute_fit_frame_scale(layout: MobileShellLayout) -> float:
+    """Scale whole phone frame to fit monitor; Playwright viewport stays 1:1."""
+    try:
+        import ctypes
+
+        sw = int(ctypes.windll.user32.GetSystemMetrics(0))
+        sh = int(ctypes.windll.user32.GetSystemMetrics(1))
+    except Exception:
+        sw, sh = 1920, 1080
+    margin_x, margin_y = 24, 72
+    avail_w = max(280, sw - margin_x * 2)
+    avail_h = max(480, sh - margin_y * 2)
+    scale = min(avail_w / max(1, layout.outer_w), avail_h / max(1, layout.outer_h), 1.0)
+    return max(0.55, round(scale, 3))
+
+
+def adjust_shell_frame_scale(
+    session_key: str,
+    mode: str,
+    *,
+    fit_by_default: bool = True,
+) -> float:
+    """
+    Resize visual shell frame without changing Playwright device viewport.
+    mode: fit | actual | in | out
+    """
+    key = str(session_key or "")
+    with _LOCK:
+        rec = _ACTIVE.get(key)
+    if not rec:
+        return 1.0
+    layout: MobileShellLayout = rec.get("layout")
+    if not isinstance(layout, MobileShellLayout):
+        return 1.0
+    cur = float(layout.frame_scale or 1.0)
+    m = (mode or "").strip().lower()
+    if m in ("fit", "fit_screen"):
+        nxt = compute_fit_frame_scale(layout)
+    elif m in ("actual", "actual_size", "100"):
+        nxt = 1.0
+    elif m in ("in", "zoom_in", "+"):
+        nxt = cur * 1.12
+    elif m in ("out", "zoom_out", "-"):
+        nxt = cur / 1.12
+    else:
+        nxt = compute_fit_frame_scale(layout) if fit_by_default else cur
+    nxt = max(0.55, min(1.5, round(nxt, 3)))
+    new_layout = layout.with_frame_scale(nxt)
+    ox, oy = _center_origin(new_layout)
+    with _LOCK:
+        rec = _ACTIVE.get(key)
+        if rec:
+            rec["layout"] = new_layout
+            rec["origin_x"] = ox
+            rec["origin_y"] = oy
+    return nxt
+
+
+def get_shell_frame_scale(session_key: str) -> float:
+    with _LOCK:
+        rec = _ACTIVE.get(str(session_key or ""))
+    if not rec:
+        return 1.0
+    layout = rec.get("layout")
+    if isinstance(layout, MobileShellLayout):
+        return float(layout.frame_scale or 1.0)
+    return 1.0
 
 
 def compute_mobile_shell_layout(
@@ -63,10 +157,8 @@ def compute_mobile_shell_layout(
     vw = max(320, min(1200, int(viewport_w or 393)))
     vh = max(568, min(1600, int(viewport_h or 844)))
     if plat in ("ios", "ipados"):
-        # Safari: minimal top, main chrome at bottom (URL pill + toolbar).
         top_h, bottom_h, bezel = 28, 82, 0
     else:
-        # Chrome Android: omnibox top + bottom nav row.
         top_h, bottom_h, bezel = 56, 52, 0
     outer_w = vw + bezel * 2
     outer_h = top_h + vh + bottom_h + bezel * 2
@@ -79,6 +171,7 @@ def compute_mobile_shell_layout(
         bezel=bezel,
         outer_w=outer_w,
         outer_h=outer_h,
+        frame_scale=1.0,
     )
 
 
@@ -331,7 +424,6 @@ def _start_shell_process(
             [sys.executable, _host_script_path(), path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         with _LOCK:
             _ACTIVE[session_key] = {
@@ -363,6 +455,29 @@ def is_mobile_shell_alive(session_key: str) -> bool:
         return False
 
 
+def wait_for_mobile_shell(session_key: str, *, timeout_sec: float = 30.0) -> bool:
+    """Wait until pywebview chrome subprocess is registered and alive."""
+    deadline = time.time() + max(2.0, float(timeout_sec or 30.0))
+    while time.time() < deadline:
+        if is_mobile_shell_alive(session_key):
+            return True
+        time.sleep(0.2)
+    return is_mobile_shell_alive(session_key)
+
+
+def _center_origin(layout: MobileShellLayout) -> Tuple[int, int]:
+    try:
+        import ctypes
+
+        sw = int(ctypes.windll.user32.GetSystemMetrics(0))
+        sh = int(ctypes.windll.user32.GetSystemMetrics(1))
+        x = max(0, (sw - layout.display_outer_w) // 2)
+        y = max(0, (sh - layout.display_outer_h) // 2)
+        return x, y
+    except Exception:
+        return 120, 80
+
+
 def stop_mobile_shell(session_key: str) -> None:
     with _LOCK:
         rec = _ACTIVE.pop(str(session_key or ""), None)
@@ -384,17 +499,28 @@ def stop_mobile_shell(session_key: str) -> None:
         pass
 
 
-def _center_origin(layout: MobileShellLayout) -> Tuple[int, int]:
+def _win_dpi_scale() -> float:
+    """Windows display scale (1.0 = 96 DPI) for sizing engine HWNDs."""
     try:
         import ctypes
 
-        sw = int(ctypes.windll.user32.GetSystemMetrics(0))
-        sh = int(ctypes.windll.user32.GetSystemMetrics(1))
-        x = max(0, (sw - layout.outer_w) // 2)
-        y = max(0, (sh - layout.outer_h) // 2)
-        return x, y
+        user32 = ctypes.windll.user32
+        hdc = user32.GetDC(0)
+        dpi = float(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88))
+        user32.ReleaseDC(0, hdc)
+        return max(1.0, dpi / 96.0)
     except Exception:
-        return 120, 80
+        return 1.0
+
+
+def _engine_window_size(layout: MobileShellLayout) -> Tuple[int, int]:
+    """Physical pixel size for Playwright engine HWND (viewport scaled visually)."""
+    dpi = _win_dpi_scale()
+    fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
+    return (
+        max(280, int(round(layout.content_w * dpi * fs))),
+        max(480, int(round(layout.content_h * dpi * fs))),
+    )
 
 
 def _strip_native_caption(hwnd: int) -> None:
@@ -499,6 +625,8 @@ def _shell_apply_loop(
     *,
     webkit: bool,
     home_url: str = "https://www.google.com/",
+    origin_xy: Optional[Tuple[int, int]] = None,
+    shell_already_started: bool = False,
 ) -> None:
     try:
         import ctypes
@@ -522,17 +650,26 @@ def _shell_apply_loop(
         ]
         GetWindowThreadProcessId.restype = wintypes.DWORD
 
-        ox, oy = _center_origin(layout)
-        _start_shell_process(
-            session_key,
-            layout,
-            profile_label,
-            profile_slot,
-            ox,
-            oy,
-            home_url=home_url,
-            interactive=True,
-        )
+        ox, oy = origin_xy if origin_xy else _center_origin(layout)
+        with _LOCK:
+            rec = _ACTIVE.get(str(session_key or ""))
+            if rec:
+                ox = int(rec.get("origin_x") or ox)
+                oy = int(rec.get("origin_y") or oy)
+                lay = rec.get("layout")
+                if isinstance(lay, MobileShellLayout):
+                    layout = lay
+        if not shell_already_started:
+            _start_shell_process(
+                session_key,
+                layout,
+                profile_label,
+                profile_slot,
+                ox,
+                oy,
+                home_url=home_url,
+                interactive=True,
+            )
 
         deadline = time.time() + deadline_s
         pid_set: Set[int] = {int(p) for p in seed_pids or []}
@@ -542,9 +679,11 @@ def _shell_apply_loop(
             pid_set |= find_webkit_browser_pids(parent_pid)
             pid_set |= find_pids_by_window_title_substrings("[WebKit]", "Safari")
 
-        content_x = ox + layout.bezel
-        content_y = oy + layout.top_h + layout.bezel
-        last_layout = (content_x, content_y, layout.content_w, layout.content_h)
+        dpi = _win_dpi_scale()
+        fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
+        content_x = int(round((ox + layout.bezel) * dpi))
+        content_y = int(round((oy + layout.top_h * fs + layout.bezel) * dpi))
+        eng_w, eng_h = _engine_window_size(layout)
 
         while time.time() < deadline:
             if parent_pid:
@@ -575,8 +714,8 @@ def _shell_apply_loop(
                     hwnd,
                     content_x,
                     content_y,
-                    layout.content_w,
-                    layout.content_h,
+                    eng_w,
+                    eng_h,
                 )
                 user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
                 try:
@@ -592,15 +731,20 @@ def _shell_apply_loop(
             handles = _load_shell_handles(session_key)
             top_hwnd = int(handles.get("top") or 0)
             bottom_hwnd = int(handles.get("bottom") or 0)
+            outer_w = int(round(layout.outer_w * dpi * fs))
+            top_h = int(round(layout.top_h * dpi * fs))
+            bottom_h = int(round(layout.bottom_h * dpi * fs))
+            origin_x = int(round(ox * dpi))
+            origin_y = int(round(oy * dpi))
             if top_hwnd:
-                _set_window_pos(top_hwnd, ox, oy, layout.outer_w, layout.top_h)
+                _set_window_pos(top_hwnd, origin_x, origin_y, outer_w, top_h)
             if bottom_hwnd and layout.bottom_h > 0:
                 _set_window_pos(
                     bottom_hwnd,
-                    ox,
-                    oy + layout.top_h + layout.bezel * 2 + layout.content_h,
-                    layout.outer_w,
-                    layout.bottom_h,
+                    origin_x,
+                    origin_y + top_h + int(round(layout.bezel * 2 * dpi * fs)) + eng_h,
+                    outer_w,
+                    bottom_h,
                 )
 
             if parent_pid:
@@ -639,8 +783,32 @@ def apply_krexion_mobile_shell(
         return None
     try:
         layout = compute_mobile_shell_layout(platform, viewport_width, viewport_height)
+        layout = layout.with_frame_scale(compute_fit_frame_scale(layout))
         _clean = sorted({int(p) for p in (pids or []) if p})
         if not _clean and not parent_pid:
+            return None
+        ox, oy = _center_origin(layout)
+        proc = None
+        for _attempt in range(2):
+            if _attempt:
+                stop_mobile_shell(str(session_key))
+            proc = _start_shell_process(
+                str(session_key),
+                layout,
+                str(profile_label or "")[:60],
+                int(profile_slot or 1),
+                ox,
+                oy,
+                home_url=str(home_url or "https://www.google.com/")[:512],
+                interactive=True,
+            )
+            if proc is not None and proc.poll() is None:
+                break
+            time.sleep(0.35)
+        if proc is None or proc.poll() is not None:
+            logger.warning(
+                f"[mobile-shell] chrome subprocess failed to start session={str(session_key)[:8]}"
+            )
             return None
         t = threading.Thread(
             target=_shell_apply_loop,
@@ -654,7 +822,12 @@ def apply_krexion_mobile_shell(
                 float(poll_seconds),
                 float(poll_interval),
             ),
-            kwargs={"webkit": bool(webkit), "home_url": str(home_url or "")[:512]},
+            kwargs={
+                "webkit": bool(webkit),
+                "home_url": str(home_url or "")[:512],
+                "origin_xy": (ox, oy),
+                "shell_already_started": True,
+            },
             daemon=True,
             name=f"KrexionMobileShell-{profile_slot}-{session_key[:8]}",
         )

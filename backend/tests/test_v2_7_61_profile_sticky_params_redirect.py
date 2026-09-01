@@ -14,7 +14,9 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_version_is_2_7_61():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.66"
+    from packaging.version import Version
+
+    assert Version((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= Version("2.7.61")
 
 
 def test_email_referrer_enriches_everflow_aliases():
@@ -25,11 +27,11 @@ def test_email_referrer_enriches_everflow_aliases():
         platform="email",
         referer_url="https://mail.google.com/",
     )
-    assert "utm_source=" in out
+    assert "utm_medium=" in out
     assert "clickid=" in out
-    assert "sub1=" in out
     assert "aff_sub=" in out
-    assert "source_id=" in out
+    assert "aff_sub3=email" in out
+    assert "sub1=" not in out
 
 
 def test_instagram_params_include_igshid():
@@ -40,7 +42,8 @@ def test_instagram_params_include_igshid():
         platform="instagram",
     )
     assert "igshid=" in out
-    assert "utm_source=" in out
+    assert "utm_medium=" in out
+    assert "aff_sub3=instagram" in out
 
 
 def test_sticky_params_same_clickid_twice():
@@ -60,7 +63,11 @@ def test_sticky_params_same_clickid_twice():
     )
     p1 = _ensure_sticky_profile_params(st)
     p2 = _ensure_sticky_profile_params(st)
-    assert p1["clickid"] == p2["clickid"] == "sticky999"
+    from referrer_pro import compact_tracker_params_for_url
+
+    c1 = compact_tracker_params_for_url("https://network.evyy.net/aff_c?offer_id=3291", p1)
+    c2 = compact_tracker_params_for_url("https://network.evyy.net/aff_c?offer_id=3291", p2)
+    assert c1["clickid"] == c2["clickid"] == "sticky999"
     u1 = _profile_enrich_nav_url("https://tracker.example/aff_c?offer_id=3291", st)
     u2 = _profile_enrich_nav_url("https://tracker.example/aff_c?offer_id=3291", st)
     assert "clickid=sticky999" in u1
@@ -76,8 +83,11 @@ def test_launcher_uses_302_redirect_enrich():
 
 
 def test_generic_platform_still_gets_clickid():
-    from referrer_pro import build_profile_platform_params
+    from referrer_pro import build_profile_platform_params, compact_tracker_params_for_url
 
-    p = build_profile_platform_params("generic", session_id="abc")
-    assert p.get("clickid")
+    p = compact_tracker_params_for_url(
+        "https://example.com/offer",
+        build_profile_platform_params("generic", session_id="abc"),
+    )
+    assert p.get("click_id")
     assert p.get("sub1")

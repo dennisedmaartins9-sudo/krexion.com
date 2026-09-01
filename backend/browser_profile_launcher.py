@@ -125,7 +125,7 @@ async def _apply_shell_commands(
 ) -> None:
     """Drain mobile-shell IPC commands and drive Playwright pages."""
     try:
-        from krexion_mobile_browser_shell import get_shell_cfg_path
+        from krexion_mobile_browser_shell import get_shell_cfg_path, adjust_shell_frame_scale, get_shell_frame_scale
         from krexion_mobile_shell_interactive import drain_shell_commands, write_shell_state
     except Exception:
         return
@@ -163,6 +163,7 @@ async def _apply_shell_commands(
             "tabs": tab_list,
             "active_tab": active_idx,
             "tab_count": len(live),
+            "zoom_pct": int(round(get_shell_frame_scale(session_id) * 100)),
         })
         sess["shell_tabs"] = tab_list
         sess["shell_active_tab"] = active_idx
@@ -204,6 +205,14 @@ async def _apply_shell_commands(
                         await live[idx].bring_to_front()
                     except Exception:
                         pass
+            elif name in ("fit_screen", "actual_size", "zoom_in", "zoom_out"):
+                mode = {
+                    "fit_screen": "fit",
+                    "actual_size": "actual",
+                    "zoom_in": "in",
+                    "zoom_out": "out",
+                }.get(name, name)
+                adjust_shell_frame_scale(session_id, mode)
         except Exception as _sc_err:
             logger.debug(f"[mobile-shell] cmd {name} skipped: {_sc_err}")
         pages = [p for p in (getattr(context, "pages", None) or []) if not p.is_closed()]
@@ -1047,7 +1056,6 @@ def _resolve_profile_referrer_state(
         _click_id = str(_uuid_mod.uuid4()).replace("-", "")[:24]
         _extras = dict(extras or {})
         _extras.setdefault("click_id", _click_id)
-        _extras.setdefault("clickid", _click_id)
         if str(referrer.get("custom_click_id") or "").strip():
             _extras["custom_click_id"] = str(referrer.get("custom_click_id") or "").strip()
         try:
@@ -1410,7 +1418,7 @@ def make_profile_referrer_route_handler(state: _ProfileReferrerState):
                     logger.debug(f"profile wrapper bounce skipped: {_wrap_err}")
 
             if state.enabled and state.referer_url and request.resource_type == "document":
-                headers["referer"] = state.referer_url
+                headers.pop("referer", None)
                 headers["Referer"] = state.referer_url
                 if state.sec_fetch:
                     headers.update(state.sec_fetch)
@@ -2341,7 +2349,7 @@ async def _launch_profile_session_inner(
                     try:
                         from krexion_mobile_browser_shell import (
                             apply_krexion_mobile_shell,
-                            is_mobile_shell_alive,
+                            wait_for_mobile_shell,
                         )
 
                         apply_krexion_mobile_shell(
@@ -2357,12 +2365,7 @@ async def _launch_profile_session_inner(
                             webkit=_profile_engine == "webkit",
                             home_url=str(start_url or "https://www.google.com/")[:512],
                         )
-                        _shell_active = False
-                        for _shell_wait in range(20):
-                            if is_mobile_shell_alive(session_id):
-                                _shell_active = True
-                                break
-                            time.sleep(0.15)
+                        _shell_active = wait_for_mobile_shell(session_id, timeout_sec=30.0)
                         if _shell_active:
                             _launch_ui_meta["mobile_shell"] = True
                             logger.info(
@@ -2375,6 +2378,7 @@ async def _launch_profile_session_inner(
                             )
                     except Exception as _ms_err:
                         logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
+                # Legacy WebKit-only polish — only when Krexion mobile shell could not start.
                 if (
                     not _launch_ui_meta.get("mobile_shell")
                     and _profile_engine == "webkit"

@@ -87,10 +87,15 @@ def _is_webkit_browser_hwnd(hwnd: int) -> bool:
 def _phone_window_size(viewport_w: int, viewport_h: int) -> Tuple[int, int]:
     vw = max(320, min(520, int(viewport_w or 393)))
     vh = max(568, min(1200, int(viewport_h or 852)))
-    # MiniBrowser keeps a compact nav strip even after menu removal.
-    chrome_h = 72
-    border_w = 16
-    return vw + border_w, vh + chrome_h
+    try:
+        from krexion_mobile_browser_shell import _win_dpi_scale
+
+        scale = _win_dpi_scale()
+    except Exception:
+        scale = 1.0
+    chrome_h = int(round(72 * scale))
+    border_w = int(round(16 * scale))
+    return int(round(vw * scale)) + border_w, int(round(vh * scale)) + chrome_h
 
 
 def _center_window(hwnd: int, width: int, height: int) -> None:
