@@ -850,4 +850,6 @@ def should_use_mobile_shell(profile_os: str, is_mobile: bool) -> bool:
     if not _IS_WINDOWS or not is_mobile:
         return False
     plat = (profile_os or "").strip().lower()
+    if plat not in ("ios", "ipados", "android"):
+        plat = "android"
     return plat in ("ios", "ipados", "android")

@@ -11,7 +11,7 @@ def test_probe_profile_proxy_uses_httpx28_transport():
     )
     assert "async def _probe_profile_proxy(" in src
     assert "AsyncClient(proxies=" not in src
-    assert "AsyncHTTPTransport(proxy=" in src
+    assert "httpx.Proxy(url=proxy_url)" in src
 
 
 def test_httpx28_has_proxy_not_proxies_kwarg():

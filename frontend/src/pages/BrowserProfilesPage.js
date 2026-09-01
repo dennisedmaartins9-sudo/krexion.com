@@ -152,6 +152,28 @@ const DEFAULT_NEW = {
 
 const CREATE_DRAFT_KEY = "krexion_bp_create_draft_v1";
 
+/** Owner-only PUT/delete; ACL shared profiles are launch-only for editors. */
+const profileIsOwner = (p) => !p?.is_shared;
+
+function sanitizeProfileProxyForSave(proxy, country = "us") {
+  if (!proxy?.enabled) {
+    return { ...DEFAULT_NEW.proxy, enabled: false };
+  }
+  if (proxy.use_proxyjet && proxy.provider_id) {
+    return {
+      ...proxy,
+      enabled: true,
+      proxyjet_country: (proxy.proxyjet_country || country || "US").toUpperCase(),
+    };
+  }
+  return {
+    ...proxy,
+    enabled: true,
+    provider_id: "",
+    use_proxyjet: false,
+  };
+}
+
 const ADV_CREATE_DEFAULTS = {
   advCount: 1,
   advNamePrefix: "",
@@ -727,19 +749,7 @@ export default function BrowserProfilesPage() {
     }
     try {
       const payload = { ...form };
-      if (payload.proxy?.provider_id) {
-        payload.proxy = {
-          ...payload.proxy,
-          enabled: true,
-          proxyjet_country: (
-            payload.proxy.proxyjet_country
-            || payload.country
-            || "US"
-          ).toUpperCase(),
-        };
-      } else if (payload.proxy?.use_proxyjet) {
-        payload.proxy = { ...payload.proxy, enabled: true };
-      }
+      payload.proxy = sanitizeProfileProxyForSave(payload.proxy, payload.country);
       const r = await fetch(`${API}/${editingId}`, {
         method: "PUT", headers: authHeaders, body: JSON.stringify(payload),
       });
@@ -800,19 +810,11 @@ export default function BrowserProfilesPage() {
           region: advUA.region || (form.country || "US").toUpperCase(),
         },
         proxy: (() => {
-          if (advProxy.provider_id) {
-            return {
-              mode: "provider",
-              provider_id: advProxy.provider_id,
-              country: (form.country || advProxy.country || "US").toUpperCase(),
-              state: (advProxy.state || "").toUpperCase(),
-            };
-          }
           if (advProxy.mode === "provider" && advProxy.provider_id) {
             return {
               mode: "provider",
               provider_id: advProxy.provider_id,
-              country: (form.country || "US").toUpperCase(),
+              country: (form.country || advProxy.country || "US").toUpperCase(),
               state: (advProxy.state || "").toUpperCase(),
             };
           }
@@ -883,6 +885,10 @@ export default function BrowserProfilesPage() {
 
   const handleBulkLaunch = async () => {
     if (!selectedCount || bulkBusy) return;
+    if (bulkLaunchAuto.enabled && !bulkLaunchAuto.automation_upload_id) {
+      toast.error("Select a JSON template for bulk launch");
+      return;
+    }
     setBulkBusy(true);
     try {
       const payload = {
@@ -898,6 +904,7 @@ export default function BrowserProfilesPage() {
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
           after_mode: "manual",
+          proxy_upload_id: bulkLaunchAuto.proxy_upload_id || "",
         };
       }
       const r = await fetch(`${API}/bulk-launch`, {
@@ -1011,18 +1018,7 @@ export default function BrowserProfilesPage() {
   };
 
   const handleCreateLegacy = async () => {
-    if (!form.name.trim()) { toast.error("Name is required"); return; }
-    try {
-      const url = editingId ? `${API}/${editingId}` : `${API}/`;
-      const method = editingId ? "PUT" : "POST";
-      const r = await fetch(url, {
-        method, headers: authHeaders, body: JSON.stringify(form),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      toast.success(editingId ? "Profile updated" : "Profile created");
-      setShowCreate(false); setEditingId(null); setForm(DEFAULT_NEW);
-      fetchProfiles();
-    } catch (e) { toast.error(`Save failed: ${e.message}`); }
+    return handleCreate();
   };
 
   const handleEdit = async (id) => {
@@ -1379,6 +1375,7 @@ export default function BrowserProfilesPage() {
         });
         if (!r.ok) throw new Error(await r.text());
         toast.success(`Cloned profile to ${email.trim()}`);
+        fetchProfiles();
       } else {
         const r = await fetch(`${API}/${id}/acl`, {
           method: "POST", headers: authHeaders,
@@ -1586,8 +1583,8 @@ export default function BrowserProfilesPage() {
   };
 
   const handleRunAutomationAgain = async (p) => {
-    const uploadId = launchAuto.automation_upload_id
-      || p.default_automation_upload_id
+    const uploadId = p.default_automation_upload_id
+      || launchAuto.automation_upload_id
       || "";
     if (!uploadId) {
       toast.error("Select a JSON template in Launch preview first, or save a default.");
@@ -1742,7 +1739,7 @@ export default function BrowserProfilesPage() {
           onClick={() => { openCookieDialog(p.id); setCardMenuId(null); }}>
           Cookies
         </button>
-        <button type="button" className={itemClass} disabled={showTrash}
+        <button type="button" className={itemClass} disabled={showTrash || !profileIsOwner(p)}
           data-testid={`bp-share-${p.id}`}
           onClick={() => {
             setShareDialog({ id: p.id, email: "", includeCookies: false, mode: "acl", role: "editor" });
@@ -1750,22 +1747,28 @@ export default function BrowserProfilesPage() {
           }}>
           Share
         </button>
-        <button type="button" className={itemClass} disabled={showTrash}
+        <button type="button" className={itemClass} disabled={showTrash || !profileIsOwner(p)}
           onClick={() => { openCloudPhoneDialog(p.id, p); setCardMenuId(null); }}>
           Cloud Phone
         </button>
+        {profileIsOwner(p) && (
         <button type="button" className={itemClass} disabled={showTrash}
           onClick={() => { handleEdit(p.id); setCardMenuId(null); }}>
           Edit
         </button>
+        )}
+        {profileIsOwner(p) && (
         <button type="button" className={itemClass} disabled={showTrash}
           onClick={() => { openCloneDialog(p.id); setCardMenuId(null); }}>
           Clone
         </button>
+        )}
+        {profileIsOwner(p) && (
         <button type="button" className={`${itemClass} text-red-400 hover:text-red-300`} disabled={showTrash}
           onClick={() => { handleDelete(p.id); setCardMenuId(null); }}>
           Delete
         </button>
+        )}
       </div>
     );
   };
@@ -2083,7 +2086,7 @@ export default function BrowserProfilesPage() {
                 </>
               )}
             </div>
-            <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkLaunch}
+            <Button size="sm" disabled={!selectedCount || bulkBusy || (bulkLaunchAuto.enabled && !bulkLaunchAuto.automation_upload_id)} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
               <Play className="w-3 h-3 mr-1" /> Launch
             </Button>
@@ -3172,7 +3175,7 @@ export default function BrowserProfilesPage() {
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "none" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="none" className="sr-only"
                           checked={advProxy.mode === "none"}
-                          onChange={() => setAdvProxy({ ...advProxy, mode: "none" })} />
+                          onChange={() => setAdvProxy({ ...advProxy, mode: "none", provider_id: "" })} />
                         <div className="font-semibold">No Proxy</div>
                         <div className="text-[10px] mt-0.5 opacity-70">Direct connection</div>
                       </label>
@@ -3470,7 +3473,14 @@ export default function BrowserProfilesPage() {
                         {/* v2.4.0 — Multi-provider dropdown */}
                         <ProxyProviderSelect
                           value={form.proxy.provider_id}
-                          onChange={(v) => setForm({ ...form, proxy: { ...form.proxy, provider_id: v } })}
+                          onChange={(v) => setForm({
+                            ...form,
+                            proxy: {
+                              ...form.proxy,
+                              provider_id: v,
+                              use_proxyjet: !!v,
+                            },
+                          })}
                           label="Provider (optional)"
                           labelDefault="(use manual proxy fields below)"
                           testIdPrefix="bp-proxy-provider"

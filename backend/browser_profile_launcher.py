@@ -1708,7 +1708,10 @@ async def _launch_profile_session_inner(
             )
     except Exception as _dvp_err:
         logger.debug(f"[profile-launch] device viewport resolve skipped: {_dvp_err}")
-    is_mobile = bool(profile_config.get("is_mobile"))
+    is_mobile = bool(
+        profile_config.get("is_mobile")
+        or str(profile_config.get("device_type") or "").lower() == "mobile"
+    )
     has_touch = bool(profile_config.get("has_touch") or is_mobile)
     dsf = float(profile_config.get("device_scale_factor") or (3.0 if is_mobile else 1.0))
     anti = profile_config.get("anti_detect") or {}
@@ -1867,11 +1870,16 @@ async def _launch_profile_session_inner(
 
     proxy_arg = None
     proxy_diag: Dict[str, Any] = {"requested": False, "server": "", "ok": None, "error": ""}
-    _proxy_enabled = bool(
-        proxy_cfg.get("enabled")
-        or proxy_cfg.get("use_proxyjet")
-        or str(proxy_cfg.get("provider_id") or "").strip()
-    )
+    _proxy_enabled = False
+    try:
+        from browser_profile_module import proxy_is_active as _proxy_is_active
+        _proxy_enabled = _proxy_is_active(proxy_cfg)
+    except Exception:
+        _proxy_enabled = bool(
+            proxy_cfg.get("enabled")
+            or proxy_cfg.get("use_proxyjet")
+            or str(proxy_cfg.get("provider_id") or "").strip()
+        )
     if _proxy_enabled and proxy_cfg.get("server"):
         # ── 2026-06 — Normalize the proxy server URL ──────────────
         # Customer report: launching a profile errored with
@@ -2284,7 +2292,7 @@ async def _launch_profile_session_inner(
         # v2.7.13 — Numbered badge = open-profile slot (top-left).
         _launch_ui_meta: Dict[str, Any] = {"mobile_shell": False, "webkit": _profile_engine == "webkit"}
 
-        def _brand_krexion_taskbar() -> None:
+        def _brand_krexion_taskbar(*, mobile_shell: bool = False) -> None:
             try:
                 from krexion_window_icon import (
                     apply_krexion_icon_to_pids,
@@ -2331,19 +2339,22 @@ async def _launch_profile_session_inner(
                     platform=str(profile_os or ""),
                 )
                 # Option B — Krexion unique mobile shell (iOS WebKit + Android Chromium).
+                # Only after first page exists — early apply races HWND embed and
+                # can tear down the shell before navigation (plain Chrome flash).
                 _use_mobile_shell = False
-                try:
-                    from krexion_mobile_browser_shell import (
-                        apply_krexion_mobile_shell,
-                        should_use_mobile_shell,
-                    )
+                if mobile_shell:
+                    try:
+                        from krexion_mobile_browser_shell import (
+                            apply_krexion_mobile_shell,
+                            should_use_mobile_shell,
+                        )
 
-                    _use_mobile_shell = should_use_mobile_shell(
-                        str(profile_os or ""),
-                        bool(is_mobile),
-                    )
-                except Exception:
-                    _use_mobile_shell = False
+                        _use_mobile_shell = should_use_mobile_shell(
+                            str(profile_os or ""),
+                            bool(is_mobile),
+                        )
+                    except Exception:
+                        _use_mobile_shell = False
 
                 if _use_mobile_shell:
                     try:
@@ -2398,7 +2409,7 @@ async def _launch_profile_session_inner(
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
 
-        _brand_krexion_taskbar()
+        _brand_krexion_taskbar(mobile_shell=False)
         if session_id in _RUNNING_SESSIONS:
             _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
             _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
@@ -2702,7 +2713,9 @@ async def _launch_profile_session_inner(
         # paints its own icon between launch() and first navigation).
         try:
             await asyncio.sleep(0.5)
-            _brand_krexion_taskbar()
+            _brand_krexion_taskbar(mobile_shell=True)
+            if session_id in _RUNNING_SESSIONS:
+                _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
         except Exception:
             pass
 

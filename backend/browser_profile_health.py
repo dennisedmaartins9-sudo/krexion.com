@@ -13,12 +13,16 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
     score = 100
     status = str(doc.get("status") or "idle").lower()
     proxy = doc.get("proxy") or {}
-    proxy_enabled = bool(
-        proxy.get("enabled")
-        or proxy.get("server")
-        or proxy.get("provider_id")
-        or proxy.get("use_proxyjet")
-    )
+    try:
+        from browser_profile_module import proxy_is_active
+        proxy_enabled = proxy_is_active(proxy)
+    except Exception:
+        proxy_enabled = bool(
+            proxy.get("enabled")
+            or proxy.get("server")
+            or proxy.get("provider_id")
+            or proxy.get("use_proxyjet")
+        )
     ss = doc.get("storage_state") or {}
     if not ss and doc.get("storage_state_stats"):
         ss = {
@@ -48,7 +52,7 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
         elif not exit_ip and not (last_proxy.get("ip") or last_proxy.get("exit_ip")):
             score -= 15
             issues.append("proxy not verified")
-    else:
+    elif proxy.get("enabled") is not False:
         score -= 5
         issues.append("no proxy configured")
 

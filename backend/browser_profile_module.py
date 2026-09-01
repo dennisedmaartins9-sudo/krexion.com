@@ -543,6 +543,19 @@ def _proxy_dict_to_probe_url(proxy: Dict[str, Any], proxy_type: str = "http") ->
     raise ValueError("no_proxy_configured")
 
 
+def proxy_is_active(proxy: Optional[Dict[str, Any]]) -> bool:
+    """True only when proxy is explicitly enabled with a configured source."""
+    p = dict(proxy or {})
+    if p.get("enabled") is False:
+        return False
+    return bool(
+        p.get("enabled")
+        or str(p.get("provider_id") or "").strip()
+        or p.get("use_proxyjet")
+        or str(p.get("server") or "").strip()
+    )
+
+
 def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Fill missing proxy username/password from raw_line or embedded server URL."""
     out = dict(cfg or {})
@@ -1640,7 +1653,7 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     result: Dict[str, Any] = {
         "ok": False,
         "checked_at": _now_iso(),
-        "proxy_enabled": bool(proxy.get("enabled") or proxy.get("provider_id") or proxy.get("use_proxyjet")),
+        "proxy_enabled": proxy_is_active(proxy),
         "exit_ip": "",
         "country": "",
         "timezone": "",
@@ -1862,12 +1875,7 @@ async def _finalize_doc_proxy_and_ip(
 ) -> None:
     """Probe profile proxy, enforce team uniqueness, persist exit_ip on doc."""
     proxy = doc.get("proxy") or {}
-    if not (
-        proxy.get("enabled")
-        or proxy.get("provider_id")
-        or proxy.get("use_proxyjet")
-        or str(proxy.get("server") or "").strip()
-    ):
+    if not proxy_is_active(proxy):
         return
     proxy = await _finalize_proxy_cfg_for_launch(uid, user, dict(proxy))
     doc["proxy"] = proxy
@@ -2014,6 +2022,8 @@ async def _ensure_profile_launch_proxy(
 ) -> Dict[str, Any]:
     """Resolve proxy, probe exit IP, and guarantee a team-unique IP before launch."""
     proxy_cfg = dict(doc.get("proxy") or {})
+    if not proxy_is_active(proxy_cfg):
+        return proxy_cfg
     profile_id = str(doc.get("id") or "")
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
 
@@ -2194,12 +2204,7 @@ async def create_profile(request: Request, body: ProfileBody):
     uid = _resolve_user_or_401(user)
     doc = _profile_doc(uid, body)
     proxy = doc.get("proxy") or {}
-    if (
-        proxy.get("enabled")
-        or proxy.get("provider_id")
-        or proxy.get("use_proxyjet")
-        or str(proxy.get("server") or "").strip()
-    ):
+    if proxy_is_active(proxy):
         used_ips = await _load_team_profile_used_ips(uid)
         if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
             lines = await _allocate_provider_proxy_lines(
@@ -2744,7 +2749,7 @@ async def import_vendor_profiles(
             if include_cookies and isinstance(raw.get("storage_state"), dict):
                 doc["storage_state"] = raw["storage_state"]
             proxy = doc.get("proxy") or {}
-            if proxy.get("enabled") or proxy.get("server") or proxy.get("provider_id"):
+            if proxy_is_active(proxy):
                 used = await _load_team_profile_used_ips(uid)
                 await _finalize_doc_proxy_and_ip(uid, user, doc, used)
             await _DB.browser_profiles.insert_one(doc)
@@ -3197,12 +3202,7 @@ async def refresh_profile_proxy(request: Request, profile_id: str):
             detail=f"Profile is {cur_status}. Stop it before rotating proxy.",
         )
     proxy = dict(doc.get("proxy") or {})
-    if not (
-        proxy.get("enabled")
-        or str(proxy.get("provider_id") or "").strip()
-        or proxy.get("use_proxyjet")
-        or str(proxy.get("server") or "").strip()
-    ):
+    if not proxy_is_active(proxy):
         raise HTTPException(status_code=400, detail="Profile has no proxy configured")
     patch_doc = dict(doc)
     proxy.pop("exit_ip", None)
@@ -3249,14 +3249,13 @@ async def refresh_profile_proxy(request: Request, profile_id: str):
 async def check_proxy(request: Request, profile_id: str):
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _get_profile_for_user(profile_id, uid, min_role="editor")
+    owner_uid = str(doc.get("user_id") or uid)
     result = await _probe_profile_proxy(doc, user)
     patch: Dict[str, Any] = {"last_proxy_check": result, "updated_at": _now_iso()}
     exit_ip = str(result.get("exit_ip") or "").strip()
     if exit_ip:
-        used = await _load_team_profile_used_ips(uid)
+        used = await _load_team_profile_used_ips(owner_uid)
         try:
             from cross_user_ip_isolation import canonicalize_ip
             cur = canonicalize_ip(doc.get("exit_ip") or "")
@@ -3266,7 +3265,7 @@ async def check_proxy(request: Request, profile_id: str):
             pass
         try:
             canonical = await _assert_unique_team_profile_ip(
-                uid, exit_ip, used, profile_id=profile_id,
+                owner_uid, exit_ip, used, profile_id=profile_id,
             )
             patch["exit_ip"] = canonical
             patch["proxy.exit_ip"] = canonical
@@ -3276,7 +3275,7 @@ async def check_proxy(request: Request, profile_id: str):
             result["error"] = str(exc.detail)
             patch["last_proxy_check"] = result
     await _DB.browser_profiles.update_one(
-        {"id": profile_id, "user_id": uid},
+        {"id": profile_id, "user_id": owner_uid},
         {"$set": patch},
     )
     return result
@@ -3352,11 +3351,7 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["cdp_ws"] = existing.get("cdp_ws") or ""
     new_doc["updated_at"] = _now_iso()
     _proxy = new_doc.get("proxy") or {}
-    _wants_proxy = bool(
-        _proxy.get("enabled")
-        or str(_proxy.get("provider_id") or "").strip()
-        or _proxy.get("use_proxyjet")
-    )
+    _wants_proxy = proxy_is_active(_proxy)
     if _wants_proxy and not str(_proxy.get("server") or "").strip():
         _used = await _load_team_profile_used_ips(uid)
         try:
@@ -3444,9 +3439,7 @@ async def launch_preview(request: Request, profile_id: str):
         "health": health,
         "exit_ip": view.get("exit_ip") or "",
         "cookie_count": (view.get("storage_state_stats") or {}).get("cookie_count") or 0,
-        "proxy_enabled": bool(
-            proxy.get("enabled") or proxy.get("server") or proxy.get("provider_id")
-        ),
+        "proxy_enabled": proxy_is_active(proxy),
         "device": doc.get("device_model") or doc.get("device_type") or "",
         "last_proxy_check": view.get("last_proxy_check") or {},
         "ready": health.get("level") in ("good", "warn", "unknown"),
@@ -4117,14 +4110,7 @@ async def import_bulk(request: Request, body: BulkCreateBody):
     batch_used = set(team_used_ips)
     for doc in docs:
         proxy = doc.get("proxy") or {}
-        if (
-            body.auto_unique_proxy
-            and (
-                proxy.get("enabled")
-                or proxy.get("provider_id")
-                or str(proxy.get("server") or "").strip()
-            )
-        ):
+        if body.auto_unique_proxy and proxy_is_active(proxy):
             await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
     if docs:
         await _DB.browser_profiles.insert_many(docs)
@@ -4157,6 +4143,7 @@ async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_f
     country = str(body.get("country") or "us").lower()
     device_type = str(body.get("device_type") or "desktop").lower()
     is_mobile = device_type == "mobile"
+    ua = _gen_random_ua(is_mobile)
     pb = ProfileBody(
         name=name,
         country=country,
@@ -4164,9 +4151,9 @@ async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_f
         is_mobile=is_mobile,
         has_touch=is_mobile,
         device_scale_factor=3.0 if is_mobile else 1.0,
-        user_agent=_gen_random_ua(is_mobile),
+        user_agent=ua,
         viewport=_gen_random_viewport(is_mobile),
-        os=_infer_os_from_ua(_gen_random_ua(is_mobile), is_mobile=is_mobile),
+        os=_infer_os_from_ua(ua, is_mobile=is_mobile),
         anti_detect=AntiDetectConfig(master=True),
     )
     doc = _profile_doc(uid, pb)
@@ -4556,10 +4543,12 @@ async def bulk_stop(request: Request, body: BulkIdsBody):
         try:
             fake_body = {}
             # Inline minimal stop: mark stop_requested / update status
-            doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
-            if not doc:
-                results.append({"id": pid, "ok": False, "reason": "not_found"})
+            try:
+                doc = await _get_profile_for_user(pid, uid, min_role="editor")
+            except HTTPException as he:
+                results.append({"id": pid, "ok": False, "reason": str(he.detail)[:120]})
                 continue
+            owner_uid = str(doc.get("user_id") or uid)
             st = str(doc.get("status") or "idle")
             if st not in ("running", "launching", "queued", "stopping"):
                 results.append({"id": pid, "ok": False, "reason": f"not_active:{st}"})
@@ -4571,7 +4560,7 @@ async def bulk_stop(request: Request, body: BulkIdsBody):
             # simplest: set status stopping and queue stop flag.
             sid = str(doc.get("session_id") or "")
             await _DB.browser_profiles.update_one(
-                {"id": pid, "user_id": uid},
+                {"id": pid, "user_id": owner_uid},
                 {"$set": {"status": "stopping"}},
             )
             if sid:
@@ -4610,9 +4599,10 @@ async def bulk_launch(request: Request, body: BulkLaunchBody):
         if len(launched) >= max_c:
             skipped.append({"id": pid, "reason": "concurrent_cap"})
             continue
-        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
-        if not doc:
-            skipped.append({"id": pid, "reason": "not_found"})
+        try:
+            doc = await _get_profile_for_user(pid, uid, min_role="editor")
+        except HTTPException as he:
+            skipped.append({"id": pid, "reason": str(he.detail)[:160]})
             continue
         st = str(doc.get("status") or "idle")
         if st in ("running", "launching", "queued", "stopping"):
@@ -4672,9 +4662,10 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
     launched_count = 0
 
     for idx, pid in enumerate(ids):
-        doc = await _DB.browser_profiles.find_one({"id": pid, "user_id": uid})
-        if not doc:
-            skipped.append({"id": pid, "reason": "not_found"})
+        try:
+            doc = await _get_profile_for_user(pid, uid, min_role="editor")
+        except HTTPException as he:
+            skipped.append({"id": pid, "reason": str(he.detail)[:160]})
             continue
         st = str(doc.get("status") or "idle").lower()
         row_data_file = default_data_file or str(doc.get("default_data_file_id") or "").strip()

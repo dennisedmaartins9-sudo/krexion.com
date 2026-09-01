@@ -132,7 +132,7 @@ def test_route_handler_injects_referer_header():
 
     route.continue_.assert_awaited_once()
     headers = route.continue_.await_args.kwargs.get("headers") or route.continue_.await_args[1].get("headers")
-    assert headers.get("referer") == state.referer_url
+    assert headers.get("Referer") == state.referer_url
     assert headers.get("Sec-Fetch-Site") == "cross-site"
 
 

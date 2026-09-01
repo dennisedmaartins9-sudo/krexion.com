@@ -106,6 +106,9 @@ _tray = None
 _pending_update_version: str | None = None
 _UPDATE_ICON_BASE = None  # PIL image cached
 _UPDATE_ICON_BADGE = None
+_COUNT_ICON_CACHE: dict[int, object] = {}
+_LAST_TRAY_RUNNING = -1
+_LAST_TRAY_TOTAL = -1
 _UPDATE_LAST_TOAST_AT = 0.0
 _UPDATE_TOAST_EVERY_S = 6 * 3600  # re-toast at most every 6h
 _UPDATE_POLL_EVERY_S = 15 * 60  # background poll while tray is alive
@@ -227,6 +230,87 @@ def _tray_icon_with_update_badge():
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Update badge icon failed: {exc}")
         return base
+
+
+def _tray_icon_with_count_badge(count: int):
+    """Telegram/Cursor-style numeric badge on tray icon (running profiles)."""
+    n = max(1, min(99, int(count or 0)))
+    cached = _COUNT_ICON_CACHE.get(n)
+    if cached is not None:
+        return cached
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+    base = _UPDATE_ICON_BASE or _load_tray_icon()
+    try:
+        img = base.copy().convert("RGBA")
+        if max(img.size) < 24:
+            resample = getattr(getattr(Image, "Resampling", Image), "NEAREST", Image.NEAREST)
+            img = img.resize((32, 32), resample)
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        label = "99+" if int(count or 0) >= 99 else str(n)
+        r = max(9, w // 3)
+        x0, y0 = w - r - 1, h - r - 1
+        x1, y1 = w - 1, h - 1
+        draw.ellipse(
+            (x0, y0, x1, y1),
+            fill=(239, 68, 68, 255),
+            outline=(26, 31, 46, 255),
+            width=max(1, w // 32),
+        )
+        font_size = max(8, r // 2)
+        font = None
+        for name in ("segoeuib.ttf", "SegoeUI-Bold.ttf", "arialbd.ttf"):
+            try:
+                font = ImageFont.truetype(name, font_size)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        try:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            tx = x0 + (r - tw) // 2 - bbox[0]
+            ty = y0 + (r - th) // 2 - bbox[1]
+        except Exception:  # noqa: BLE001
+            tw, th = draw.textsize(label, font=font)
+            tx = x0 + (r - tw) // 2
+            ty = y0 + (r - th) // 2
+        draw.text((tx, ty), label, fill=(255, 255, 255, 255), font=font)
+        _COUNT_ICON_CACHE[n] = img
+        return img
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Count badge icon failed: {exc}")
+        return base
+
+
+def _refresh_tray_for_profile_count(running: int, total: int) -> None:
+    """Update tray icon tooltip + badge with active/total browser profiles."""
+    global _LAST_TRAY_RUNNING, _LAST_TRAY_TOTAL
+    if _tray is None:
+        return
+    running = max(0, int(running or 0))
+    total = max(0, int(total or 0))
+    if running == _LAST_TRAY_RUNNING and total == _LAST_TRAY_TOTAL:
+        return
+    _LAST_TRAY_RUNNING = running
+    _LAST_TRAY_TOTAL = total
+    try:
+        if running > 0:
+            _tray.icon = _tray_icon_with_count_badge(running)
+            _tray.title = f"Krexion — {running} running · {total} profile(s)"
+            return
+        if _pending_update_version:
+            _refresh_tray_for_update(_pending_update_version)
+            return
+        base = _UPDATE_ICON_BASE or _load_tray_icon()
+        _tray.icon = base
+        _tray.title = (
+            f"Krexion — {total} profile(s)" if total else "Krexion — running"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"tray profile-count refresh failed: {exc}")
 
 
 def _on_install_pending_update(icon=None, _item=None) -> None:
@@ -719,6 +803,27 @@ def _user_session_browser_launcher_loop() -> None:
                     logger.info(
                         f"[user-session-launcher] dispatched {processed} "
                         f"browser-profile launch(es)"
+                    )
+                try:
+                    coll = client[db_name].browser_profiles
+                    not_deleted = {
+                        "$or": [
+                            {"deleted_at": {"$exists": False}},
+                            {"deleted_at": None},
+                            {"deleted_at": ""},
+                        ]
+                    }
+                    running = await coll.count_documents(
+                        {
+                            **not_deleted,
+                            "status": {"$in": ["running", "launching", "queued"]},
+                        }
+                    )
+                    total = await coll.count_documents(not_deleted)
+                    _refresh_tray_for_profile_count(running, total)
+                except Exception as count_err:  # noqa: BLE001
+                    logger.debug(
+                        f"[user-session-launcher] tray profile count skipped: {count_err}"
                     )
             except Exception as work_err:  # noqa: BLE001
                 logger.warning(f"[user-session-launcher] cycle error: {work_err}")

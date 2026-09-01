@@ -31,6 +31,7 @@ def test_mobile_shell_module():
     assert lay_a.bottom_h == 52
     assert should_use_mobile_shell("ios", True) is True
     assert should_use_mobile_shell("android", True) is True
+    assert should_use_mobile_shell("windows", True) is True
     assert should_use_mobile_shell("windows", False) is False
 
 
