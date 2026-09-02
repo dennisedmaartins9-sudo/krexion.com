@@ -57,6 +57,13 @@ const TABS = [
   { key: "automation_json", label: "Automation JSON", icon: FileCode },
 ];
 
+function uploadAvailableCount(u) {
+  const original = Number(u?.original_item_count || 0);
+  const consumed = Number(u?.consumed_count || 0);
+  if (original > 0) return Math.max(0, original - consumed);
+  return Number(u?.available_count ?? u?.item_count ?? 0);
+}
+
 function TagBadge({ children, color = "indigo" }) {
   // 2026-06 — added `yellow` + `blue` palette for the "used" + "original"
   // count badges on the Data-Files tab (and any future tabs that need
@@ -876,7 +883,7 @@ export default function UploadedThingsPage() {
                       {u.os_tag && <TagBadge>OS · {u.os_tag}</TagBadge>}
                       {u.network_tag && <TagBadge color="emerald">App · {u.network_tag}</TagBadge>}
                       <TagBadge>
-                        {(u.available_count || u.item_count || 0).toLocaleString()} available
+                        {uploadAvailableCount(u).toLocaleString()} available
                       </TagBadge>
                       {u.consumed_count > 0 && (
                         <TagBadge color="yellow">
@@ -1082,7 +1089,7 @@ export default function UploadedThingsPage() {
                       {u.country_tag && <TagBadge>{u.country_tag}</TagBadge>}
                       {u.state_tag && <TagBadge color="emerald">State · {u.state_tag}</TagBadge>}
                       <TagBadge>
-                        {(u.available_count || u.item_count || 0).toLocaleString()} available
+                        {uploadAvailableCount(u).toLocaleString()} available
                       </TagBadge>
                       {u.consumed_count > 0 && (
                         <TagBadge color="yellow">
@@ -1285,7 +1292,7 @@ export default function UploadedThingsPage() {
                         </TagBadge>
                       )}
                       <TagBadge color="emerald">
-                        {(u.available_count || u.item_count || 0).toLocaleString()} available
+                        {uploadAvailableCount(u).toLocaleString()} available
                       </TagBadge>
                       {u.consumed_count > 0 && (
                         <TagBadge color="yellow">
@@ -1298,42 +1305,45 @@ export default function UploadedThingsPage() {
                       {new Date(u.created_at).toLocaleString()}
                     </div>
                   </div>
-                  <div className="flex flex-col gap-1">
+                  <div className="flex flex-col gap-1 min-w-[7.5rem]">
                     {canDownload && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => downloadOne(u)}
-                        className="text-emerald-400 hover:text-emerald-300 hover:bg-emerald-900/20"
-                        data-testid={`ut-dl-${u.id}`}
-                        title="Download ORIGINAL master file (all rows, untouched)"
-                      >
-                        <Download size={16} />
-                      </Button>
-                    )}
-                    {canDownload && u.has_remaining_file && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => downloadOne(u, "remaining")}
-                        className="text-amber-400 hover:text-amber-300 hover:bg-amber-900/20"
-                        data-testid={`ut-dl-remaining-${u.id}`}
-                        title={`Download REMAINING leads (${u.available_count} of ${u.original_item_count} unused)`}
-                      >
-                        <Download size={16} />
-                      </Button>
-                    )}
-                    {canDownload && u.has_used_file && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => downloadOne(u, "used")}
-                        className="text-violet-400 hover:text-violet-300 hover:bg-violet-900/20"
-                        data-testid={`ut-dl-used-${u.id}`}
-                        title={`Download USED leads sheet (${u.consumed_count || 0} consumed rows)`}
-                      >
-                        <Download size={16} />
-                      </Button>
+                      <>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => downloadOne(u, "original")}
+                          className="h-7 px-2 text-[11px] text-emerald-300 border-emerald-700/40 hover:bg-emerald-900/20"
+                          data-testid={`ut-dl-${u.id}`}
+                          title="Download original master file (all rows at upload time)"
+                        >
+                          <Download size={12} className="mr-1" />
+                          Original
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => downloadOne(u, "remaining")}
+                          disabled={!(u.has_remaining_file || uploadAvailableCount(u) > 0)}
+                          className="h-7 px-2 text-[11px] text-amber-300 border-amber-700/40 hover:bg-amber-900/20 disabled:opacity-40"
+                          data-testid={`ut-dl-remaining-${u.id}`}
+                          title={`Download remaining / available leads (${uploadAvailableCount(u)} rows)`}
+                        >
+                          <Download size={12} className="mr-1" />
+                          Available
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => downloadOne(u, "used")}
+                          disabled={!(u.has_used_file || (u.consumed_count || 0) > 0)}
+                          className="h-7 px-2 text-[11px] text-violet-300 border-violet-700/40 hover:bg-violet-900/20 disabled:opacity-40"
+                          data-testid={`ut-dl-used-${u.id}`}
+                          title={`Download used / consumed leads (${u.consumed_count || 0} rows)`}
+                        >
+                          <Download size={12} className="mr-1" />
+                          Used
+                        </Button>
+                      </>
                     )}
                     <Button
                       variant="ghost"

@@ -125,16 +125,27 @@ async def resolve_launch_automation(
         "after_mode": str(auto.get("after_mode") or "manual"),
         "save_as_default": bool(auto.get("save_as_default")),
         "proxy_upload_id": str(auto.get("proxy_upload_id") or "").strip(),
+        "ua_upload_id": str(auto.get("ua_upload_id") or "").strip(),
+        "smart_funnel_enabled": bool(auto.get("smart_funnel_enabled")),
+        "smart_funnel_pattern": str(auto.get("smart_funnel_pattern") or "auto"),
+        "smart_funnel_min_deals": int(auto.get("smart_funnel_min_deals") or 2),
+        "smart_funnel_wait_until_conversion": bool(auto.get("smart_funnel_wait_until_conversion", True)),
     }
 
-    if not enabled or not upload_id:
+    if not enabled:
         return out
 
-    steps, name = await load_automation_upload(db, user_id, upload_id)
-    out["steps"] = steps
-    out["upload_name"] = name
-    out["total_steps"] = len(steps)
-    out["enabled"] = True
+    if upload_id:
+        steps, name = await load_automation_upload(db, user_id, upload_id)
+        out["steps"] = steps
+        out["upload_name"] = name
+        out["total_steps"] = len(steps)
+        out["enabled"] = True
+    elif bool(auto.get("smart_funnel_enabled")):
+        out["enabled"] = True
+        out["total_steps"] = 1
+    else:
+        return out
 
     if data_file_id:
         rows = await load_data_file_rows(db, user_id, data_file_id)
@@ -343,12 +354,16 @@ async def run_profile_automation(
     lead_row_index: Optional[int] = None,
     db: Any = None,
     on_lead_submitted: Optional[Any] = None,
+    smart_funnel_enabled: bool = False,
+    smart_funnel_pattern: str = "auto",
+    smart_funnel_min_deals: int = 2,
+    smart_funnel_wait_until_conversion: bool = True,
 ) -> Dict[str, Any]:
     """Execute RUT automation steps on an open profile page."""
     from real_user_traffic import _execute_automation_steps
 
     total = len(steps or [])
-    if not steps:
+    if not steps and not smart_funnel_enabled:
         return {"status": "skipped", "executed_steps": 0, "total_steps": 0}
 
     _lead_consumed = False
@@ -368,6 +383,28 @@ async def run_profile_automation(
             await consume_data_file_row(
                 db, user_id, data_file_id, int(lead_row_index), lead_row=dict(lead_row or {}),
             )
+            try:
+                from browser_profile_audit import log_profile_event
+
+                await log_profile_event(
+                    db,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    session_id=session_id,
+                    event_type="lead_consumed",
+                    detail={
+                        "data_file_id": data_file_id,
+                        "lead_row_index": int(lead_row_index),
+                        "reason": str(reason or "")[:120],
+                        "lead_email": str(
+                            (lead_row or {}).get("email")
+                            or (lead_row or {}).get("email_address")
+                            or ""
+                        )[:120],
+                    },
+                )
+            except Exception:
+                pass
             logger.info(
                 f"[profile-automation] lead row #{int(lead_row_index) + 1} consumed ({reason})"
             )
@@ -388,11 +425,73 @@ async def run_profile_automation(
                 "status": "running",
                 "automation_status": "running",
                 "automation_step": idx + 1,
-                "automation_total_steps": total,
+                "automation_total_steps": total or 1,
                 "automation_action": str(payload.get("action") or "")[:64],
             })
         except Exception as exc:
             logger.debug(f"[profile-automation] progress callback skipped: {exc}")
+
+    if smart_funnel_enabled:
+        try:
+            from smart_funnel import execute_smart_funnel, rut_config_for_pattern
+
+            def _substitute(tmpl: str, row: Dict[str, Any]) -> str:
+                out = str(tmpl or "")
+                for k, v in (row or {}).items():
+                    out = out.replace("{{" + str(k) + "}}", str(v or ""))
+                    out = out.replace("{" + str(k) + "}", str(v or ""))
+                return out
+
+            sf_cfg = rut_config_for_pattern(
+                str(smart_funnel_pattern or "auto"),
+                min_deals=max(1, min(5, int(smart_funnel_min_deals or 2))),
+                wait_until_conversion=bool(smart_funnel_wait_until_conversion),
+            )
+            if on_session_update:
+                await on_session_update({
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "status": "running",
+                    "automation_status": "running",
+                    "automation_step": 0,
+                    "automation_total_steps": 1,
+                    "automation_action": "smart_funnel",
+                })
+            result = await execute_smart_funnel(
+                page,
+                dict(lead_row or {}),
+                substitute=_substitute,
+                config=sf_cfg,
+                on_step_progress=_on_progress,
+                job_id=f"profile-{session_id[:8]}",
+                on_lead_submitted=_lead_cb,
+            )
+            auto_status = "completed" if result.get("status") == "ok" else str(result.get("status") or "failed")
+            if on_session_update:
+                await on_session_update({
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "status": "running",
+                    "automation_status": auto_status,
+                    "automation_step": 1,
+                    "automation_total_steps": 1,
+                    "automation_error": str(result.get("error") or "")[:512],
+                })
+            return result
+        except Exception as exc:
+            logger.warning(f"[profile-automation] smart funnel failed: {exc}")
+            if on_session_update:
+                try:
+                    await on_session_update({
+                        "profile_id": profile_id,
+                        "session_id": session_id,
+                        "status": "running",
+                        "automation_status": "error",
+                        "automation_error": str(exc)[:512],
+                    })
+                except Exception:
+                    pass
+            return {"status": "failed", "error": str(exc)}
 
     try:
         if on_session_update:

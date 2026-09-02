@@ -191,6 +191,7 @@ const ADV_CREATE_DEFAULTS = {
     password: "",
     paste_input: "",
     provider_id: "",
+    smart_session: true,
   },
   advAntiDetect: true,
   advMix: { ios: 0, android: 0, desktop: 100 },
@@ -340,6 +341,8 @@ export default function BrowserProfilesPage() {
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [proxyRetryBusy, setProxyRetryBusy] = useState(null);
+  const [auditDialog, setAuditDialog] = useState({ open: false, id: null, loading: false, events: [] });
+  const [cloudModeHint, setCloudModeHint] = useState(null);
 
   const authHeaders = useMemo(() => {
     const t = localStorage.getItem("token");
@@ -354,6 +357,32 @@ export default function BrowserProfilesPage() {
       setFolders(d.folders || []);
       setFoldersUnsorted(d.unsorted || 0);
     } catch (_) { /* folders optional */ }
+  };
+
+  useEffect(() => {
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/api/health`, { headers: authHeaders })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && String(d.mode || "").toLowerCase() === "cloud") {
+          setCloudModeHint("cloud");
+        } else {
+          setCloudModeHint("local");
+        }
+      })
+      .catch(() => setCloudModeHint(null));
+  }, [authHeaders]);
+
+  const openAuditLog = async (profileId) => {
+    setAuditDialog({ open: true, id: profileId, loading: true, events: [] });
+    try {
+      const r = await fetch(`${API}/${profileId}/audit?limit=80`, { headers: authHeaders });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setAuditDialog({ open: true, id: profileId, loading: false, events: d.events || [] });
+    } catch (e) {
+      toast.error(`Audit log failed: ${e.message}`);
+      setAuditDialog({ open: false, id: null, loading: false, events: [] });
+    }
   };
 
   const fetchProfiles = async (opts = {}) => {
@@ -814,6 +843,7 @@ export default function BrowserProfilesPage() {
             return {
               mode: "provider",
               provider_id: advProxy.provider_id,
+              smart_session: advProxy.smart_session !== false,
               country: (form.country || advProxy.country || "US").toUpperCase(),
               state: (advProxy.state || "").toUpperCase(),
             };
@@ -900,7 +930,6 @@ export default function BrowserProfilesPage() {
           enabled: true,
           automation_upload_id: bulkLaunchAuto.automation_upload_id,
           data_file_id: bulkLaunchAuto.data_file_id || "",
-          lead_row_index: Number(bulkLaunchAuto.lead_row_index) || 0,
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
           after_mode: "manual",
@@ -1715,6 +1744,11 @@ export default function BrowserProfilesPage() {
           </button>
         )}
         <button type="button" className={itemClass} disabled={showTrash}
+          onClick={() => { openAuditLog(p.id); setCardMenuId(null); }}
+          data-testid={`bp-audit-${p.id}`}>
+          Run history
+        </button>
+        <button type="button" className={itemClass} disabled={showTrash}
           onClick={() => { openFingerprintModal(p.id); setCardMenuId(null); }}>
           Fingerprint
         </button>
@@ -1896,6 +1930,13 @@ export default function BrowserProfilesPage() {
             Select multiple cards for bulk Launch / Stop / Delete.
           </div>
         </div>
+
+        {cloudModeHint === "cloud" && (
+          <div className="mb-4 p-3 rounded-lg bg-violet-950/25 border border-violet-700/40 text-xs text-violet-200">
+            <span className="font-semibold">Cloud mode:</span> Launch requires your Krexion desktop app online on this account.
+            Profiles queue here; Chromium opens on your PC — not in the browser tab.
+          </div>
+        )}
 
         {/* Filters toolbar */}
         <div className="mb-3 flex flex-wrap items-center gap-2 p-2 rounded-lg bg-zinc-900/80 border border-zinc-800">
@@ -2412,6 +2453,15 @@ export default function BrowserProfilesPage() {
                       {p.automation_error && (
                         <span className="block text-red-400/90 truncate" title={p.automation_error}>{p.automation_error}</span>
                       )}
+                    </div>
+                  )}
+                  {(p.launch_warnings || []).length > 0 && (
+                    <div className="mt-2 space-y-1" data-testid={`bp-launch-warnings-${p.id}`}>
+                      {(p.launch_warnings || []).map((w, wi) => (
+                        <div key={wi} className="text-[10px] text-amber-300/95 italic break-words">
+                          ⚠ {w}
+                        </div>
+                      ))}
                     </div>
                   )}
                   {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
@@ -3170,6 +3220,18 @@ export default function BrowserProfilesPage() {
                         labelDefault="(pick a mode below instead)"
                         testIdPrefix="bp-adv-proxy-provider"
                       />
+                      {advProxy.mode === "provider" && advProxy.provider_id && (
+                        <label className="flex items-center gap-2 mt-2 text-[11px] text-cyan-200/90 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="accent-cyan-500"
+                            checked={advProxy.smart_session !== false}
+                            onChange={(e) => setAdvProxy({ ...advProxy, smart_session: e.target.checked })}
+                            data-testid="bp-adv-proxy-smart-session"
+                          />
+                          Smart session — fresh provider IP at each launch (no bulk line pre-allocate)
+                        </label>
+                      )}
                     </div>
                     <div className="grid grid-cols-3 gap-2">
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "none" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
@@ -3624,6 +3686,10 @@ export default function BrowserProfilesPage() {
             <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-md w-full p-5"
               onClick={(e) => e.stopPropagation()}>
               <h3 className="text-sm font-semibold text-zinc-100 mb-3">Krexion Android / Cloud phone</h3>
+              <p className="text-[10px] text-zinc-500 mb-3 leading-relaxed">
+                Binds a device URL or CPI Android id for queued URL opens — not full remote control like AdsPower.
+                Use <span className="text-zinc-400">Open on Device</span> after binding.
+              </p>
               <Label className="text-zinc-300 text-xs">Provider</Label>
               <select
                 className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded-md h-9 text-xs mb-3 px-2"
@@ -3687,6 +3753,52 @@ export default function BrowserProfilesPage() {
                     Open now
                   </Button>
                 )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Profile audit / run history */}
+        {auditDialog.open && (
+          <div className="fixed inset-0 z-[70] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setAuditDialog({ open: false, id: null, loading: false, events: [] })}>
+            <div className="bg-zinc-950 border border-zinc-800 rounded-xl max-w-lg w-full max-h-[80vh] overflow-hidden flex flex-col"
+              onClick={(e) => e.stopPropagation()}>
+              <div className="p-4 border-b border-zinc-800">
+                <h3 className="text-sm font-semibold text-zinc-100">Run history / audit log</h3>
+                <p className="text-[10px] text-zinc-500 mt-1">Lead rows consumed, sessions, automation events</p>
+              </div>
+              <div className="p-4 overflow-y-auto flex-1 text-xs">
+                {auditDialog.loading ? (
+                  <p className="text-zinc-500">Loading…</p>
+                ) : (auditDialog.events || []).length === 0 ? (
+                  <p className="text-zinc-500">No events yet.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {auditDialog.events.map((ev) => (
+                      <li key={ev.id} className="border border-zinc-800 rounded p-2 bg-zinc-900/50">
+                        <div className="flex justify-between gap-2">
+                          <span className="text-fuchsia-300 font-medium">{ev.event_type}</span>
+                          <span className="text-zinc-500 shrink-0">{(ev.created_at || "").slice(0, 19)}</span>
+                        </div>
+                        {ev.session_id && (
+                          <div className="text-zinc-500 mt-0.5">session {String(ev.session_id).slice(0, 8)}…</div>
+                        )}
+                        {ev.detail && Object.keys(ev.detail).length > 0 && (
+                          <pre className="mt-1 text-[10px] text-zinc-400 whitespace-pre-wrap break-all">
+                            {JSON.stringify(ev.detail, null, 0)}
+                          </pre>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div className="p-3 border-t border-zinc-800 flex justify-end">
+                <Button size="sm" variant="outline" className="border-zinc-700 text-zinc-300 h-7 text-xs"
+                  onClick={() => setAuditDialog({ open: false, id: null, loading: false, events: [] })}>
+                  Close
+                </Button>
               </div>
             </div>
           </div>

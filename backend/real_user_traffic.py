@@ -10167,7 +10167,8 @@ async def run_real_user_traffic_job(
                 user_db = client[f"krexion_user_{user_db_truncated}"]
                 doc = await user_db["uploaded_resources"].find_one(
                     {"id": upload_data_file_id, "user_id": engine_user_id, "type": "data_file"},
-                    {"_id": 0, "file_path": 1, "items": 1, "gsheet_url": 1, "consumed_keys": 1},
+                    {"_id": 0, "file_path": 1, "remaining_file_path": 1, "used_file_path": 1,
+                     "items": 1, "gsheet_url": 1, "consumed_keys": 1},
                 )
                 if not doc:
                     return
@@ -10236,29 +10237,37 @@ async def run_real_user_traffic_job(
                         logger.debug(f"low-stock alert dispatch failed: {e}")
                     return
 
-                # ── Path B: on-disk XLSX (legacy / Excel uploads) ─────────
-                fp = doc.get("file_path") or ""
-                if not fp or not Path(fp).exists():
-                    return
-                # Load, drop the row, save back. We use openpyxl directly
-                # to keep things fast (no pandas roundtrip for 1 row).
+                # ── Path B: on-disk XLSX — preserve original file_path ──
                 import openpyxl
-                wb = openpyxl.load_workbook(fp)
+                import shutil
+
+                UPLOADS_DATA_DIR = Path(__file__).resolve().parent / "uploaded_resources"
+                UPLOADS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+                remaining_fp = str(doc.get("remaining_file_path") or "").strip()
+                original_fp = str(doc.get("file_path") or "").strip()
+                if not remaining_fp or not Path(remaining_fp).exists():
+                    if original_fp and Path(original_fp).exists():
+                        user_dir = UPLOADS_DATA_DIR / str(engine_user_id)
+                        user_dir.mkdir(parents=True, exist_ok=True)
+                        remaining_fp = str(user_dir / f"{upload_data_file_id}__remaining.xlsx")
+                        shutil.copyfile(original_fp, remaining_fp)
+                        await user_db["uploaded_resources"].update_one(
+                            {"id": upload_data_file_id, "user_id": engine_user_id},
+                            {"$set": {"remaining_file_path": remaining_fp}},
+                        )
+                    else:
+                        return
+
+                fp_str = remaining_fp
+                if not Path(fp_str).exists():
+                    return
+
+                wb = openpyxl.load_workbook(fp_str)
                 ws = wb.active
-                # row_idx is 0-based against the original-data rows; the
-                # XLSX has a header row at row 1, so the actual sheet row
-                # is row_idx + 2. After previous deletions the sheet has
-                # fewer rows than the original — we therefore work off
-                # row VALUES, not indices: scan all data rows and find
-                # the one whose original_row_index column matches.
-                # Simpler approach: maintain a hidden "_orig_idx" column
-                # added on first write so subsequent deletions work
-                # against a stable identifier.
                 header = [c.value for c in ws[1]] if ws.max_row >= 1 else []
+                display_header = [h for h in header if h and str(h) != "_orig_idx"]
                 if "_orig_idx" not in header:
-                    # Add the column once, populate with current sheet
-                    # row positions (they correspond 1:1 to the source
-                    # data file order on first write).
                     col_idx = len(header) + 1
                     ws.cell(row=1, column=col_idx, value="_orig_idx")
                     for r in range(2, ws.max_row + 1):
@@ -10266,36 +10275,64 @@ async def run_real_user_traffic_job(
                     header.append("_orig_idx")
                 orig_col = header.index("_orig_idx") + 1
                 target_sheet_row = None
+                row_values: List[Any] = []
                 for r in range(2, ws.max_row + 1):
                     val = ws.cell(row=r, column=orig_col).value
                     try:
                         if int(val) == int(row_idx):
                             target_sheet_row = r
+                            for c in range(1, len(header) + 1):
+                                if header[c - 1] == "_orig_idx":
+                                    continue
+                                row_values.append(ws.cell(row=r, column=c).value)
                             break
                     except (TypeError, ValueError):
                         continue
-                if target_sheet_row:
-                    ws.delete_rows(target_sheet_row, 1)
-                wb.save(fp)
-                wb.close()
-                # Update count + bump consumed_count for analytics
+                if not target_sheet_row:
+                    wb.close()
+                    return
+
+                used_fp = str(doc.get("used_file_path") or "").strip()
+                if not used_fp:
+                    user_dir = UPLOADS_DATA_DIR / str(engine_user_id)
+                    user_dir.mkdir(parents=True, exist_ok=True)
+                    used_fp = str(user_dir / f"{upload_data_file_id}__used.xlsx")
+                used_wb = openpyxl.load_workbook(used_fp) if Path(used_fp).exists() else openpyxl.Workbook()
+                if "used data" in used_wb.sheetnames:
+                    used_ws = used_wb["used data"]
+                else:
+                    used_ws = used_wb.active
+                    used_ws.title = "used data"
+                if used_ws.max_row == 1 and not used_ws.cell(row=1, column=1).value:
+                    used_ws.delete_rows(1, 1)
+                if used_ws.max_row < 1 or not used_ws.cell(row=1, column=1).value:
+                    for ci, h in enumerate(display_header or row_values, start=1):
+                        used_ws.cell(row=1, column=ci, value=h)
+                next_used_row = used_ws.max_row + 1
+                for ci, val in enumerate(row_values, start=1):
+                    used_ws.cell(row=next_used_row, column=ci, value=val)
+                used_wb.save(used_fp)
+                used_wb.close()
+
+                ws.delete_rows(target_sheet_row, 1)
+                wb.save(fp_str)
                 remaining = max(0, (ws.max_row or 1) - 1)
+                wb.close()
+
+                update_doc: Dict[str, Any] = {
+                    "row_count": remaining,
+                    "item_count": remaining,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "remaining_file_path": fp_str,
+                    "used_file_path": used_fp,
+                }
                 await user_db["uploaded_resources"].update_one(
                     {"id": upload_data_file_id, "user_id": engine_user_id},
-                    {
-                        "$set": {
-                            "row_count": remaining,
-                            "updated_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                        "$inc": {"consumed_count": 1},
-                    },
+                    {"$set": update_doc, "$inc": {"consumed_count": 1}},
                 )
-                # Auto-delete the on-disk file if completely consumed,
-                # but PRESERVE the DB entry as a depleted record so the
-                # user can still see "I uploaded X rows, all consumed".
                 if remaining == 0:
                     try:
-                        Path(fp).unlink(missing_ok=True)
+                        Path(fp_str).unlink(missing_ok=True)
                     except Exception:
                         pass
                     await user_db["uploaded_resources"].update_one(
@@ -10303,8 +10340,9 @@ async def run_real_user_traffic_job(
                         {"$set": {
                             "depleted": True,
                             "depleted_at": datetime.now(timezone.utc).isoformat(),
-                            "file_path": None,
+                            "remaining_file_path": None,
                             "item_count": 0,
+                            "row_count": 0,
                         }},
                     )
             except Exception as e:

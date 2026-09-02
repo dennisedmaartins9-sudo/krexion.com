@@ -2155,8 +2155,8 @@ export default function RealUserTrafficPage() {
         }
         }
       }
-      const wantProxies = !effectiveUseProxyJetAuto && !useStoredProxies && !selectedUploadProxyId && selectedUploadProxyIds.length === 0 && effectiveProxies && effectiveProxies.trim();
-      const wantUas = !selectedUploadUaId && selectedUploadUaIds.length === 0 && userAgents && userAgents.trim();
+      const wantProxies = false;
+      const wantUas = false;
       const wantAj = formFillEnabled && (useCustomJson || funnelMode === "custom") && !selectedUploadAjId && automationJson.trim();
       const wantTarget = !!targetScreenshotFile;
 

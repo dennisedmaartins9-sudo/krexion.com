@@ -21181,6 +21181,20 @@ UPLOADS_DATA_DIR = Path("/app/backend/uploaded_resources")
 UPLOADS_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 UPLOAD_TYPES = {"user_agents", "proxies", "data_file", "automation_json", "target_screenshot"}
+# Job-scoped auto batches (RUT paste / provider fetch) must not clutter
+# Uploaded Things — only `source=user` rows are listed in the UI.
+UPLOAD_LIST_SOURCES = {"user", ""}
+
+
+def _upload_is_user_visible(doc: dict) -> bool:
+    """Hide auto-created job batches from Uploaded Things list."""
+    src = str(doc.get("source") or "user").strip().lower()
+    if src and src not in UPLOAD_LIST_SOURCES:
+        return False
+    name = str(doc.get("name") or "").strip().lower()
+    if name.startswith("auto-"):
+        return False
+    return True
 
 
 class UploadedResourceResponse(BaseModel):
@@ -21222,14 +21236,21 @@ def _upload_doc_to_response(doc: dict) -> dict:
         available_count = max(0, item_count - consumed_count)
     else:
         # Static upload: consumed_count is incremented as items are pulled,
-        # item_count is decremented. original_item_count = remaining + consumed.
+        # item_count SHOULD be decremented in sync. Some legacy live-remove
+        # paths only bumped consumed_count — derive available from original
+        # so the UI never shows "12 available" when 4 are already used.
         consumed_count = int(doc.get("consumed_count") or 0)
         original_item_count = int(
             doc.get("original_item_count")
             or (item_count + consumed_count)
             or item_count
         )
-        available_count = item_count
+        derived_available = max(0, original_item_count - consumed_count)
+        available_count = (
+            derived_available
+            if original_item_count > 0
+            else max(0, item_count)
+        )
     depleted = bool(doc.get("depleted")) or (
         original_item_count > 0 and available_count == 0 and consumed_count > 0
     )
@@ -21289,6 +21310,7 @@ async def upload_user_agents(
         "original_item_count": len(items),
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": None,
         "created_at": datetime.now(timezone.utc),
     }
@@ -21335,6 +21357,7 @@ async def upload_user_agents_gsheet(
         "original_item_count": len(items),
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": "google-sheet (live)",
         "gsheet_url": url,
         "consumed_keys": [],
@@ -21371,6 +21394,7 @@ async def upload_proxies_resource(
         "original_item_count": len(items),
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": None,
         "created_at": datetime.now(timezone.utc),
     }
@@ -21418,6 +21442,7 @@ async def upload_proxies_gsheet(
         "original_item_count": len(items),
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": "google-sheet (live)",
         "gsheet_url": url,
         "consumed_keys": [],    # auto-skip-after-use list
@@ -21469,6 +21494,7 @@ async def upload_data_file(
         "original_item_count": item_count,
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": file.filename,
         "file_path": str(stored_path),
         "created_at": datetime.now(timezone.utc),
@@ -21605,6 +21631,7 @@ async def upload_data_file_gsheet(
         "original_item_count": item_count,
         "consumed_count": 0,
         "depleted": False,
+        "source": "user",
         "file_name": "google-sheet (live)",
         "file_path": None,        # No on-disk file — sheet is the source
         "gsheet_url": url,        # ← live fetch happens via this URL
@@ -21651,6 +21678,7 @@ async def upload_automation_json(
         "original_item_count": step_count,
         "consumed_count": 0,
         "depleted": False,             # automation templates never auto-deplete
+        "source": "user",
         "file_name": None,
         "created_at": datetime.now(timezone.utc),
     }
@@ -21787,6 +21815,7 @@ async def list_uploads(
     # `file_path` are stripped here (those can be huge).
     cursor = user_db["uploaded_resources"].find(query, {"_id": 0, "items": 0, "file_path": 0}).sort("created_at", -1)
     docs = [doc async for doc in cursor]
+    docs = [d for d in docs if _upload_is_user_visible(d)]
 
     # ── Live-sync any gsheet-backed docs in BACKGROUND (TTL guarded) ──
     # Don't refetch a sheet more than once every ~25 s — the frontend
@@ -22770,12 +22799,45 @@ async def _consume_uploads(
                         try:
                             import shutil
                             shutil.copyfile(str(pending_p), remaining_fp)
+                            used_fp = str(user_dir / f"{up_id}__used.xlsx")
+                            try:
+                                import pandas as _pd
+                                orig_fp = (doc.get("file_path") or "").strip()
+                                if orig_fp and Path(orig_fp).exists():
+                                    df_o = _pd.read_excel(orig_fp)
+                                    df_p = _pd.read_excel(pending_p)
+                                    email_col = None
+                                    for c in df_o.columns:
+                                        if str(c).strip().lower() in (
+                                            "email", "email_address", "e_mail", "mail",
+                                        ):
+                                            email_col = c
+                                            break
+                                    if email_col is not None:
+                                        pend = {
+                                            str(v).strip().lower()
+                                            for v in df_p[email_col].fillna("").tolist()
+                                            if str(v).strip()
+                                        }
+                                        mask = ~df_o[email_col].fillna("").astype(str).str.strip().str.lower().isin(pend)
+                                        df_used = df_o[mask]
+                                    else:
+                                        df_used = df_o.iloc[max(0, len(df_o) - (len(df_o) - pending_rows)):]
+                                    if len(df_used) > 0:
+                                        df_used.to_excel(used_fp, index=False)
+                                    else:
+                                        used_fp = (doc.get("used_file_path") or "").strip()
+                            except Exception as _ue:
+                                logger.debug(f"used-leads file build skipped: {_ue}")
+                                used_fp = (doc.get("used_file_path") or "").strip()
                             update_set = {
                                 "updated_at": now_iso,
                                 "item_count": pending_rows,
                                 "row_count": pending_rows,
                                 "remaining_file_path": remaining_fp,
                             }
+                            if used_fp and Path(used_fp).exists():
+                                update_set["used_file_path"] = used_fp
                             update_op = {"$set": update_set}
                             if consumed_inc:
                                 update_op["$inc"] = {"consumed_count": consumed_inc}

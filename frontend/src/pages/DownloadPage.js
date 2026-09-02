@@ -49,6 +49,7 @@ export default function DownloadPage() {
   const [licenseKey, setLicenseKey] = useState("");
   const [verifying, setVerifying] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [downloadProduct, setDownloadProduct] = useState("native"); // native | electron
   const [verified, setVerified] = useState(null); // { license, max_pcs, machines_used, machines_remaining }
 
   const formatKey = (raw) => {
@@ -91,20 +92,34 @@ export default function DownloadPage() {
     }
   };
 
-  const downloadInstaller = async () => {
+  const requireLicenseForDownload = (product = "native") => {
+    if (!verified) {
+      toast.error("Enter and verify your license key below before downloading.");
+      try {
+        document.getElementById("license-gate-card")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      } catch { /* ignore */ }
+      return;
+    }
+    setDownloadProduct(product);
+    downloadInstaller(product);
+  };
+
+  const detectDesktopProduct = () => {
+    const ua = (navigator.userAgent || "").toLowerCase();
+    const plat = (navigator.platform || "").toLowerCase();
+    if (ua.includes("mac") || plat.includes("mac")) return "mac";
+    if (ua.includes("linux") && !ua.includes("android")) return "linux";
+    return "electron";
+  };
+
+  const downloadInstaller = async (product = downloadProduct) => {
     const key = (licenseKey || "").trim().toUpperCase();
     if (!verified) return;
     setDownloading(true);
     try {
-      // ── Native-exe flow ───────────────────────────────────────────
-      // Backend responds with a 302 redirect to the GitHub Release
-      // .exe asset. We open it in a new tab so the browser handles the
-      // download natively (no in-memory blob → no 300 MB memory spike,
-      // no axios timeout).
-      if (isNativeExe) {
-        const url = `${API}/license/download-installer/${encodeURIComponent(key)}`;
-        // Use a hidden anchor so the request is sent with credentials
-        // (cookies) and the browser follows the 302 automatically.
+      const productQ = product && product !== "native" ? `?product=${encodeURIComponent(product)}` : "";
+      if (isNativeExe && product === "native") {
+        const url = `${API}/license/download-installer/${encodeURIComponent(key)}${productQ}`;
         const a = document.createElement("a");
         a.href = url;
         a.target = "_self";
@@ -114,6 +129,27 @@ export default function DownloadPage() {
         a.remove();
         toast.success("Krexion installer download started.");
         return;
+      }
+      if (product === "mac" || product === "linux" || product === "electron") {
+        const r = await axios.get(
+          `${API}/license/download-installer/${encodeURIComponent(key)}${productQ}`,
+          { maxRedirects: 0, validateStatus: (s) => s >= 200 && s < 400 || s === 503 },
+        ).catch((e) => e.response);
+        if (r?.status === 503) {
+          const detail = r?.data?.detail || "Mac/Linux desktop installer is not available yet.";
+          toast.error(detail);
+          return;
+        }
+        const loc = r?.headers?.location;
+        if (loc) {
+          window.location.href = loc;
+          toast.success("Download started.");
+          return;
+        }
+        if (r?.status === 302 && r?.request?.responseURL) {
+          window.location.href = r.request.responseURL;
+          return;
+        }
       }
 
       // ── Legacy-zip flow (backwards compat) ───────────────────────
@@ -217,9 +253,9 @@ export default function DownloadPage() {
             */}
         <div className="flex flex-col sm:flex-row items-stretch justify-center gap-4 mb-4">
           {/* WINDOWS — Native (recommended for heavy users) */}
-          <a
-            href="https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"
-            download
+          <button
+            type="button"
+            onClick={() => requireLicenseForDownload("native")}
             data-testid="download-windows-native-btn"
             className="group flex-1 max-w-sm bg-[#3B82F6] hover:bg-[#60A5FA] text-black font-semibold px-6 py-4 rounded-xl transition shadow-xl shadow-[#3B82F6]/30 text-left"
           >
@@ -235,12 +271,12 @@ export default function DownloadPage() {
               </div>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-hover:translate-y-0.5 transition-transform"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </div>
-          </a>
+          </button>
 
-          {/* MAC / LINUX — Electron */}
-          <a
-            href="https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe"
-            download
+          {/* MAC / LINUX — platform-aware (never serves Windows .exe on Mac) */}
+          <button
+            type="button"
+            onClick={() => requireLicenseForDownload(detectDesktopProduct())}
             data-testid="download-mac-linux-electron-btn"
             className="group flex-1 max-w-sm bg-white/[0.04] hover:bg-white/[0.08] border border-white/15 text-white font-semibold px-6 py-4 rounded-xl transition text-left"
           >
@@ -250,24 +286,29 @@ export default function DownloadPage() {
                 <path d="M17.05 13.34c-.02-2.11 1.72-3.13 1.8-3.18-.98-1.44-2.51-1.64-3.06-1.66-1.3-.13-2.55.77-3.21.77-.66 0-1.69-.75-2.78-.73-1.43.02-2.75.83-3.49 2.11-1.49 2.58-.38 6.4 1.07 8.5.71 1.03 1.55 2.18 2.65 2.14 1.07-.04 1.47-.69 2.76-.69s1.65.69 2.78.67c1.15-.02 1.87-1.04 2.57-2.07.81-1.19 1.14-2.34 1.16-2.4-.03-.01-2.22-.85-2.25-3.36zM14.94 7.27c.58-.71 1-1.69.88-2.67-.85.04-1.89.57-2.49 1.27-.54.62-1.01 1.63-.88 2.59.95.07 1.91-.48 2.49-1.19z"/>
               </svg>
               <div className="flex-1">
-                <div className="text-[10px] uppercase tracking-wider opacity-70 font-bold mb-0.5 text-[#A1A1AA]">Cross-platform · Auto-update</div>
+                <div className="text-[10px] uppercase tracking-wider opacity-70 font-bold mb-0.5 text-[#A1A1AA]">Mac / Linux desktop</div>
                 <div className="text-base font-bold leading-tight">Download for Mac / Linux</div>
-                <div className="text-[11px] opacity-70 mt-0.5 font-normal">Electron build · v{installerVersion} · ~579 MB · auto-updates</div>
+                <div className="text-[11px] opacity-70 mt-0.5 font-normal">Cloud dashboard always works · native Mac/Linux build when published</div>
               </div>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-hover:translate-y-0.5 transition-transform"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </div>
-          </a>
+          </button>
         </div>
+        <p className="text-xs text-[#71717A] max-w-2xl mx-auto mb-4">
+          <strong className="text-[#A1A1AA]">License required:</strong> verify your KRX key below — download unlocks only after verification.
+        </p>
         <p className="text-xs text-[#71717A] max-w-2xl mx-auto mb-10">
           <strong className="text-[#A1A1AA]">Not sure which?</strong> If you're on Windows and plan to run heavy
           jobs (Real User Traffic, Form Filler, 50+ concurrent visits), pick the <span className="text-white">Native</span> installer
           on the left — it leaves more RAM free for the browser workers and stays stable under load.
-          The <span className="text-white">Mac / Linux</span> build also runs on Windows if you prefer
-          built-in auto-update over the small RAM premium.
+          The <span className="text-white">Mac / Linux</span> button detects your platform — it will never
+          send a Windows <span className="text-white">.exe</span> to Mac. Until a native Mac/Linux installer is
+          published, use <Link to="/login" className="text-white underline">krexion.com/login</Link> on those devices.
         </p>
 
         {/* License-gated download card */}
         <div
+          id="license-gate-card"
           data-testid="license-gate-card"
           className="max-w-xl mx-auto bg-white/[0.03] border border-white/10 rounded-2xl p-6 sm:p-8 text-left backdrop-blur-sm"
         >
@@ -366,7 +407,7 @@ export default function DownloadPage() {
           <div className="mt-6 flex flex-col items-center">
             <button
               type="button"
-              onClick={downloadInstaller}
+              onClick={() => downloadInstaller(downloadProduct)}
               disabled={!verified || downloading}
               data-testid="download-installer-button"
               className={`inline-flex items-center gap-3 font-bold px-10 py-4 rounded-xl transition shadow-2xl w-full sm:w-auto justify-center

@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -236,6 +237,7 @@ def fast_rebuild_from_cached_deps(req_file: Path) -> None:
     if app_dir.exists():
         shutil.rmtree(app_dir, ignore_errors=True)
     copy_backend_source()
+    compile_strip_backend_source()
     copy_desktop_package()
     rebrand_python_exe()
     write_build_manifest()
@@ -517,6 +519,46 @@ def copy_backend_source() -> None:
             copied += 1
     log(f"Copied {copied} backend source files into {app_dir}")
 
+
+# Scripts launched via `python -m …` or subprocess must keep readable .py sources.
+_NATIVE_KEEP_PY = frozenset({
+    "server.py",
+    "krexion_mobile_shell_host.py",
+})
+
+
+def compile_strip_backend_source() -> None:
+    """Compile backend to .pyc and remove .py sources (native IP protection).
+
+    Same goal as the cloud Docker image: customers inspecting
+    ``Program Files\\Krexion\\bin\\app`` see bytecode artefacts, not
+    readable Python. Entry/subprocess scripts stay as .py.
+    """
+    import compileall
+
+    app_dir = DIST_DIR / "app"
+    if not app_dir.is_dir():
+        return
+    log("Bytecode-compiling native backend (strip .py sources)")
+    compileall.compile_dir(
+        str(app_dir),
+        force=True,
+        quiet=1,
+        legacy=True,
+    )
+    stripped = 0
+    for py in app_dir.rglob("*.py"):
+        if py.name in _NATIVE_KEEP_PY:
+            continue
+        if "tests" in py.parts:
+            continue
+        try:
+            py.unlink()
+            stripped += 1
+        except OSError as exc:
+            log(f"  could not strip {py.name}: {exc}", prefix="   ")
+    log(f"  stripped {stripped} .py files (kept {', '.join(sorted(_NATIVE_KEEP_PY))})")
+
     # Also bundle the legacy Krexion-User-Package so /api/license/
     # download-installer can still serve the ZIP fallback to older
     # customers who don't get the native redirect path yet.
@@ -655,6 +697,7 @@ def main() -> int:
             install_pip()
             pip_install_requirements(req)
             copy_backend_source()
+            compile_strip_backend_source()
             copy_desktop_package()
             rebrand_python_exe()
             write_build_manifest()

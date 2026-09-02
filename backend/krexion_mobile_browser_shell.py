@@ -420,11 +420,60 @@ def _start_shell_process(
         os.close(fd)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh)
-        proc = subprocess.Popen(
-            [sys.executable, _host_script_path(), path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        err_log = os.path.join(
+            tempfile.gettempdir(),
+            f"krx_shell_{str(session_key)[:8]}_{int(profile_slot)}.log",
         )
+        with open(err_log, "wb") as errfh:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "krexion_mobile_shell_host", path],
+                cwd=app_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=errfh,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+        time.sleep(0.85)
+        if proc.poll() is not None:
+            err_tail = ""
+            try:
+                with open(err_log, encoding="utf-8", errors="replace") as ef:
+                    err_tail = ef.read()[-1500:]
+            except Exception:
+                pass
+            logger.warning(
+                f"[mobile-shell] host exited rc={proc.returncode} session={str(session_key)[:8]} "
+                f"{err_tail[:400]}"
+            )
+            if not interactive:
+                return None
+            # Retry static chrome (no interactive IPC) — still shows Krexion design.
+            plat = str(layout.platform or "android")
+            cfg["interactive"] = False
+            cfg["top_html"] = _top_html(profile_label, profile_slot, platform=plat)
+            cfg["bottom_html"] = _bottom_html(plat, profile_label=profile_label, slot=profile_slot)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh)
+            with open(err_log, "wb") as errfh:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "krexion_mobile_shell_host", path],
+                    cwd=app_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=errfh,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                )
+            time.sleep(0.85)
+            if proc.poll() is not None:
+                try:
+                    with open(err_log, encoding="utf-8", errors="replace") as ef:
+                        err_tail = ef.read()[-1500:]
+                except Exception:
+                    err_tail = ""
+                logger.warning(
+                    f"[mobile-shell] static chrome also failed rc={proc.returncode} "
+                    f"{err_tail[:400]}"
+                )
+                return None
         with _LOCK:
             _ACTIVE[session_key] = {
                 "proc": proc,
@@ -432,7 +481,8 @@ def _start_shell_process(
                 "layout": layout,
                 "origin_x": origin_x,
                 "origin_y": origin_y,
-                "interactive": bool(interactive),
+                "interactive": bool(interactive) and bool(cfg.get("interactive")),
+                "err_log": err_log,
             }
         return proc
     except Exception as exc:
@@ -575,10 +625,15 @@ def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
             return (
                 "[webkit]" in title.lower()
                 or "safari" in title.lower()
+                or "krexion orbit" in title.lower()
                 or "webkit" in cname
                 or "minibrowser" in cname
             )
-        return "chrome" in cname or title.startswith("Krexion")
+        return (
+            "chrome" in cname
+            or title.startswith("Krexion")
+            or "krexion orbit" in title.lower()
+        )
     except Exception:
         return False
 

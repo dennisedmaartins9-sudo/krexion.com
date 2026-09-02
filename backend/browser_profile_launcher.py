@@ -1765,6 +1765,8 @@ async def _launch_profile_session_inner(
         except Exception:
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
+    _launch_warnings: List[str] = []
+    _wanted_webkit = _profile_engine == "webkit"
     # v2.7.52 — Resolve referer ONCE per launch (sticky_session parity).
     # Previously _coerce_profile_ua and route setup each called the resolver
     # independently, so platform_pool could pick Facebook for the UA and
@@ -2176,6 +2178,10 @@ async def _launch_profile_session_inner(
                     "WebKit launch failed (%s) — falling back to Chromium",
                     _wk_err,
                 )
+                _launch_warnings.append(
+                    "Safari/WebKit engine unavailable — running Chromium instead. "
+                    "This is NOT a real iOS Safari fingerprint."
+                )
                 _profile_engine = "chromium"
                 try:
                     from real_user_traffic import (
@@ -2208,6 +2214,9 @@ async def _launch_profile_session_inner(
                 logger.info("[profile-launch] Firefox engine ON")
             except Exception as _ff_err:
                 logger.warning(f"Firefox launch failed ({_ff_err}) — Chromium fallback")
+                _launch_warnings.append(
+                    "Firefox engine unavailable — running Chromium instead."
+                )
                 _profile_engine = "chromium"
                 if proxy_arg:
                     launch_kwargs["proxy"] = proxy_arg
@@ -2387,14 +2396,25 @@ async def _launch_profile_session_inner(
                                 f"[profile-launch] mobile shell failed to start "
                                 f"session={session_id[:8]} — using engine window only"
                             )
+                            _launch_warnings.append(
+                                "Krexion mobile device shell did not start — "
+                                "you are seeing the plain browser window, not the branded iOS/Android shell."
+                            )
                     except Exception as _ms_err:
                         logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
+                        _launch_warnings.append(
+                            "Mobile device shell could not be applied — not a real device shell UI."
+                        )
                 # Legacy WebKit-only polish — only when Krexion mobile shell could not start.
                 if (
                     not _launch_ui_meta.get("mobile_shell")
                     and _profile_engine == "webkit"
                     and str(profile_os or "").lower() in ("ios", "ipados")
                 ):
+                    if not any("shell" in w.lower() for w in _launch_warnings):
+                        _launch_warnings.append(
+                            "Using legacy Safari chrome overlay — not the full Krexion mobile shell."
+                        )
                     from krexion_ios_safari_shell import apply_ios_safari_shell_to_pids
 
                     apply_ios_safari_shell_to_pids(
@@ -3129,6 +3149,9 @@ async def _launch_profile_session_inner(
                     "last_tls_prewarm_ok": _last_tls_prewarm_ok,
                     "last_proxy_check": proxy_diag if proxy_diag.get("requested") else {},
                     "browser_kernel": str(_kernel_plan.get("kernel_label") or ""),
+                    "launch_warnings": list(_launch_warnings),
+                    "mobile_shell_active": bool(_launch_ui_meta.get("mobile_shell")),
+                    "engine_used": str(_profile_engine or "chromium"),
                 })
             except Exception:
                 pass
@@ -3385,7 +3408,9 @@ async def _run_profile_automation_if_configured(
 ) -> None:
     """Run JSON steps when launch spec or queued re-run requests automation."""
     spec = dict(automation_spec or profile_config.get("_launch_automation") or {})
-    if not spec.get("enabled") or not spec.get("steps"):
+    if not spec.get("enabled"):
+        return
+    if not spec.get("steps") and not spec.get("smart_funnel_enabled"):
         return
     uid = str(profile_config.get("user_id") or "").strip()
     sess = _RUNNING_SESSIONS.get(session_id)
@@ -3425,6 +3450,12 @@ async def _run_profile_automation_if_configured(
             data_file_id=str(spec.get("data_file_id") or ""),
             lead_row_index=spec.get("lead_row_index"),
             db=_profile_db,
+            smart_funnel_enabled=bool(spec.get("smart_funnel_enabled")),
+            smart_funnel_pattern=str(spec.get("smart_funnel_pattern") or "auto"),
+            smart_funnel_min_deals=int(spec.get("smart_funnel_min_deals") or 2),
+            smart_funnel_wait_until_conversion=bool(
+                spec.get("smart_funnel_wait_until_conversion", True)
+            ),
         )
     except asyncio.CancelledError:
         if on_session_update:

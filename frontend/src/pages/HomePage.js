@@ -323,25 +323,23 @@ export default function HomePage() {
               has built-in auto-update via electron-updater. Both URLs
               are stable forever — every release overwrites
               "*-latest.exe" on the VPS mirror. */}
-          <a
-            href="https://krexion.com/downloads/windows/Krexion-Setup-latest.exe"
+          <Link
+            to="/download"
             className="group bg-white/95 text-zinc-900 font-semibold px-7 py-3.5 rounded-lg hover:bg-white transition inline-flex items-center gap-2 shadow-xl"
             data-testid="hero-cta-download-windows"
-            download
           >
             <Download size={16} />
             Download for Windows
-          </a>
-          <a
-            href="https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe"
+          </Link>
+          <Link
+            to="/download"
             className="group border border-white/20 bg-white/5 text-white font-medium px-6 py-3.5 rounded-lg hover:bg-white/10 transition inline-flex items-center gap-2 text-sm"
             data-testid="hero-cta-download-mac-linux"
-            download
             title="Cross-platform Electron build · auto-update built in"
           >
             <Download size={14} />
             For Mac / Linux
-          </a>
+          </Link>
           <a
             href="#features"
             className="border border-white/15 px-7 py-3.5 rounded-lg hover:bg-white/5 transition text-sm backdrop-blur-sm"

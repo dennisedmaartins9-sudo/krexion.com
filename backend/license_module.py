@@ -647,7 +647,11 @@ async def verify_for_download(body: VerifyForDownloadRequest):
 
 
 @license_router.get("/license/download-installer/{license_key}")
-async def download_installer_with_key(license_key: str, request: Request):
+async def download_installer_with_key(
+    license_key: str,
+    request: Request,
+    product: str = "native",
+):
     """Stream a personalized installer ZIP with the customer's license
     key pre-embedded as `license-key.txt` at the root. The bundled
     `install-master.ps1` reads this file and auto-fills the LICENSE_KEY=
@@ -689,6 +693,85 @@ async def download_installer_with_key(license_key: str, request: Request):
             raise HTTPException(410, "License / trial expired.")
 
     # ── 2026-02: Native installer redirect ─────────────────────────────
+    product_kind = (product or "native").strip().lower()
+    electron_win_url = (
+        os.environ.get("KREXION_ELECTRON_INSTALLER_URL")
+        or "https://krexion.com/downloads/desktop/Krexion-Desktop-Setup-latest.exe"
+    )
+    electron_mac_url = (os.environ.get("KREXION_ELECTRON_MAC_URL") or "").strip()
+    electron_linux_url = (os.environ.get("KREXION_ELECTRON_LINUX_URL") or "").strip()
+
+    if product_kind in ("mac", "darwin", "osx"):
+        if electron_mac_url:
+            try:
+                await _db.licenses.update_one(
+                    {"license_key": key},
+                    {"$set": {
+                        "installer_downloaded_at": _now().isoformat(),
+                        "installer_kind": "electron-mac",
+                        "installer_downloaded_count": (lic_doc.get("installer_downloaded_count") or 0) + 1 if lic_doc else 1,
+                    }},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return RedirectResponse(
+                url=electron_mac_url,
+                status_code=302,
+                headers={"Cache-Control": "no-store"},
+            )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Krexion desktop installer for Mac is not published yet. "
+                "Use https://krexion.com/login for the full cloud dashboard on Mac."
+            ),
+        )
+
+    if product_kind in ("linux",):
+        if electron_linux_url:
+            try:
+                await _db.licenses.update_one(
+                    {"license_key": key},
+                    {"$set": {
+                        "installer_downloaded_at": _now().isoformat(),
+                        "installer_kind": "electron-linux",
+                        "installer_downloaded_count": (lic_doc.get("installer_downloaded_count") or 0) + 1 if lic_doc else 1,
+                    }},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return RedirectResponse(
+                url=electron_linux_url,
+                status_code=302,
+                headers={"Cache-Control": "no-store"},
+            )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Krexion desktop installer for Linux is not published yet. "
+                "Use https://krexion.com/login for the full cloud dashboard."
+            ),
+        )
+
+    if product_kind in ("electron", "desktop"):
+        try:
+            await _db.licenses.update_one(
+                {"license_key": key},
+                {"$set": {
+                    "installer_downloaded_at": _now().isoformat(),
+                    "installer_kind": "electron-exe",
+                    "installer_version": "",
+                    "installer_downloaded_count": (lic_doc.get("installer_downloaded_count") or 0) + 1 if lic_doc else 1,
+                }},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return RedirectResponse(
+            url=electron_win_url,
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
+
     # If the admin has published a release with a `download_url` set
     # (e.g. a GitHub Releases asset for the Krexion-Setup-x.x.x.exe),
     # short-circuit the legacy ZIP build and send the customer to the

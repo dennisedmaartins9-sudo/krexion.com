@@ -217,8 +217,29 @@ def _split_mix_counts(
     )
     n_ios = int(round(total * ios_pct / 100.0))
     n_android = int(round(total * android_pct / 100.0))
-    n_desktop = total - n_ios - n_android
-    # Fix rare overshoot from rounding.
+    if desktop_pct <= 0:
+        n_desktop = 0
+    elif ios_pct <= 0 and android_pct <= 0:
+        n_desktop = total
+        n_ios = 0
+        n_android = 0
+    else:
+        n_desktop = total - n_ios - n_android
+    # When desktop is 0%, rounding remainder must go to iOS/Android only.
+    if desktop_pct <= 0:
+        while n_ios + n_android < total:
+            if ios_pct >= android_pct:
+                n_ios += 1
+            else:
+                n_android += 1
+        while n_ios + n_android > total:
+            if n_ios >= n_android and n_ios > 0:
+                n_ios -= 1
+            elif n_android > 0:
+                n_android -= 1
+            else:
+                break
+    # Fix rare overshoot from rounding when desktop allowed.
     while n_desktop < 0 and (n_ios > 0 or n_android > 0):
         if n_ios >= n_android and n_ios > 0:
             n_ios -= 1
@@ -235,7 +256,12 @@ def _split_mix_counts(
         else:
             break
     while n_ios + n_android + n_desktop < total:
-        n_desktop += 1
+        if desktop_pct > 0:
+            n_desktop += 1
+        elif ios_pct >= android_pct:
+            n_ios += 1
+        else:
+            n_android += 1
     out: List[Tuple[str, int]] = []
     if n_ios:
         out.append(("ios", n_ios))
@@ -971,9 +997,15 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
         "automation_total_steps",
         "automation_action",
         "automation_error",
+        "launch_warnings",
+        "mobile_shell_active",
+        "engine_used",
     ):
         if _ak in body:
             prof_update[_ak] = body[_ak]
+    if status in ("stopped", "closed", "error"):
+        prof_update.setdefault("launch_warnings", [])
+        prof_update["mobile_shell_active"] = False
     if prof_update:
         await _DB.browser_profiles.update_one(
             {"id": profile_id},
@@ -997,6 +1029,8 @@ class ProxyConfig(BaseModel):
     # resolves this to a live proxy from the user's Proxy Providers.
     # Empty ⇒ existing enabled/server/proxyjet fields apply.
     provider_id: str = ""
+    # v2.7.94 — provider smart mode: no pre-bound line at create; fresh session each launch
+    smart_session: bool = False
 
 
 class AntiDetectConfig(BaseModel):
@@ -1163,6 +1197,8 @@ class AdvProxyCfg(BaseModel):
     sticky_minutes: Optional[int] = None
     # v2.4.0 — Multi-provider proxy (see settings › Proxy Providers)
     provider_id: Optional[str] = None
+    # When mode=provider: bind provider_id only — fresh line + IP at each launch (no bulk pre-gen)
+    smart_session: bool = True
 
 
 class AdvancedCreateBody(BaseModel):
@@ -1292,6 +1328,11 @@ class ProfileAutomationLaunch(BaseModel):
     after_mode: str = Field(default="manual", max_length=32)  # manual = keep browser open
     save_as_default: bool = False
     proxy_upload_id: str = Field(default="", max_length=64)  # Uploaded Things proxy batch (RUT parity)
+    ua_upload_id: str = Field(default="", max_length=64)
+    smart_funnel_enabled: bool = False
+    smart_funnel_pattern: str = Field(default="auto", max_length=64)
+    smart_funnel_min_deals: int = Field(default=2, ge=1, le=5)
+    smart_funnel_wait_until_conversion: bool = True
 
 
 class LaunchBody(BaseModel):
@@ -1313,6 +1354,11 @@ class RunAutomationBody(BaseModel):
     skip_missing_steps: bool = True
     self_heal: bool = False
     proxy_upload_id: str = Field(default="", max_length=64)
+    ua_upload_id: str = Field(default="", max_length=64)
+    smart_funnel_enabled: bool = False
+    smart_funnel_pattern: str = Field(default="auto", max_length=64)
+    smart_funnel_min_deals: int = Field(default=2, ge=1, le=5)
+    smart_funnel_wait_until_conversion: bool = True
 
 
 class BulkRunJsonBody(BaseModel):
@@ -1323,6 +1369,11 @@ class BulkRunJsonBody(BaseModel):
     skip_missing_steps: bool = True
     self_heal: bool = False
     proxy_upload_id: str = Field(default="", max_length=64)
+    ua_upload_id: str = Field(default="", max_length=64)
+    smart_funnel_enabled: bool = False
+    smart_funnel_pattern: str = Field(default="auto", max_length=64)
+    smart_funnel_min_deals: int = Field(default=2, ge=1, le=5)
+    smart_funnel_wait_until_conversion: bool = True
 
 
 class SaveAutomationDefaultsBody(BaseModel):
@@ -1573,6 +1624,10 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["automation_status"] = str(d.get("automation_status") or "")
     d["automation_step"] = int(d.get("automation_step") or 0)
     d["automation_total_steps"] = int(d.get("automation_total_steps") or 0)
+    _lw = d.get("launch_warnings")
+    d["launch_warnings"] = list(_lw) if isinstance(_lw, list) else []
+    d["mobile_shell_active"] = bool(d.get("mobile_shell_active"))
+    d["engine_used"] = str(d.get("engine_used") or "")
     return d
 
 
@@ -1922,6 +1977,60 @@ async def _finalize_doc_proxy_and_ip(
     doc["exit_ip"] = canonical
     doc["proxy"]["exit_ip"] = canonical
     doc["proxy"]["sticky_session"] = True
+
+
+async def _pick_ua_line_from_upload(uid: str, upload_id: str) -> Optional[str]:
+    """Pick next UA from Uploaded Things batch (one-time use at launch)."""
+    up_id = str(upload_id or "").strip()
+    if not up_id or _DB is None:
+        return None
+    doc = await _DB.uploaded_resources.find_one(
+        {"id": up_id, "user_id": uid, "type": "user_agents"},
+        {"_id": 0, "items": 1, "consumed_keys": 1},
+    )
+    if not doc:
+        return None
+    consumed = {str(k).strip() for k in (doc.get("consumed_keys") or []) if str(k).strip()}
+    items = [str(x).strip() for x in (doc.get("items") or []) if str(x).strip()]
+    for raw in items:
+        if raw not in consumed:
+            return raw
+    return None
+
+
+async def _consume_ua_line_from_upload(uid: str, upload_id: str, raw_line: str) -> bool:
+    """Mark one UA line consumed in Uploaded Things (does not create auto batches)."""
+    up_id = str(upload_id or "").strip()
+    raw = str(raw_line or "").strip()
+    if not up_id or not raw or _DB is None:
+        return False
+    try:
+        key = raw[:256].lower()
+        res = await _DB.uploaded_resources.update_one(
+            {"id": up_id, "user_id": uid, "type": "user_agents"},
+            {
+                "$addToSet": {"consumed_keys": key},
+                "$set": {"updated_at": _now_iso()},
+                "$inc": {"consumed_count": 1},
+            },
+        )
+        return bool(res.modified_count)
+    except Exception as exc:
+        logger.debug(f"[profile-launch] ua consume skipped: {exc}")
+        return False
+
+
+async def _apply_launch_ua_from_upload(uid: str, doc: Dict[str, Any], upload_id: str) -> None:
+    """Override profile UA from an Uploaded Things UA batch for this launch."""
+    raw = await _pick_ua_line_from_upload(uid, upload_id)
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail="UA upload batch is empty or fully consumed — upload more user-agents.",
+        )
+    doc["user_agent"] = raw
+    doc["_consume_ua_upload_id"] = str(upload_id or "").strip()
+    doc["_consume_ua_raw"] = raw
 
 
 async def _pick_proxy_line_from_upload(uid: str, upload_id: str) -> Optional[str]:
@@ -2885,7 +2994,19 @@ async def bind_cloud_phone(request: Request, profile_id: str, body: CloudPhoneBi
         {"id": profile_id},
         {"$set": {"cloud_phone": binding, "updated_at": _now_iso()}},
     )
-    return {"ok": True, "cloud_phone": binding}
+    return {
+        "ok": True,
+        "cloud_phone": binding,
+        "capabilities": {
+            "url_open": provider == "cpi",
+            "binding_only": provider == "partner",
+            "remote_control": False,
+        },
+        "note": (
+            "Cloud Phone binds a device URL or CPI Android id for URL opens — "
+            "not full remote control like AdsPower. Use Open on Device for queued navigation."
+        ),
+    }
 
 
 @router.post("/{profile_id}/open-on-device")
@@ -2975,12 +3096,34 @@ async def open_profile_on_cpi_device(request: Request, profile_id: str, body: Op
     }
 
 
+@router.get("/{profile_id}/audit")
+async def profile_audit_log(
+    request: Request,
+    profile_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Profile run history — lead rows consumed, sessions, automation events."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    try:
+        from browser_profile_audit import list_profile_audit
+
+        rows = await list_profile_audit(_DB, uid, profile_id, limit=limit)
+    except Exception as exc:
+        logger.warning(f"[profile-audit] list failed: {exc}")
+        rows = []
+    return {"profile_id": profile_id, "events": rows, "count": len(rows)}
+
+
 @router.get("/{profile_id}/cookies")
 async def export_cookies(request: Request, profile_id: str):
-    """Export Playwright storage_state cookies (+ origins)."""
+    """Export Playwright storage_state cookies (+ origins). Owner-only."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    if str(doc.get("user_id") or "") != str(uid):
+        raise HTTPException(status_code=403, detail="Cookie export is owner-only for shared profiles")
     ss = doc.get("storage_state") or {}
     return {
         "profile_id": profile_id,
@@ -3620,6 +3763,15 @@ async def launch_profile(
             detail=f"Proxy setup failed before launch: {_pp_err}",
         ) from _pp_err
 
+    _ua_upload = str((auto_payload or {}).get("ua_upload_id") or "").strip()
+    if _ua_upload:
+        try:
+            await _apply_launch_ua_from_upload(uid, doc, _ua_upload)
+        except HTTPException:
+            raise
+        except Exception as _ua_exc:
+            logger.warning(f"[browser-profile launch] ua upload apply skipped: {_ua_exc}")
+
     _proxy_patch: Dict[str, Any] = {
         "proxy": _proxy_cfg,
         "exit_ip": doc.get("exit_ip") or "",
@@ -3660,6 +3812,36 @@ async def launch_profile(
         )
 
     await _DB.browser_profile_sessions.insert_one(session)
+
+    try:
+        from browser_profile_audit import log_profile_event
+
+        await log_profile_event(
+            _DB,
+            user_id=uid,
+            profile_id=profile_id,
+            session_id=session_id,
+            event_type="session_start",
+            detail={
+                "start_url": start_url,
+                "automation_enabled": bool(auto_spec.get("enabled")),
+                "lead_row_index": auto_spec.get("lead_row_index"),
+                "data_file_id": str(auto_spec.get("data_file_id") or ""),
+                "bulk_row_index": _bulk_row_index,
+            },
+        )
+    except Exception as _audit_err:
+        logger.debug(f"[profile-audit] session_start skipped: {_audit_err}")
+
+    if doc.get("_consume_ua_upload_id") and doc.get("_consume_ua_raw"):
+        try:
+            await _consume_ua_line_from_upload(
+                uid,
+                str(doc.get("_consume_ua_upload_id") or ""),
+                str(doc.get("_consume_ua_raw") or ""),
+            )
+        except Exception as _uac_err:
+            logger.debug(f"[profile-launch] ua consume skipped: {_uac_err}")
 
     await _DB.browser_profiles.update_one(
         {"id": profile_id, "user_id": uid},
@@ -3886,6 +4068,11 @@ async def run_profile_automation_endpoint(
         "skip_missing_steps": body.skip_missing_steps,
         "self_heal": body.self_heal,
         "proxy_upload_id": str(body.proxy_upload_id or "").strip(),
+        "ua_upload_id": str(body.ua_upload_id or "").strip(),
+        "smart_funnel_enabled": bool(body.smart_funnel_enabled),
+        "smart_funnel_pattern": str(body.smart_funnel_pattern or "auto"),
+        "smart_funnel_min_deals": int(body.smart_funnel_min_deals or 2),
+        "smart_funnel_wait_until_conversion": bool(body.smart_funnel_wait_until_conversion),
     }
     try:
         from browser_profile_automation import resolve_launch_automation
@@ -4306,13 +4493,17 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             },
             body.country,
         )
-        provider_lines = await _allocate_provider_proxy_lines(
-            uid,
-            str(body.proxy.provider_id),
-            count,
-            team_used_ips,
-            targeting=_prov_targeting,
-        )
+        _smart_provider = bool(body.proxy.smart_session)
+        if not _smart_provider:
+            provider_lines = await _allocate_provider_proxy_lines(
+                uid,
+                str(body.proxy.provider_id),
+                count,
+                team_used_ips,
+                targeting=_prov_targeting,
+            )
+        else:
+            provider_lines = []
     elif proxy_mode == "proxyjet":
         if _PROXYJET_GEN is None:
             raise HTTPException(
@@ -4402,7 +4593,15 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
         proxy_cfg = ProxyConfig()
         if proxy_mode == "provider" and body.proxy.provider_id:
-            if i < len(provider_lines):
+            if body.proxy.smart_session:
+                proxy_cfg = ProxyConfig(
+                    enabled=True,
+                    provider_id=str(body.proxy.provider_id or ""),
+                    smart_session=True,
+                    proxyjet_country=(body.proxy.country or body.country or "US").upper()[:2],
+                    proxyjet_state=(body.proxy.state or "").upper(),
+                )
+            elif i < len(provider_lines):
                 proxy_cfg = _parse_proxy_line_to_cfg(
                     provider_lines[i].strip(),
                     provider_id=str(body.proxy.provider_id or ""),
@@ -4481,8 +4680,9 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         doc["device_label"] = str(device.get("label") or "")
         doc["device_catalog_id"] = str(device.get("id") or "")
         _pline = ""
-        if proxy_mode == "provider" and i < len(provider_lines):
-            _pline = provider_lines[i].strip()
+        if proxy_mode == "provider" and body.proxy.provider_id and not body.proxy.smart_session:
+            if i < len(provider_lines):
+                _pline = provider_lines[i].strip()
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
             _pline = proxy_lines[i].strip()
         elif proxy_mode == "manual":
@@ -4494,9 +4694,10 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         docs.append(doc)
 
     if docs and proxy_mode in ("provider", "proxyjet", "manual"):
-        batch_used = set(team_used_ips)
-        for doc in docs:
-            await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
+        if not (proxy_mode == "provider" and body.proxy.smart_session):
+            batch_used = set(team_used_ips)
+            for doc in docs:
+                await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
 
     if docs:
         await _DB.browser_profiles.insert_many(docs)
@@ -4506,6 +4707,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
         "proxies_allocated": len(provider_lines or proxy_lines) if proxy_mode in ("proxyjet", "provider") else 0,
+        "smart_session": bool(proxy_mode == "provider" and body.proxy.smart_session),
         "unique_ips_bound": sum(1 for d in docs if d.get("exit_ip")),
         "mix": {plat: n for plat, n in (mix_plan or [])},
     }
@@ -4693,11 +4895,15 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
             enabled=True,
             automation_upload_id=upload_id,
             data_file_id=row_data_file,
-            lead_row_index=0,
             skip_missing_steps=body.skip_missing_steps is not False,
             self_heal=bool(body.self_heal),
             after_mode="manual",
             proxy_upload_id=default_proxy_upload,
+            ua_upload_id=str(body.ua_upload_id or "").strip(),
+            smart_funnel_enabled=bool(body.smart_funnel_enabled),
+            smart_funnel_pattern=str(body.smart_funnel_pattern or "auto"),
+            smart_funnel_min_deals=int(body.smart_funnel_min_deals or 2),
+            smart_funnel_wait_until_conversion=bool(body.smart_funnel_wait_until_conversion),
         )
 
         if st in ("running", "launching", "queued"):
