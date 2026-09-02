@@ -529,7 +529,21 @@ def _proxy_dict_to_probe_url(proxy: Dict[str, Any], proxy_type: str = "http") ->
         if "://" in server:
             scheme, hostpart = server.split("://", 1)
         if "@" in hostpart:
-            return server if "://" in server else f"{scheme_fallback}://{hostpart}"
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(server if "://" in server else f"{scheme_fallback}://{hostpart}")
+            if parsed.hostname:
+                scheme = parsed.scheme or scheme_fallback
+                netloc = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+                u = unquote(parsed.username or "") or username
+                p = unquote(parsed.password or "") or password
+                if u and p:
+                    return (
+                        f"{scheme}://{quote(u, safe='')}:{quote(p, safe='')}@{netloc}"
+                    )
+                if u:
+                    return f"{scheme}://{quote(u, safe='')}@{netloc}"
+                return f"{scheme}://{netloc}"
         if username and password:
             return (
                 f"{scheme}://{quote(username, safe='')}:"
@@ -1639,10 +1653,27 @@ def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _friendly_proxy_probe_error(raw: str, gateway_host: str = "") -> str:
+    """Turn Windows DNS / malformed-gateway failures into operator hints."""
+    msg = (raw or "ipify_probe_failed").strip()
+    host = (gateway_host or "").strip()
+    low = msg.lower()
+    if "getaddrinfo" in low or "11001" in msg or "nodename" in low or "name or service not known" in low:
+        if host:
+            return (
+                f"DNS could not resolve proxy gateway '{host}'. "
+                "Open Proxies → edit provider → Gateway host must be real "
+                "(e.g. gw.dataimpulse.com) with port 823 or 10000."
+            )
+        return (
+            "DNS could not resolve the proxy gateway host. "
+            "Open Proxies → edit provider → check Gateway host + port."
+        )
+    return msg[:240]
+
+
 async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any]:
     """Exit-IP + optional fraud score for Proxy Check UI."""
-    import httpx
-
     proxy = dict(doc.get("proxy") or {})
     uid = str(user.get("id") or doc.get("user_id") or "").strip()
     if uid:
@@ -1684,45 +1715,42 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
         proxy["server"] = server
 
     try:
-        proxy_url = _proxy_dict_to_probe_url(
-            proxy, str(proxy.get("proxy_type") or "http"),
+        from real_user_traffic import (  # noqa: WPS433
+            _host_from_proxy_server,
+            _probe_proxy_geo,
+            _proxy_url_for_http,
         )
-    except ValueError as e:
-        result["error"] = str(e)
+    except Exception as imp_exc:
+        result["error"] = f"probe_engine_unavailable: {imp_exc}"
         return result
 
-    probe_urls = (
-        "http://api.ipify.org?format=json",
-        "https://api.ipify.org?format=json",
-    )
-    last_err = ""
+    probe_url = _proxy_url_for_http(proxy)
+    if not probe_url:
+        result["error"] = "no_proxy_configured"
+        return result
+    gateway_host = _host_from_proxy_server(probe_url)
+    if not gateway_host or " " in gateway_host:
+        result["error"] = (
+            f"Invalid proxy gateway host '{gateway_host or '(empty)'}'. "
+            "Open Proxies → edit provider → set Gateway host + port, then save password."
+        )
+        return result
+
     try:
-        for ip_url in probe_urls:
-            try:
-                async with httpx.AsyncClient(
-                    proxy=httpx.Proxy(url=proxy_url),
-                    timeout=httpx.Timeout(25.0),
-                    follow_redirects=True,
-                    verify=False,
-                ) as client:
-                    r = await client.get(ip_url)
-                    r.raise_for_status()
-                    if ip_url.endswith("format=json"):
-                        result["exit_ip"] = str((r.json() or {}).get("ip") or "").strip()
-                    else:
-                        result["exit_ip"] = (r.text or "").strip()
-                if result["exit_ip"] and ":" not in result["exit_ip"]:
-                    result["ok"] = True
-                    break
-            except Exception as e:
-                last_err = str(e)[:240]
-        if result["ok"]:
+        geo = await _probe_proxy_geo(dict(proxy), ua="", user_id=uid or None)
+        exit_ip = str(geo.get("exit_ip") or "").strip()
+        if geo.get("ok") and exit_ip and ":" not in exit_ip:
+            result["ok"] = True
+            result["exit_ip"] = exit_ip
+            result["country"] = str(geo.get("country") or geo.get("country_name") or "").strip()
+            result["timezone"] = str(geo.get("timezone") or "").strip()
             try:
                 from fraud_provider_module import check_ip_for_user  # type: ignore
-                fr = await check_ip_for_user(user, result["exit_ip"])
+                fr = await check_ip_for_user(user, exit_ip)
                 if isinstance(fr, dict):
                     result["fraud_score"] = fr.get("fraud_score") or fr.get("score")
-                    result["country"] = fr.get("country") or fr.get("country_code") or ""
+                    if not result["country"]:
+                        result["country"] = fr.get("country") or fr.get("country_code") or ""
                     result["raw_fraud"] = {
                         k: fr.get(k)
                         for k in ("provider", "is_proxy", "is_vpn", "risk")
@@ -1730,20 +1758,11 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
                     }
             except Exception:
                 pass
-            if not result["country"]:
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as c2:
-                        gr = await c2.get(f"https://ipapi.co/{result['exit_ip']}/json/")
-                        if gr.status_code == 200:
-                            gj = gr.json() or {}
-                            result["country"] = gj.get("country_code") or gj.get("country") or ""
-                            result["timezone"] = gj.get("timezone") or ""
-                except Exception:
-                    pass
         else:
-            result["error"] = last_err or "ipify_probe_failed"
+            raw_err = str(geo.get("probe_error") or geo.get("error") or "").strip()
+            result["error"] = _friendly_proxy_probe_error(raw_err, gateway_host)
     except Exception as e:
-        result["error"] = str(e)[:240]
+        result["error"] = _friendly_proxy_probe_error(str(e), gateway_host)
     return result
 
 

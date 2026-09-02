@@ -4635,6 +4635,23 @@ def _proxy_url_for_http(proxy: Dict[str, Any]) -> str:
         server = f"http://{server}"
     prefix, rest = server.split("://", 1)
     if "@" in rest:
+        try:
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(server)
+            if parsed.hostname:
+                scheme = parsed.scheme or prefix or "http"
+                netloc = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+                u = unquote(parsed.username or "") or str(user)
+                p = unquote(parsed.password or "") or str(pwd)
+                if u:
+                    return (
+                        f"{scheme}://{quote(str(u), safe='')}:"
+                        f"{quote(str(p), safe='')}@{netloc}"
+                    )
+                return f"{scheme}://{netloc}"
+        except Exception:
+            pass
         return server
     user = proxy.get("username") or ""
     pwd = proxy.get("password") or ""
@@ -5260,6 +5277,7 @@ async def _probe_proxy_geo(
                             headers={"User-Agent": ua},
                             verify=False,
                             http2=False,
+                            trust_env=False,
                         ) as cli:
                             ok = False
                             if _is_decodo:

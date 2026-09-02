@@ -1695,7 +1695,7 @@ async def _probe_ip_via_proxy(proxy_url: str) -> Optional[Dict[str, Any]]:
         # First step: ONLY discover the exit IP through the proxy
         # (fast, single request). Then check cache before classifying.
         async with httpx.AsyncClient(
-            proxy=proxy_url, timeout=_IP_PROBE_TIMEOUT, verify=False,
+            proxy=proxy_url, timeout=_IP_PROBE_TIMEOUT, verify=False, trust_env=False,
         ) as c:
             r = await c.get(_IP_PROBE_URL)
             if r.status_code != 200:
