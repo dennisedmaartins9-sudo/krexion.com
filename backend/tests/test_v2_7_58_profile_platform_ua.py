@@ -18,7 +18,7 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_58():
-    assert _read("VERSION").strip() == "2.7.94"
+    assert _read("VERSION").strip() == "2.7.95"
 
 
 def test_generic_mobile_browser_uses_real_device_not_k():

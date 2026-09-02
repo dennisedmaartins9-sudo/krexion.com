@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_version_is_2_7_77():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.94"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.95"
 
 
 def test_anti_detect_allow_extensions_fields():

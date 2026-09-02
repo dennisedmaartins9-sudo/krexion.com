@@ -49,5 +49,5 @@ def test_public_view_launch_warnings():
     assert '"launch_warnings"' in mod or "'launch_warnings'" in mod
 
 
-def test_version_is_2_7_94():
-    assert (ROOT / "VERSION").read_text().strip() == "2.7.94"
+def test_version_is_2_7_95():
+    assert (ROOT / "VERSION").read_text().strip() == "2.7.95"

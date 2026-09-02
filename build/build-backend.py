@@ -533,19 +533,58 @@ def compile_strip_backend_source() -> None:
     Same goal as the cloud Docker image: customers inspecting
     ``Program Files\\Krexion\\bin\\app`` see bytecode artefacts, not
     readable Python. Entry/subprocess scripts stay as .py.
-    """
-    import compileall
 
+    CRITICAL: must compile with the *embedded* Python 3.11 interpreter
+    (``DIST_DIR/python.exe``), NOT the host CI Python (3.12/3.14).
+    Host-compiled .pyc magic numbers break at runtime with
+    ``ImportError: bad magic number``.
+    """
     app_dir = DIST_DIR / "app"
     if not app_dir.is_dir():
         return
-    log("Bytecode-compiling native backend (strip .py sources)")
-    compileall.compile_dir(
-        str(app_dir),
-        force=True,
-        quiet=1,
-        legacy=True,
+
+    python_exe = _python_exe()
+    if not python_exe.is_file():
+        raise RuntimeError(
+            f"Embedded python missing at {python_exe} — cannot bytecode-compile for native bundle"
+        )
+
+    log(f"Bytecode-compiling native backend with {python_exe.name} (strip .py sources)")
+    r = subprocess.run(
+        [str(python_exe), "-m", "compileall", "-f", "-q", "-b", str(app_dir)],
+        capture_output=True,
+        text=True,
     )
+    if r.returncode != 0:
+        tail = (r.stdout + r.stderr).strip().splitlines()[-10:]
+        raise RuntimeError(
+            "compileall failed with embedded Python:\n  " + "\n  ".join(tail)
+        )
+
+    # Sanity: one compiled module must match embedded interpreter magic.
+    sample_pyc = app_dir / "ua_profile_contract.pyc"
+    if sample_pyc.is_file():
+        probe = subprocess.run(
+            [
+                str(python_exe),
+                "-c",
+                (
+                    "import importlib.util, pathlib, sys; "
+                    f"p=pathlib.Path(r'{sample_pyc}'); "
+                    "m=p.read_bytes()[:4]; "
+                    "e=importlib.util.MAGIC_NUMBER; "
+                    "sys.exit(0 if m==e else 1)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            raise RuntimeError(
+                "Bytecode magic mismatch after compileall — "
+                "host Python may have been used; refusing broken native bundle"
+            )
+
     stripped = 0
     for py in app_dir.rglob("*.py"):
         if py.name in _NATIVE_KEEP_PY:
