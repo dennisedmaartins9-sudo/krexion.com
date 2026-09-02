@@ -1979,6 +1979,29 @@ async def _finalize_doc_proxy_and_ip(
     doc["proxy"]["sticky_session"] = True
 
 
+def _prepare_proxy_for_profile_create(doc: Dict[str, Any]) -> None:
+    """Persist proxy intent only — never live-probe or bind exit IP at create.
+
+    Recurring customer failure: advanced-create returned 502 when provider
+    gateway was slow, batch IP dedupe failed, or ProxyJet could not pre-gen N
+    lines. Launch already runs _ensure_profile_launch_proxy / smart_session.
+    """
+    proxy = dict(doc.get("proxy") or {})
+    if not proxy_is_active(proxy):
+        doc.pop("exit_ip", None)
+        return
+    provider_id = str(proxy.get("provider_id") or "").strip()
+    if provider_id:
+        proxy["enabled"] = True
+        proxy["provider_id"] = provider_id
+        proxy["smart_session"] = True
+    if proxy.get("use_proxyjet"):
+        proxy["enabled"] = True
+    proxy.pop("exit_ip", None)
+    doc["proxy"] = proxy
+    doc.pop("exit_ip", None)
+
+
 async def _pick_ua_line_from_upload(uid: str, upload_id: str) -> Optional[str]:
     """Pick next UA from Uploaded Things batch (one-time use at launch)."""
     up_id = str(upload_id or "").strip()
@@ -2331,19 +2354,7 @@ async def create_profile(request: Request, body: ProfileBody):
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     doc = _profile_doc(uid, body)
-    proxy = doc.get("proxy") or {}
-    if proxy_is_active(proxy):
-        used_ips = await _load_team_profile_used_ips(uid)
-        if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
-            lines = await _allocate_provider_proxy_lines(
-                uid, str(proxy["provider_id"]), 1, used_ips,
-            )
-            parsed = _parse_proxy_line(lines[0])
-            doc["proxy"]["enabled"] = True
-            doc["proxy"]["server"] = parsed.get("server") or ""
-            doc["proxy"]["username"] = parsed.get("username") or ""
-            doc["proxy"]["password"] = parsed.get("password") or ""
-        await _finalize_doc_proxy_and_ip(uid, user, doc, used_ips)
+    _prepare_proxy_for_profile_create(doc)
     await _DB.browser_profiles.insert_one(doc)
     return {"profile": _public_view(doc), "id": doc["id"]}
 
@@ -2876,10 +2887,7 @@ async def import_vendor_profiles(
                 doc["proxy"] = {**(doc.get("proxy") or {}), **raw["proxy"]}
             if include_cookies and isinstance(raw.get("storage_state"), dict):
                 doc["storage_state"] = raw["storage_state"]
-            proxy = doc.get("proxy") or {}
-            if proxy_is_active(proxy):
-                used = await _load_team_profile_used_ips(uid)
-                await _finalize_doc_proxy_and_ip(uid, user, doc, used)
+            _prepare_proxy_for_profile_create(doc)
             await _DB.browser_profiles.insert_one(doc)
             created += 1
         except Exception as exc:
@@ -3663,17 +3671,7 @@ async def clone_profile(
     if body and body.fresh_proxy and (
         str(proxy.get("provider_id") or "").strip() or str(proxy.get("server") or "").strip()
     ):
-        used = await _load_team_profile_used_ips(uid)
-        if proxy.get("provider_id") and not str(proxy.get("server") or "").strip():
-            lines = await _allocate_provider_proxy_lines(
-                uid, str(proxy["provider_id"]), 1, used,
-            )
-            parsed = _parse_proxy_line(lines[0])
-            new_doc["proxy"]["enabled"] = True
-            new_doc["proxy"]["server"] = parsed.get("server") or ""
-            new_doc["proxy"]["username"] = parsed.get("username") or ""
-            new_doc["proxy"]["password"] = parsed.get("password") or ""
-        await _finalize_doc_proxy_and_ip(uid, user, new_doc, used)
+        _prepare_proxy_for_profile_create(new_doc)
     await _DB.browser_profiles.insert_one(new_doc)
     return {"profile": _public_view(new_doc), "id": new_doc["id"]}
 
@@ -4289,14 +4287,8 @@ async def import_bulk(request: Request, body: BulkCreateBody):
     uid = _resolve_user_or_401(user)
     docs: List[Dict[str, Any]] = []
     pad = max(2, len(str(body.count)))
-    team_used_ips = await _load_team_profile_used_ips(uid)
-    provider_lines: List[str] = []
     base_proxy = body.base.proxy if hasattr(body.base, "proxy") else ProxyConfig()
     provider_id = str(getattr(base_proxy, "provider_id", None) or "").strip()
-    if body.auto_unique_proxy and provider_id:
-        provider_lines = await _allocate_provider_proxy_lines(
-            uid, provider_id, body.count, team_used_ips,
-        )
     for i in range(1, body.count + 1):
         profile_body = body.base.copy(deep=True) if hasattr(body.base, "copy") else body.base
         profile_body.name = f"{body.name_prefix} {str(i).zfill(pad)}"
@@ -4304,26 +4296,20 @@ async def import_bulk(request: Request, body: BulkCreateBody):
             profile_body.user_agent = _gen_random_ua(profile_body.is_mobile or profile_body.device_type == "mobile")
         if body.randomize_viewport:
             profile_body.viewport = _gen_random_viewport(profile_body.is_mobile or profile_body.device_type == "mobile")
-        if body.auto_unique_proxy and provider_id and i - 1 < len(provider_lines):
-            parsed = _parse_proxy_line(provider_lines[i - 1])
+        if body.auto_unique_proxy and provider_id:
             profile_body.proxy.enabled = True
             profile_body.proxy.provider_id = provider_id
-            profile_body.proxy.server = parsed.get("server") or ""
-            profile_body.proxy.username = parsed.get("username") or ""
-            profile_body.proxy.password = parsed.get("password") or ""
+            profile_body.proxy.smart_session = True
         doc = _profile_doc(uid, profile_body)
+        _prepare_proxy_for_profile_create(doc)
         docs.append(doc)
-    batch_used = set(team_used_ips)
-    for doc in docs:
-        proxy = doc.get("proxy") or {}
-        if body.auto_unique_proxy and proxy_is_active(proxy):
-            await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
     if docs:
         await _DB.browser_profiles.insert_many(docs)
     return {
         "created": len(docs),
         "profiles": [_public_view(d) for d in docs],
-        "unique_ips_bound": sum(1 for d in docs if d.get("exit_ip")),
+        "unique_ips_bound": 0,
+        "proxy_bind_deferred": bool(body.auto_unique_proxy and provider_id),
     }
 
 
@@ -4479,65 +4465,44 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         )
         ua_cursors[plat] = 0
 
-    # ── Proxies — team-unique exit IP per profile ───────────────────
+    # ── Proxies — bind at launch, not at create (permanent 502 fix) ──
     proxy_lines: List[str] = []
     provider_lines: List[str] = []
     proxy_mode = (body.proxy.mode or "none").lower()
-    team_used_ips = await _load_team_profile_used_ips(uid)
+    proxy_warnings: List[str] = []
 
     if proxy_mode == "provider" and body.proxy.provider_id:
-        _prov_targeting = _profile_provider_targeting(
-            {
-                "proxyjet_country": body.proxy.country,
-                "proxyjet_state": body.proxy.state,
-            },
-            body.country,
-        )
-        _smart_provider = bool(body.proxy.smart_session)
-        if not _smart_provider:
-            provider_lines = await _allocate_provider_proxy_lines(
-                uid,
-                str(body.proxy.provider_id),
-                count,
-                team_used_ips,
-                targeting=_prov_targeting,
-            )
-        else:
-            provider_lines = []
+        # Never bulk-allocate or probe at create — launch resolves fresh IP.
+        provider_lines = []
     elif proxy_mode == "proxyjet":
         if _PROXYJET_GEN is None:
-            raise HTTPException(
-                status_code=503,
-                detail="ProxyJet generator not bound — install ProxyJet credentials first",
+            proxy_warnings.append(
+                "ProxyJet not configured — profiles saved; add ProxyJet creds before launch."
             )
-        try:
-            from server import ProxyJetGenerateIn  # type: ignore
-            pj_payload = ProxyJetGenerateIn(
-                count=count,
-                country=(body.proxy.country or "").strip().upper() or None,
-                state=(body.proxy.state or "").strip().upper() or None,
-                countries=body.proxy.countries,
-                states=body.proxy.states,
-                sticky_minutes=body.proxy.sticky_minutes,
-            )
-            pj_resp = await _PROXYJET_GEN(pj_payload, user)
-            proxy_lines = pj_resp.get("proxies") or []
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception("advanced_create: ProxyJet generate failed")
-            raise HTTPException(
-                status_code=502,
-                detail=f"Proxy generation failed: {str(e)[:200]}",
-            )
-        if len(proxy_lines) < count:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"ProxyJet returned only {len(proxy_lines)} of {count} "
-                    f"proxies. Try a different country/state or smaller batch."
-                ),
-            )
+        else:
+            try:
+                from server import ProxyJetGenerateIn  # type: ignore
+                pj_payload = ProxyJetGenerateIn(
+                    count=count,
+                    country=(body.proxy.country or "").strip().upper() or None,
+                    state=(body.proxy.state or "").strip().upper() or None,
+                    countries=body.proxy.countries,
+                    states=body.proxy.states,
+                    sticky_minutes=body.proxy.sticky_minutes,
+                )
+                pj_resp = await _PROXYJET_GEN(pj_payload, user)
+                proxy_lines = [str(x).strip() for x in (pj_resp.get("proxies") or []) if str(x).strip()]
+                if len(proxy_lines) < count:
+                    proxy_warnings.append(
+                        f"ProxyJet returned {len(proxy_lines)}/{count} lines — "
+                        "missing slots will dial at launch."
+                    )
+            except HTTPException as he:
+                logger.warning(f"advanced_create: ProxyJet soft-fail: {he.detail}")
+                proxy_warnings.append(str(he.detail)[:200])
+            except Exception as e:
+                logger.warning(f"advanced_create: ProxyJet soft-fail: {e}")
+                proxy_warnings.append(f"ProxyJet generate failed: {str(e)[:120]}")
 
     def _parse_proxy_line_to_cfg(
         line: str,
@@ -4593,24 +4558,13 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
         proxy_cfg = ProxyConfig()
         if proxy_mode == "provider" and body.proxy.provider_id:
-            if body.proxy.smart_session:
-                proxy_cfg = ProxyConfig(
-                    enabled=True,
-                    provider_id=str(body.proxy.provider_id or ""),
-                    smart_session=True,
-                    proxyjet_country=(body.proxy.country or body.country or "US").upper()[:2],
-                    proxyjet_state=(body.proxy.state or "").upper(),
-                )
-            elif i < len(provider_lines):
-                proxy_cfg = _parse_proxy_line_to_cfg(
-                    provider_lines[i].strip(),
-                    provider_id=str(body.proxy.provider_id or ""),
-                )
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Provider line missing for profile slot {i + 1}/{count}",
-                )
+            proxy_cfg = ProxyConfig(
+                enabled=True,
+                provider_id=str(body.proxy.provider_id or ""),
+                smart_session=True,
+                proxyjet_country=(body.proxy.country or body.country or "US").upper()[:2],
+                proxyjet_state=(body.proxy.state or "").upper(),
+            )
         elif proxy_mode == "manual":
             # Unique line per profile when `lines` provided; else same server.
             lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
@@ -4624,13 +4578,21 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     username=body.proxy.username or "",
                     password=body.proxy.password or "",
                 )
-        elif proxy_mode == "proxyjet" and i < len(proxy_lines):
-            proxy_cfg = _parse_proxy_line_to_cfg(
-                proxy_lines[i].strip(),
-                use_proxyjet=True,
-                proxyjet_country=(body.proxy.country or "US"),
-                proxyjet_state=(body.proxy.state or ""),
-            )
+        elif proxy_mode == "proxyjet":
+            if i < len(proxy_lines):
+                proxy_cfg = _parse_proxy_line_to_cfg(
+                    proxy_lines[i].strip(),
+                    use_proxyjet=True,
+                    proxyjet_country=(body.proxy.country or "US"),
+                    proxyjet_state=(body.proxy.state or ""),
+                )
+            else:
+                proxy_cfg = ProxyConfig(
+                    enabled=True,
+                    use_proxyjet=True,
+                    proxyjet_country=(body.proxy.country or "US").upper(),
+                    proxyjet_state=(body.proxy.state or "").upper(),
+                )
 
         viewport = _viewport_for_device(
             device,
@@ -4680,9 +4642,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         doc["device_label"] = str(device.get("label") or "")
         doc["device_catalog_id"] = str(device.get("id") or "")
         _pline = ""
-        if proxy_mode == "provider" and body.proxy.provider_id and not body.proxy.smart_session:
-            if i < len(provider_lines):
-                _pline = provider_lines[i].strip()
+        if proxy_mode == "provider" and body.proxy.provider_id:
+            pass
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
             _pline = proxy_lines[i].strip()
         elif proxy_mode == "manual":
@@ -4691,13 +4652,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 _pline = _mlines[i % len(_mlines)]
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
+        _prepare_proxy_for_profile_create(doc)
         docs.append(doc)
-
-    if docs and proxy_mode in ("provider", "proxyjet", "manual"):
-        if not (proxy_mode == "provider" and body.proxy.smart_session):
-            batch_used = set(team_used_ips)
-            for doc in docs:
-                await _finalize_doc_proxy_and_ip(uid, user, doc, batch_used)
 
     if docs:
         await _DB.browser_profiles.insert_many(docs)
@@ -4707,8 +4663,10 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
         "proxies_allocated": len(provider_lines or proxy_lines) if proxy_mode in ("proxyjet", "provider") else 0,
-        "smart_session": bool(proxy_mode == "provider" and body.proxy.smart_session),
-        "unique_ips_bound": sum(1 for d in docs if d.get("exit_ip")),
+        "smart_session": bool(proxy_mode == "provider" and body.proxy.provider_id),
+        "proxy_bind_deferred": proxy_mode in ("provider", "proxyjet", "manual"),
+        "proxy_warnings": proxy_warnings,
+        "unique_ips_bound": 0,
         "mix": {plat: n for plat, n in (mix_plan or [])},
     }
 

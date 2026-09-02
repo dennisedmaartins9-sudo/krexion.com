@@ -70,7 +70,7 @@ def test_shell_ipc_roundtrip(tmp_path):
 
 
 def test_version_is_2_7_76():
-        assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.95"
+        assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
 
 
 def test_soft_delete_and_restore():

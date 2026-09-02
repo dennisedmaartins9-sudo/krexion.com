@@ -50,4 +50,4 @@ def test_public_view_launch_warnings():
 
 
 def test_version_is_2_7_95():
-    assert (ROOT / "VERSION").read_text().strip() == "2.7.95"
+    assert (ROOT / "VERSION").read_text().strip() == "2.7.96"

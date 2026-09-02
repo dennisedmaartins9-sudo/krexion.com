@@ -903,6 +903,9 @@ export default function BrowserProfilesPage() {
           ? `Profile "${d.profiles?.[0]?.name || ""}" created`
           : `${n} unique profiles created${mixLabel}`,
       );
+      if (Array.isArray(d.proxy_warnings) && d.proxy_warnings.length) {
+        toast.warning(`Proxy note: ${d.proxy_warnings.join(" · ")}`, { duration: 9000 });
+      }
       closeCreateModal(true);
       resetAdvCreateForm();
       fetchProfiles();
@@ -3245,8 +3248,8 @@ export default function BrowserProfilesPage() {
                         <input type="radio" name="proxy_mode" value="proxyjet" className="sr-only"
                           checked={advProxy.mode === "proxyjet"}
                           onChange={() => setAdvProxy({ ...advProxy, mode: "proxyjet" })} />
-                        <div className="font-semibold">⚡ Generate (Provider)</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Unique IP per profile</div>
+                        <div className="font-semibold">⚡ ProxyJet batch</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">Pre-gen lines (optional) · launch fallback</div>
                       </label>
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "manual" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="manual" className="sr-only"

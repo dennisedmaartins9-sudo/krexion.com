@@ -12,5 +12,5 @@ def test_compile_strip_uses_embedded_python_not_host_compileall():
     assert "bad magic number" in src or "Bytecode magic mismatch" in src
 
 
-def test_version_is_2_7_95():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.95"
+def test_version_is_2_7_96():
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
