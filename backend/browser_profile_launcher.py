@@ -100,6 +100,21 @@ def _profile_user_closed_ui(
             from krexion_mobile_browser_shell import is_mobile_shell_alive
 
             if not is_mobile_shell_alive(session_id):
+                # Shell subprocess can restart — keep session if engine window exists.
+                if driver_pid:
+                    try:
+                        from krexion_window_icon import profile_engine_window_exists
+
+                        if profile_engine_window_exists(
+                            int(driver_pid), webkit=bool(sess.get("webkit"))
+                        ):
+                            sess["mobile_shell"] = False
+                            _RUNNING_SESSIONS[session_id] = sess
+                            return False
+                    except Exception:
+                        pass
+                if in_grace:
+                    return False
                 return True
         except Exception:
             pass
@@ -1766,6 +1781,9 @@ async def _launch_profile_session_inner(
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
     _launch_warnings: List[str] = []
+    _lppw = str(profile_config.get("_launch_proxy_probe_warning") or "").strip()
+    if _lppw:
+        _launch_warnings.append(_lppw)
     _wanted_webkit = _profile_engine == "webkit"
     # v2.7.52 — Resolve referer ONCE per launch (sticky_session parity).
     # Previously _coerce_profile_ua and route setup each called the resolver
@@ -1860,11 +1878,13 @@ async def _launch_profile_session_inner(
 
     if _uid:
         try:
-            from browser_profile_module import _finalize_proxy_cfg_for_launch
+            from browser_profile_module import resolve_launch_proxy_cfg
 
-            proxy_cfg = await _finalize_proxy_cfg_for_launch(_uid, None, proxy_cfg)
+            proxy_cfg = await resolve_launch_proxy_cfg(_uid, None, proxy_cfg)
             profile_config = dict(profile_config)
             profile_config["proxy"] = proxy_cfg
+        except HTTPException:
+            raise
         except Exception as _hydr_err:
             logger.warning(f"[profile-launch] proxy cred hydrate skipped: {_hydr_err}")
 
@@ -1987,6 +2007,15 @@ async def _launch_profile_session_inner(
             )
         proxy_diag["requested"] = True
         proxy_diag["server"] = raw_server
+        if username and not password:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Proxy username is set but password is missing. "
+                    "Edit the profile → Proxy → re-enter password (or paste "
+                    "host:port:user:pass as one line), then launch again."
+                ),
+            )
     elif _proxy_enabled and not proxy_cfg.get("server"):
         proxy_diag["requested"] = True
         proxy_diag["ok"] = False
@@ -2336,6 +2365,17 @@ async def _launch_profile_session_inner(
                     or set(_target_pids)
                 )
                 _poll = 120.0 if _profile_engine == "webkit" else 90.0
+                _will_try_mobile_shell = False
+                if mobile_shell:
+                    try:
+                        from krexion_mobile_browser_shell import should_use_mobile_shell
+
+                        _will_try_mobile_shell = should_use_mobile_shell(
+                            str(profile_os or ""),
+                            bool(is_mobile),
+                        )
+                    except Exception:
+                        _will_try_mobile_shell = False
                 apply_krexion_icon_to_pids(
                     _family_pids,
                     profile_label=str(_profile_label)[:60] or "Profile",
@@ -2346,24 +2386,14 @@ async def _launch_profile_session_inner(
                     window_title_markers=_title_markers,
                     include_webkit=_include_webkit,
                     platform=str(profile_os or ""),
+                    session_key=str(session_id),
                 )
                 # Option B — Krexion unique mobile shell (iOS WebKit + Android Chromium).
-                # Only after first page exists — early apply races HWND embed and
-                # can tear down the shell before navigation (plain Chrome flash).
+                # Only after first page + navigation — early apply races HWND embed and
+                # spawns a duplicate Safari/Chrome window alongside the engine.
                 _use_mobile_shell = False
                 if mobile_shell:
-                    try:
-                        from krexion_mobile_browser_shell import (
-                            apply_krexion_mobile_shell,
-                            should_use_mobile_shell,
-                        )
-
-                        _use_mobile_shell = should_use_mobile_shell(
-                            str(profile_os or ""),
-                            bool(is_mobile),
-                        )
-                    except Exception:
-                        _use_mobile_shell = False
+                    _use_mobile_shell = _will_try_mobile_shell
 
                 if _use_mobile_shell:
                     try:
@@ -2372,20 +2402,27 @@ async def _launch_profile_session_inner(
                             wait_for_mobile_shell,
                         )
 
-                        apply_krexion_mobile_shell(
-                            _family_pids,
-                            session_key=str(session_id),
-                            parent_pid=int(_driver_pid) if _driver_pid else None,
-                            platform=str(profile_os or "android"),
-                            viewport_width=int(viewport.get("width", 393)),
-                            viewport_height=int(viewport.get("height", 852)),
-                            profile_label=str(_profile_label)[:60] or "Profile",
-                            profile_slot=int(_taskbar_slot),
-                            poll_seconds=_poll,
-                            webkit=_profile_engine == "webkit",
-                            home_url=str(start_url or "https://www.google.com/")[:512],
-                        )
-                        _shell_active = wait_for_mobile_shell(session_id, timeout_sec=30.0)
+                        _shell_active = False
+                        for _shell_try in range(3):
+                            apply_krexion_mobile_shell(
+                                _family_pids,
+                                session_key=str(session_id),
+                                parent_pid=int(_driver_pid) if _driver_pid else None,
+                                platform=str(profile_os or "android"),
+                                viewport_width=int(viewport.get("width", 393)),
+                                viewport_height=int(viewport.get("height", 852)),
+                                profile_label=str(_profile_label)[:60] or "Profile",
+                                profile_slot=int(_taskbar_slot),
+                                poll_seconds=_poll,
+                                webkit=_profile_engine == "webkit",
+                                home_url=str(start_url or "https://www.google.com/")[:512],
+                            )
+                            _shell_active = wait_for_mobile_shell(
+                                session_id, timeout_sec=12.0,
+                            )
+                            if _shell_active:
+                                break
+                            time.sleep(0.6)
                         if _shell_active:
                             _launch_ui_meta["mobile_shell"] = True
                             logger.info(
@@ -2405,34 +2442,13 @@ async def _launch_profile_session_inner(
                         _launch_warnings.append(
                             "Mobile device shell could not be applied — not a real device shell UI."
                         )
-                # Legacy WebKit-only polish — only when Krexion mobile shell could not start.
-                if (
-                    not _launch_ui_meta.get("mobile_shell")
-                    and _profile_engine == "webkit"
-                    and str(profile_os or "").lower() in ("ios", "ipados")
-                ):
-                    if not any("shell" in w.lower() for w in _launch_warnings):
-                        _launch_warnings.append(
-                            "Using legacy Safari chrome overlay — not the full Krexion mobile shell."
-                        )
-                    from krexion_ios_safari_shell import apply_ios_safari_shell_to_pids
-
-                    apply_ios_safari_shell_to_pids(
-                        _family_pids,
-                        parent_pid=int(_driver_pid) if _driver_pid else None,
-                        viewport_width=int(viewport.get("width", 393)),
-                        viewport_height=int(viewport.get("height", 852)),
-                        profile_label=str(_profile_label)[:60] or "Profile",
-                        poll_seconds=_poll,
-                        profile_slot=int(_taskbar_slot),
-                    )
+                # Legacy Safari overlay removed — it caused a second window + wrong zoom.
+                # Krexion mobile shell is the only branded mobile UI on Windows.
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
 
-        _brand_krexion_taskbar(mobile_shell=False)
-        if session_id in _RUNNING_SESSIONS:
-            _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
-            _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
+        # Branding + mobile shell run ONCE after navigation (see below).
+        # Early branding here caused duplicate Safari/Chrome windows + icon flicker.
 
         # Publish CDP websocket for Local API automation clients
         _cdp_ws = ""
@@ -2729,15 +2745,6 @@ async def _launch_profile_session_inner(
             logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
-        # HWND exists after first page — re-brand taskbar (Chrome often
-        # paints its own icon between launch() and first navigation).
-        try:
-            await asyncio.sleep(0.5)
-            _brand_krexion_taskbar(mobile_shell=True)
-            if session_id in _RUNNING_SESSIONS:
-                _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
-        except Exception:
-            pass
 
         # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
         _last_tls_prewarm_ok = None
@@ -3136,6 +3143,16 @@ async def _launch_profile_session_inner(
                 except Exception as _de:
                     logger.warning(f"[profile-launch] post-goto diagnostic page render failed: {_de}")
 
+        # Single branding pass — after page content exists (prevents duplicate windows).
+        try:
+            await asyncio.sleep(0.35)
+            _brand_krexion_taskbar(mobile_shell=True)
+            if session_id in _RUNNING_SESSIONS:
+                _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
+                _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
+        except Exception as _brand_post_err:
+            logger.debug(f"[profile-launch] post-nav branding skipped: {_brand_post_err}")
+
         # Tell cloud the session is now RUNNING
         if on_session_update:
             try:
@@ -3308,8 +3325,10 @@ async def _launch_profile_session_inner(
         # ── Save storage_state + push to cloud ────────────────────────
         try:
             from krexion_mobile_browser_shell import stop_mobile_shell
+            from krexion_window_icon import stop_session_icon_keeper
 
             stop_mobile_shell(session_id)
+            stop_session_icon_keeper(session_id)
         except Exception:
             pass
         new_storage: Dict[str, Any] = {}
@@ -3356,8 +3375,10 @@ def request_stop(session_id: str) -> bool:
     sid = str(session_id or "").strip()
     try:
         from krexion_mobile_browser_shell import stop_mobile_shell
+        from krexion_window_icon import stop_session_icon_keeper
 
         stop_mobile_shell(sid)
+        stop_session_icon_keeper(sid)
     except Exception:
         pass
     sess = _RUNNING_SESSIONS.get(session_id)

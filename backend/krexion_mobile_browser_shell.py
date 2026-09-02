@@ -88,11 +88,11 @@ def compute_fit_frame_scale(layout: MobileShellLayout) -> float:
         sh = int(ctypes.windll.user32.GetSystemMetrics(1))
     except Exception:
         sw, sh = 1920, 1080
-    margin_x, margin_y = 24, 72
+    margin_x, margin_y = 24, 96
     avail_w = max(280, sw - margin_x * 2)
     avail_h = max(480, sh - margin_y * 2)
     scale = min(avail_w / max(1, layout.outer_w), avail_h / max(1, layout.outer_h), 1.0)
-    return max(0.55, round(scale, 3))
+    return max(0.55, round(min(scale, 0.92), 3))
 
 
 def adjust_shell_frame_scale(
@@ -529,8 +529,16 @@ def _center_origin(layout: MobileShellLayout) -> Tuple[int, int]:
 
 
 def stop_mobile_shell(session_key: str) -> None:
+    key = str(session_key or "")
     with _LOCK:
-        rec = _ACTIVE.pop(str(session_key or ""), None)
+        rec = _ACTIVE.pop(key, None)
+    if rec:
+        stop_ev = rec.get("stop_event")
+        if stop_ev is not None:
+            try:
+                stop_ev.set()
+            except Exception:
+                pass
     if not rec:
         return
     proc = rec.get("proc")
@@ -564,13 +572,24 @@ def _win_dpi_scale() -> float:
 
 
 def _engine_window_size(layout: MobileShellLayout) -> Tuple[int, int]:
-    """Physical pixel size for Playwright engine HWND (viewport scaled visually)."""
-    dpi = _win_dpi_scale()
+    """Physical pixel size for Playwright engine HWND (match CSS viewport, not DPI²)."""
     fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
     return (
-        max(280, int(round(layout.content_w * dpi * fs))),
-        max(480, int(round(layout.content_h * dpi * fs))),
+        max(280, int(round(layout.content_w * fs))),
+        max(480, int(round(layout.content_h * fs))),
     )
+
+
+def _shell_content_origin(
+    layout: MobileShellLayout,
+    origin_xy: Tuple[int, int],
+) -> Tuple[int, int]:
+    """Content area origin inside the phone frame (logical px, no extra DPI multiply)."""
+    ox, oy = origin_xy
+    fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
+    content_x = int(round((ox + layout.bezel) * fs))
+    content_y = int(round((oy + layout.top_h * fs + layout.bezel) * fs))
+    return content_x, content_y
 
 
 def _strip_native_caption(hwnd: int) -> None:
@@ -682,6 +701,7 @@ def _shell_apply_loop(
     home_url: str = "https://www.google.com/",
     origin_xy: Optional[Tuple[int, int]] = None,
     shell_already_started: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     try:
         import ctypes
@@ -692,6 +712,7 @@ def _shell_apply_loop(
             collect_profile_process_tree,
             find_pids_by_window_title_substrings,
             find_webkit_browser_pids,
+            hide_hwnd_from_taskbar,
         )
 
         user32 = ctypes.windll.user32
@@ -726,7 +747,7 @@ def _shell_apply_loop(
                 interactive=True,
             )
 
-        deadline = time.time() + deadline_s
+        deadline = time.time() + max(float(deadline_s or 120.0), 86400.0)
         pid_set: Set[int] = {int(p) for p in seed_pids or []}
         if parent_pid:
             pid_set |= collect_profile_process_tree(int(parent_pid))
@@ -736,11 +757,12 @@ def _shell_apply_loop(
 
         dpi = _win_dpi_scale()
         fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
-        content_x = int(round((ox + layout.bezel) * dpi))
-        content_y = int(round((oy + layout.top_h * fs + layout.bezel) * dpi))
+        content_x, content_y = _shell_content_origin(layout, (ox, oy))
         eng_w, eng_h = _engine_window_size(layout)
 
         while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
             if parent_pid:
                 pid_set |= collect_profile_process_tree(int(parent_pid))
             if webkit:
@@ -772,7 +794,12 @@ def _shell_apply_loop(
                     eng_w,
                     eng_h,
                 )
+                user32.ShowWindow(int(hwnd), 5)
                 user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
+                try:
+                    hide_hwnd_from_taskbar(int(hwnd))
+                except Exception:
+                    pass
                 try:
                     brand_single_hwnd_krexion(
                         hwnd,
@@ -782,6 +809,31 @@ def _shell_apply_loop(
                     )
                 except Exception:
                     pass
+
+            embedded = set(engine_hwnds)
+
+            def _hide_stray_cb(hwnd, _lparam):
+                try:
+                    win_pid = wintypes.DWORD(0)
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                    if win_pid.value not in pid_set:
+                        return True
+                    if int(hwnd) in embedded:
+                        return True
+                    title_buf = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(hwnd, title_buf, 512)
+                    title = (title_buf.value or "").strip()
+                    if title.lower() == "playwright":
+                        user32.ShowWindow(int(hwnd), 0)
+                        return True
+                    if _is_engine_content_hwnd(int(hwnd), webkit=webkit):
+                        user32.ShowWindow(int(hwnd), 0)
+                except Exception:
+                    pass
+                return True
+
+            if embedded:
+                user32.EnumWindows(EnumWindowsProc(_hide_stray_cb), 0)
 
             handles = _load_shell_handles(session_key)
             top_hwnd = int(handles.get("top") or 0)
@@ -837,6 +889,9 @@ def apply_krexion_mobile_shell(
     if not _IS_WINDOWS:
         return None
     try:
+        key = str(session_key or "")
+        stop_mobile_shell(key)
+        stop_ev = threading.Event()
         layout = compute_mobile_shell_layout(platform, viewport_width, viewport_height)
         layout = layout.with_frame_scale(compute_fit_frame_scale(layout))
         _clean = sorted({int(p) for p in (pids or []) if p})
@@ -846,9 +901,10 @@ def apply_krexion_mobile_shell(
         proc = None
         for _attempt in range(2):
             if _attempt:
-                stop_mobile_shell(str(session_key))
+                stop_mobile_shell(key)
+                stop_ev = threading.Event()
             proc = _start_shell_process(
-                str(session_key),
+                key,
                 layout,
                 str(profile_label or "")[:60],
                 int(profile_slot or 1),
@@ -868,13 +924,13 @@ def apply_krexion_mobile_shell(
         t = threading.Thread(
             target=_shell_apply_loop,
             args=(
-                str(session_key),
+                key,
                 _clean,
                 parent_pid,
                 layout,
                 str(profile_label or "")[:60],
                 int(profile_slot or 1),
-                float(poll_seconds),
+                float(max(poll_seconds or 120.0, 86400.0)),
                 float(poll_interval),
             ),
             kwargs={
@@ -882,11 +938,16 @@ def apply_krexion_mobile_shell(
                 "home_url": str(home_url or "")[:512],
                 "origin_xy": (ox, oy),
                 "shell_already_started": True,
+                "stop_event": stop_ev,
             },
             daemon=True,
-            name=f"KrexionMobileShell-{profile_slot}-{session_key[:8]}",
+            name=f"KrexionMobileShell-{profile_slot}-{key[:8]}",
         )
         t.start()
+        with _LOCK:
+            rec = _ACTIVE.get(key)
+            if rec is not None:
+                rec["stop_event"] = stop_ev
         return t
     except Exception as exc:
         logger.debug(f"[mobile-shell] apply failed: {exc}")

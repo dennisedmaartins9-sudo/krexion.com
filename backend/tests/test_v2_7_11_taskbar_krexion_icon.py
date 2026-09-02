@@ -18,4 +18,6 @@ def test_icon_module_uses_appusermodel_relaunch():
 def test_launcher_rebrands_after_first_page():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "_brand_krexion_taskbar" in src
-    assert src.count("_brand_krexion_taskbar()") >= 2
+    assert "_brand_krexion_taskbar(mobile_shell=True)" in src
+    assert "_brand_krexion_taskbar(mobile_shell=False)" not in src
+    assert "Single branding pass" in src

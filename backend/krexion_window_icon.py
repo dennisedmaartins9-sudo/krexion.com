@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger("krexion.window_icon")
 
@@ -32,7 +32,41 @@ _IS_WINDOWS = sys.platform.startswith("win")
 _KREXION_APP_ID_BASE = "Krexion.BrowserProfile"
 
 _ICONED_HWNDS: Set[int] = set()
+_SESSION_ICON_STOP: Dict[str, threading.Event] = {}
 _LOCK = threading.Lock()
+
+
+def stop_session_icon_keeper(session_key: str) -> None:
+    """Stop the per-session taskbar icon loop (call when profile session ends)."""
+    key = str(session_key or "").strip()
+    if not key:
+        return
+    with _LOCK:
+        ev = _SESSION_ICON_STOP.pop(key, None)
+    if ev is not None:
+        ev.set()
+
+
+def hide_hwnd_from_taskbar(hwnd: int) -> None:
+    """Remove an embedded engine HWND from the taskbar (shell owns the button)."""
+    if not _IS_WINDOWS or not hwnd:
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_APPWINDOW = 0x00040000
+        style = user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
+        user32.SetWindowLongW(
+            int(hwnd),
+            GWL_EXSTYLE,
+            (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW,
+        )
+        user32.ShowWindow(int(hwnd), 5)  # SW_SHOW — refresh taskbar grouping
+    except Exception as exc:
+        logger.debug(f"[krexion-icon] hide hwnd from taskbar skipped: {exc}")
 
 
 def _app_id_for_slot(slot: int) -> str:
@@ -508,11 +542,20 @@ def apply_krexion_icon_to_pids(
     window_title_markers: Optional[list] = None,
     include_webkit: bool = False,
     platform: str = "",
+    session_key: str = "",
 ) -> Optional[threading.Thread]:
     """Brand Chromium HWNDs as Krexion Browser with profile number badge."""
     if not _IS_WINDOWS:
         return None
     try:
+        sk = str(session_key or "").strip()
+        if sk:
+            stop_session_icon_keeper(sk)
+        stop_ev = threading.Event()
+        if sk:
+            with _LOCK:
+                _SESSION_ICON_STOP[sk] = stop_ev
+
         slot = max(1, min(99, int(profile_slot or 1)))
         app_id = _app_id_for_slot(slot)
         try:
@@ -549,6 +592,9 @@ def apply_krexion_icon_to_pids(
         display = f"Krexion Browser ({slot})"
         if profile_label:
             display = f"Krexion — {profile_label} ({slot})"
+        # Session-bound profiles keep re-applying icons for the full session —
+        # Chromium/WebKit reset WM_SETICON after navigation and title changes.
+        session_poll = 86400.0 if sk else float(poll_seconds or 90.0)
         t = threading.Thread(
             target=_icon_apply_loop_multi,
             args=(
@@ -557,12 +603,13 @@ def apply_krexion_icon_to_pids(
                 ico_path,
                 display,
                 app_id,
-                poll_seconds,
+                session_poll,
                 poll_interval,
                 list(cmdline_markers or []),
                 list(window_title_markers or []),
                 bool(include_webkit),
             ),
+            kwargs={"stop_event": stop_ev if sk else None},
             daemon=True,
             name=f"KrexionIcon-{slot}-{parent_pid or (_clean[0] if _clean else slot)}",
         )
@@ -770,6 +817,7 @@ def _icon_apply_loop_multi(
     cmdline_markers: Optional[list] = None,
     window_title_markers: Optional[list] = None,
     include_webkit: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     try:
         import ctypes
@@ -797,13 +845,16 @@ def _icon_apply_loop_multi(
         GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         GetWindowThreadProcessId.restype = wintypes.DWORD
 
-        deadline = time.time() + deadline_s
+        session_mode = stop_event is not None
+        deadline = time.time() + max(float(deadline_s or 90.0), 86400.0 if session_mode else 0.0)
         pid_set: Set[int] = {int(p) for p in seed_pids or []}
         if parent_pid:
             pid_set.add(int(parent_pid))
         last_force = 0.0
 
         while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
             if parent_pid:
                 pid_set |= collect_profile_process_tree(int(parent_pid))
             if cmdline_markers:
@@ -844,7 +895,7 @@ def _icon_apply_loop_multi(
             user32.EnumWindows(EnumWindowsProc(_cb), 0)
 
             now = time.time()
-            force_all = (now - last_force) >= 3.0 or (deadline - now) > (deadline_s - 15.0)
+            force_all = session_mode or (now - last_force) >= 3.0 or (deadline - now) > (deadline_s - 15.0)
             if force_all:
                 last_force = now
 

@@ -4633,6 +4633,8 @@ def _proxy_url_for_http(proxy: Dict[str, Any]) -> str:
         return ""
     if "://" not in server:
         server = f"http://{server}"
+    user = proxy.get("username") or ""
+    pwd = proxy.get("password") or ""
     prefix, rest = server.split("://", 1)
     if "@" in rest:
         try:
@@ -4653,8 +4655,6 @@ def _proxy_url_for_http(proxy: Dict[str, Any]) -> str:
         except Exception:
             pass
         return server
-    user = proxy.get("username") or ""
-    pwd = proxy.get("password") or ""
     if user:
         return f"{prefix}://{quote(str(user), safe='')}:{quote(str(pwd), safe='')}@{rest}"
     return server

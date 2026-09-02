@@ -634,6 +634,88 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _proxy_host_from_server(server: str) -> str:
+    srv = (server or "").strip()
+    if not srv:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        p = urlparse(srv if "://" in srv else f"http://{srv}")
+        return (p.hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _canonical_proxy_raw_line(proxy: Dict[str, Any]) -> str:
+    """Rebuild host:port:user:pass line for launch-time auth recovery."""
+    out = hydrate_proxy_credentials(dict(proxy or {}))
+    server = str(out.get("server") or "").strip()
+    username = str(out.get("username") or "").strip()
+    password = str(out.get("password") or "").strip()
+    if not server or not username or not password:
+        return str(out.get("raw_line") or out.get("raw") or "").strip()
+    hostpart = server.split("://", 1)[-1]
+    if "@" in hostpart:
+        return str(out.get("raw_line") or out.get("raw") or server).strip()
+    from urllib.parse import quote
+
+    return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{hostpart}"
+
+
+async def resolve_launch_proxy_cfg(
+    uid: str,
+    user: Optional[dict],
+    proxy_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Hydrate manual/provider proxy auth before Playwright — prevents Chromium sign-in popup."""
+    out = await _finalize_proxy_cfg_for_launch(uid, user, dict(proxy_cfg or {}))
+    out = hydrate_proxy_credentials(out)
+
+    if not str(out.get("password") or "").strip():
+        for key in ("raw_line", "raw"):
+            raw = str(out.get(key) or "").strip()
+            if raw:
+                parsed = _parse_proxy_line(raw)
+                if parsed.get("password"):
+                    out["password"] = parsed["password"]
+                if parsed.get("username") and not str(out.get("username") or "").strip():
+                    out["username"] = parsed["username"]
+                if parsed.get("server"):
+                    out["server"] = parsed["server"]
+                break
+
+    if not str(out.get("password") or "").strip() and str(out.get("server") or "").strip():
+        parsed = _parse_proxy_line(str(out.get("server") or ""))
+        if parsed.get("password"):
+            out["password"] = parsed["password"]
+        if parsed.get("username") and not str(out.get("username") or "").strip():
+            out["username"] = parsed["username"]
+        if parsed.get("server"):
+            out["server"] = parsed["server"]
+
+    host = _proxy_host_from_server(str(out.get("server") or ""))
+    if host and not str(out.get("password") or "").strip() and uid and _DB is not None:
+        try:
+            async for prov in _DB.proxy_providers.find({"user_id": uid, "enabled": True}):
+                cfg = prov.get("config") or {}
+                gw = str(cfg.get("gateway_host") or "").strip().lower()
+                if gw and gw == host:
+                    gw_pwd = str(cfg.get("password") or "").strip()
+                    if gw_pwd:
+                        out["password"] = gw_pwd
+                        if not str(out.get("username") or "").strip() and cfg.get("username"):
+                            out["username"] = str(cfg["username"]).strip()
+                        break
+        except Exception as exc:
+            logger.debug(f"[browser-profile] gateway password lookup skipped: {exc}")
+
+    raw = _canonical_proxy_raw_line(out)
+    if raw:
+        out["raw_line"] = raw
+    return hydrate_proxy_credentials(out)
+
+
 async def _finalize_proxy_cfg_for_launch(
     uid: str,
     user: Optional[dict],
@@ -1708,6 +1790,268 @@ def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_valid_exit_ip(ip: str) -> bool:
+    """Accept IPv4/IPv6 exit IPs (legacy check rejected IPv6 because of ':')."""
+    s = (ip or "").strip()
+    if not s:
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _format_profile_proxy_probe_failure(
+    doc: Dict[str, Any],
+    proxy: Dict[str, Any],
+    probe: Optional[Dict[str, Any]] = None,
+) -> str:
+    name = str(doc.get("name") or doc.get("id") or "profile")[:64]
+    err = str((probe or {}).get("error") or "").strip()
+    if not str(proxy.get("password") or "").strip() and proxy.get("provider_id"):
+        return (
+            f"Profile '{name}': proxy configured but exit IP probe failed. "
+            "Provider gateway password missing — open Proxies → edit provider → save password."
+        )
+    detail = f"Profile '{name}': proxy configured but exit IP probe failed"
+    if err:
+        detail += f" ({err[:160]})"
+    return detail
+
+
+def _is_rotating_gateway_proxy(proxy_cfg: Dict[str, Any]) -> bool:
+    """True for manual pasted lines on DataImpulse / Smartproxy / etc."""
+    cfg = hydrate_proxy_credentials(dict(proxy_cfg or {}))
+    server = str(cfg.get("server") or "").strip()
+    username = str(cfg.get("username") or "").strip()
+    host = _proxy_host_from_server(server)
+    if not host:
+        for key in ("raw_line", "raw"):
+            raw = str(cfg.get(key) or "").strip()
+            if not raw:
+                continue
+            parsed = _parse_proxy_line(raw)
+            host = _proxy_host_from_server(str(parsed.get("server") or ""))
+            username = username or str(parsed.get("username") or "").strip()
+            if host:
+                break
+    if not host:
+        return False
+    try:
+        from real_user_traffic import _detect_rotating_gateway
+
+        return bool(_detect_rotating_gateway(host, username))
+    except Exception:
+        host_l = host.lower()
+        return any(
+            dom in host_l
+            for dom in ("dataimpulse.com", "smartproxy.com", "oxylabs.io", "brightdata.com")
+        )
+
+
+def _rotate_manual_proxy_session(proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Inject a fresh gateway session so the next probe gets a new exit IP."""
+    out = hydrate_proxy_credentials(dict(proxy_cfg or {}))
+    username = str(out.get("username") or "").strip()
+    if not username:
+        return out
+    host = _proxy_host_from_server(str(out.get("server") or ""))
+    try:
+        from proxy_provider_module import (
+            _apply_targeting_to_username,
+            _detect_profile,
+            _make_session_id,
+            _rotate_session_in_username,
+        )
+
+        new_user = _rotate_session_in_username(username)
+        if new_user == username and _is_rotating_gateway_proxy(out):
+            targeting: Dict[str, Any] = {"_want_sid": True, "force_replace": True}
+            cc = str(
+                out.get("proxyjet_country") or out.get("country") or ""
+            ).strip().upper()
+            st = str(out.get("proxyjet_state") or out.get("state") or "").strip()
+            if cc and cc != "ANY":
+                targeting["country"] = cc
+            if st:
+                targeting["state"] = st
+            new_user = _apply_targeting_to_username(username, host, targeting)
+            new_user = _rotate_session_in_username(new_user)
+            if new_user == username:
+                sid = _make_session_id()
+                if ";" in username or "__cr." in username.lower():
+                    new_user = f"{username};sessid.{sid}"
+                elif "-session-" in username.lower() or "_session-" in username.lower():
+                    new_user = _rotate_session_in_username(f"{username}-session-{sid}")
+                else:
+                    new_user = f"{username};sessid.{sid}"
+        if new_user != username:
+            out["username"] = new_user
+            raw = _canonical_proxy_raw_line(out)
+            if raw:
+                out["raw_line"] = raw
+            logger.info(
+                "[browser-profile launch] rotated manual gateway session "
+                f"host={host[:32]} user={username[:24]}→{new_user[:32]}"
+            )
+    except Exception as exc:
+        logger.debug(f"[browser-profile] manual session rotate skipped: {exc}")
+    return out
+
+
+def _proxy_ready_for_soft_launch(proxy_cfg: Dict[str, Any]) -> bool:
+    """Launch may proceed without pre-bound exit IP when proxy line resolved."""
+    if not str(proxy_cfg.get("server") or "").strip():
+        return False
+    if str(proxy_cfg.get("password") or "").strip():
+        return True
+    if str(proxy_cfg.get("provider_id") or "").strip():
+        return True
+    if proxy_cfg.get("use_proxyjet"):
+        return True
+    if _is_rotating_gateway_proxy(proxy_cfg):
+        return True
+    return bool(str(proxy_cfg.get("username") or "").strip())
+
+
+def _defer_launch_proxy_probe(proxy_cfg: Dict[str, Any]) -> bool:
+    """Rotating/provider proxies — pre-probe must never block browser open."""
+    if str(proxy_cfg.get("provider_id") or "").strip():
+        return True
+    if proxy_cfg.get("smart_session"):
+        return True
+    if proxy_cfg.get("use_proxyjet"):
+        return True
+    if _is_rotating_gateway_proxy(proxy_cfg):
+        return True
+    return False
+
+
+def _set_soft_launch_proxy_state(
+    doc: Dict[str, Any],
+    proxy_cfg: Dict[str, Any],
+    *,
+    probe: Optional[Dict[str, Any]] = None,
+) -> None:
+    doc.pop("exit_ip", None)
+    doc["proxy"] = dict(proxy_cfg)
+    doc["proxy"].pop("exit_ip", None)
+    err = str((probe or {}).get("error") or "").strip()
+    msg = "Exit IP pre-check failed — browser will verify proxy after launch."
+    if err:
+        msg += f" ({err[:100]})"
+    doc["_launch_proxy_probe_warning"] = msg
+
+
+async def _best_effort_bind_exit_ip_at_launch(
+    cred_uid: str,
+    user: dict,
+    doc: Dict[str, Any],
+    proxy_cfg: Dict[str, Any],
+    *,
+    provider_id: str,
+    profile_id: str,
+    used_ips: Set[str],
+    targeting: Optional[Dict[str, Any]],
+    max_retries: int = 0,
+) -> Dict[str, Any]:
+    """Rotating provider/manual: probe + dedupe when possible; never block browser open."""
+    rotating_manual = _is_rotating_gateway_proxy(proxy_cfg) and not provider_id
+    attempts = max_retries or (8 if (provider_id or rotating_manual) else 3)
+    last_probe: Dict[str, Any] = {}
+    for attempt in range(attempts):
+        doc["proxy"] = dict(proxy_cfg)
+        probe_doc = {
+            "proxy": proxy_cfg,
+            "user_id": cred_uid,
+            "id": profile_id,
+            "name": doc.get("name"),
+        }
+        probe = await _probe_profile_proxy(probe_doc, user)
+        last_probe = probe
+        exit_ip = str(probe.get("exit_ip") or "").strip()
+        if exit_ip:
+            try:
+                canonical = await _assert_unique_team_profile_ip(
+                    cred_uid, exit_ip, used_ips, profile_id=profile_id,
+                )
+                doc["exit_ip"] = canonical
+                doc["proxy"]["exit_ip"] = canonical
+                doc["proxy"]["sticky_session"] = True
+                doc.pop("_launch_proxy_probe_warning", None)
+                logger.info(
+                    f"[browser-profile launch] exit_ip={canonical} "
+                    f"profile={profile_id[:8]} attempt={attempt + 1} "
+                    f"provider={bool(provider_id)} manual_rotating={rotating_manual}"
+                )
+                return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+            except HTTPException as exc:
+                if exc.status_code != 409 or attempt >= attempts - 1:
+                    break
+                if provider_id:
+                    logger.warning(
+                        f"[browser-profile launch] duplicate provider IP attempt "
+                        f"{attempt + 1} — rotating session"
+                    )
+                elif rotating_manual:
+                    logger.warning(
+                        f"[browser-profile launch] duplicate manual rotating IP "
+                        f"attempt {attempt + 1} — fresh gateway session"
+                    )
+                    proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                    proxy_cfg = await _finalize_proxy_cfg_for_launch(
+                        cred_uid, user, proxy_cfg,
+                    )
+                    await asyncio.sleep(0.25)
+                    continue
+                else:
+                    break
+        elif (provider_id or rotating_manual) and attempt < attempts - 1:
+            logger.warning(
+                f"[browser-profile launch] rotating probe miss attempt "
+                f"{attempt + 1} — new session"
+            )
+        else:
+            break
+        if provider_id:
+            lines = await _allocate_provider_proxy_lines(
+                cred_uid, provider_id, 1, used_ips, targeting=targeting,
+            )
+            proxy_cfg = _apply_resolved_line_to_proxy_cfg(
+                proxy_cfg, lines[0], provider_id=provider_id,
+            )
+            proxy_cfg = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+        elif rotating_manual:
+            proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+            proxy_cfg = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+            await asyncio.sleep(0.25)
+        else:
+            break
+
+    if rotating_manual or provider_id:
+        err = str(last_probe.get("error") or "").strip()
+        doc["_launch_proxy_probe_warning"] = (
+            "Could not reserve a team-unique exit IP before launch — browser will "
+            "open and verify proxy after connect. For rotating gateways, each new "
+            "session usually assigns a fresh IP."
+        )
+        if err:
+            doc["_launch_proxy_probe_warning"] += f" ({err[:80]})"
+        doc.pop("exit_ip", None)
+        doc["proxy"] = dict(proxy_cfg)
+        doc["proxy"].pop("exit_ip", None)
+    else:
+        _set_soft_launch_proxy_state(doc, proxy_cfg, probe=last_probe)
+    logger.warning(
+        f"[browser-profile launch] rotating soft launch profile={profile_id[:8]} "
+        f"server={str(proxy_cfg.get('server') or '')[:48]}"
+    )
+    return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+
+
 def _friendly_proxy_probe_error(raw: str, gateway_host: str = "") -> str:
     """Turn Windows DNS / malformed-gateway failures into operator hints."""
     msg = (raw or "ipify_probe_failed").strip()
@@ -1731,9 +2075,10 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     """Exit-IP + optional fraud score for Proxy Check UI."""
     proxy = dict(doc.get("proxy") or {})
     uid = str(user.get("id") or doc.get("user_id") or "").strip()
-    if uid:
+    cred_uid = str(doc.get("user_id") or uid).strip() or uid
+    if cred_uid:
         try:
-            proxy = await _finalize_proxy_cfg_for_launch(uid, user, proxy)
+            proxy = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy)
         except Exception as _hydr_probe:
             logger.debug(f"[browser-profile] proxy probe hydrate skipped: {_hydr_probe}")
     result: Dict[str, Any] = {
@@ -1792,9 +2137,9 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
         return result
 
     try:
-        geo = await _probe_proxy_geo(dict(proxy), ua="", user_id=uid or None)
+        geo = await _probe_proxy_geo(dict(proxy), ua="", user_id=cred_uid or None)
         exit_ip = str(geo.get("exit_ip") or "").strip()
-        if geo.get("ok") and exit_ip and ":" not in exit_ip:
+        if geo.get("ok") and _is_valid_exit_ip(exit_ip):
             result["ok"] = True
             result["exit_ip"] = exit_ip
             result["country"] = str(geo.get("country") or geo.get("country_name") or "").strip()
@@ -1872,34 +2217,36 @@ async def _assert_unique_team_profile_ip(
     used_ips: Set[str],
     *,
     profile_id: Optional[str] = None,
+    batch_assigned: Optional[Set[str]] = None,
 ) -> str:
     """Fail if exit_ip already used by team; else reserve in-batch set."""
     try:
-        from cross_user_ip_isolation import canonicalize_ip, is_team_profile_ip_used
+        from cross_user_ip_isolation import canonicalize_ip
         canonical = canonicalize_ip(exit_ip)
     except Exception:
         canonical = (exit_ip or "").strip()
     if not canonical:
         raise HTTPException(status_code=502, detail="Could not detect proxy exit IP")
+    if batch_assigned is not None and canonical in batch_assigned:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Duplicate exit IP {canonical} — already assigned to another "
+                f"profile in this batch"
+            ),
+        )
     if canonical in used_ips:
         raise HTTPException(
             status_code=409,
-            detail=f"Duplicate exit IP {canonical} — already assigned to another profile in this batch",
+            detail=(
+                f"Duplicate exit IP {canonical} — already used by another profile "
+                f"(team IP isolation). Retry launch for a fresh rotating IP, or "
+                f"stop the other profile using this address."
+            ),
         )
-    try:
-        if await is_team_profile_ip_used(_DB, uid, canonical):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Duplicate exit IP {canonical} — already used by a team profile "
-                    f"(IP isolation). Pick another provider session or country."
-                ),
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass
     used_ips.add(canonical)
+    if batch_assigned is not None:
+        batch_assigned.add(canonical)
     if profile_id:
         await _bind_profile_exit_ip(uid, profile_id, canonical)
     return canonical
@@ -1953,24 +2300,13 @@ async def _finalize_doc_proxy_and_ip(
         return
     proxy = await _finalize_proxy_cfg_for_launch(uid, user, dict(proxy))
     doc["proxy"] = proxy
-    exit_ip = await _probe_proxy_cfg_exit_ip(user, proxy)
+    probe = await _probe_profile_proxy({"proxy": proxy, "user_id": uid}, user)
+    exit_ip = str(probe.get("exit_ip") or "").strip()
     if not exit_ip:
-        probe = await _probe_profile_proxy({"proxy": proxy}, user)
-        err = str(probe.get("error") or "").strip()
-        if not str(proxy.get("password") or "").strip() and proxy.get("provider_id"):
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed. "
-                    "DataImpulse/provider gateway password missing — open Proxies → edit provider → save password."
-                ),
-            )
-        detail = (
-            f"Profile '{doc.get('name') or doc.get('id')}': proxy configured but exit IP probe failed"
+        raise HTTPException(
+            status_code=502,
+            detail=_format_profile_proxy_probe_failure(doc, proxy, probe),
         )
-        if err:
-            detail += f" ({err[:120]})"
-        raise HTTPException(status_code=502, detail=detail)
     canonical = await _assert_unique_team_profile_ip(
         uid, exit_ip, used_ips, profile_id=str(doc.get("id") or ""),
     )
@@ -1997,6 +2333,10 @@ def _prepare_proxy_for_profile_create(doc: Dict[str, Any]) -> None:
         proxy["smart_session"] = True
     if proxy.get("use_proxyjet"):
         proxy["enabled"] = True
+    proxy = hydrate_proxy_credentials(proxy)
+    raw = _canonical_proxy_raw_line(proxy)
+    if raw:
+        proxy["raw_line"] = raw
     proxy.pop("exit_ip", None)
     doc["proxy"] = proxy
     doc.pop("exit_ip", None)
@@ -2176,6 +2516,7 @@ async def _ensure_profile_launch_proxy(
     if not proxy_is_active(proxy_cfg):
         return proxy_cfg
     profile_id = str(doc.get("id") or "")
+    cred_uid = str(doc.get("user_id") or uid).strip() or uid
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
 
     # Rotating providers: always request a fresh session line at launch.
@@ -2183,14 +2524,48 @@ async def _ensure_profile_launch_proxy(
         proxy_cfg.pop("exit_ip", None)
         proxy_cfg["server"] = ""
         proxy_cfg = await resolve_profile_proxy_for_launch(
-            uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+            cred_uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
         )
     elif not str(proxy_cfg.get("server") or "").strip():
         proxy_cfg = await resolve_profile_proxy_for_launch(
-            uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+            cred_uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
         )
 
-    used_ips = await _load_team_profile_used_ips(uid)
+    proxy_cfg = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+
+    if not str(proxy_cfg.get("server") or "").strip():
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Profile '{doc.get('name') or profile_id[:8]}': proxy enabled but no server "
+                "URL could be resolved. Open Proxies → edit provider → verify gateway "
+                "host, port, and password, then launch again."
+            ),
+        )
+
+    # Provider / smart_session / ProxyJet — pre-probe is best-effort only.
+    if _defer_launch_proxy_probe(proxy_cfg):
+        used_ips = await _load_team_profile_used_ips(cred_uid)
+        try:
+            from cross_user_ip_isolation import canonicalize_ip
+            cur = canonicalize_ip(doc.get("exit_ip") or "")
+            if cur:
+                used_ips.discard(cur)
+        except Exception:
+            pass
+        targeting = _profile_provider_targeting(proxy_cfg, profile_country)
+        return await _best_effort_bind_exit_ip_at_launch(
+            cred_uid,
+            user,
+            doc,
+            proxy_cfg,
+            provider_id=provider_id,
+            profile_id=profile_id,
+            used_ips=used_ips,
+            targeting=targeting,
+        )
+
+    used_ips = await _load_team_profile_used_ips(cred_uid)
     try:
         from cross_user_ip_isolation import canonicalize_ip
         cur = canonicalize_ip(doc.get("exit_ip") or "")
@@ -2200,51 +2575,93 @@ async def _ensure_profile_launch_proxy(
         pass
 
     targeting = _profile_provider_targeting(proxy_cfg, profile_country)
+    last_probe: Dict[str, Any] = {}
     last_err: Optional[HTTPException] = None
 
     for attempt in range(max_retries):
         doc["proxy"] = dict(proxy_cfg)
+        probe_doc = {"proxy": proxy_cfg, "user_id": cred_uid, "id": profile_id, "name": doc.get("name")}
         try:
-            exit_ip = await _probe_proxy_cfg_exit_ip(user, proxy_cfg)
+            probe = await _probe_profile_proxy(probe_doc, user)
+            last_probe = probe
+            exit_ip = str(probe.get("exit_ip") or "").strip()
             if not exit_ip:
+                if provider_id and attempt < max_retries - 1:
+                    logger.warning(
+                        f"[browser-profile launch] exit IP probe failed on attempt "
+                        f"{attempt + 1} — rotating provider session"
+                    )
+                    lines = await _allocate_provider_proxy_lines(
+                        cred_uid, provider_id, 1, used_ips, targeting=targeting,
+                    )
+                    proxy_cfg = _apply_resolved_line_to_proxy_cfg(
+                        proxy_cfg, lines[0], provider_id=provider_id,
+                    )
+                    proxy_cfg = await _finalize_proxy_cfg_for_launch(
+                        cred_uid, user, proxy_cfg,
+                    )
+                    continue
+                if _proxy_ready_for_soft_launch(proxy_cfg):
+                    _set_soft_launch_proxy_state(doc, proxy_cfg, probe=probe)
+                    logger.warning(
+                        f"[browser-profile launch] soft launch without exit_ip "
+                        f"profile={profile_id[:8]} err={str(probe.get('error') or '')[:80]}"
+                    )
+                    return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
                 raise HTTPException(
                     status_code=502,
-                    detail=(
-                        f"Profile '{doc.get('name') or profile_id[:8]}': "
-                        "proxy configured but exit IP probe failed"
-                    ),
+                    detail=_format_profile_proxy_probe_failure(doc, proxy_cfg, probe),
                 )
             canonical = await _assert_unique_team_profile_ip(
-                uid, exit_ip, used_ips, profile_id=profile_id,
+                cred_uid, exit_ip, used_ips, profile_id=profile_id,
             )
             doc["exit_ip"] = canonical
             doc["proxy"]["exit_ip"] = canonical
             doc["proxy"]["sticky_session"] = True
+            doc.pop("_launch_proxy_probe_warning", None)
             logger.info(
                 f"[browser-profile launch] unique exit_ip={canonical} "
                 f"profile={profile_id[:8]} attempt={attempt + 1}"
             )
-            return await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+            return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
         except HTTPException as exc:
             last_err = exc
-            if exc.status_code != 409 or not provider_id or attempt >= max_retries - 1:
+            if exc.status_code != 409 or attempt >= max_retries - 1:
                 raise
-            logger.warning(
-                f"[browser-profile launch] duplicate IP on attempt {attempt + 1} "
-                f"— rotating provider session"
-            )
-            lines = await _allocate_provider_proxy_lines(
-                uid, provider_id, 1, used_ips, targeting=targeting,
-            )
-            proxy_cfg = _apply_resolved_line_to_proxy_cfg(
-                proxy_cfg, lines[0], provider_id=provider_id,
-            )
+            if provider_id:
+                logger.warning(
+                    f"[browser-profile launch] duplicate IP on attempt {attempt + 1} "
+                    f"— rotating provider session"
+                )
+                lines = await _allocate_provider_proxy_lines(
+                    cred_uid, provider_id, 1, used_ips, targeting=targeting,
+                )
+                proxy_cfg = _apply_resolved_line_to_proxy_cfg(
+                    proxy_cfg, lines[0], provider_id=provider_id,
+                )
+                proxy_cfg = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+            elif _is_rotating_gateway_proxy(proxy_cfg):
+                logger.warning(
+                    f"[browser-profile launch] duplicate manual rotating IP on "
+                    f"attempt {attempt + 1} — fresh gateway session"
+                )
+                proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                proxy_cfg = await _finalize_proxy_cfg_for_launch(
+                    cred_uid, user, proxy_cfg,
+                )
+                await asyncio.sleep(0.25)
+            else:
+                raise
 
+    if _proxy_ready_for_soft_launch(proxy_cfg):
+        _set_soft_launch_proxy_state(doc, proxy_cfg, probe=last_probe)
+        return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
     if last_err:
         raise last_err
     raise HTTPException(
         status_code=502,
-        detail="Could not allocate a unique proxy exit IP for this profile",
+        detail=_format_profile_proxy_probe_failure(doc, proxy_cfg, last_probe)
+        or "Could not allocate a unique proxy exit IP for this profile",
     )
 
 
@@ -3778,7 +4195,7 @@ async def launch_profile(
 
     if str(_proxy_cfg.get("server") or "").strip():
         await _DB.browser_profiles.update_one(
-            {"id": profile_id, "user_id": uid},
+            {"id": profile_id, "user_id": owner_uid},
             {"$set": _proxy_patch},
         )
     elif (

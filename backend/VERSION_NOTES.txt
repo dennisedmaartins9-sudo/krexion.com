@@ -1,3 +1,10 @@
+# v2.7.101 — 2026-09 — Manual rotating proxy launch: duplicate IP never blocks browser
+#
+# - Root cause: manual DataImpulse/Smartproxy lines hit team IP isolation with
+#   misleading "in this batch" error; no session rotation on retry (same sticky IP).
+# - Fix: detect rotating gateways on manual profiles; best-effort probe + up to 8
+#   session rotations (`;sessid.*`) before soft launch; clearer team vs batch errors.
+#
 # v2.7.12 — 2026-08 — Browser Profiles: mix %, devices, bulk select
 #
 # - Create: iOS/Android/Desktop mix %, random/specific device catalog,

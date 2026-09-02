@@ -43,4 +43,6 @@ def test_create_profile_defers_proxy_probe():
 
 
 def test_version_is_2_7_96():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
+    ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    parts = [int(x) for x in ver.split(".")]
+    assert parts >= [2, 7, 96]
