@@ -1737,7 +1737,16 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for raw in (text or "").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if not line:
+            continue
+        # Netscape files mark HttpOnly cookies with a "#HttpOnly_" domain
+        # prefix. Previously these lines were dropped as comments, losing
+        # every HttpOnly (session/login) cookie. Preserve them.
+        _http_only = False
+        if line.startswith("#HttpOnly_"):
+            _http_only = True
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) < 7:
@@ -1755,7 +1764,8 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
             "domain": domain.lstrip("."),
             "path": path or "/",
             "secure": str(secure).upper() in ("TRUE", "1", "YES"),
-            "httpOnly": False,
+            "httpOnly": _http_only,
+            "sameSite": "Lax",
         }
         if exp > 0:
             ck["expires"] = exp
@@ -3359,7 +3369,13 @@ async def grant_profile_acl(request: Request, profile_id: str, body: AclGrantBod
     target_uid = target["id"]
     if target_uid == doc.get("user_id"):
         raise HTTPException(status_code=400, detail="Cannot ACL-grant the owner")
-    role = _normalize_role(body.role)
+    role_in = (body.role or "").strip().lower()
+    if role_in not in ("viewer", "editor", "admin"):
+        raise HTTPException(
+            status_code=400,
+            detail="role must be one of: viewer, editor, admin",
+        )
+    role = _normalize_role(role_in)
     entries = [e for e in _acl_entries(doc) if e.get("user_id") != target_uid]
     entries.append({
         "user_id": target_uid,
@@ -3572,16 +3588,46 @@ async def import_cookies(request: Request, profile_id: str, body: CookieImportBo
     existing = dict(doc.get("storage_state") or {})
     cookies: List[Dict[str, Any]] = []
     origins = list(existing.get("origins") or [])
+    raw_input_count = 0
     if body.storage_state and isinstance(body.storage_state, dict):
-        cookies = _normalize_cookie_list(body.storage_state.get("cookies") or [])
+        _raw = body.storage_state.get("cookies") or []
+        raw_input_count = len(_raw) if isinstance(_raw, list) else 0
+        cookies = _normalize_cookie_list(_raw)
         if "origins" in body.storage_state and isinstance(body.storage_state.get("origins"), list):
             origins = body.storage_state["origins"]
     elif body.cookies:
+        raw_input_count = len(body.cookies)
         cookies = _normalize_cookie_list(body.cookies)
     elif body.netscape:
-        cookies = _normalize_cookie_list(_parse_netscape_cookies(body.netscape))
+        _parsed = _parse_netscape_cookies(body.netscape)
+        raw_input_count = len(_parsed)
+        cookies = _normalize_cookie_list(_parsed)
+        if body.netscape.strip() and not _parsed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not parse any cookies from the pasted text. "
+                    "Expecting Netscape/curl cookie format (7 tab- or "
+                    "space-separated fields per line)."
+                ),
+            )
     else:
         raise HTTPException(status_code=400, detail="Provide storage_state, cookies, or netscape text")
+    # Guard: a non-empty source that normalised to zero valid cookies must
+    # NOT silently wipe existing cookies in replace mode (data-loss bug).
+    if (
+        raw_input_count > 0
+        and not cookies
+        and not body.merge
+        and (existing.get("cookies") or [])
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "None of the provided cookies were valid — refusing to "
+                "overwrite existing cookies. Check the format and try again."
+            ),
+        )
     if body.merge:
         by_key = {}
         for c in (existing.get("cookies") or []) + cookies:
@@ -4748,10 +4794,13 @@ async def export_all(request: Request):
 async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    name = str(body.get("name") or "").strip() or f"Profile {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     country = str(body.get("country") or "us").lower()
     device_type = str(body.get("device_type") or "desktop").lower()
     is_mobile = device_type == "mobile"
+    # v2.7.104 — consistent smart unique naming (was "Profile <datetime>"
+    # which used spaces/colons and clashed with the rest of the module).
+    _name_slug = "Mobile" if is_mobile else "Desktop"
+    name = str(body.get("name") or "").strip() or _auto_name_device(country, _name_slug)
     ua = _gen_random_ua(is_mobile)
     pb = ProfileBody(
         name=name,
@@ -4888,6 +4937,18 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
     proxy_mode = (body.proxy.mode or "none").lower()
     proxy_warnings: List[str] = []
 
+    # v2.7.104 — Manual proxy: warn (and never silently reuse) when the
+    # user pasted fewer lines than profiles. Extra profiles are created
+    # proxy-less so no two profiles share the same exit IP.
+    if proxy_mode == "manual":
+        _manual_lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
+        if _manual_lines and len(_manual_lines) < count:
+            proxy_warnings.append(
+                f"Only {len(_manual_lines)} proxy line(s) provided for {count} "
+                f"profiles — {count - len(_manual_lines)} profile(s) created "
+                "WITHOUT a proxy to avoid IP reuse. Paste one line per profile."
+            )
+
     if proxy_mode == "provider" and body.proxy.provider_id:
         # Never bulk-allocate or probe at create — launch resolves fresh IP.
         provider_lines = []
@@ -4983,11 +5044,14 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 proxyjet_state=(body.proxy.state or "").upper(),
             )
         elif proxy_mode == "manual":
-            # Unique line per profile when `lines` provided; else same server.
+            # One UNIQUE line per profile. Never reuse a line across
+            # profiles (silent IP reuse defeats anti-detect) — extra
+            # profiles are created proxy-less instead (warning emitted).
             lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
             if lines:
-                line = lines[i % len(lines)]
-                proxy_cfg = _parse_proxy_line_to_cfg(line)
+                if i < len(lines):
+                    proxy_cfg = _parse_proxy_line_to_cfg(lines[i])
+                # else: leave proxy-less on purpose (no IP reuse)
             elif body.proxy.server:
                 proxy_cfg = ProxyConfig(
                     enabled=True,
@@ -5065,8 +5129,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             _pline = proxy_lines[i].strip()
         elif proxy_mode == "manual":
             _mlines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
-            if _mlines:
-                _pline = _mlines[i % len(_mlines)]
+            if _mlines and i < len(_mlines):
+                _pline = _mlines[i]
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
         _prepare_proxy_for_profile_create(doc)
