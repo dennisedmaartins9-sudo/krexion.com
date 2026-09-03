@@ -1195,6 +1195,8 @@ class AntiDetectConfig(BaseModel):
     # Strict proxy: never open the browser without a live proxy when proxy is
     # enabled (blocks DNS soft-launch / "open without proxy" real-IP leak).
     proxy_check_block_on_fail: bool = True
+    # Abort launch if mobile device shell cannot start (Windows phone chrome).
+    strict_mobile_shell: bool = False
     # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
     browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
@@ -1469,7 +1471,9 @@ class ProfileAutomationLaunch(BaseModel):
     lead_row_index: int = Field(default=0, ge=-1, le=100000)
     skip_missing_steps: bool = True
     self_heal: bool = False
-    after_mode: str = Field(default="manual", max_length=32)  # manual = keep browser open
+    after_mode: str = Field(default="manual", max_length=32)  # manual | close | next_lead
+    consume_mode: str = Field(default="on_submit", max_length=32)  # on_submit | on_start
+    claim_next: bool = False  # True = atomic next free row (bulk sets this ON)
     save_as_default: bool = False
     proxy_upload_id: str = Field(default="", max_length=64)  # Uploaded Things proxy batch (RUT parity)
     ua_upload_id: str = Field(default="", max_length=64)
@@ -1482,6 +1486,7 @@ class ProfileAutomationLaunch(BaseModel):
 class LaunchBody(BaseModel):
     start_url: Optional[str] = Field(default=None, max_length=512)
     automation: Optional[ProfileAutomationLaunch] = None
+    recheck_proxy: bool = False
 
 
 class BulkLaunchBody(BaseModel):
@@ -1497,6 +1502,9 @@ class RunAutomationBody(BaseModel):
     lead_row_index: int = Field(default=0, ge=0, le=100000)
     skip_missing_steps: bool = True
     self_heal: bool = False
+    after_mode: str = Field(default="manual", max_length=32)
+    consume_mode: str = Field(default="on_submit", max_length=32)
+    claim_next: bool = True
     proxy_upload_id: str = Field(default="", max_length=64)
     ua_upload_id: str = Field(default="", max_length=64)
     smart_funnel_enabled: bool = False
@@ -1512,12 +1520,20 @@ class BulkRunJsonBody(BaseModel):
     max_concurrent: int = Field(default=5, ge=1, le=20)
     skip_missing_steps: bool = True
     self_heal: bool = False
+    after_mode: str = Field(default="manual", max_length=32)
+    consume_mode: str = Field(default="on_submit", max_length=32)
+    claim_next: bool = True
     proxy_upload_id: str = Field(default="", max_length=64)
     ua_upload_id: str = Field(default="", max_length=64)
     smart_funnel_enabled: bool = False
     smart_funnel_pattern: str = Field(default="auto", max_length=64)
     smart_funnel_min_deals: int = Field(default=2, ge=1, le=5)
     smart_funnel_wait_until_conversion: bool = True
+
+
+class ValidateAutomationBody(BaseModel):
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
 
 
 class SaveAutomationDefaultsBody(BaseModel):
@@ -1758,12 +1774,29 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["fingerprint_short"] = fh[:12] if fh else ""
     d["last_proxy_check"] = d.get("last_proxy_check") or {}
     d["exit_ip"] = str(d.get("exit_ip") or (d.get("proxy") or {}).get("exit_ip") or "").strip()
-    # Hint: old profiles without Strict proxy flag still soft-launch
+    # Hint: strict when proxy enabled (default ON for unset / old profiles)
+    d["strict_proxy"] = _strict_proxy_mode(doc if isinstance(doc, dict) else d)
     _anti = d.get("anti_detect") if isinstance(d.get("anti_detect"), dict) else {}
-    d["strict_proxy"] = bool(
-        (_anti or {}).get("proxy_check_block_on_fail")
-        or (_anti or {}).get("strict_proxy")
-    )
+    d["strict_mobile_shell"] = bool((_anti or {}).get("strict_mobile_shell"))
+    # Proxy check age for UI badge
+    _lpc = d.get("last_proxy_check") if isinstance(d.get("last_proxy_check"), dict) else {}
+    _checked_at = str(
+        _lpc.get("checked_at") or _lpc.get("at") or _lpc.get("ts") or _lpc.get("timestamp") or ""
+    ).strip()
+    d["proxy_check_age_hours"] = None
+    d["proxy_check_stale"] = False
+    if _checked_at:
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromisoformat(_checked_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+            d["proxy_check_age_hours"] = round(age_h, 2)
+            d["proxy_check_stale"] = age_h > 24.0
+        except Exception:
+            pass
     if "last_tls_prewarm_ok" not in d:
         d["last_tls_prewarm_ok"] = None
     # CDP endpoint only for local automation clients (still useful in UI copy)
@@ -2012,17 +2045,35 @@ def _strict_proxy_mode(doc_or_anti: Optional[Dict[str, Any]]) -> bool:
     """True when profile must never soft-open without a working proxy.
 
     Reads anti_detect.proxy_check_block_on_fail (UI: Strict proxy) or
-    anti_detect.strict_proxy alias. Existing profiles without the flag
-    keep legacy soft-launch behaviour.
+    anti_detect.strict_proxy alias.
+
+    Default: ON when proxy is enabled and the flag was never saved
+    (closes real-IP soft-launch leak on old profiles). Explicit False
+    still allows soft-launch for power users who opt out.
     """
     if not isinstance(doc_or_anti, dict):
         return False
     anti = doc_or_anti.get("anti_detect") if "anti_detect" in doc_or_anti else doc_or_anti
     if not isinstance(anti, dict):
-        return False
+        anti = {}
     if anti.get("proxy_check_block_on_fail") is True:
         return True
     if anti.get("strict_proxy") is True:
+        return True
+    if anti.get("proxy_check_block_on_fail") is False:
+        return False
+    if anti.get("strict_proxy") is False:
+        return False
+    # Unset flag: treat as strict when proxy is configured on the profile
+    proxy = {}
+    if "proxy" in doc_or_anti and isinstance(doc_or_anti.get("proxy"), dict):
+        proxy = doc_or_anti.get("proxy") or {}
+    if (
+        proxy.get("enabled")
+        or str(proxy.get("server") or "").strip()
+        or str(proxy.get("provider_id") or "").strip()
+        or proxy.get("use_proxyjet")
+    ):
         return True
     return False
 
@@ -4239,11 +4290,19 @@ async def launch_preview(request: Request, profile_id: str):
         "exit_ip": view.get("exit_ip") or "",
         "cookie_count": (view.get("storage_state_stats") or {}).get("cookie_count") or 0,
         "proxy_enabled": proxy_is_active(proxy),
+        "strict_proxy": bool(view.get("strict_proxy")),
+        "strict_mobile_shell": bool(view.get("strict_mobile_shell")),
+        "proxy_check_age_hours": view.get("proxy_check_age_hours"),
+        "proxy_check_stale": bool(view.get("proxy_check_stale")),
+        "is_mobile": bool(doc.get("is_mobile")),
+        "os": str(doc.get("os") or ""),
+        "mobile_shell_active": bool(view.get("mobile_shell_active")),
         "device": doc.get("device_model") or doc.get("device_type") or "",
         "last_proxy_check": view.get("last_proxy_check") or {},
         "ready": health.get("level") in ("good", "warn", "unknown"),
         "default_automation_upload_id": str(doc.get("default_automation_upload_id") or ""),
         "default_data_file_id": str(doc.get("default_data_file_id") or ""),
+        "launch_warnings": list(view.get("launch_warnings") or []),
     }
 
 @router.post("/{profile_id}/clone")
@@ -4341,6 +4400,11 @@ async def launch_profile(
             auto_payload,
             doc,
             bulk_row_index=_bulk_row_index,
+            claim_next=(
+                True
+                if _bulk_row_index is not None
+                else bool((auto_payload or {}).get("claim_next"))
+            ),
         )
     except ValueError as _auto_err:
         raise HTTPException(status_code=400, detail=str(_auto_err)) from _auto_err
@@ -4663,6 +4727,21 @@ async def save_automation_defaults(
     return {"ok": True, "profile": _public_view(doc or {})}
 
 
+@router.post("/validate-automation")
+async def validate_automation(request: Request, body: ValidateAutomationBody):
+    """Dry-run: JSON template parses + placeholders match lead columns."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_automation import validate_automation_against_data
+
+    return await validate_automation_against_data(
+        _DB,
+        uid,
+        automation_upload_id=str(body.automation_upload_id or "").strip(),
+        data_file_id=str(body.data_file_id or "").strip(),
+    )
+
+
 @router.post("/{profile_id}/run-automation")
 async def run_profile_automation_endpoint(
     request: Request,
@@ -4694,6 +4773,9 @@ async def run_profile_automation_endpoint(
         "lead_row_index": int(body.lead_row_index or 0),
         "skip_missing_steps": body.skip_missing_steps,
         "self_heal": body.self_heal,
+        "after_mode": str(body.after_mode or "manual"),
+        "consume_mode": str(body.consume_mode or "on_submit"),
+        "claim_next": body.claim_next is not False,
         "proxy_upload_id": str(body.proxy_upload_id or "").strip(),
         "ua_upload_id": str(body.ua_upload_id or "").strip(),
         "smart_funnel_enabled": bool(body.smart_funnel_enabled),
@@ -4704,7 +4786,13 @@ async def run_profile_automation_endpoint(
     try:
         from browser_profile_automation import resolve_launch_automation
 
-        auto_spec = await resolve_launch_automation(_DB, uid, auto_payload, doc)
+        auto_spec = await resolve_launch_automation(
+            _DB,
+            uid,
+            auto_payload,
+            doc,
+            claim_next=bool(auto_payload.get("claim_next")),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -5439,6 +5527,8 @@ async def bulk_launch(request: Request, body: BulkLaunchBody):
             automation=body.automation,
         )
         try:
+            # Always pass a bulk marker so resolve uses atomic claim_next
+            # (selection index is NOT used as lead row — avoids duplicate leads).
             result = await launch_profile(
                 request,
                 pid,
@@ -5502,7 +5592,9 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
             data_file_id=row_data_file,
             skip_missing_steps=body.skip_missing_steps is not False,
             self_heal=bool(body.self_heal),
-            after_mode="manual",
+            after_mode=str(body.after_mode or "manual"),
+            consume_mode=str(body.consume_mode or "on_submit"),
+            claim_next=body.claim_next is not False,
             proxy_upload_id=default_proxy_upload,
             ua_upload_id=str(body.ua_upload_id or "").strip(),
             smart_funnel_enabled=bool(body.smart_funnel_enabled),
@@ -5519,9 +5611,12 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
                 run_body = RunAutomationBody(
                     automation_upload_id=upload_id,
                     data_file_id=row_data_file,
-                    lead_row_index=idx,
+                    lead_row_index=0,
                     skip_missing_steps=body.skip_missing_steps,
                     self_heal=body.self_heal,
+                    after_mode=str(body.after_mode or "manual"),
+                    consume_mode=str(body.consume_mode or "on_submit"),
+                    claim_next=body.claim_next is not False,
                     proxy_upload_id=default_proxy_upload,
                 )
                 result = await run_profile_automation_endpoint(request, pid, run_body)

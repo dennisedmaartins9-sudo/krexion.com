@@ -1817,11 +1817,25 @@ async def _launch_profile_session_inner(
     font_mode = str(anti.get("font_mode") or "noise").lower().strip()
     webrtc_mode = str(anti.get("webrtc_mode") or "proxy").lower().strip()
     proxy_check_on_launch = bool(anti.get("proxy_check_on_launch", True))
-    # Default False preserves legacy soft-launch for old profiles that never
-    # saved the flag; new profiles persist True via AntiDetectConfig.
-    proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail", False))
+    # Default True when proxy is enabled — old profiles without the flag
+    # used to soft-open on real IP; that leak is closed unless Strict is
+    # explicitly turned OFF (proxy_check_block_on_fail=False).
+    _proxy_cfg_early = profile_config.get("proxy") if isinstance(profile_config.get("proxy"), dict) else {}
+    _proxy_on = bool(
+        (_proxy_cfg_early or {}).get("enabled")
+        or str((_proxy_cfg_early or {}).get("server") or "").strip()
+        or str((_proxy_cfg_early or {}).get("provider_id") or "").strip()
+        or (_proxy_cfg_early or {}).get("use_proxyjet")
+    )
+    if "proxy_check_block_on_fail" in anti:
+        proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail"))
+    else:
+        proxy_check_block_on_fail = bool(_proxy_on)
     if anti.get("strict_proxy") is True:
         proxy_check_block_on_fail = True
+    if anti.get("strict_proxy") is False and "proxy_check_block_on_fail" not in anti:
+        proxy_check_block_on_fail = False
+    strict_mobile_shell = bool(anti.get("strict_mobile_shell"))
     use_persistent_context = bool(anti.get("use_persistent_context", False))
 
     try:
@@ -2550,10 +2564,36 @@ async def _launch_profile_session_inner(
                             "Krexion mobile device shell did not start — "
                             "you are seeing the plain browser window, not the branded iOS/Android shell."
                         )
+                        if strict_mobile_shell:
+                            raise RuntimeError(
+                                "Strict mobile shell: device chrome failed to start. "
+                                "Aborting so this is not mistaken for a real phone browser."
+                            )
+                    except RuntimeError:
+                        raise
                     except Exception as _ms_err:
                         logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
                         _launch_warnings.append(
                             "Mobile device shell could not be applied — not a real device shell UI."
+                        )
+                        if strict_mobile_shell:
+                            raise RuntimeError(
+                                f"Strict mobile shell: {str(_ms_err)[:200]}"
+                            ) from _ms_err
+
+                # Non-Windows / shell not attempted: honesty warning for mobile profiles
+                if (
+                    bool(profile_config.get("is_mobile"))
+                    and not _launch_ui_meta.get("mobile_shell")
+                ):
+                    _launch_warnings.append(
+                        "Desktop Chromium — not a real iPhone/Android device. "
+                        "Mobile shell is Windows-only; fingerprint sites may detect desktop."
+                    )
+                    if strict_mobile_shell and not _use_mobile_shell:
+                        raise RuntimeError(
+                            "Strict mobile shell: mobile chrome is unavailable on this host "
+                            "(Windows + pywebview required). Launch aborted."
                         )
 
                 apply_krexion_icon_to_pids(
@@ -3658,30 +3698,101 @@ async def _run_profile_automation_if_configured(
         except Exception:
             _profile_db = None
 
+    _max_next_leads = 50
+    _next_loops = 0
     try:
-        from browser_profile_automation import run_profile_automation
-
-        await run_profile_automation(
-            page,
-            list(spec.get("steps") or []),
-            dict(spec.get("lead_row") or {}),
-            user_id=uid,
-            session_id=session_id,
-            profile_id=profile_id,
-            on_session_update=on_session_update,
-            skip_missing_steps=spec.get("skip_missing_steps", True) is not False,
-            self_heal=bool(spec.get("self_heal")),
-            should_cancel=_should_cancel,
-            data_file_id=str(spec.get("data_file_id") or ""),
-            lead_row_index=spec.get("lead_row_index"),
-            db=_profile_db,
-            smart_funnel_enabled=bool(spec.get("smart_funnel_enabled")),
-            smart_funnel_pattern=str(spec.get("smart_funnel_pattern") or "auto"),
-            smart_funnel_min_deals=int(spec.get("smart_funnel_min_deals") or 2),
-            smart_funnel_wait_until_conversion=bool(
-                spec.get("smart_funnel_wait_until_conversion", True)
-            ),
+        from browser_profile_automation import (
+            run_profile_automation,
+            claim_next_data_file_row,
+            release_reserved_data_file_row,
+            _normalize_after_mode,
         )
+
+        while True:
+            result = await run_profile_automation(
+                page,
+                list(spec.get("steps") or []),
+                dict(spec.get("lead_row") or {}),
+                user_id=uid,
+                session_id=session_id,
+                profile_id=profile_id,
+                on_session_update=on_session_update,
+                skip_missing_steps=spec.get("skip_missing_steps", True) is not False,
+                self_heal=bool(spec.get("self_heal")),
+                should_cancel=_should_cancel,
+                data_file_id=str(spec.get("data_file_id") or ""),
+                lead_row_index=spec.get("lead_row_index"),
+                db=_profile_db,
+                smart_funnel_enabled=bool(spec.get("smart_funnel_enabled")),
+                smart_funnel_pattern=str(spec.get("smart_funnel_pattern") or "auto"),
+                smart_funnel_min_deals=int(spec.get("smart_funnel_min_deals") or 2),
+                smart_funnel_wait_until_conversion=bool(
+                    spec.get("smart_funnel_wait_until_conversion", True)
+                ),
+                consume_mode=str(spec.get("consume_mode") or "on_submit"),
+                lead_consumed_already=bool(spec.get("lead_consumed_already")),
+                lead_fingerprint=str(spec.get("lead_fingerprint") or ""),
+                after_mode=str(spec.get("after_mode") or "manual"),
+            )
+
+            after = _normalize_after_mode(
+                (result or {}).get("after_mode") or spec.get("after_mode") or "manual"
+            )
+            status = str((result or {}).get("automation_status") or (result or {}).get("status") or "")
+
+            if after == "next_lead" and status in ("completed", "ok", "captcha") and _next_loops < _max_next_leads:
+                dfid = str(spec.get("data_file_id") or "").strip()
+                if not dfid or _profile_db is None:
+                    break
+                try:
+                    lead, idx, meta = await claim_next_data_file_row(
+                        _profile_db,
+                        uid,
+                        dfid,
+                        consume_now=str(spec.get("consume_mode") or "") == "on_start",
+                    )
+                    spec["lead_row"] = lead
+                    spec["lead_row_index"] = idx
+                    spec["lead_fingerprint"] = str(meta.get("fingerprint") or "")
+                    spec["lead_consumed_already"] = bool(meta.get("consumed_now"))
+                    profile_config["_launch_automation"] = spec
+                    _next_loops += 1
+                    if on_session_update:
+                        try:
+                            await on_session_update({
+                                "profile_id": profile_id,
+                                "session_id": session_id,
+                                "status": "running",
+                                "automation_status": "running",
+                                "automation_action": "next_lead",
+                                "automation_error": "",
+                            })
+                        except Exception:
+                            pass
+                    continue
+                except Exception as _nl_err:
+                    logger.info(f"[profile-automation] next_lead stopped: {_nl_err}")
+                    if on_session_update:
+                        try:
+                            await on_session_update({
+                                "profile_id": profile_id,
+                                "session_id": session_id,
+                                "status": "running",
+                                "automation_status": "completed",
+                                "automation_error": f"next_lead ended: {str(_nl_err)[:200]}",
+                            })
+                        except Exception:
+                            pass
+                    break
+
+            if after == "close":
+                # Request browser stop after JSON finishes (keep open on error/stop).
+                if status in ("completed", "ok", "captcha"):
+                    try:
+                        request_stop(session_id)
+                    except Exception as _cls_err:
+                        logger.debug(f"[profile-automation] after_mode close skipped: {_cls_err}")
+            break
     except asyncio.CancelledError:
         if on_session_update:
             try:
@@ -3694,6 +3805,18 @@ async def _run_profile_automation_if_configured(
                 })
             except Exception:
                 pass
+        # Release soft reservation if lead was never consumed
+        try:
+            if _profile_db and not bool(spec.get("lead_consumed_already")):
+                await release_reserved_data_file_row(
+                    _profile_db,
+                    uid,
+                    str(spec.get("data_file_id") or ""),
+                    lead_row_index=spec.get("lead_row_index"),
+                    fingerprint=str(spec.get("lead_fingerprint") or ""),
+                )
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning(f"[profile-automation] run failed: {exc}")
         if on_session_update:

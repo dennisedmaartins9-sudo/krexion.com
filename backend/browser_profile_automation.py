@@ -4,15 +4,68 @@ Browser Profile JSON automation (v2.7.79)
 Reuses RUT Visual Recorder step engine on headed profile sessions.
 Default launch = manual browse. Automation runs ONLY when the user
 explicitly enables JSON in the launch request.
+
+v2.7.105c — Atomic lead-row claim (bulk race fix), consume_mode,
+after_mode helpers, GSheet fingerprint consume, JSON↔data validate.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("browser_profile_automation")
+
+_ROW_CLAIM_LOCK_TTL_SEC = 45
+_ROW_RESERVE_TTL_SEC = 3600
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}|\{([a-zA-Z0-9_.-]+)\}")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _row_fingerprint(row: Dict[str, Any]) -> str:
+    """Stable key for a lead row when email is missing (GSheet / audit)."""
+    parts: List[str] = []
+    for k in sorted((row or {}).keys()):
+        if str(k).startswith("_"):
+            continue
+        v = row.get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        parts.append(f"{k}={str(v).strip()}")
+    raw = "|".join(parts) or "empty"
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def _row_email(row: Dict[str, Any]) -> str:
+    for k in ("email", "email_address", "emailaddress", "e_mail", "mail"):
+        v = (row or {}).get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _normalize_after_mode(raw: Any) -> str:
+    m = str(raw or "manual").strip().lower()
+    if m in ("close", "close_browser", "stop", "quit"):
+        return "close"
+    if m in ("next", "next_lead", "next_row", "loop"):
+        return "next_lead"
+    return "manual"
+
+
+def _normalize_consume_mode(raw: Any) -> str:
+    m = str(raw or "on_submit").strip().lower()
+    if m in ("on_start", "start", "claim", "immediate"):
+        return "on_start"
+    return "on_submit"
 
 
 def parse_automation_steps(raw: Any) -> List[Dict[str, Any]]:
@@ -90,6 +143,323 @@ async def load_data_file_rows(db: Any, user_id: str, upload_id: str) -> List[Dic
     return [dict(r) for r in (rows or []) if isinstance(r, dict)]
 
 
+async def _acquire_data_file_lock(db: Any, user_id: str, data_file_id: str) -> bool:
+    """Short Mongo lock so bulk launches cannot pick the same lead row."""
+    uid = str(data_file_id or "").strip()
+    if not uid or db is None:
+        return False
+    now = datetime.now(timezone.utc)
+    lock_until = (now + timedelta(seconds=_ROW_CLAIM_LOCK_TTL_SEC)).isoformat()
+    stale_before = (now - timedelta(seconds=1)).isoformat()
+    for _ in range(40):
+        doc = await db.uploaded_resources.find_one_and_update(
+            {
+                "id": uid,
+                "user_id": user_id,
+                "type": "data_file",
+                "$or": [
+                    {"row_claim_lock_until": {"$exists": False}},
+                    {"row_claim_lock_until": None},
+                    {"row_claim_lock_until": ""},
+                    {"row_claim_lock_until": {"$lte": stale_before}},
+                ],
+            },
+            {"$set": {
+                "row_claim_lock_until": lock_until,
+                "row_claim_lock_at": now.isoformat(),
+            }},
+            return_document=True,
+        )
+        if doc:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def _release_data_file_lock(db: Any, user_id: str, data_file_id: str) -> None:
+    uid = str(data_file_id or "").strip()
+    if not uid or db is None:
+        return
+    try:
+        await db.uploaded_resources.update_one(
+            {"id": uid, "user_id": user_id, "type": "data_file"},
+            {"$set": {"row_claim_lock_until": "", "updated_at": _now_iso()}},
+        )
+    except Exception:
+        pass
+
+
+def _prune_reservations(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = doc.get("reserved_rows") or []
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(timezone.utc)
+    kept: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        exp = str(item.get("expires_at") or "")
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            if exp_dt < now:
+                continue
+        except Exception:
+            continue
+        kept.append(item)
+    return kept
+
+
+async def claim_next_data_file_row(
+    db: Any,
+    user_id: str,
+    data_file_id: str,
+    *,
+    consume_now: bool = False,
+    prefer_index: Optional[int] = None,
+    prefer_strict: bool = False,
+) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
+    """
+    Atomically claim one lead row for a profile launch.
+
+    Returns (lead_row, lead_row_index, meta).
+    meta may include depleted / reserved / consumed_now.
+    Raises ValueError when the file is empty or missing.
+    """
+    uid = str(data_file_id or "").strip()
+    if not uid:
+        raise ValueError("data_file_id required")
+    if db is None:
+        raise ValueError("database required for lead claim")
+
+    locked = await _acquire_data_file_lock(db, user_id, uid)
+    if not locked:
+        raise ValueError("Lead file is busy — retry in a moment")
+
+    meta: Dict[str, Any] = {"consumed_now": False, "reserved": False}
+    try:
+        doc = await db.uploaded_resources.find_one(
+            {"id": uid, "user_id": user_id, "type": "data_file"},
+            {"_id": 0},
+        )
+        if not doc:
+            raise ValueError("Lead data file not found")
+        if doc.get("depleted"):
+            raise ValueError("Lead data file is depleted (no remaining rows)")
+
+        rows = await load_data_file_rows(db, user_id, uid)
+        if not rows:
+            raise ValueError("Lead data file has no remaining rows")
+
+        reserved = _prune_reservations(doc)
+        reserved_idxs = {
+            int(r.get("lead_row_index"))
+            for r in reserved
+            if r.get("lead_row_index") is not None
+        }
+        reserved_fps = {str(r.get("fingerprint") or "") for r in reserved if r.get("fingerprint")}
+        consumed_keys = {
+            str(x).strip().lower()
+            for x in (doc.get("consumed_keys") or [])
+            if str(x).strip()
+        }
+
+        def _available(i: int, row: Dict[str, Any]) -> bool:
+            if i in reserved_idxs:
+                return False
+            fp = _row_fingerprint(row)
+            if fp in reserved_fps:
+                return False
+            email = _row_email(row).lower()
+            if email and email in consumed_keys:
+                return False
+            if fp.lower() in consumed_keys:
+                return False
+            return True
+
+        chosen_idx: Optional[int] = None
+        chosen_row: Dict[str, Any] = {}
+
+        if prefer_index is not None:
+            pi = int(prefer_index) % max(1, len(rows))
+            if 0 <= pi < len(rows) and _available(pi, rows[pi]):
+                chosen_idx = pi
+                chosen_row = dict(rows[pi])
+            elif prefer_strict:
+                raise ValueError(
+                    f"Lead row index {pi} is reserved, consumed, or unavailable"
+                )
+
+        if chosen_idx is None:
+            for i, row in enumerate(rows):
+                if _available(i, dict(row)):
+                    chosen_idx = i
+                    chosen_row = dict(row)
+                    break
+
+        if chosen_idx is None:
+            raise ValueError("No free lead rows (all reserved or consumed)")
+
+        fp = _row_fingerprint(chosen_row)
+        if consume_now:
+            ok = await consume_data_file_row(
+                db, user_id, uid, int(chosen_idx), lead_row=chosen_row,
+            )
+            meta["consumed_now"] = bool(ok)
+            if not ok:
+                logger.warning(
+                    f"[profile-automation] claim consume_now failed for row {chosen_idx}"
+                )
+        else:
+            expires = (
+                datetime.now(timezone.utc) + timedelta(seconds=_ROW_RESERVE_TTL_SEC)
+            ).isoformat()
+            reserved.append({
+                "lead_row_index": int(chosen_idx),
+                "fingerprint": fp,
+                "email": _row_email(chosen_row)[:120],
+                "expires_at": expires,
+                "reserved_at": _now_iso(),
+            })
+            await db.uploaded_resources.update_one(
+                {"id": uid, "user_id": user_id},
+                {"$set": {
+                    "reserved_rows": reserved[-200:],
+                    "updated_at": _now_iso(),
+                }},
+            )
+            meta["reserved"] = True
+
+        meta["fingerprint"] = fp
+        meta["remaining_after_pick"] = max(0, len(rows) - 1) if consume_now else max(0, len(rows) - len(reserved))
+        return chosen_row, int(chosen_idx), meta
+    finally:
+        await _release_data_file_lock(db, user_id, uid)
+
+
+async def release_reserved_data_file_row(
+    db: Any,
+    user_id: str,
+    data_file_id: str,
+    lead_row_index: Optional[int] = None,
+    fingerprint: str = "",
+) -> None:
+    """Drop a soft reservation when automation is cancelled without consume."""
+    uid = str(data_file_id or "").strip()
+    if not uid or db is None:
+        return
+    doc = await db.uploaded_resources.find_one(
+        {"id": uid, "user_id": user_id, "type": "data_file"},
+        {"_id": 0, "reserved_rows": 1},
+    )
+    if not doc:
+        return
+    kept = []
+    for item in _prune_reservations(doc):
+        if lead_row_index is not None and int(item.get("lead_row_index") or -1) == int(lead_row_index):
+            continue
+        if fingerprint and str(item.get("fingerprint") or "") == str(fingerprint):
+            continue
+        kept.append(item)
+    await db.uploaded_resources.update_one(
+        {"id": uid, "user_id": user_id},
+        {"$set": {"reserved_rows": kept, "updated_at": _now_iso()}},
+    )
+
+
+def extract_placeholders_from_steps(steps: List[Dict[str, Any]]) -> List[str]:
+    found: set = set()
+    for step in steps or []:
+        if not isinstance(step, dict):
+            continue
+        for val in step.values():
+            if isinstance(val, str):
+                for m in _PLACEHOLDER_RE.finditer(val):
+                    found.add((m.group(1) or m.group(2) or "").strip())
+            elif isinstance(val, dict):
+                for vv in val.values():
+                    if isinstance(vv, str):
+                        for m in _PLACEHOLDER_RE.finditer(vv):
+                            found.add((m.group(1) or m.group(2) or "").strip())
+    return sorted(x for x in found if x)
+
+
+async def validate_automation_against_data(
+    db: Any,
+    user_id: str,
+    *,
+    automation_upload_id: str = "",
+    data_file_id: str = "",
+    steps: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Dry-run check: template parses + placeholders vs lead columns."""
+    out: Dict[str, Any] = {
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "total_steps": 0,
+        "placeholders": [],
+        "data_columns": [],
+        "missing_columns": [],
+        "row_count": 0,
+        "depleted": False,
+        "upload_name": "",
+    }
+    step_list: List[Dict[str, Any]] = list(steps or [])
+    if automation_upload_id:
+        try:
+            step_list, name = await load_automation_upload(db, user_id, automation_upload_id)
+            out["upload_name"] = name
+        except Exception as exc:
+            out["ok"] = False
+            out["errors"].append(str(exc)[:240])
+            return out
+    out["total_steps"] = len(step_list)
+    if not step_list:
+        out["warnings"].append("Template has no steps")
+    placeholders = extract_placeholders_from_steps(step_list)
+    out["placeholders"] = placeholders
+
+    dfid = str(data_file_id or "").strip()
+    if dfid:
+        try:
+            doc = await db.uploaded_resources.find_one(
+                {"id": dfid, "user_id": user_id, "type": "data_file"},
+                {"_id": 0},
+            )
+            if not doc:
+                out["ok"] = False
+                out["errors"].append("Lead data file not found")
+                return out
+            out["depleted"] = bool(doc.get("depleted"))
+            rows = await load_data_file_rows(db, user_id, dfid)
+            out["row_count"] = len(rows)
+            if not rows:
+                out["ok"] = False
+                out["errors"].append("Lead data file has no remaining rows")
+            else:
+                cols = sorted({str(k) for k in rows[0].keys() if not str(k).startswith("_")})
+                out["data_columns"] = cols
+                missing = [p for p in placeholders if p not in cols and p.lower() not in {c.lower() for c in cols}]
+                out["missing_columns"] = missing
+                if missing:
+                    out["warnings"].append(
+                        "Placeholders missing from lead columns: " + ", ".join(missing[:12])
+                    )
+        except Exception as exc:
+            out["ok"] = False
+            out["errors"].append(str(exc)[:240])
+    elif placeholders:
+        out["warnings"].append(
+            "Template uses placeholders but no lead file selected: "
+            + ", ".join(placeholders[:8])
+        )
+    if out["errors"]:
+        out["ok"] = False
+    return out
+
+
 async def resolve_launch_automation(
     db: Any,
     user_id: str,
@@ -97,6 +467,7 @@ async def resolve_launch_automation(
     profile_doc: Optional[Dict[str, Any]] = None,
     *,
     bulk_row_index: Optional[int] = None,
+    claim_next: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Build launch-time automation spec. Returns dict with:
@@ -111,6 +482,13 @@ async def resolve_launch_automation(
     if not data_file_id:
         data_file_id = str(prof.get("default_data_file_id") or "").strip()
 
+    consume_mode = _normalize_consume_mode(auto.get("consume_mode"))
+    after_mode = _normalize_after_mode(auto.get("after_mode"))
+    # Bulk always claims next free row (fixes index-collision race).
+    use_claim = bool(claim_next) if claim_next is not None else (
+        bulk_row_index is not None or bool(auto.get("claim_next"))
+    )
+
     out: Dict[str, Any] = {
         "enabled": False,
         "steps": [],
@@ -122,7 +500,11 @@ async def resolve_launch_automation(
         "lead_row_index": int(auto.get("lead_row_index") or 0),
         "skip_missing_steps": auto.get("skip_missing_steps", True) is not False,
         "self_heal": bool(auto.get("self_heal")),
-        "after_mode": str(auto.get("after_mode") or "manual"),
+        "after_mode": after_mode,
+        "consume_mode": consume_mode,
+        "claim_next": use_claim,
+        "lead_consumed_already": False,
+        "lead_fingerprint": "",
         "save_as_default": bool(auto.get("save_as_default")),
         "proxy_upload_id": str(auto.get("proxy_upload_id") or "").strip(),
         "ua_upload_id": str(auto.get("ua_upload_id") or "").strip(),
@@ -130,6 +512,8 @@ async def resolve_launch_automation(
         "smart_funnel_pattern": str(auto.get("smart_funnel_pattern") or "auto"),
         "smart_funnel_min_deals": int(auto.get("smart_funnel_min_deals") or 2),
         "smart_funnel_wait_until_conversion": bool(auto.get("smart_funnel_wait_until_conversion", True)),
+        "data_file_depleted": False,
+        "data_file_warning": "",
     }
 
     if not enabled:
@@ -148,16 +532,48 @@ async def resolve_launch_automation(
         return out
 
     if data_file_id:
-        rows = await load_data_file_rows(db, user_id, data_file_id)
-        if rows:
-            idx = out["lead_row_index"]
-            if bulk_row_index is not None:
-                idx = int(bulk_row_index)
-            elif idx < 0:
-                idx = 0
-            idx = idx % len(rows)
-            out["lead_row"] = dict(rows[idx])
-            out["lead_row_index"] = idx
+        prefer = None
+        if not use_claim:
+            prefer = int(auto.get("lead_row_index") or 0)
+            if prefer < 0:
+                prefer = 0
+        elif bulk_row_index is not None and not bool(auto.get("claim_next", True)):
+            # Legacy path only when caller explicitly disables claim_next
+            prefer = int(bulk_row_index)
+
+        try:
+            if use_claim or prefer is not None:
+                lead, idx, meta = await claim_next_data_file_row(
+                    db,
+                    user_id,
+                    data_file_id,
+                    consume_now=(consume_mode == "on_start"),
+                    prefer_index=prefer if not use_claim else None,
+                    prefer_strict=bool(prefer is not None and not use_claim),
+                )
+                out["lead_row"] = lead
+                out["lead_row_index"] = idx
+                out["lead_fingerprint"] = str(meta.get("fingerprint") or "")
+                out["lead_consumed_already"] = bool(meta.get("consumed_now"))
+            else:
+                rows = await load_data_file_rows(db, user_id, data_file_id)
+                if not rows:
+                    out["data_file_depleted"] = True
+                    out["data_file_warning"] = "Lead data file has no remaining rows"
+                else:
+                    idx = int(auto.get("lead_row_index") or 0)
+                    if idx < 0:
+                        idx = 0
+                    idx = idx % len(rows)
+                    out["lead_row"] = dict(rows[idx])
+                    out["lead_row_index"] = idx
+        except ValueError as exc:
+            msg = str(exc)
+            out["data_file_warning"] = msg
+            if "depleted" in msg.lower() or "no remaining" in msg.lower() or "no free" in msg.lower():
+                out["data_file_depleted"] = True
+            # Fail hard when automation needs leads
+            raise
 
     return out
 
@@ -186,40 +602,63 @@ async def consume_data_file_row(
     gsheet_url = str(doc.get("gsheet_url") or "").strip()
     if gsheet_url:
         rows = await load_data_file_rows(db, user_id, uid)
-        if not rows or row_index < 0 or row_index >= len(rows):
-            return False
-        target = dict(lead_row or rows[row_index] or {})
-        target_email = ""
-        for k in ("email", "email_address", "emailaddress", "e_mail", "mail"):
-            v = target.get(k)
-            if v and str(v).strip():
-                target_email = str(v).strip()
-                break
+        target = dict(lead_row or {})
+        if not target:
+            if not rows or row_index < 0 or row_index >= len(rows):
+                return False
+            target = dict(rows[row_index] or {})
+        target_email = _row_email(target)
+        fp = _row_fingerprint(target)
         deleted = False
-        if target_email:
-            try:
-                import asyncio
-                import gsheet_writer
+        try:
+            import gsheet_writer
 
-                loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
+            if target_email:
                 deleted = await loop.run_in_executor(
                     None,
                     gsheet_writer.delete_row_by_email,
                     gsheet_url,
                     target_email,
                 )
-            except Exception as exc:
-                logger.debug(f"[profile-automation] gsheet consume skipped: {exc}")
-        key_for_audit = (target_email or f"row_{row_index}").lower()
+            if not deleted:
+                # No email column / match — try first-column unique value
+                first_val = ""
+                for k, v in target.items():
+                    if str(k).startswith("_"):
+                        continue
+                    if v is not None and str(v).strip():
+                        first_val = str(v).strip()
+                        break
+                if first_val and hasattr(gsheet_writer, "delete_rows_by_first_column"):
+                    n = await loop.run_in_executor(
+                        None,
+                        gsheet_writer.delete_rows_by_first_column,
+                        gsheet_url,
+                        [first_val],
+                    )
+                    deleted = bool(n)
+        except Exception as exc:
+            logger.debug(f"[profile-automation] gsheet consume skipped: {exc}")
+        key_for_audit = (target_email or fp or f"row_{row_index}").lower()
+        # Clear reservation + mark consumed even if remote delete failed
+        reserved = [
+            r for r in _prune_reservations(doc)
+            if int(r.get("lead_row_index") or -1) != int(row_index)
+            and str(r.get("fingerprint") or "") != fp
+        ]
         await db.uploaded_resources.update_one(
             {"id": uid, "user_id": user_id},
             {
                 "$addToSet": {"consumed_keys": key_for_audit},
                 "$inc": {"consumed_count": 1, "item_count": -1},
-                "$set": {"updated_at": datetime.now(timezone.utc).isoformat()},
+                "$set": {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "reserved_rows": reserved,
+                },
             },
         )
-        return bool(deleted or target_email)
+        return bool(deleted or target_email or fp)
 
     try:
         import openpyxl
@@ -306,12 +745,19 @@ async def consume_data_file_row(
         remaining = max(0, (ws.max_row or 1) - 1)
         wb.close()
 
+        fp = _row_fingerprint(dict(lead_row or {}))
+        reserved = [
+            r for r in _prune_reservations(doc)
+            if int(r.get("lead_row_index") or -1) != int(row_index)
+            and str(r.get("fingerprint") or "") != fp
+        ]
         update: Dict[str, Any] = {
             "row_count": remaining,
             "item_count": remaining,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "remaining_file_path": fp_str,
             "used_file_path": used_fp,
+            "reserved_rows": reserved,
         }
         await db.uploaded_resources.update_one(
             {"id": uid, "user_id": user_id},
@@ -358,15 +804,22 @@ async def run_profile_automation(
     smart_funnel_pattern: str = "auto",
     smart_funnel_min_deals: int = 2,
     smart_funnel_wait_until_conversion: bool = True,
+    consume_mode: str = "on_submit",
+    lead_consumed_already: bool = False,
+    lead_fingerprint: str = "",
+    after_mode: str = "manual",
 ) -> Dict[str, Any]:
     """Execute RUT automation steps on an open profile page."""
     from real_user_traffic import _execute_automation_steps
 
     total = len(steps or [])
     if not steps and not smart_funnel_enabled:
-        return {"status": "skipped", "executed_steps": 0, "total_steps": 0}
+        return {"status": "skipped", "executed_steps": 0, "total_steps": 0, "after_mode": _normalize_after_mode(after_mode)}
 
-    _lead_consumed = False
+    _lead_consumed = bool(lead_consumed_already)
+    _consume_mode = _normalize_consume_mode(consume_mode)
+    _after_mode = _normalize_after_mode(after_mode)
+    _fp = str(lead_fingerprint or "") or _row_fingerprint(dict(lead_row or {}))
 
     async def _consume_lead(reason: str) -> None:
         nonlocal _lead_consumed
@@ -396,11 +849,8 @@ async def run_profile_automation(
                         "data_file_id": data_file_id,
                         "lead_row_index": int(lead_row_index),
                         "reason": str(reason or "")[:120],
-                        "lead_email": str(
-                            (lead_row or {}).get("email")
-                            or (lead_row or {}).get("email_address")
-                            or ""
-                        )[:120],
+                        "lead_email": _row_email(lead_row or {})[:120],
+                        "fingerprint": _fp[:32],
                     },
                 )
             except Exception:
@@ -412,7 +862,16 @@ async def run_profile_automation(
             _lead_consumed = False
             logger.debug(f"[profile-automation] lead consume failed: {exc}")
 
-    _lead_cb = _consume_lead if (data_file_id and lead_row_index is not None) else on_lead_submitted
+    _lead_cb = _consume_lead if (data_file_id and lead_row_index is not None and not _lead_consumed) else on_lead_submitted
+
+    # Optional: consume at automation start (already claimed+consumed when lead_consumed_already)
+    if (
+        not _lead_consumed
+        and _consume_mode == "on_start"
+        and data_file_id
+        and lead_row_index is not None
+    ):
+        await _consume_lead("on_start")
 
     async def _on_progress(payload: Dict[str, Any]) -> None:
         if on_session_update is None:
@@ -476,7 +935,12 @@ async def run_profile_automation(
                     "automation_step": 1,
                     "automation_total_steps": 1,
                     "automation_error": str(result.get("error") or "")[:512],
+                    "automation_lead_consumed": _lead_consumed,
+                    "automation_after_mode": _after_mode,
                 })
+            if isinstance(result, dict):
+                result["after_mode"] = _after_mode
+                result["lead_consumed"] = _lead_consumed
             return result
         except Exception as exc:
             logger.warning(f"[profile-automation] smart funnel failed: {exc}")
@@ -491,7 +955,7 @@ async def run_profile_automation(
                     })
                 except Exception:
                     pass
-            return {"status": "failed", "error": str(exc)}
+            return {"status": "failed", "error": str(exc), "after_mode": _after_mode, "lead_consumed": _lead_consumed}
 
     try:
         if on_session_update:
@@ -536,8 +1000,14 @@ async def run_profile_automation(
                 "automation_step": int(result.get("executed_steps") or 0),
                 "automation_total_steps": total,
                 "automation_error": str(result.get("error") or "")[:512],
+                "automation_lead_consumed": _lead_consumed,
+                "automation_after_mode": _after_mode,
             })
         except Exception:
             pass
 
+    if isinstance(result, dict):
+        result["after_mode"] = _after_mode
+        result["lead_consumed"] = _lead_consumed
+        result["automation_status"] = auto_status
     return result

@@ -48,6 +48,9 @@ const DEFAULT_LAUNCH_AUTO = {
   self_heal: false,
   save_as_default: false,
   proxy_upload_id: "",
+  after_mode: "manual",
+  consume_mode: "on_submit",
+  claim_next: false,
 };
 const PAGE_SIZE = 50;
 
@@ -144,6 +147,8 @@ const DEFAULT_NEW = {
     proxy_check_on_launch: true,
     // Strict proxy ON for new profiles — never open on real IP if proxy dead
     proxy_check_block_on_fail: true,
+    // Abort if phone chrome (mobile shell) cannot start
+    strict_mobile_shell: false,
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
@@ -954,7 +959,9 @@ export default function BrowserProfilesPage() {
           data_file_id: bulkLaunchAuto.data_file_id || "",
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
-          after_mode: "manual",
+          after_mode: bulkLaunchAuto.after_mode || "manual",
+          consume_mode: bulkLaunchAuto.consume_mode || "on_submit",
+          claim_next: true,
           proxy_upload_id: bulkLaunchAuto.proxy_upload_id || "",
         };
       }
@@ -990,6 +997,9 @@ export default function BrowserProfilesPage() {
           max_concurrent: maxConcurrent,
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
+          after_mode: bulkLaunchAuto.after_mode || "manual",
+          consume_mode: bulkLaunchAuto.consume_mode || "on_submit",
+          claim_next: true,
         }),
       });
       if (!r.ok) throw new Error(await r.text());
@@ -1581,9 +1591,15 @@ export default function BrowserProfilesPage() {
           lead_row_index: Number(auto.lead_row_index) || 0,
           skip_missing_steps: auto.skip_missing_steps !== false,
           self_heal: !!auto.self_heal,
-          after_mode: "manual",
+          after_mode: auto.after_mode || "manual",
+          consume_mode: auto.consume_mode || "on_submit",
+          claim_next: !!auto.claim_next,
           save_as_default: !!auto.save_as_default,
+          proxy_upload_id: auto.proxy_upload_id || "",
         };
+      }
+      if (auto.recheck_proxy) {
+        payload.recheck_proxy = true;
       }
       const r = await fetch(`${API}/${id}/launch`, {
         method: "POST", headers: authHeaders,
@@ -1661,6 +1677,9 @@ export default function BrowserProfilesPage() {
           lead_row_index: Number(launchAuto.lead_row_index) || 0,
           skip_missing_steps: launchAuto.skip_missing_steps !== false,
           self_heal: !!launchAuto.self_heal,
+          after_mode: launchAuto.after_mode || "manual",
+          consume_mode: launchAuto.consume_mode || "on_submit",
+          claim_next: !!launchAuto.claim_next,
         }),
       });
       if (!r.ok) throw new Error(await r.text());
@@ -2160,8 +2179,48 @@ export default function BrowserProfilesPage() {
                       <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
                     ))}
                   </select>
+                  <select
+                    className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[110px]"
+                    value={bulkLaunchAuto.after_mode || "manual"}
+                    onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, after_mode: e.target.value }))}
+                    data-testid="bp-bulk-after-mode"
+                    title="After JSON finishes"
+                  >
+                    <option value="manual">Keep open</option>
+                    <option value="close">Close browser</option>
+                    <option value="next_lead">Next lead</option>
+                  </select>
+                  <select
+                    className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[120px]"
+                    value={bulkLaunchAuto.consume_mode || "on_submit"}
+                    onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, consume_mode: e.target.value }))}
+                    data-testid="bp-bulk-consume-mode"
+                    title="When to remove lead row"
+                  >
+                    <option value="on_submit">Consume on submit</option>
+                    <option value="on_start">Consume on start</option>
+                  </select>
                 </>
               )}
+              {bulkLaunchAuto.data_file_id && (() => {
+                const df = dataFileUploads.find((u) => u.id === bulkLaunchAuto.data_file_id);
+                const left = df?.available_count ?? df?.item_count ?? df?.row_count;
+                if (df && (df.depleted || left === 0)) {
+                  return (
+                    <span className="text-red-400 text-[10px]" data-testid="bp-bulk-leads-depleted">
+                      Lead file depleted
+                    </span>
+                  );
+                }
+                if (typeof left === "number" && left > 0 && left < selectedCount) {
+                  return (
+                    <span className="text-amber-400 text-[10px]" data-testid="bp-bulk-leads-short">
+                      Only {left} leads for {selectedCount} profiles
+                    </span>
+                  );
+                }
+                return null;
+              })()}
             </div>
             <Button size="sm" disabled={!selectedCount || bulkBusy || (bulkLaunchAuto.enabled && !bulkLaunchAuto.automation_upload_id)} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
@@ -2498,6 +2557,31 @@ export default function BrowserProfilesPage() {
                           ⚠ {w}
                         </div>
                       ))}
+                    </div>
+                  )}
+                  {!!p.is_mobile && !p.mobile_shell_active && (p.status === "running" || p.status === "launching") && (
+                    <div
+                      className="mt-2 text-[10px] text-amber-200 bg-amber-950/40 border border-amber-800/50 rounded px-2 py-1"
+                      data-testid={`bp-mobile-honesty-${p.id}`}
+                    >
+                      Desktop Chromium — not a real phone. Mobile shell off / unavailable.
+                    </div>
+                  )}
+                  {p.proxy_check_stale && (
+                    <div className="mt-1 text-[10px] text-amber-400/90" data-testid={`bp-proxy-stale-${p.id}`}>
+                      Proxy check stale
+                      {typeof p.proxy_check_age_hours === "number"
+                        ? ` (${Math.round(p.proxy_check_age_hours)}h)`
+                        : ""} — recheck recommended
+                    </div>
+                  )}
+                  {(p.automation_status === "completed" || p.automation_status === "error" || p.automation_status === "stopped") && (
+                    <div className="mt-1 text-[10px] text-zinc-500" data-testid={`bp-auto-log-${p.id}`}>
+                      JSON {p.automation_status}
+                      {p.automation_step != null && p.automation_total_steps
+                        ? ` · ${p.automation_step}/${p.automation_total_steps}`
+                        : ""}
+                      {p.automation_error ? ` · ${String(p.automation_error).slice(0, 80)}` : ""}
                     </div>
                   )}
                   {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
@@ -3142,6 +3226,16 @@ export default function BrowserProfilesPage() {
                               <span className="block text-[9px] text-zinc-500">
                                 If proxy DNS/check fails, abort launch — do NOT open on your real IP.
                                 Recommended ON for agency / offer accounts.
+                              </span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2" data-testid="bp-strict-mobile-shell">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.strict_mobile_shell}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, strict_mobile_shell: e.target.checked } })} />
+                            <span>
+                              Strict mobile shell (abort if phone chrome fails)
+                              <span className="block text-[9px] text-zinc-500">
+                                Windows phone frame must start — otherwise launch aborts (no plain Chromium fake).
                               </span>
                             </span>
                           </label>
@@ -3884,12 +3978,35 @@ export default function BrowserProfilesPage() {
               <ul className="space-y-2 text-xs text-zinc-300 mb-4">
                 <li className="flex items-start gap-2">
                   <span className={launchChecklist.data.proxy_enabled ? "text-emerald-400" : "text-zinc-500"}>●</span>
-                  <span>Proxy: {launchChecklist.data.proxy_enabled ? (launchChecklist.data.exit_ip || "configured") : "none"}</span>
+                  <span>
+                    Proxy: {launchChecklist.data.proxy_enabled ? (launchChecklist.data.exit_ip || "configured") : "none"}
+                    {launchChecklist.data.strict_proxy !== false && launchChecklist.data.proxy_enabled && (
+                      <span className="text-emerald-500/80"> · strict</span>
+                    )}
+                    {typeof launchChecklist.data.proxy_check_age_hours === "number" && (
+                      <span className={launchChecklist.data.proxy_check_stale ? "text-amber-400" : "text-zinc-500"}>
+                        {" "}· checked {launchChecklist.data.proxy_check_age_hours < 1
+                          ? `${Math.round(launchChecklist.data.proxy_check_age_hours * 60)}m ago`
+                          : `${Math.round(launchChecklist.data.proxy_check_age_hours)}h ago`}
+                        {launchChecklist.data.proxy_check_stale ? " (stale)" : ""}
+                      </span>
+                    )}
+                  </span>
                 </li>
                 <li className="flex items-start gap-2">
                   <span className={launchChecklist.data.cookie_count > 0 ? "text-emerald-400" : "text-amber-400"}>●</span>
                   <span>Cookies: {launchChecklist.data.cookie_count || 0}</span>
                 </li>
+                {!!launchChecklist.data.is_mobile && (
+                  <li className="flex items-start gap-2" data-testid="bp-launch-mobile-honesty">
+                    <span className={launchChecklist.data.mobile_shell_active ? "text-emerald-400" : "text-amber-400"}>●</span>
+                    <span>
+                      {launchChecklist.data.mobile_shell_active
+                        ? "Mobile shell was active last session (desktop frame — not a real phone)"
+                        : "Mobile profile: Desktop Chromium — not a real iPhone/Android. Shell is Windows-only."}
+                    </span>
+                  </li>
+                )}
                 <li className="flex items-start gap-2">
                   <span className={healthBadgeClass(launchChecklist.data.health?.level).includes("emerald") ? "text-emerald-400" : launchChecklist.data.health?.level === "bad" ? "text-red-400" : "text-amber-400"}>●</span>
                   <span>
@@ -3938,22 +4055,80 @@ export default function BrowserProfilesPage() {
                       >
                         <option value="">Static JSON only</option>
                         {dataFileUploads.map((u) => (
-                          <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
+                          <option key={u.id} value={u.id}>
+                            {u.name || u.filename || u.id.slice(0, 8)}
+                            {typeof (u.available_count ?? u.item_count) === "number"
+                              ? ` (${u.available_count ?? u.item_count} left)`
+                              : ""}
+                            {u.depleted ? " — depleted" : ""}
+                          </option>
                         ))}
                       </select>
+                      {launchAuto.data_file_id && (() => {
+                        const df = dataFileUploads.find((u) => u.id === launchAuto.data_file_id);
+                        if (df && (df.depleted || (df.available_count ?? df.item_count) === 0)) {
+                          return (
+                            <p className="text-[10px] text-red-400 mt-1" data-testid="bp-launch-leads-depleted">
+                              This lead file is depleted — pick another or upload new rows.
+                            </p>
+                          );
+                        }
+                        return null;
+                      })()}
                     </div>
                     {launchAuto.data_file_id && (
-                      <div>
-                        <Label className="text-[10px] text-zinc-500">Lead row index</Label>
-                        <Input
-                          type="number"
-                          min={0}
-                          className="mt-1 h-7 text-xs bg-zinc-950 border-zinc-700"
-                          value={launchAuto.lead_row_index}
-                          onChange={(e) => setLaunchAuto((s) => ({ ...s, lead_row_index: Number(e.target.value) || 0 }))}
-                        />
-                      </div>
+                      <>
+                        <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="accent-fuchsia-500"
+                            checked={!!launchAuto.claim_next}
+                            onChange={(e) => setLaunchAuto((s) => ({ ...s, claim_next: e.target.checked }))}
+                            data-testid="bp-launch-claim-next"
+                          />
+                          Claim next free row (ignore index — race-safe)
+                        </label>
+                        {!launchAuto.claim_next && (
+                          <div>
+                            <Label className="text-[10px] text-zinc-500">Lead row index</Label>
+                            <Input
+                              type="number"
+                              min={0}
+                              className="mt-1 h-7 text-xs bg-zinc-950 border-zinc-700"
+                              value={launchAuto.lead_row_index}
+                              onChange={(e) => setLaunchAuto((s) => ({ ...s, lead_row_index: Number(e.target.value) || 0 }))}
+                            />
+                          </div>
+                        )}
+                      </>
                     )}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <Label className="text-[10px] text-zinc-500">After JSON</Label>
+                        <select
+                          className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                          value={launchAuto.after_mode || "manual"}
+                          onChange={(e) => setLaunchAuto((s) => ({ ...s, after_mode: e.target.value }))}
+                          data-testid="bp-launch-after-mode"
+                        >
+                          <option value="manual">Keep browser open</option>
+                          <option value="close">Close browser</option>
+                          <option value="next_lead">Run next lead</option>
+                        </select>
+                      </div>
+                      <div>
+                        <Label className="text-[10px] text-zinc-500">Consume lead</Label>
+                        <select
+                          className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                          value={launchAuto.consume_mode || "on_submit"}
+                          onChange={(e) => setLaunchAuto((s) => ({ ...s, consume_mode: e.target.value }))}
+                          data-testid="bp-launch-consume-mode"
+                        >
+                          <option value="on_submit">On form submit</option>
+                          <option value="on_start">On automation start</option>
+                        </select>
+                      </div>
+                    </div>
                     <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
                       <input
                         type="checkbox"
@@ -3972,6 +4147,69 @@ export default function BrowserProfilesPage() {
                       />
                       Save as profile default (pre-select next time)
                     </label>
+                    <div className="flex gap-2 pt-1">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="border-zinc-700 text-zinc-300 h-7 text-[10px]"
+                        data-testid="bp-launch-validate-json"
+                        disabled={!launchAuto.automation_upload_id || uploadsLoading}
+                        onClick={async () => {
+                          try {
+                            const r = await fetch(`${API}/validate-automation`, {
+                              method: "POST",
+                              headers: authHeaders,
+                              body: JSON.stringify({
+                                automation_upload_id: launchAuto.automation_upload_id,
+                                data_file_id: launchAuto.data_file_id || "",
+                              }),
+                            });
+                            const d = await r.json();
+                            if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+                            if (d.ok) {
+                              toast.success(
+                                `JSON OK — ${d.total_steps} steps`
+                                + (d.row_count ? ` · ${d.row_count} leads` : "")
+                                + (d.warnings?.length ? ` · ${d.warnings.length} warning(s)` : ""),
+                              );
+                              (d.warnings || []).slice(0, 3).forEach((w) => toast.message(w));
+                            } else {
+                              toast.error((d.errors || ["Validation failed"]).join(" · "));
+                            }
+                          } catch (e) {
+                            toast.error(`Validate failed: ${e.message}`);
+                          }
+                        }}
+                      >
+                        Validate JSON
+                      </Button>
+                      {launchChecklist.data.proxy_enabled && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="border-zinc-700 text-zinc-300 h-7 text-[10px]"
+                          data-testid="bp-launch-recheck-proxy"
+                          onClick={async () => {
+                            try {
+                              const id = launchChecklist.id;
+                              const r = await fetch(`${API}/${id}/check-proxy`, { method: "POST", headers: authHeaders });
+                              if (!r.ok) throw new Error(await r.text());
+                              const d = await r.json();
+                              toast.success(d.ok !== false
+                                ? `Proxy OK${d.ip || d.exit_ip ? `: ${d.ip || d.exit_ip}` : ""}`
+                                : `Proxy check: ${d.error || "failed"}`);
+                              fetchProfiles();
+                            } catch (e) {
+                              toast.error(`Proxy recheck failed: ${e.message}`);
+                            }
+                          }}
+                        >
+                          Recheck proxy
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 )}
                 {!launchAuto.enabled && (
