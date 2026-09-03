@@ -32,11 +32,12 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
@@ -47,6 +48,56 @@ _RUNNING_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 # v2.7.78 — Ignore transient missing windows/shell during profile startup.
 _PROFILE_UI_WATCH_GRACE_SEC = 45.0
+
+
+def _proxy_dns_failure(server: str) -> Optional[str]:
+    """Return a clear error if proxy hostname cannot be resolved (ENOTFOUND).
+
+    BestGo / stale gateways often store hosts that no longer resolve on the
+    customer's PC — Playwright then fails every request with getaddrinfo
+    ENOTFOUND and iOS/Android profiles look 'broken'. Soft-disable instead.
+    """
+    raw = (server or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(raw if "://" in raw else f"http://{raw}").hostname or ""
+    except Exception:
+        host = ""
+    host = (host or "").strip().strip("[]")
+    if not host:
+        return "Proxy server URL has no hostname"
+    # Literal IPs always "resolve".
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return None
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+        return None
+    except OSError:
+        pass
+    try:
+        socket.getaddrinfo(host, None)
+        return None
+    except socket.gaierror as exc:
+        return f"getaddrinfo ENOTFOUND {host} ({exc})"
+    except OSError as exc:
+        return f"DNS lookup failed for {host} ({exc})"
+
+
+def _is_dns_proxy_error(err: str) -> bool:
+    low = (err or "").lower()
+    return (
+        "enotfound" in low
+        or "getaddrinfo" in low
+        or "name or service not known" in low
+        or "nodename nor servname" in low
+        or "11001" in low  # WSAHOST_NOT_FOUND
+    )
 
 
 def _profile_user_closed_ui(
@@ -2024,6 +2075,29 @@ async def _launch_profile_session_inner(
             "(check Settings → Proxy Providers or ProxyJet credentials)"
         )
 
+    # v2.7.103 — Dead DNS (BestGo ENOTFOUND etc.): never open browser through
+    # an unresolvable gateway. Soft-disable proxy so iPhone/Android still open
+    # with Krexion mobile shell; operator fixes host in Proxy Providers.
+    if proxy_arg and proxy_arg.get("server"):
+        _dns_err = _proxy_dns_failure(str(proxy_arg.get("server") or ""))
+        if _dns_err:
+            logger.warning(
+                f"[profile-launch] proxy DNS soft-disable: {_dns_err} "
+                f"session={(session_id or '')[:8]}"
+            )
+            proxy_diag["requested"] = True
+            proxy_diag["ok"] = False
+            proxy_diag["error"] = _dns_err
+            proxy_diag["soft_disabled"] = True
+            proxy_diag["server"] = str(proxy_arg.get("server") or "")
+            _launch_warnings.append(
+                f"Proxy host could not be resolved ({_dns_err}). "
+                "Launched WITHOUT proxy so the profile still opens. "
+                "Fix Settings → Proxy Providers (use a working host like "
+                "gw.dataimpulse.com) or paste a fresh manual line, then relaunch."
+            )
+            proxy_arg = None
+
     # RUT parity: when proxy is live, align timezone/locale/geo to exit IP.
     geo = await _align_profile_geo_from_proxy(geo, proxy_arg, ua, profile_config)
     locale = geo["locale"]
@@ -2518,7 +2592,32 @@ async def _launch_profile_session_inner(
             context_kwargs["storage_state"] = storage_state
 
         if not _persistent_mode:
-            context = await browser.new_context(**context_kwargs)
+            try:
+                context = await browser.new_context(**context_kwargs)
+            except Exception as _ctx_err:
+                _ctx_msg = str(_ctx_err)
+                if proxy_arg and (
+                    _is_dns_proxy_error(_ctx_msg)
+                    or "proxy" in _ctx_msg.lower()
+                    or "tunnel" in _ctx_msg.lower()
+                ):
+                    logger.warning(
+                        f"[profile-launch] context+proxy failed ({_ctx_msg[:120]}) "
+                        "— retrying WITHOUT proxy so iOS/Android still open"
+                    )
+                    context_kwargs.pop("proxy", None)
+                    proxy_arg = None
+                    proxy_diag["soft_disabled"] = True
+                    proxy_diag["ok"] = False
+                    proxy_diag["error"] = _ctx_msg[:240]
+                    proxy_diag["requested"] = True
+                    _launch_warnings.append(
+                        "Proxy failed at browser start — opened WITHOUT proxy. "
+                        "Fix Proxy Providers host/password, then relaunch."
+                    )
+                    context = await browser.new_context(**context_kwargs)
+                else:
+                    raise
 
         _webgl_cfg: Optional[Dict[str, Any]] = None
         _profile_ua = str(context_kwargs.get("user_agent") or ua)
@@ -3018,6 +3117,23 @@ async def _launch_profile_session_inner(
                 await page.set_content(_fraud_html, timeout=5000)
             except Exception as _fe:
                 logger.warning(f"[profile-launch] fraud block page render failed: {_fe}")
+        elif proxy_diag.get("soft_disabled"):
+            # DNS soft-disable already stripped proxy — open the real start URL.
+            try:
+                _target_url = start_url or "https://www.google.com/"
+                _target_url = _profile_enrich_nav_url(
+                    _target_url, _profile_referrer_state
+                )
+                await page.goto(
+                    _target_url,
+                    timeout=45000,
+                    wait_until="domcontentloaded",
+                    **({"referer": _referer_url} if _referer_url else {}),
+                )
+            except Exception as _soft_nav_err:
+                logger.warning(
+                    f"[profile-launch] soft-disable nav failed: {_soft_nav_err}"
+                )
         elif proxy_diag["requested"] and proxy_diag["ok"] is False:
             try:
                 _safe_server = str(proxy_diag.get("server") or "").replace("<", "&lt;").replace(">", "&gt;")

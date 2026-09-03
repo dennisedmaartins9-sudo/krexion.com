@@ -1,3 +1,11 @@
+# v2.7.103 — 2026-09 — Dead proxy DNS soft-launch (BestGo ENOTFOUND) + iPhone opens
+#
+# - Root cause: unresolvable hosts (e.g. ca.rrp.bestgo.work) made every profile
+#   show "Proxy could not be reached"; iOS looked like it never launched.
+# - Fix: DNS preflight — if host ENOTFOUND, launch WITHOUT proxy + warning;
+#   context+proxy retry without proxy; skip blocking diag page when soft-disabled;
+#   UI clears sticky "Opening Chromium…" once status is running.
+#
 # v2.7.102 — 2026-09 — Permanent mobile shell + iPhone taskbar flicker fix
 #
 # - Root causes: icon keeper ShowWindow(SW_SHOW) fought shell TOOLWINDOW;

@@ -413,6 +413,19 @@ export default function BrowserProfilesPage() {
       const batch = d.profiles || [];
       setProfiles((prev) => (append ? [...prev, ...batch] : batch));
       setHasMore(!!d.has_more || batch.length >= PAGE_SIZE);
+      // Drop sticky launch toast once the profile is actually running/idle/error.
+      setStatusMap((m) => {
+        let changed = false;
+        const next = { ...m };
+        for (const p of batch) {
+          const st = String(p.status || "").toLowerCase();
+          if (next[p.id] && (st === "running" || st === "idle" || st === "error" || st === "stopped")) {
+            delete next[p.id];
+            changed = true;
+          }
+        }
+        return changed ? next : m;
+      });
       fetchFolders();
     } catch (e) {
       toast.error(`Failed to load profiles: ${e.message}`);
@@ -1583,6 +1596,15 @@ export default function BrowserProfilesPage() {
             ? "Launch + JSON automation queued on this PC"
             : "Launch queued — desktop app will open the browser",
         );
+        // Clear sticky "Opening Chromium…" after browser is claimed (poll).
+        setTimeout(() => {
+          setStatusMap((m) => {
+            if (!m[id]) return m;
+            const next = { ...m };
+            delete next[id];
+            return next;
+          });
+        }, 25000);
       } else {
         toast.warning("Profile saved — install the Krexion desktop app to launch", { duration: 6000 });
       }

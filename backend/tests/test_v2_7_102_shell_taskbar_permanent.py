@@ -50,4 +50,4 @@ def test_proxy_diag_mentions_dns_enotfound():
 def test_version_is_2_7_102():
     ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     parts = [int(x) for x in ver.split(".")]
-    assert parts >= [2, 7, 102]
+    assert parts >= [2, 7, 103]
