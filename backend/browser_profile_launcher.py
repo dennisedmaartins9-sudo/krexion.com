@@ -1817,7 +1817,11 @@ async def _launch_profile_session_inner(
     font_mode = str(anti.get("font_mode") or "noise").lower().strip()
     webrtc_mode = str(anti.get("webrtc_mode") or "proxy").lower().strip()
     proxy_check_on_launch = bool(anti.get("proxy_check_on_launch", True))
+    # Default False preserves legacy soft-launch for old profiles that never
+    # saved the flag; new profiles persist True via AntiDetectConfig.
     proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail", False))
+    if anti.get("strict_proxy") is True:
+        proxy_check_block_on_fail = True
     use_persistent_context = bool(anti.get("use_persistent_context", False))
 
     try:
@@ -2072,7 +2076,20 @@ async def _launch_profile_session_inner(
         proxy_diag["ok"] = False
         proxy_diag["error"] = (
             "Proxy enabled but no server URL could be resolved "
-            "(check Settings → Proxy Providers or ProxyJet credentials)"
+            "(check Settings → Proxy Providers credentials, or paste a manual line)"
+        )
+
+    # Proxy ON + webrtc=real would leak the customer's real IP via STUN.
+    try:
+        from browser_profile_module import proxy_is_active as _pia_webrtc
+        _proxy_on_for_webrtc = _pia_webrtc(proxy_cfg) or bool(proxy_arg)
+    except Exception:
+        _proxy_on_for_webrtc = bool(proxy_arg) or bool(_proxy_enabled)
+    if _proxy_on_for_webrtc and webrtc_mode == "real":
+        webrtc_mode = "proxy"
+        _launch_warnings.append(
+            "WebRTC was set to 'real' while a proxy is enabled — forced to "
+            "'proxy' so your real IP cannot leak through WebRTC/STUN."
         )
 
     # v2.7.103 — Dead DNS (BestGo ENOTFOUND etc.): never open browser through

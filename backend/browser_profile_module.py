@@ -457,22 +457,35 @@ def _honest_ua_platform_for_profiles(platform: str, *, is_mobile: bool) -> str:
     return plat or ("android" if is_mobile else "desktop")
 
 
-def _parse_proxy_line(line: str) -> Dict[str, str]:
-    """Normalize a ProxyJet / provider proxy line → server + creds dict."""
+def _parse_proxy_line(line: str, proxy_type: str = "http") -> Dict[str, str]:
+    """Normalize a provider / manual proxy line → server + creds dict.
+
+    Preserves socks5/socks4 when the line (or proxy_type) says so — do not
+    force everything to http:// (breaks SOCKS providers).
+    """
     line = (line or "").strip()
     server = ""
     username = ""
     password = ""
     if not line:
         return {"server": "", "username": "", "password": ""}
+    ptype = (proxy_type or "http").strip().lower()
+    if ptype.startswith("socks5"):
+        default_scheme = "socks5"
+    elif ptype.startswith("socks4"):
+        default_scheme = "socks4"
+    elif ptype in ("https", "http"):
+        default_scheme = ptype
+    else:
+        default_scheme = "http"
     try:
         from urllib.parse import unquote, urlparse
 
-        probe = line if "://" in line else f"http://{line}"
+        probe = line if "://" in line else f"{default_scheme}://{line}"
         if "://" in probe and "@" in probe.split("://", 1)[-1]:
             parsed = urlparse(probe)
             if parsed.hostname:
-                scheme = parsed.scheme or "http"
+                scheme = parsed.scheme or default_scheme
                 host = parsed.hostname
                 port = parsed.port
                 netloc = host if not port else f"{host}:{port}"
@@ -503,15 +516,15 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
         elif "@" in line:
             creds, hostport = line.rsplit("@", 1)
             username, _, password = creds.partition(":")
-            server = f"http://{hostport}"
+            server = f"{default_scheme}://{hostport}"
         else:
             parts = line.split(":")
             if len(parts) >= 4:
                 host, port, username = parts[0], parts[1], parts[2]
                 password = ":".join(parts[3:])
-                server = f"http://{host}:{port}"
+                server = f"{default_scheme}://{host}:{port}"
             elif len(parts) >= 2:
-                server = f"http://{parts[0]}:{parts[1]}"
+                server = f"{default_scheme}://{parts[0]}:{parts[1]}"
             else:
                 server = line
     except Exception as _pe:
@@ -602,12 +615,13 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
     server = str(out.get("server") or "").strip()
     username = str(out.get("username") or "").strip()
     password = str(out.get("password") or "").strip()
+    ptype = str(out.get("proxy_type") or "http").strip() or "http"
     if not server and not str(out.get("raw_line") or out.get("raw") or "").strip():
         return out
 
     raw_line = str(out.get("raw_line") or out.get("raw") or "").strip()
     if raw_line:
-        parsed = _parse_proxy_line(raw_line)
+        parsed = _parse_proxy_line(raw_line, proxy_type=ptype)
         if not server and parsed.get("server"):
             server = str(parsed["server"]).strip()
         if not username and parsed.get("username"):
@@ -616,8 +630,8 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
             password = str(parsed["password"]).strip()
 
     if server and (not username or not password):
-        probe = server if "://" in server else f"http://{server}"
-        parsed = _parse_proxy_line(probe)
+        probe = server if "://" in server else f"{ptype if ptype.startswith('socks') or ptype in ('http', 'https') else 'http'}://{server}"
+        parsed = _parse_proxy_line(probe, proxy_type=ptype)
         if parsed.get("server"):
             server = str(parsed["server"]).strip()
         if not username and parsed.get("username"):
@@ -631,7 +645,33 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["username"] = username
     if password:
         out["password"] = password
+    if ptype:
+        out["proxy_type"] = ptype
     return out
+
+
+def _canonical_proxy_raw_line(proxy: Dict[str, Any]) -> str:
+    """Rebuild scheme://user:pass@host:port line for launch-time auth recovery."""
+    out = hydrate_proxy_credentials(dict(proxy or {}))
+    server = str(out.get("server") or "").strip()
+    username = str(out.get("username") or "").strip()
+    password = str(out.get("password") or "").strip()
+    if not server or not username or not password:
+        return str(out.get("raw_line") or out.get("raw") or "").strip()
+    hostpart = server.split("://", 1)[-1]
+    if "@" in hostpart:
+        return str(out.get("raw_line") or out.get("raw") or server).strip()
+    from urllib.parse import quote, urlparse
+
+    try:
+        scheme = urlparse(server if "://" in server else f"http://{server}").scheme or "http"
+    except Exception:
+        scheme = "http"
+    if str(out.get("proxy_type") or "").lower().startswith("socks5"):
+        scheme = "socks5"
+    elif str(out.get("proxy_type") or "").lower().startswith("socks4"):
+        scheme = "socks4"
+    return f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{hostpart}"
 
 
 def _proxy_host_from_server(server: str) -> str:
@@ -647,20 +687,35 @@ def _proxy_host_from_server(server: str) -> str:
         return ""
 
 
-def _canonical_proxy_raw_line(proxy: Dict[str, Any]) -> str:
-    """Rebuild host:port:user:pass line for launch-time auth recovery."""
-    out = hydrate_proxy_credentials(dict(proxy or {}))
-    server = str(out.get("server") or "").strip()
-    username = str(out.get("username") or "").strip()
-    password = str(out.get("password") or "").strip()
-    if not server or not username or not password:
-        return str(out.get("raw_line") or out.get("raw") or "").strip()
-    hostpart = server.split("://", 1)[-1]
-    if "@" in hostpart:
-        return str(out.get("raw_line") or out.get("raw") or server).strip()
-    from urllib.parse import quote
+def _sanitize_proxy_for_public(proxy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Redact secrets before API responses (list/get/ACL share)."""
+    p = dict(proxy or {})
+    has_password = bool(str(p.get("password") or "").strip())
+    raw = str(p.get("raw_line") or p.get("raw") or "").strip()
+    if raw and (":" in raw or "@" in raw):
+        has_password = True
+    p.pop("password", None)
+    p.pop("raw_line", None)
+    p.pop("raw", None)
+    # Never leak user:pass embedded in server URL
+    srv = str(p.get("server") or "").strip()
+    if srv and "@" in srv.split("://", 1)[-1]:
+        try:
+            from urllib.parse import urlparse
 
-    return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{hostpart}"
+            parsed = urlparse(srv if "://" in srv else f"http://{srv}")
+            if parsed.hostname:
+                netloc = parsed.hostname
+                if parsed.port:
+                    netloc = f"{parsed.hostname}:{parsed.port}"
+                p["server"] = f"{parsed.scheme or 'http'}://{netloc}"
+                has_password = True
+        except Exception:
+            pass
+    p["has_password"] = has_password
+    # Empty password field for edit forms — client must send new value to change
+    p["password"] = ""
+    return p
 
 
 async def resolve_launch_proxy_cfg(
@@ -1103,15 +1158,18 @@ class ProxyConfig(BaseModel):
     server: str = ""            # http://host:port or socks5://host:port
     username: str = ""
     password: str = ""
-    # ProxyJet auto-mode (uses customer's saved ProxyJet creds)
+    # http | https | socks5 | socks4 — used when server has no scheme
+    proxy_type: str = "http"
+    # Legacy flag name kept for DB compat — means "auto line from selected
+    # Proxy Provider" (any provider the user added in Settings), NOT
+    # ProxyJet-only.
     use_proxyjet: bool = False
     proxyjet_country: str = "US"
     proxyjet_state: str = ""
-    # v2.4.0 — Multi-provider proxy dropdown. When set, the launch flow
-    # resolves this to a live proxy from the user's Proxy Providers.
-    # Empty ⇒ existing enabled/server/proxyjet fields apply.
+    # Multi-provider: resolves a live line from Settings → Proxy Providers.
+    # Empty ⇒ manual server/username/password fields apply.
     provider_id: str = ""
-    # v2.7.94 — provider smart mode: no pre-bound line at create; fresh session each launch
+    # Provider smart mode: no pre-bound line at create; fresh session each launch
     smart_session: bool = False
 
 
@@ -1690,6 +1748,9 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
         d["health"] = {"level": "unknown", "score": 0, "issues": []}
         d["last_used_label"] = ""
     d.pop("storage_state", None)
+    # Never expose proxy passwords / raw lines to list/get/ACL clients
+    if isinstance(d.get("proxy"), dict):
+        d["proxy"] = _sanitize_proxy_for_public(d.get("proxy"))
     d["folder"] = (d.get("folder") or "").strip()
     d["geo_follow_proxy"] = bool(d.get("geo_follow_proxy", True))
     d["quick_links"] = d.get("quick_links") or []
@@ -1697,6 +1758,12 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["fingerprint_short"] = fh[:12] if fh else ""
     d["last_proxy_check"] = d.get("last_proxy_check") or {}
     d["exit_ip"] = str(d.get("exit_ip") or (d.get("proxy") or {}).get("exit_ip") or "").strip()
+    # Hint: old profiles without Strict proxy flag still soft-launch
+    _anti = d.get("anti_detect") if isinstance(d.get("anti_detect"), dict) else {}
+    d["strict_proxy"] = bool(
+        (_anti or {}).get("proxy_check_block_on_fail")
+        or (_anti or {}).get("strict_proxy")
+    )
     if "last_tls_prewarm_ok" not in d:
         d["last_tls_prewarm_ok"] = None
     # CDP endpoint only for local automation clients (still useful in UI copy)
@@ -2008,6 +2075,20 @@ def _set_soft_launch_proxy_state(
     doc["_launch_proxy_probe_warning"] = msg
 
 
+def _raise_if_strict_soft_launch(doc: Dict[str, Any], *, reason: str) -> None:
+    """Strict proxy profiles must not soft-continue when exit-IP / probe failed."""
+    if not _strict_proxy_mode(doc):
+        return
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Strict proxy: "
+            f"{reason}. Fix Settings → Proxy Providers (or manual line), then relaunch. "
+            "Browser was NOT opened."
+        )[:480],
+    )
+
+
 async def _best_effort_bind_exit_ip_at_launch(
     cred_uid: str,
     user: dict,
@@ -2020,7 +2101,11 @@ async def _best_effort_bind_exit_ip_at_launch(
     targeting: Optional[Dict[str, Any]],
     max_retries: int = 0,
 ) -> Dict[str, Any]:
-    """Rotating provider/manual: probe + dedupe when possible; never block browser open."""
+    """Rotating provider/manual: probe + dedupe when possible.
+
+    Soft-continues with proxy still attached when Strict is OFF.
+    Strict ON → abort if no verified unique exit IP.
+    """
     rotating_manual = _is_rotating_gateway_proxy(proxy_cfg) and not provider_id
     attempts = max_retries or (8 if (provider_id or rotating_manual) else 3)
     last_probe: Dict[str, Any] = {}
@@ -2093,14 +2178,18 @@ async def _best_effort_bind_exit_ip_at_launch(
         else:
             break
 
+    err = str(last_probe.get("error") or "").strip() or "exit IP probe failed"
+    _raise_if_strict_soft_launch(
+        doc,
+        reason=f"could not verify a unique exit IP before launch ({err[:160]})",
+    )
     if rotating_manual or provider_id:
-        err = str(last_probe.get("error") or "").strip()
         doc["_launch_proxy_probe_warning"] = (
             "Could not reserve a team-unique exit IP before launch — browser will "
             "open and verify proxy after connect. For rotating gateways, each new "
             "session usually assigns a fresh IP."
         )
-        if err:
+        if err and err != "exit IP probe failed":
             doc["_launch_proxy_probe_warning"] += f" ({err[:80]})"
         doc.pop("exit_ip", None)
         doc["proxy"] = dict(proxy_cfg)
@@ -2664,6 +2753,13 @@ async def _ensure_profile_launch_proxy(
                     )
                     continue
                 if _proxy_ready_for_soft_launch(proxy_cfg):
+                    _raise_if_strict_soft_launch(
+                        doc,
+                        reason=(
+                            "proxy exit-IP pre-check failed "
+                            f"({str(probe.get('error') or 'no exit IP')[:120]})"
+                        ),
+                    )
                     _set_soft_launch_proxy_state(doc, proxy_cfg, probe=probe)
                     logger.warning(
                         f"[browser-profile launch] soft launch without exit_ip "
@@ -2716,6 +2812,13 @@ async def _ensure_profile_launch_proxy(
                 raise
 
     if _proxy_ready_for_soft_launch(proxy_cfg):
+        _raise_if_strict_soft_launch(
+            doc,
+            reason=(
+                "could not allocate a unique verified exit IP "
+                f"({str((last_probe or {}).get('error') or 'probe failed')[:120]})"
+            ),
+        )
         _set_soft_launch_proxy_state(doc, proxy_cfg, probe=last_probe)
         return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
     if last_err:
@@ -4038,7 +4141,15 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["exit_ip"] = existing.get("exit_ip") or ""
     new_doc["cdp_ws"] = existing.get("cdp_ws") or ""
     new_doc["updated_at"] = _now_iso()
-    _proxy = new_doc.get("proxy") or {}
+    # Password redact on GET means edit forms send password="". Keep prior
+    # secret unless the operator typed a new one.
+    _proxy = dict(new_doc.get("proxy") or {})
+    _old_proxy = dict(existing.get("proxy") or {})
+    if not str(_proxy.get("password") or "").strip() and str(_old_proxy.get("password") or "").strip():
+        _proxy["password"] = _old_proxy["password"]
+    if not str(_proxy.get("raw_line") or "").strip() and str(_old_proxy.get("raw_line") or "").strip():
+        _proxy["raw_line"] = _old_proxy["raw_line"]
+    new_doc["proxy"] = _proxy
     _wants_proxy = proxy_is_active(_proxy)
     if _wants_proxy and not str(_proxy.get("server") or "").strip():
         _used = await _load_team_profile_used_ips(uid)

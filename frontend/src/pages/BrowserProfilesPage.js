@@ -121,6 +121,7 @@ const DEFAULT_NEW = {
     use_proxyjet: false,
     proxyjet_country: "US",
     proxyjet_state: "",
+    proxy_type: "http",
     // v2.4.0 — Selected Proxy Provider (from Settings › Proxy Providers)
     provider_id: "",
   },
@@ -761,9 +762,15 @@ export default function BrowserProfilesPage() {
     const h = p.health || {};
     const level = h.level || "unknown";
     const score = h.score != null ? h.score : "—";
+    const stale = h.proxy_check_stale ? " · proxy check stale" : "";
     return (
-      <Badge variant="outline" className={`text-[10px] ${healthBadgeClass(level)}`} title={(h.issues || []).join("; ")}>
-        {level} · {score}
+      <Badge
+        variant="outline"
+        className={`text-[10px] ${healthBadgeClass(level)}`}
+        title={`${(h.issues || []).join("; ")}${h.proxy_check_age_sec != null ? ` · checked ${Math.round(h.proxy_check_age_sec / 3600)}h ago` : ""}`}
+        data-testid={`bp-health-${p.id}`}
+      >
+        {level} · {score}{stale}
       </Badge>
     );
   };
@@ -784,8 +791,7 @@ export default function BrowserProfilesPage() {
   const handleCreate = async () => {
     // 2026-01: When NOT editing an existing profile, route through the
     // new advanced-create endpoint so the form fully exploits the UA
-    // generator + ProxyJet integration (no need for the customer to
-    // pre-fill `user_agent` or proxy creds manually). The Edit flow
+    // generator + any Proxy Provider the user added in Settings.
     // keeps using the old `/` PUT — that just replaces existing config
     // verbatim.
     if (!editingId) {
@@ -861,6 +867,7 @@ export default function BrowserProfilesPage() {
               smart_session: advProxy.smart_session !== false,
               country: (form.country || advProxy.country || "US").toUpperCase(),
               state: (advProxy.state || "").toUpperCase(),
+              sticky_minutes: Number(advProxy.sticky_minutes) || 0,
             };
           }
           if (advProxy.mode === "proxyjet") {
@@ -1957,7 +1964,8 @@ export default function BrowserProfilesPage() {
             Select multiple cards for bulk Launch / Stop / Delete.
             <div className="mt-2 text-amber-100/90">
               <span className="font-semibold">New defaults:</span> Strict proxy ON (dead proxy = no browser / no real-IP leak)
-              · Full profile save ON (persistent disk folder) · iPhone/Android = desktop shell, not a real phone.
+              · Full profile save ON · iPhone/Android = desktop shell, not a real phone.
+              · Use <span className="text-amber-50">any</span> proxy provider from Settings (not locked to one vendor).
             </div>
           </div>
         </div>
@@ -3097,7 +3105,8 @@ export default function BrowserProfilesPage() {
                                 ))}
                               </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
-                                proxy = leak via proxy IP; disabled = block; real = system WebRTC
+                                Keep <span className="text-zinc-300">proxy</span> when a proxy is on.
+                                &quot;real&quot; can leak your real IP — launcher auto-forces proxy if needed.
                               </p>
                             </div>
                           </div>
@@ -3254,9 +3263,9 @@ export default function BrowserProfilesPage() {
                     <div className="pb-2 border-b border-cyan-500/20">
                       <ProxyProviderSelect
                         value={advProxy.provider_id}
-                        onChange={(v) => setAdvProxy({ ...advProxy, provider_id: v, mode: v ? "provider" : "none" })}
-                        label="Proxy provider (from Settings)"
-                        labelDefault="(pick a mode below instead)"
+                        onChange={(v) => setAdvProxy({ ...advProxy, provider_id: v, mode: v ? "provider" : (advProxy.mode === "provider" ? "none" : advProxy.mode) })}
+                        label="Proxy provider (Settings → add any provider: DataImpulse, Smartproxy, Oxylabs, etc.)"
+                        labelDefault="(or pick Manual / No Proxy below)"
                         testIdPrefix="bp-adv-proxy-provider"
                       />
                       {advProxy.mode === "provider" && advProxy.provider_id && (
@@ -3268,36 +3277,32 @@ export default function BrowserProfilesPage() {
                             onChange={(e) => setAdvProxy({ ...advProxy, smart_session: e.target.checked })}
                             data-testid="bp-adv-proxy-smart-session"
                           />
-                          Smart session — fresh provider IP at each launch (no bulk line pre-allocate)
+                          Smart session — fresh provider IP at each launch (recommended)
                         </label>
                       )}
+                      <p className="text-[10px] text-zinc-500 mt-1.5">
+                        Not locked to one vendor — use whatever proxy provider you added in Settings.
+                      </p>
                     </div>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-2 gap-2">
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "none" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="none" className="sr-only"
                           checked={advProxy.mode === "none"}
                           onChange={() => setAdvProxy({ ...advProxy, mode: "none", provider_id: "" })} />
                         <div className="font-semibold">No Proxy</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Direct connection</div>
-                      </label>
-                      <label data-testid="bp-proxy-mode-proxyjet" className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "proxyjet" ? "border-amber-400 bg-amber-500/15 text-amber-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
-                        <input type="radio" name="proxy_mode" value="proxyjet" className="sr-only"
-                          checked={advProxy.mode === "proxyjet"}
-                          onChange={() => setAdvProxy({ ...advProxy, mode: "proxyjet" })} />
-                        <div className="font-semibold">⚡ ProxyJet batch</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Pre-gen lines (optional) · launch fallback</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">Direct connection (real IP)</div>
                       </label>
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "manual" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="manual" className="sr-only"
                           checked={advProxy.mode === "manual"}
-                          onChange={() => setAdvProxy({ ...advProxy, mode: "manual" })} />
-                        <div className="font-semibold">Manual</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Paste host/port</div>
+                          onChange={() => setAdvProxy({ ...advProxy, mode: "manual", provider_id: "" })} />
+                        <div className="font-semibold">Manual line</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">Paste host:port:user:pass</div>
                       </label>
                     </div>
 
-                    {advProxy.mode === "proxyjet" && (
-                      <div className="grid grid-cols-3 gap-2">
+                    {advProxy.mode === "provider" && advProxy.provider_id && (
+                      <div className="grid grid-cols-3 gap-2" data-testid="bp-provider-targeting">
                         <div>
                           <Label className="text-zinc-300 text-[11px]">Country</Label>
                           <select data-testid="bp-pj-country" value={advProxy.country}
@@ -3308,11 +3313,6 @@ export default function BrowserProfilesPage() {
                         </div>
                         <div>
                           <Label className="text-zinc-300 text-[11px]">State <span className="text-zinc-500">(US only)</span></Label>
-                          {/* 2026-06 — Customer ask: state should be a
-                              dropdown, no typing. The dropdown is only
-                              meaningful when country=US, but we keep
-                              it visible (disabled+greyed) for non-US
-                              picks so the form layout stays stable. */}
                           <select
                             value={advProxy.state || ""}
                             onChange={(e) => setAdvProxy({ ...advProxy, state: e.target.value })}
@@ -3340,6 +3340,20 @@ export default function BrowserProfilesPage() {
                             <option value={120}>Sticky 120 min</option>
                           </select>
                         </div>
+                      </div>
+                    )}
+
+                    {advProxy.mode === "proxyjet" && (
+                      <div className="p-2 rounded border border-amber-700/40 bg-amber-950/20 text-[11px] text-amber-200" data-testid="bp-proxyjet-legacy-hint">
+                        Legacy batch mode is optional. Prefer picking your own provider above
+                        (DataImpulse / Smartproxy / Oxylabs / any gateway you added in Settings).
+                        <button
+                          type="button"
+                          className="ml-2 underline"
+                          onClick={() => setAdvProxy({ ...advProxy, mode: "none", provider_id: "" })}
+                        >
+                          Switch to provider / manual
+                        </button>
                       </div>
                     )}
 
@@ -3579,10 +3593,11 @@ export default function BrowserProfilesPage() {
                             proxy: {
                               ...form.proxy,
                               provider_id: v,
+                              // Legacy field name: means "auto from selected provider"
                               use_proxyjet: !!v,
                             },
                           })}
-                          label="Provider (optional)"
+                          label="Your proxy provider (any you added in Settings)"
                           labelDefault="(use manual proxy fields below)"
                           testIdPrefix="bp-proxy-provider"
                         />
@@ -3590,20 +3605,38 @@ export default function BrowserProfilesPage() {
                           <input type="checkbox" checked={form.proxy.use_proxyjet}
                             onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, use_proxyjet: e.target.checked } })}
                             className="w-4 h-4 rounded accent-cyan-500" />
-                          Auto-generate unique proxy via selected Provider (same as RUT)
+                          Auto-generate unique IP from selected provider each launch
                         </label>
                         {!form.proxy.use_proxyjet && (
                           <div className="grid grid-cols-2 gap-2">
-                            <Input placeholder="http://host:port" value={form.proxy.server}
+                            <div className="col-span-2">
+                              <Label className="text-zinc-400 text-[10px]">Type</Label>
+                              <select
+                                value={form.proxy.proxy_type || "http"}
+                                onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, proxy_type: e.target.value } })}
+                                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
+                                data-testid="bp-form-proxy-type"
+                              >
+                                <option value="http">HTTP</option>
+                                <option value="https">HTTPS</option>
+                                <option value="socks5">SOCKS5</option>
+                                <option value="socks4">SOCKS4</option>
+                              </select>
+                            </div>
+                            <Input placeholder="http://host:port or socks5://host:port" value={form.proxy.server}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, server: e.target.value } })}
-                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
-                            <div />
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs col-span-2" />
                             <Input placeholder="username" value={form.proxy.username}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, username: e.target.value } })}
                               className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
-                            <Input placeholder="password" type="password" value={form.proxy.password}
+                            <Input
+                              placeholder={form.proxy.has_password ? "•••• saved (type to change)" : "password"}
+                              type="password"
+                              value={form.proxy.password || ""}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, password: e.target.value } })}
-                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs"
+                              autoComplete="new-password"
+                            />
                           </div>
                         )}
                       </div>

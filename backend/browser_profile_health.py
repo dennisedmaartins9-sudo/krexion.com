@@ -1,7 +1,27 @@
-"""Profile health score for Browser Profiles UI (v2.7.76)."""
+"""Profile health score for Browser Profiles UI (v2.7.76 / v2.7.105)."""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
+
+
+def _proxy_check_age_sec(last_proxy: Dict[str, Any]) -> Optional[int]:
+    raw = str(
+        last_proxy.get("checked_at")
+        or last_proxy.get("at")
+        or last_proxy.get("ts")
+        or ""
+    ).strip()
+    if not raw:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except Exception:
+        return None
 
 
 def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -38,6 +58,7 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
     exit_ip = str(doc.get("exit_ip") or proxy.get("exit_ip") or "").strip()
     fp = str(doc.get("fingerprint_hash") or doc.get("fingerprint_short") or "").strip()
     tls_ok = doc.get("last_tls_prewarm_ok")
+    proxy_age = _proxy_check_age_sec(last_proxy if isinstance(last_proxy, dict) else {})
 
     if status == "error":
         score -= 40
@@ -52,6 +73,14 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
         elif not exit_ip and not (last_proxy.get("ip") or last_proxy.get("exit_ip")):
             score -= 15
             issues.append("proxy not verified")
+        elif proxy_age is not None and proxy_age > 86400:
+            score -= 10
+            hours = proxy_age // 3600
+            issues.append(f"proxy check stale ({hours}h ago — re-check)")
+        elif proxy_age is None and exit_ip:
+            # Have an exit IP from launch but no dated check row
+            score -= 3
+            issues.append("proxy check age unknown")
     elif proxy.get("enabled") is not False:
         score -= 5
         issues.append("no proxy configured")
@@ -94,16 +123,22 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
     else:
         level = "unknown"
 
+    proxy_ok: Any = None
+    if proxy_enabled:
+        proxy_ok = bool(
+            last_proxy.get("ok") is not False
+            and not last_proxy.get("error")
+            and (proxy_age is None or proxy_age <= 86400)
+        )
+
     return {
         "level": level,
         "score": score,
         "issues": issues[:6],
         "cookie_count": cookie_count,
-        "proxy_ok": (
-            None
-            if not proxy_enabled
-            else bool(last_proxy.get("ok") is not False and not last_proxy.get("error"))
-        ),
+        "proxy_ok": proxy_ok,
+        "proxy_check_age_sec": proxy_age,
+        "proxy_check_stale": bool(proxy_age is not None and proxy_age > 86400),
     }
 
 
