@@ -15,10 +15,15 @@ def test_antidetect_config_has_new_fields():
     assert cfg.audio_mode == "noise"
     assert cfg.font_mode == "noise"
     assert cfg.webrtc_mode == "proxy"
-    assert cfg.use_persistent_context is False
+    # v2.7.105e — persistent ON by default (AdsPower-class disk save)
+    assert cfg.use_persistent_context is True
     assert cfg.proxy_check_on_launch is True
-    assert cfg.proxy_check_block_on_fail is False
+    # Strict proxy ON by default (never soft-open on real IP)
+    assert cfg.proxy_check_block_on_fail is True
     assert cfg.tls_prewarm is True
+    assert cfg.local_api_cdp is False
+    assert cfg.disable_ipv6 is True
+    assert cfg.stealth_profile == "full"
 
 
 def test_launcher_tls_prewarm_default_true_and_modes():
@@ -49,6 +54,8 @@ def test_cookie_robot_and_fingerprint_routes_exist():
 
 
 def test_version_2_7_15_or_newer():
+    from releases_module import _parse
+
     ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     # Bundle introduced in 2.7.15; later patches keep features
-    assert ver >= "2.7.15"
+    assert _parse(ver) >= _parse("2.7.15")

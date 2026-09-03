@@ -903,6 +903,7 @@ test_runs/
 # XLSX, reports). Per-job dirs under these roots are ephemeral and
 # should never be committed.
 backend/real_user_traffic_results/
+backend/form_filler_results/
 backend/uploaded_resources/
 backend/visual_recorder_sessions/
 backend/.krexion/

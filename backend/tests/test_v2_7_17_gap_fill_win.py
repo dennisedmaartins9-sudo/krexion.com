@@ -6,8 +6,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_2_7_17():
+    from releases_module import _parse
+
     ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    assert ver >= "2.7.17"
+    assert _parse(ver) >= _parse("2.7.17")
 
 
 def test_sync_module_ast_and_api():
@@ -34,10 +36,13 @@ def test_module_routes_and_acl_helpers():
     assert '"/sync/start"' in src
 
 
-def test_launcher_cdp_default_local():
+def test_launcher_cdp_opt_in():
+    """v2.7.105e — CDP is opt-in (local_api_cdp), not always-on for native/local."""
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
-    assert 'in ("native", "local")' in src
+    assert "CDP opt-in ONLY" in src
+    assert "_want_cdp = bool(local_api_cdp)" in src
     assert "remote-debugging-port" in src
+    assert "local_api_cdp" in src
 
 
 def test_frontend_sync_acl_cloud_phone():

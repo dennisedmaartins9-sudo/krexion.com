@@ -74,8 +74,28 @@ except Exception:  # noqa: BLE001
 logger = logging.getLogger(__name__)
 
 # ─────── Storage root ──────────────────────────────────────────────
-RESULTS_ROOT = Path("/app/backend/form_filler_results")
-RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+# Docker uses /app/backend; native/local/CI must not crash on import.
+def _resolve_results_root(dirname: str) -> Path:
+    import tempfile
+
+    candidates = []
+    env_root = (os.environ.get("KREXION_RESULTS_ROOT") or "").strip()
+    if env_root:
+        candidates.append(Path(env_root) / dirname)
+    candidates.append(Path("/app/backend") / dirname)
+    candidates.append(Path(__file__).resolve().parent / dirname)
+    candidates.append(Path.home() / ".local" / "share" / "Krexion" / dirname)
+    candidates.append(Path(tempfile.gettempdir()) / "krexion" / dirname)
+    for p in candidates:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            continue
+    return candidates[-1]
+
+
+RESULTS_ROOT = _resolve_results_root("form_filler_results")
 
 # In-memory job registry (jobs also persisted in Mongo; this is the hot cache)
 JOBS: Dict[str, Dict[str, Any]] = {}
