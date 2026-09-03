@@ -426,8 +426,14 @@ def _start_shell_process(
             f"krx_shell_{str(session_key)[:8]}_{int(profile_slot)}.log",
         )
         with open(err_log, "wb") as errfh:
+            # Prefer runnable .py path (native keeps krexion_mobile_shell_host.py).
+            host_py = _host_script_path()
+            if os.path.isfile(host_py):
+                cmd = [sys.executable, host_py, path]
+            else:
+                cmd = [sys.executable, "-m", "krexion_mobile_shell_host", path]
             proc = subprocess.Popen(
-                [sys.executable, "-m", "krexion_mobile_shell_host", path],
+                cmd,
                 cwd=app_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=errfh,
@@ -455,8 +461,13 @@ def _start_shell_process(
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh)
             with open(err_log, "wb") as errfh:
+                host_py = _host_script_path()
+                if os.path.isfile(host_py):
+                    cmd = [sys.executable, host_py, path]
+                else:
+                    cmd = [sys.executable, "-m", "krexion_mobile_shell_host", path]
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "krexion_mobile_shell_host", path],
+                    cmd,
                     cwd=app_dir,
                     stdout=subprocess.DEVNULL,
                     stderr=errfh,
@@ -759,6 +770,8 @@ def _shell_apply_loop(
         fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
         content_x, content_y = _shell_content_origin(layout, (ox, oy))
         eng_w, eng_h = _engine_window_size(layout)
+        _positioned: Set[int] = set()
+        _shell_branded = False
 
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -787,26 +800,28 @@ def _shell_apply_loop(
             for hwnd in engine_hwnds:
                 _remove_menu_bar(hwnd)
                 _strip_native_caption(hwnd)
-                _set_window_pos(
-                    hwnd,
-                    content_x,
-                    content_y,
-                    eng_w,
-                    eng_h,
-                )
-                user32.ShowWindow(int(hwnd), 5)
-                user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
+                if int(hwnd) not in _positioned:
+                    _set_window_pos(
+                        hwnd,
+                        content_x,
+                        content_y,
+                        eng_w,
+                        eng_h,
+                    )
+                    # One-time show — never every tick (taskbar flicker).
+                    user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
+                    user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
+                    _positioned.add(int(hwnd))
+                else:
+                    _set_window_pos(
+                        hwnd,
+                        content_x,
+                        content_y,
+                        eng_w,
+                        eng_h,
+                    )
                 try:
                     hide_hwnd_from_taskbar(int(hwnd))
-                except Exception:
-                    pass
-                try:
-                    brand_single_hwnd_krexion(
-                        hwnd,
-                        profile_slot=profile_slot,
-                        profile_label=profile_label,
-                        platform=layout.platform,
-                    )
                 except Exception:
                     pass
 
@@ -845,6 +860,17 @@ def _shell_apply_loop(
             origin_y = int(round(oy * dpi))
             if top_hwnd:
                 _set_window_pos(top_hwnd, origin_x, origin_y, outer_w, top_h)
+                if not _shell_branded:
+                    try:
+                        brand_single_hwnd_krexion(
+                            top_hwnd,
+                            profile_slot=profile_slot,
+                            profile_label=profile_label,
+                            platform=layout.platform,
+                        )
+                        _shell_branded = True
+                    except Exception:
+                        pass
             if bottom_hwnd and layout.bottom_h > 0:
                 _set_window_pos(
                     bottom_hwnd,
@@ -853,21 +879,37 @@ def _shell_apply_loop(
                     outer_w,
                     bottom_h,
                 )
+                try:
+                    hide_hwnd_from_taskbar(int(bottom_hwnd))
+                except Exception:
+                    pass
 
             if parent_pid:
                 try:
                     from krexion_window_icon import is_process_alive
 
                     if not is_process_alive(int(parent_pid)):
-                        return
+                        break
                 except Exception:
                     pass
 
             time.sleep(interval_s)
     except Exception as exc:
-        logger.debug(f"[mobile-shell] loop crashed: {exc}")
+        logger.warning(f"[mobile-shell] loop crashed (chrome kept alive): {exc}")
     finally:
-        stop_mobile_shell(session_key)
+        # Only tear down chrome when intentionally stopped or browser died.
+        # A transient EnumWindows exception must NOT kill the phone UI.
+        intentional = stop_event is not None and stop_event.is_set()
+        parent_dead = False
+        if parent_pid:
+            try:
+                from krexion_window_icon import is_process_alive
+
+                parent_dead = not is_process_alive(int(parent_pid))
+            except Exception:
+                parent_dead = False
+        if intentional or parent_dead:
+            stop_mobile_shell(session_key)
 
 
 def apply_krexion_mobile_shell(

@@ -2336,6 +2336,7 @@ async def _launch_profile_session_inner(
                     apply_krexion_icon_to_pids,
                     collect_profile_process_tree,
                     resolve_playwright_driver_pid,
+                    stop_session_icon_keeper,
                 )
 
                 _driver_pid = resolve_playwright_driver_pid(browser, context)
@@ -2376,30 +2377,16 @@ async def _launch_profile_session_inner(
                         )
                     except Exception:
                         _will_try_mobile_shell = False
-                apply_krexion_icon_to_pids(
-                    _family_pids,
-                    profile_label=str(_profile_label)[:60] or "Profile",
-                    parent_pid=int(_driver_pid) if _driver_pid else None,
-                    poll_seconds=_poll,
-                    profile_slot=int(_taskbar_slot),
-                    cmdline_markers=_cmd_markers,
-                    window_title_markers=_title_markers,
-                    include_webkit=_include_webkit,
-                    platform=str(profile_os or ""),
-                    session_key=str(session_id),
-                )
-                # Option B — Krexion unique mobile shell (iOS WebKit + Android Chromium).
-                # Only after first page + navigation — early apply races HWND embed and
-                # spawns a duplicate Safari/Chrome window alongside the engine.
-                _use_mobile_shell = False
-                if mobile_shell:
-                    _use_mobile_shell = _will_try_mobile_shell
 
+                # Mobile shell FIRST — then stop engine icon keeper so it cannot
+                # fight TOOLWINDOW / ShowWindow and flicker the taskbar.
+                _use_mobile_shell = bool(mobile_shell and _will_try_mobile_shell)
                 if _use_mobile_shell:
                     try:
                         from krexion_mobile_browser_shell import (
                             apply_krexion_mobile_shell,
                             wait_for_mobile_shell,
+                            is_mobile_shell_alive,
                         )
 
                         _shell_active = False
@@ -2418,30 +2405,61 @@ async def _launch_profile_session_inner(
                                 home_url=str(start_url or "https://www.google.com/")[:512],
                             )
                             _shell_active = wait_for_mobile_shell(
-                                session_id, timeout_sec=12.0,
+                                session_id, timeout_sec=15.0,
                             )
-                            if _shell_active:
+                            if _shell_active and is_mobile_shell_alive(session_id):
                                 break
-                            time.sleep(0.6)
-                        if _shell_active:
+                            time.sleep(0.7)
+                        if _shell_active and is_mobile_shell_alive(session_id):
                             _launch_ui_meta["mobile_shell"] = True
+                            stop_session_icon_keeper(str(session_id))
                             logger.info(
                                 f"[profile-launch] mobile shell ON session={session_id[:8]}"
                             )
-                        else:
-                            logger.warning(
-                                f"[profile-launch] mobile shell failed to start "
-                                f"session={session_id[:8]} — using engine window only"
+                            # Brief brand only for shell chrome; engine stays TOOLWINDOW.
+                            apply_krexion_icon_to_pids(
+                                _family_pids,
+                                profile_label=str(_profile_label)[:60] or "Profile",
+                                parent_pid=int(_driver_pid) if _driver_pid else None,
+                                poll_seconds=12.0,
+                                profile_slot=int(_taskbar_slot),
+                                cmdline_markers=_cmd_markers,
+                                window_title_markers=_title_markers,
+                                include_webkit=_include_webkit,
+                                platform=str(profile_os or ""),
+                                session_key=str(session_id),
+                                skip_toolwindow=True,
+                                session_lifetime=False,
                             )
-                            _launch_warnings.append(
-                                "Krexion mobile device shell did not start — "
-                                "you are seeing the plain browser window, not the branded iOS/Android shell."
-                            )
+                            return
+                        logger.warning(
+                            f"[profile-launch] mobile shell failed to start "
+                            f"session={session_id[:8]} — using engine window only"
+                        )
+                        _launch_warnings.append(
+                            "Krexion mobile device shell did not start — "
+                            "you are seeing the plain browser window, not the branded iOS/Android shell."
+                        )
                     except Exception as _ms_err:
                         logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
                         _launch_warnings.append(
                             "Mobile device shell could not be applied — not a real device shell UI."
                         )
+
+                apply_krexion_icon_to_pids(
+                    _family_pids,
+                    profile_label=str(_profile_label)[:60] or "Profile",
+                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                    poll_seconds=_poll,
+                    profile_slot=int(_taskbar_slot),
+                    cmdline_markers=_cmd_markers,
+                    window_title_markers=_title_markers,
+                    include_webkit=_include_webkit,
+                    platform=str(profile_os or ""),
+                    session_key=str(session_id),
+                    skip_toolwindow=True,
+                    session_lifetime=True,
+                )
                 # Legacy Safari overlay removed — it caused a second window + wrong zoom.
                 # Krexion mobile shell is the only branded mobile UI on Windows.
             except Exception as _icon_err:
@@ -3030,11 +3048,23 @@ async def _launch_profile_session_inner(
                     "<h2>Proxy server</h2><code>"+_safe_server+"</code>"
                     "<h2>Reason</h2><code>"+_safe_err+"</code>"
                     "<h2>What to try</h2><ul class='muted'>"
-                    "<li>Verify your ProxyJet credentials are still active (Settings → ProxyJet)</li>"
-                    "<li>Try a different country / state in the profile's proxy section</li>"
+                    + (
+                        "<li><b>DNS could not resolve this proxy hostname</b> — the gateway "
+                        "name is wrong, expired, or blocked on this PC. Open Settings → Proxy "
+                        "Providers and paste a working host (e.g. DataImpulse "
+                        "<code>gw.dataimpulse.com</code>). BestGo hosts like "
+                        "<code>*.bestgo.work</code> must resolve in your browser/DNS first.</li>"
+                        if ("ENOTFOUND" in _safe_err or "getaddrinfo" in _safe_err.lower()
+                            or "Name or service not known" in _safe_err)
+                        else
+                        "<li>Verify your proxy credentials are still active (Settings → Proxy Providers / ProxyJet)</li>"
+                    )
+                    + "<li>Try a different country / state or a fresh manual proxy line</li>"
                     "<li>Switch to <code>No Proxy</code> if you only need a clean UA / viewport</li>"
-                    "<li>Check that the desktop machine's firewall allows outbound HTTPS</li>"
+                    "<li>Check that the desktop machine's firewall / DNS allows outbound HTTPS</li>"
                     "</ul>"
+                    "<p class='muted'>Note: &quot;Continue without proxy&quot; only opens the start URL "
+                    "in this window — the profile proxy setting is unchanged until you edit the profile.</p>"
                     "<a class='btn' href='"+_safe_start+"'>Continue without proxy →</a>"
                     "</div></body></html>"
                 )

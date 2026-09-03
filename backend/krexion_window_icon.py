@@ -47,8 +47,27 @@ def stop_session_icon_keeper(session_key: str) -> None:
         ev.set()
 
 
+def _hwnd_is_toolwindow(hwnd: int) -> bool:
+    """True when HWND is already marked TOOLWINDOW (hidden from taskbar)."""
+    if not _IS_WINDOWS or not hwnd:
+        return False
+    try:
+        import ctypes
+
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        style = int(ctypes.windll.user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE) or 0)
+        return bool(style & WS_EX_TOOLWINDOW)
+    except Exception:
+        return False
+
+
 def hide_hwnd_from_taskbar(hwnd: int) -> None:
-    """Remove an embedded engine HWND from the taskbar (shell owns the button)."""
+    """Remove an embedded engine HWND from the taskbar (shell owns the button).
+
+    Never call ShowWindow(SW_SHOW) here — that re-activates the window and
+    causes the recurring taskbar flicker (appear → hide → appear).
+    """
     if not _IS_WINDOWS or not hwnd:
         return
     try:
@@ -58,13 +77,26 @@ def hide_hwnd_from_taskbar(hwnd: int) -> None:
         GWL_EXSTYLE = -20
         WS_EX_TOOLWINDOW = 0x00000080
         WS_EX_APPWINDOW = 0x00040000
-        style = user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
-        user32.SetWindowLongW(
+        style = int(user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE) or 0)
+        new_style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+        if new_style == style:
+            return
+        user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, new_style)
+        # Frame change only — no SW_SHOW (flicker root cause).
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+        user32.SetWindowPos(
             int(hwnd),
-            GWL_EXSTYLE,
-            (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
-        user32.ShowWindow(int(hwnd), 5)  # SW_SHOW — refresh taskbar grouping
     except Exception as exc:
         logger.debug(f"[krexion-icon] hide hwnd from taskbar skipped: {exc}")
 
@@ -543,6 +575,8 @@ def apply_krexion_icon_to_pids(
     include_webkit: bool = False,
     platform: str = "",
     session_key: str = "",
+    skip_toolwindow: bool = True,
+    session_lifetime: bool = True,
 ) -> Optional[threading.Thread]:
     """Brand Chromium HWNDs as Krexion Browser with profile number badge."""
     if not _IS_WINDOWS:
@@ -592,9 +626,17 @@ def apply_krexion_icon_to_pids(
         display = f"Krexion Browser ({slot})"
         if profile_label:
             display = f"Krexion — {profile_label} ({slot})"
-        # Session-bound profiles keep re-applying icons for the full session —
-        # Chromium/WebKit reset WM_SETICON after navigation and title changes.
-        session_poll = 86400.0 if sk else float(poll_seconds or 90.0)
+        # Session-bound keepers re-apply icons; Chromium/WebKit reset after paint.
+        # When mobile shell owns the taskbar button, callers pass a short poll
+        # and stop the keeper after shell attaches (session_lifetime=False).
+        if sk and session_lifetime:
+            session_poll = 86400.0
+        else:
+            session_poll = float(poll_seconds or 90.0)
+        # WebKit MiniBrowser: slower interval reduces taskbar flicker.
+        interval = float(poll_interval or 0.6)
+        if include_webkit:
+            interval = max(interval, 1.25)
         t = threading.Thread(
             target=_icon_apply_loop_multi,
             args=(
@@ -604,12 +646,15 @@ def apply_krexion_icon_to_pids(
                 display,
                 app_id,
                 session_poll,
-                poll_interval,
+                interval,
                 list(cmdline_markers or []),
                 list(window_title_markers or []),
                 bool(include_webkit),
             ),
-            kwargs={"stop_event": stop_ev if sk else None},
+            kwargs={
+                "stop_event": stop_ev if sk else None,
+                "skip_toolwindow": bool(skip_toolwindow),
+            },
             daemon=True,
             name=f"KrexionIcon-{slot}-{parent_pid or (_clean[0] if _clean else slot)}",
         )
@@ -668,7 +713,12 @@ def resolve_playwright_driver_pid(browser: Any = None, context: Any = None) -> O
 
 
 def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
-    """Locate Playwright WebKit MiniBrowser PIDs (Windows headed iOS profiles)."""
+    """Locate Playwright WebKit MiniBrowser PIDs (Windows headed iOS profiles).
+
+    When *parent_pid* is known, ONLY return WebKit processes inside that
+    profile's process tree — never every MiniBrowser on the machine (that
+    caused cross-profile taskbar flicker when Android + iOS launched together).
+    """
     out: Set[int] = set()
     _webkit_names = {
         "minibrowser.exe",
@@ -679,13 +729,19 @@ def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
     try:
         import psutil as _psu
 
+        tree: Optional[Set[int]] = None
         if parent_pid:
-            out |= collect_profile_process_tree(int(parent_pid))
+            tree = set(collect_profile_process_tree(int(parent_pid)))
+            tree.add(int(parent_pid))
         for proc in _psu.process_iter(["pid", "name"]):
             try:
                 pname = (proc.info.get("name") or "").lower()
-                if pname in _webkit_names:
-                    out.add(int(proc.info["pid"]))
+                if pname not in _webkit_names:
+                    continue
+                pid = int(proc.info["pid"])
+                if tree is not None and pid not in tree:
+                    continue
+                out.add(pid)
             except Exception:
                 pass
     except Exception:
@@ -818,6 +874,7 @@ def _icon_apply_loop_multi(
     window_title_markers: Optional[list] = None,
     include_webkit: bool = False,
     stop_event: Optional[threading.Event] = None,
+    skip_toolwindow: bool = True,
 ) -> None:
     try:
         import ctypes
@@ -845,12 +902,15 @@ def _icon_apply_loop_multi(
         GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         GetWindowThreadProcessId.restype = wintypes.DWORD
 
-        session_mode = stop_event is not None
-        deadline = time.time() + max(float(deadline_s or 90.0), 86400.0 if session_mode else 0.0)
+        # Honour caller poll_seconds — do NOT force 86400 just because stop_event exists.
+        poll_s = max(5.0, float(deadline_s or 90.0))
+        session_mode = poll_s >= 86000.0
+        deadline = time.time() + poll_s
         pid_set: Set[int] = {int(p) for p in seed_pids or []}
         if parent_pid:
             pid_set.add(int(parent_pid))
         last_force = 0.0
+        force_every = 8.0 if include_webkit else 3.0
 
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -875,6 +935,10 @@ def _icon_apply_loop_multi(
                     title = title_buf.value or ""
                     if not user32.IsWindowVisible(hwnd):
                         return True
+                    if skip_toolwindow and _hwnd_is_toolwindow(int(hwnd)):
+                        return True
+                    if title.startswith("KrexionShell-"):
+                        return True
                     pid_match = win_pid.value in pid_set
                     title_match = bool(
                         window_title_markers
@@ -895,7 +959,7 @@ def _icon_apply_loop_multi(
             user32.EnumWindows(EnumWindowsProc(_cb), 0)
 
             now = time.time()
-            force_all = session_mode or (now - last_force) >= 3.0 or (deadline - now) > (deadline_s - 15.0)
+            force_all = session_mode or (now - last_force) >= force_every or (deadline - now) > (poll_s - 15.0)
             if force_all:
                 last_force = now
 
@@ -936,7 +1000,7 @@ def _icon_apply_loop_multi(
                 except Exception:
                     pass
 
-            time.sleep(interval_s)
+            time.sleep(max(0.4, float(interval_s or 0.6)))
     except Exception as e:
         logger.debug(f"[krexion-icon] loop crashed: {e}")
 

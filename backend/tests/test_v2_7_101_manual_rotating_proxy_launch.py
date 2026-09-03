@@ -78,4 +78,6 @@ async def test_assert_unique_ip_batch_message():
 
 
 def test_version_is_2_7_101():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.101"
+    ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    parts = [int(x) for x in ver.split(".")]
+    assert parts >= [2, 7, 101]

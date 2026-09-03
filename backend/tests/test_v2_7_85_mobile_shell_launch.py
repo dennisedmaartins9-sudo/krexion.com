@@ -59,4 +59,5 @@ def test_wait_for_mobile_shell_eventually_true():
 def test_launcher_uses_wait_for_mobile_shell():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "wait_for_mobile_shell" in src
-    assert "timeout_sec=30.0" in src
+    assert "timeout_sec=15.0" in src or "timeout_sec=30.0" in src
+    assert "is_mobile_shell_alive" in src

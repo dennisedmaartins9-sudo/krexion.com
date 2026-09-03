@@ -1,3 +1,12 @@
+# v2.7.102 — 2026-09 — Permanent mobile shell + iPhone taskbar flicker fix
+#
+# - Root causes: icon keeper ShowWindow(SW_SHOW) fought shell TOOLWINDOW;
+#   WebKit PID scan branded ALL MiniBrowsers on the PC; shell loop crash
+#   killed pywebview chrome in finally; icon keeper started before shell.
+# - Fix: shell first then stop engine icon keeper; scope WebKit to parent
+#   tree; hide_hwnd uses FRAMECHANGED only; loop crash keeps chrome alive;
+#   clearer ENOTFOUND/BestGo DNS proxy error copy.
+#
 # v2.7.101 — 2026-09 — Manual rotating proxy launch: duplicate IP never blocks browser
 #
 # - Root cause: manual DataImpulse/Smartproxy lines hit team IP isolation with
