@@ -91,7 +91,7 @@ def test_cdp_stealth_in_v230_bundle():
     assert "__playwright" in bundle or "__pw" in bundle
     src = (REPO_ROOT / "anti_detect_v230.py").read_text(encoding="utf-8")
     assert "def cdp_stealth_js(" in src
-    assert "cdp_stealth_js()," in src
+    assert "cdp_stealth_js(safari_mode=safari_mode)" in src
 
 
 def test_tls_companion_prewarm_exists():

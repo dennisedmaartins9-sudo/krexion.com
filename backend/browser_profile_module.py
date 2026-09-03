@@ -457,22 +457,35 @@ def _honest_ua_platform_for_profiles(platform: str, *, is_mobile: bool) -> str:
     return plat or ("android" if is_mobile else "desktop")
 
 
-def _parse_proxy_line(line: str) -> Dict[str, str]:
-    """Normalize a ProxyJet / provider proxy line → server + creds dict."""
+def _parse_proxy_line(line: str, proxy_type: str = "http") -> Dict[str, str]:
+    """Normalize a provider / manual proxy line → server + creds dict.
+
+    Preserves socks5/socks4 when the line (or proxy_type) says so — do not
+    force everything to http:// (breaks SOCKS providers).
+    """
     line = (line or "").strip()
     server = ""
     username = ""
     password = ""
     if not line:
         return {"server": "", "username": "", "password": ""}
+    ptype = (proxy_type or "http").strip().lower()
+    if ptype.startswith("socks5"):
+        default_scheme = "socks5"
+    elif ptype.startswith("socks4"):
+        default_scheme = "socks4"
+    elif ptype in ("https", "http"):
+        default_scheme = ptype
+    else:
+        default_scheme = "http"
     try:
         from urllib.parse import unquote, urlparse
 
-        probe = line if "://" in line else f"http://{line}"
+        probe = line if "://" in line else f"{default_scheme}://{line}"
         if "://" in probe and "@" in probe.split("://", 1)[-1]:
             parsed = urlparse(probe)
             if parsed.hostname:
-                scheme = parsed.scheme or "http"
+                scheme = parsed.scheme or default_scheme
                 host = parsed.hostname
                 port = parsed.port
                 netloc = host if not port else f"{host}:{port}"
@@ -503,15 +516,15 @@ def _parse_proxy_line(line: str) -> Dict[str, str]:
         elif "@" in line:
             creds, hostport = line.rsplit("@", 1)
             username, _, password = creds.partition(":")
-            server = f"http://{hostport}"
+            server = f"{default_scheme}://{hostport}"
         else:
             parts = line.split(":")
             if len(parts) >= 4:
                 host, port, username = parts[0], parts[1], parts[2]
                 password = ":".join(parts[3:])
-                server = f"http://{host}:{port}"
+                server = f"{default_scheme}://{host}:{port}"
             elif len(parts) >= 2:
-                server = f"http://{parts[0]}:{parts[1]}"
+                server = f"{default_scheme}://{parts[0]}:{parts[1]}"
             else:
                 server = line
     except Exception as _pe:
@@ -602,12 +615,13 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
     server = str(out.get("server") or "").strip()
     username = str(out.get("username") or "").strip()
     password = str(out.get("password") or "").strip()
+    ptype = str(out.get("proxy_type") or "http").strip() or "http"
     if not server and not str(out.get("raw_line") or out.get("raw") or "").strip():
         return out
 
     raw_line = str(out.get("raw_line") or out.get("raw") or "").strip()
     if raw_line:
-        parsed = _parse_proxy_line(raw_line)
+        parsed = _parse_proxy_line(raw_line, proxy_type=ptype)
         if not server and parsed.get("server"):
             server = str(parsed["server"]).strip()
         if not username and parsed.get("username"):
@@ -616,8 +630,8 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
             password = str(parsed["password"]).strip()
 
     if server and (not username or not password):
-        probe = server if "://" in server else f"http://{server}"
-        parsed = _parse_proxy_line(probe)
+        probe = server if "://" in server else f"{ptype if ptype.startswith('socks') or ptype in ('http', 'https') else 'http'}://{server}"
+        parsed = _parse_proxy_line(probe, proxy_type=ptype)
         if parsed.get("server"):
             server = str(parsed["server"]).strip()
         if not username and parsed.get("username"):
@@ -631,7 +645,33 @@ def hydrate_proxy_credentials(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["username"] = username
     if password:
         out["password"] = password
+    if ptype:
+        out["proxy_type"] = ptype
     return out
+
+
+def _canonical_proxy_raw_line(proxy: Dict[str, Any]) -> str:
+    """Rebuild scheme://user:pass@host:port line for launch-time auth recovery."""
+    out = hydrate_proxy_credentials(dict(proxy or {}))
+    server = str(out.get("server") or "").strip()
+    username = str(out.get("username") or "").strip()
+    password = str(out.get("password") or "").strip()
+    if not server or not username or not password:
+        return str(out.get("raw_line") or out.get("raw") or "").strip()
+    hostpart = server.split("://", 1)[-1]
+    if "@" in hostpart:
+        return str(out.get("raw_line") or out.get("raw") or server).strip()
+    from urllib.parse import quote, urlparse
+
+    try:
+        scheme = urlparse(server if "://" in server else f"http://{server}").scheme or "http"
+    except Exception:
+        scheme = "http"
+    if str(out.get("proxy_type") or "").lower().startswith("socks5"):
+        scheme = "socks5"
+    elif str(out.get("proxy_type") or "").lower().startswith("socks4"):
+        scheme = "socks4"
+    return f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{hostpart}"
 
 
 def _proxy_host_from_server(server: str) -> str:
@@ -647,20 +687,35 @@ def _proxy_host_from_server(server: str) -> str:
         return ""
 
 
-def _canonical_proxy_raw_line(proxy: Dict[str, Any]) -> str:
-    """Rebuild host:port:user:pass line for launch-time auth recovery."""
-    out = hydrate_proxy_credentials(dict(proxy or {}))
-    server = str(out.get("server") or "").strip()
-    username = str(out.get("username") or "").strip()
-    password = str(out.get("password") or "").strip()
-    if not server or not username or not password:
-        return str(out.get("raw_line") or out.get("raw") or "").strip()
-    hostpart = server.split("://", 1)[-1]
-    if "@" in hostpart:
-        return str(out.get("raw_line") or out.get("raw") or server).strip()
-    from urllib.parse import quote
+def _sanitize_proxy_for_public(proxy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Redact secrets before API responses (list/get/ACL share)."""
+    p = dict(proxy or {})
+    has_password = bool(str(p.get("password") or "").strip())
+    raw = str(p.get("raw_line") or p.get("raw") or "").strip()
+    if raw and (":" in raw or "@" in raw):
+        has_password = True
+    p.pop("password", None)
+    p.pop("raw_line", None)
+    p.pop("raw", None)
+    # Never leak user:pass embedded in server URL
+    srv = str(p.get("server") or "").strip()
+    if srv and "@" in srv.split("://", 1)[-1]:
+        try:
+            from urllib.parse import urlparse
 
-    return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{hostpart}"
+            parsed = urlparse(srv if "://" in srv else f"http://{srv}")
+            if parsed.hostname:
+                netloc = parsed.hostname
+                if parsed.port:
+                    netloc = f"{parsed.hostname}:{parsed.port}"
+                p["server"] = f"{parsed.scheme or 'http'}://{netloc}"
+                has_password = True
+        except Exception:
+            pass
+    p["has_password"] = has_password
+    # Empty password field for edit forms — client must send new value to change
+    p["password"] = ""
+    return p
 
 
 async def resolve_launch_proxy_cfg(
@@ -1081,13 +1136,25 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
         "automation_error",
         "launch_warnings",
         "mobile_shell_active",
+        "mobile_shell_embedded",
         "engine_used",
     ):
         if _ak in body:
             prof_update[_ak] = body[_ak]
+    # One-shot migrate: persist Strict proxy when launch reported the patch
+    _ad_patch = body.get("anti_detect_patch")
+    if isinstance(_ad_patch, dict) and _ad_patch:
+        try:
+            doc0 = await _DB.browser_profiles.find_one({"id": profile_id}, {"_id": 0, "anti_detect": 1})
+            cur_anti = dict((doc0 or {}).get("anti_detect") or {})
+            cur_anti.update({k: v for k, v in _ad_patch.items() if k})
+            prof_update["anti_detect"] = cur_anti
+        except Exception:
+            pass
     if status in ("stopped", "closed", "error"):
         prof_update.setdefault("launch_warnings", [])
         prof_update["mobile_shell_active"] = False
+        prof_update["mobile_shell_embedded"] = False
     if prof_update:
         await _DB.browser_profiles.update_one(
             {"id": profile_id},
@@ -1103,15 +1170,18 @@ class ProxyConfig(BaseModel):
     server: str = ""            # http://host:port or socks5://host:port
     username: str = ""
     password: str = ""
-    # ProxyJet auto-mode (uses customer's saved ProxyJet creds)
+    # http | https | socks5 | socks4 — used when server has no scheme
+    proxy_type: str = "http"
+    # Legacy flag name kept for DB compat — means "auto line from selected
+    # Proxy Provider" (any provider the user added in Settings), NOT
+    # ProxyJet-only.
     use_proxyjet: bool = False
     proxyjet_country: str = "US"
     proxyjet_state: str = ""
-    # v2.4.0 — Multi-provider proxy dropdown. When set, the launch flow
-    # resolves this to a live proxy from the user's Proxy Providers.
-    # Empty ⇒ existing enabled/server/proxyjet fields apply.
+    # Multi-provider: resolves a live line from Settings → Proxy Providers.
+    # Empty ⇒ manual server/username/password fields apply.
     provider_id: str = ""
-    # v2.7.94 — provider smart mode: no pre-bound line at create; fresh session each launch
+    # Provider smart mode: no pre-bound line at create; fresh session each launch
     smart_session: bool = False
 
 
@@ -1130,9 +1200,24 @@ class AntiDetectConfig(BaseModel):
     audio_mode: str = "noise"       # off | noise | real
     font_mode: str = "noise"        # off | noise | real
     webrtc_mode: str = "proxy"      # disabled | proxy | real
-    use_persistent_context: bool = False
+    # Full Chromium user-data dir (AdsPower-class persistence). Default ON
+    # for new profiles so logins/extensions survive better than storage_state alone.
+    use_persistent_context: bool = True
     proxy_check_on_launch: bool = True
-    proxy_check_block_on_fail: bool = False
+    # Strict proxy: never open the browser without a live proxy when proxy is
+    # enabled (blocks DNS soft-launch / "open without proxy" real-IP leak).
+    proxy_check_block_on_fail: bool = True
+    # Abort launch if mobile device shell cannot frame the browser.
+    # Default ON for new configs — mobile profiles must not soft-open as
+    # plain Chromium/WebKit. Explicit False still allowed for power users.
+    strict_mobile_shell: bool = True
+    # Opt-in Local API CDP (--remote-debugging-port). Default OFF — was a
+    # detection surface when always-on for native/local.
+    local_api_cdp: bool = False
+    # Prefer IPv4 (avoid dual-stack / WebRTC IPv6 leaks with proxies).
+    disable_ipv6: bool = True
+    # full | minimal | safari — safari auto for WebKit; minimal skips FP WIN layer
+    stealth_profile: str = "full"
     # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
     browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
@@ -1407,7 +1492,9 @@ class ProfileAutomationLaunch(BaseModel):
     lead_row_index: int = Field(default=0, ge=-1, le=100000)
     skip_missing_steps: bool = True
     self_heal: bool = False
-    after_mode: str = Field(default="manual", max_length=32)  # manual = keep browser open
+    after_mode: str = Field(default="manual", max_length=32)  # manual | close | next_lead
+    consume_mode: str = Field(default="on_submit", max_length=32)  # on_submit | on_start
+    claim_next: bool = False  # True = atomic next free row (bulk sets this ON)
     save_as_default: bool = False
     proxy_upload_id: str = Field(default="", max_length=64)  # Uploaded Things proxy batch (RUT parity)
     ua_upload_id: str = Field(default="", max_length=64)
@@ -1420,6 +1507,7 @@ class ProfileAutomationLaunch(BaseModel):
 class LaunchBody(BaseModel):
     start_url: Optional[str] = Field(default=None, max_length=512)
     automation: Optional[ProfileAutomationLaunch] = None
+    recheck_proxy: bool = False
 
 
 class BulkLaunchBody(BaseModel):
@@ -1435,6 +1523,9 @@ class RunAutomationBody(BaseModel):
     lead_row_index: int = Field(default=0, ge=0, le=100000)
     skip_missing_steps: bool = True
     self_heal: bool = False
+    after_mode: str = Field(default="manual", max_length=32)
+    consume_mode: str = Field(default="on_submit", max_length=32)
+    claim_next: bool = True
     proxy_upload_id: str = Field(default="", max_length=64)
     ua_upload_id: str = Field(default="", max_length=64)
     smart_funnel_enabled: bool = False
@@ -1450,12 +1541,20 @@ class BulkRunJsonBody(BaseModel):
     max_concurrent: int = Field(default=5, ge=1, le=20)
     skip_missing_steps: bool = True
     self_heal: bool = False
+    after_mode: str = Field(default="manual", max_length=32)
+    consume_mode: str = Field(default="on_submit", max_length=32)
+    claim_next: bool = True
     proxy_upload_id: str = Field(default="", max_length=64)
     ua_upload_id: str = Field(default="", max_length=64)
     smart_funnel_enabled: bool = False
     smart_funnel_pattern: str = Field(default="auto", max_length=64)
     smart_funnel_min_deals: int = Field(default=2, ge=1, le=5)
     smart_funnel_wait_until_conversion: bool = True
+
+
+class ValidateAutomationBody(BaseModel):
+    automation_upload_id: str = Field(default="", max_length=64)
+    data_file_id: str = Field(default="", max_length=64)
 
 
 class SaveAutomationDefaultsBody(BaseModel):
@@ -1607,7 +1706,7 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     pid = str(uuid.uuid4())
     # 2026-01 — auto-generate unique name if blank
     name = (body.name or "").strip() or _auto_name(body.country, body.device_type)
-    return {
+    doc = {
         "id": pid,
         "user_id": user_id,
         "name": name,
@@ -1651,6 +1750,13 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
+    # Mobile: Strict phone chrome ON unless user explicitly turned it off
+    _anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
+    if is_mobile and "strict_mobile_shell" not in _anti:
+        _anti = dict(_anti)
+        _anti["strict_mobile_shell"] = True
+        doc["anti_detect"] = _anti
+    return doc
 
 
 def _not_deleted_filter() -> Dict[str, Any]:
@@ -1686,6 +1792,9 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
         d["health"] = {"level": "unknown", "score": 0, "issues": []}
         d["last_used_label"] = ""
     d.pop("storage_state", None)
+    # Never expose proxy passwords / raw lines to list/get/ACL clients
+    if isinstance(d.get("proxy"), dict):
+        d["proxy"] = _sanitize_proxy_for_public(d.get("proxy"))
     d["folder"] = (d.get("folder") or "").strip()
     d["geo_follow_proxy"] = bool(d.get("geo_follow_proxy", True))
     d["quick_links"] = d.get("quick_links") or []
@@ -1693,6 +1802,33 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["fingerprint_short"] = fh[:12] if fh else ""
     d["last_proxy_check"] = d.get("last_proxy_check") or {}
     d["exit_ip"] = str(d.get("exit_ip") or (d.get("proxy") or {}).get("exit_ip") or "").strip()
+    # Hint: strict when proxy enabled (default ON for unset / old profiles)
+    d["strict_proxy"] = _strict_proxy_mode(doc if isinstance(doc, dict) else d)
+    _anti = d.get("anti_detect") if isinstance(d.get("anti_detect"), dict) else {}
+    d["strict_mobile_shell"] = bool((_anti or {}).get("strict_mobile_shell", True)) if bool(d.get("is_mobile")) else bool((_anti or {}).get("strict_mobile_shell"))
+    # Effective: mobile + unset → strict ON
+    if bool(d.get("is_mobile")) and "strict_mobile_shell" not in (_anti or {}):
+        d["strict_mobile_shell"] = True
+    d["mobile_shell_embedded"] = bool(d.get("mobile_shell_embedded"))
+    # Proxy check age for UI badge
+    _lpc = d.get("last_proxy_check") if isinstance(d.get("last_proxy_check"), dict) else {}
+    _checked_at = str(
+        _lpc.get("checked_at") or _lpc.get("at") or _lpc.get("ts") or _lpc.get("timestamp") or ""
+    ).strip()
+    d["proxy_check_age_hours"] = None
+    d["proxy_check_stale"] = False
+    if _checked_at:
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromisoformat(_checked_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+            d["proxy_check_age_hours"] = round(age_h, 2)
+            d["proxy_check_stale"] = age_h > 24.0
+        except Exception:
+            pass
     if "last_tls_prewarm_ok" not in d:
         d["last_tls_prewarm_ok"] = None
     # CDP endpoint only for local automation clients (still useful in UI copy)
@@ -1758,6 +1894,9 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
             exp = int(float(expires))
         except Exception:
             exp = -1
+        # Classic Netscape has no SameSite column — do NOT invent "Lax"
+        # (forces logout on sites that issued Strict/None). Playwright
+        # applies its own default when sameSite is omitted.
         ck: Dict[str, Any] = {
             "name": name,
             "value": value,
@@ -1765,12 +1904,31 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
             "path": path or "/",
             "secure": str(secure).upper() in ("TRUE", "1", "YES"),
             "httpOnly": _http_only,
-            "sameSite": "Lax",
         }
         if exp > 0:
             ck["expires"] = exp
         out.append(ck)
     return out
+
+
+def _normalize_same_site(raw: Any) -> Optional[str]:
+    """Preserve Strict / Lax / None; never invent a default."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    key = s.lower().replace("_", "")
+    if key in ("strict",):
+        return "Strict"
+    if key in ("lax",):
+        return "Lax"
+    if key in ("none", "no_restriction", "norestriction"):
+        return "None"
+    # Already canonical?
+    if s in ("Strict", "Lax", "None"):
+        return s
+    return None
 
 
 def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
@@ -1794,8 +1952,11 @@ def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
                 item["expires"] = float(c["expires"])
             except Exception:
                 pass
-        if c.get("sameSite"):
-            item["sameSite"] = c["sameSite"]
+        ss = _normalize_same_site(
+            c.get("sameSite") if c.get("sameSite") is not None else c.get("same_site")
+        )
+        if ss:
+            item["sameSite"] = ss
         out.append(item)
     return out
 
@@ -1912,8 +2073,49 @@ def _rotate_manual_proxy_session(proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _strict_proxy_mode(doc_or_anti: Optional[Dict[str, Any]]) -> bool:
+    """True when profile must never soft-open without a working proxy.
+
+    Reads anti_detect.proxy_check_block_on_fail (UI: Strict proxy) or
+    anti_detect.strict_proxy alias.
+
+    Default: ON when proxy is enabled and the flag was never saved
+    (closes real-IP soft-launch leak on old profiles). Explicit False
+    still allows soft-launch for power users who opt out.
+    """
+    if not isinstance(doc_or_anti, dict):
+        return False
+    anti = doc_or_anti.get("anti_detect") if "anti_detect" in doc_or_anti else doc_or_anti
+    if not isinstance(anti, dict):
+        anti = {}
+    if anti.get("proxy_check_block_on_fail") is True:
+        return True
+    if anti.get("strict_proxy") is True:
+        return True
+    if anti.get("proxy_check_block_on_fail") is False:
+        return False
+    if anti.get("strict_proxy") is False:
+        return False
+    # Unset flag: treat as strict when proxy is configured on the profile
+    proxy = {}
+    if "proxy" in doc_or_anti and isinstance(doc_or_anti.get("proxy"), dict):
+        proxy = doc_or_anti.get("proxy") or {}
+    if (
+        proxy.get("enabled")
+        or str(proxy.get("server") or "").strip()
+        or str(proxy.get("provider_id") or "").strip()
+        or proxy.get("use_proxyjet")
+    ):
+        return True
+    return False
+
+
 def _proxy_ready_for_soft_launch(proxy_cfg: Dict[str, Any]) -> bool:
-    """Launch may proceed without pre-bound exit IP when proxy line resolved."""
+    """Launch may proceed without pre-bound exit IP when proxy line resolved.
+
+    Note: this still keeps the proxy on the browser — it only skips the
+    pre-bound unique exit-IP gate. It does NOT mean "open on real IP".
+    """
     if not str(proxy_cfg.get("server") or "").strip():
         return False
     if str(proxy_cfg.get("password") or "").strip():
@@ -1956,6 +2158,20 @@ def _set_soft_launch_proxy_state(
     doc["_launch_proxy_probe_warning"] = msg
 
 
+def _raise_if_strict_soft_launch(doc: Dict[str, Any], *, reason: str) -> None:
+    """Strict proxy profiles must not soft-continue when exit-IP / probe failed."""
+    if not _strict_proxy_mode(doc):
+        return
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Strict proxy: "
+            f"{reason}. Fix Settings → Proxy Providers (or manual line), then relaunch. "
+            "Browser was NOT opened."
+        )[:480],
+    )
+
+
 async def _best_effort_bind_exit_ip_at_launch(
     cred_uid: str,
     user: dict,
@@ -1968,7 +2184,11 @@ async def _best_effort_bind_exit_ip_at_launch(
     targeting: Optional[Dict[str, Any]],
     max_retries: int = 0,
 ) -> Dict[str, Any]:
-    """Rotating provider/manual: probe + dedupe when possible; never block browser open."""
+    """Rotating provider/manual: probe + dedupe when possible.
+
+    Soft-continues with proxy still attached when Strict is OFF.
+    Strict ON → abort if no verified unique exit IP.
+    """
     rotating_manual = _is_rotating_gateway_proxy(proxy_cfg) and not provider_id
     attempts = max_retries or (8 if (provider_id or rotating_manual) else 3)
     last_probe: Dict[str, Any] = {}
@@ -2041,14 +2261,18 @@ async def _best_effort_bind_exit_ip_at_launch(
         else:
             break
 
+    err = str(last_probe.get("error") or "").strip() or "exit IP probe failed"
+    _raise_if_strict_soft_launch(
+        doc,
+        reason=f"could not verify a unique exit IP before launch ({err[:160]})",
+    )
     if rotating_manual or provider_id:
-        err = str(last_probe.get("error") or "").strip()
         doc["_launch_proxy_probe_warning"] = (
             "Could not reserve a team-unique exit IP before launch — browser will "
             "open and verify proxy after connect. For rotating gateways, each new "
             "session usually assigns a fresh IP."
         )
-        if err:
+        if err and err != "exit IP probe failed":
             doc["_launch_proxy_probe_warning"] += f" ({err[:80]})"
         doc.pop("exit_ip", None)
         doc["proxy"] = dict(proxy_cfg)
@@ -2612,6 +2836,13 @@ async def _ensure_profile_launch_proxy(
                     )
                     continue
                 if _proxy_ready_for_soft_launch(proxy_cfg):
+                    _raise_if_strict_soft_launch(
+                        doc,
+                        reason=(
+                            "proxy exit-IP pre-check failed "
+                            f"({str(probe.get('error') or 'no exit IP')[:120]})"
+                        ),
+                    )
                     _set_soft_launch_proxy_state(doc, proxy_cfg, probe=probe)
                     logger.warning(
                         f"[browser-profile launch] soft launch without exit_ip "
@@ -2664,6 +2895,13 @@ async def _ensure_profile_launch_proxy(
                 raise
 
     if _proxy_ready_for_soft_launch(proxy_cfg):
+        _raise_if_strict_soft_launch(
+            doc,
+            reason=(
+                "could not allocate a unique verified exit IP "
+                f"({str((last_probe or {}).get('error') or 'probe failed')[:120]})"
+            ),
+        )
         _set_soft_launch_proxy_state(doc, proxy_cfg, probe=last_probe)
         return await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
     if last_err:
@@ -3579,12 +3817,17 @@ async def export_cookies(request: Request, profile_id: str):
 
 @router.put("/{profile_id}/cookies")
 async def import_cookies(request: Request, profile_id: str, body: CookieImportBody):
-    """Import cookies (replace or merge)."""
+    """Import cookies (replace or merge). Owner-only — matches export ACL."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    # Use ACL helper so shared users get 403 (not misleading 404), then
+    # require ownership — same policy as cookie export.
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    if str(doc.get("user_id") or "") != str(uid):
+        raise HTTPException(
+            status_code=403,
+            detail="Cookie import is owner-only for shared profiles",
+        )
     existing = dict(doc.get("storage_state") or {})
     cookies: List[Dict[str, Any]] = []
     origins = list(existing.get("origins") or [])
@@ -3655,9 +3898,7 @@ async def fingerprint_preview(request: Request, profile_id: str):
     """Coherence panel data from stored profile fields — no browser launch."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
     pub = _public_view(doc)
     anti = doc.get("anti_detect") or {}
     if not isinstance(anti, dict):
@@ -3699,9 +3940,9 @@ async def fingerprint_preview(request: Request, profile_id: str):
             "audio_mode": str(anti.get("audio_mode") or "noise"),
             "font_mode": str(anti.get("font_mode") or "noise"),
             "webrtc_mode": str(anti.get("webrtc_mode") or "proxy"),
-            "use_persistent_context": bool(anti.get("use_persistent_context", False)),
+            "use_persistent_context": bool(anti.get("use_persistent_context", True)),
             "proxy_check_on_launch": bool(anti.get("proxy_check_on_launch", True)),
-            "proxy_check_block_on_fail": bool(anti.get("proxy_check_block_on_fail", False)),
+            "proxy_check_block_on_fail": bool(anti.get("proxy_check_block_on_fail", True)),
             "browser_kernel": str(anti.get("browser_kernel") or "auto"),
             "fingerprint_win": bool(anti.get("fingerprint_win", True)),
             "fingerprint_win_prefer_real": bool(anti.get("fingerprint_win_prefer_real", True)),
@@ -3983,7 +4224,15 @@ async def update_profile(request: Request, profile_id: str, body: ProfileBody):
     new_doc["exit_ip"] = existing.get("exit_ip") or ""
     new_doc["cdp_ws"] = existing.get("cdp_ws") or ""
     new_doc["updated_at"] = _now_iso()
-    _proxy = new_doc.get("proxy") or {}
+    # Password redact on GET means edit forms send password="". Keep prior
+    # secret unless the operator typed a new one.
+    _proxy = dict(new_doc.get("proxy") or {})
+    _old_proxy = dict(existing.get("proxy") or {})
+    if not str(_proxy.get("password") or "").strip() and str(_old_proxy.get("password") or "").strip():
+        _proxy["password"] = _old_proxy["password"]
+    if not str(_proxy.get("raw_line") or "").strip() and str(_old_proxy.get("raw_line") or "").strip():
+        _proxy["raw_line"] = _old_proxy["raw_line"]
+    new_doc["proxy"] = _proxy
     _wants_proxy = proxy_is_active(_proxy)
     if _wants_proxy and not str(_proxy.get("server") or "").strip():
         _used = await _load_team_profile_used_ips(uid)
@@ -4073,11 +4322,21 @@ async def launch_preview(request: Request, profile_id: str):
         "exit_ip": view.get("exit_ip") or "",
         "cookie_count": (view.get("storage_state_stats") or {}).get("cookie_count") or 0,
         "proxy_enabled": proxy_is_active(proxy),
+        "strict_proxy": bool(view.get("strict_proxy")),
+        "strict_mobile_shell": bool(view.get("strict_mobile_shell")),
+        "proxy_check_age_hours": view.get("proxy_check_age_hours"),
+        "proxy_check_stale": bool(view.get("proxy_check_stale")),
+        "is_mobile": bool(doc.get("is_mobile")),
+        "os": str(doc.get("os") or ""),
+        "mobile_shell_active": bool(view.get("mobile_shell_active")),
+        "mobile_shell_embedded": bool(view.get("mobile_shell_embedded")),
         "device": doc.get("device_model") or doc.get("device_type") or "",
         "last_proxy_check": view.get("last_proxy_check") or {},
         "ready": health.get("level") in ("good", "warn", "unknown"),
         "default_automation_upload_id": str(doc.get("default_automation_upload_id") or ""),
         "default_data_file_id": str(doc.get("default_data_file_id") or ""),
+        "launch_warnings": list(view.get("launch_warnings") or []),
+        "engine_used": str(view.get("engine_used") or ""),
     }
 
 @router.post("/{profile_id}/clone")
@@ -4175,6 +4434,11 @@ async def launch_profile(
             auto_payload,
             doc,
             bulk_row_index=_bulk_row_index,
+            claim_next=(
+                True
+                if _bulk_row_index is not None
+                else bool((auto_payload or {}).get("claim_next"))
+            ),
         )
     except ValueError as _auto_err:
         raise HTTPException(status_code=400, detail=str(_auto_err)) from _auto_err
@@ -4497,6 +4761,21 @@ async def save_automation_defaults(
     return {"ok": True, "profile": _public_view(doc or {})}
 
 
+@router.post("/validate-automation")
+async def validate_automation(request: Request, body: ValidateAutomationBody):
+    """Dry-run: JSON template parses + placeholders match lead columns."""
+    user = await _resolve_user(request)
+    uid = _resolve_user_or_401(user)
+    from browser_profile_automation import validate_automation_against_data
+
+    return await validate_automation_against_data(
+        _DB,
+        uid,
+        automation_upload_id=str(body.automation_upload_id or "").strip(),
+        data_file_id=str(body.data_file_id or "").strip(),
+    )
+
+
 @router.post("/{profile_id}/run-automation")
 async def run_profile_automation_endpoint(
     request: Request,
@@ -4528,6 +4807,9 @@ async def run_profile_automation_endpoint(
         "lead_row_index": int(body.lead_row_index or 0),
         "skip_missing_steps": body.skip_missing_steps,
         "self_heal": body.self_heal,
+        "after_mode": str(body.after_mode or "manual"),
+        "consume_mode": str(body.consume_mode or "on_submit"),
+        "claim_next": body.claim_next is not False,
         "proxy_upload_id": str(body.proxy_upload_id or "").strip(),
         "ua_upload_id": str(body.ua_upload_id or "").strip(),
         "smart_funnel_enabled": bool(body.smart_funnel_enabled),
@@ -4538,7 +4820,13 @@ async def run_profile_automation_endpoint(
     try:
         from browser_profile_automation import resolve_launch_automation
 
-        auto_spec = await resolve_launch_automation(_DB, uid, auto_payload, doc)
+        auto_spec = await resolve_launch_automation(
+            _DB,
+            uid,
+            auto_payload,
+            doc,
+            claim_next=bool(auto_payload.get("claim_next")),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -5273,6 +5561,8 @@ async def bulk_launch(request: Request, body: BulkLaunchBody):
             automation=body.automation,
         )
         try:
+            # Always pass a bulk marker so resolve uses atomic claim_next
+            # (selection index is NOT used as lead row — avoids duplicate leads).
             result = await launch_profile(
                 request,
                 pid,
@@ -5336,7 +5626,9 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
             data_file_id=row_data_file,
             skip_missing_steps=body.skip_missing_steps is not False,
             self_heal=bool(body.self_heal),
-            after_mode="manual",
+            after_mode=str(body.after_mode or "manual"),
+            consume_mode=str(body.consume_mode or "on_submit"),
+            claim_next=body.claim_next is not False,
             proxy_upload_id=default_proxy_upload,
             ua_upload_id=str(body.ua_upload_id or "").strip(),
             smart_funnel_enabled=bool(body.smart_funnel_enabled),
@@ -5353,9 +5645,12 @@ async def bulk_run_json(request: Request, body: BulkRunJsonBody):
                 run_body = RunAutomationBody(
                     automation_upload_id=upload_id,
                     data_file_id=row_data_file,
-                    lead_row_index=idx,
+                    lead_row_index=0,
                     skip_missing_steps=body.skip_missing_steps,
                     self_heal=body.self_heal,
+                    after_mode=str(body.after_mode or "manual"),
+                    consume_mode=str(body.consume_mode or "on_submit"),
+                    claim_next=body.claim_next is not False,
                     proxy_upload_id=default_proxy_upload,
                 )
                 result = await run_profile_automation_endpoint(request, pid, run_body)

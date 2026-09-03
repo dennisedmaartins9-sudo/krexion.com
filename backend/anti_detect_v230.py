@@ -758,8 +758,31 @@ _CDP_STEALTH_JS = r"""
 """
 
 
-def cdp_stealth_js() -> str:
+def cdp_stealth_js(*, safari_mode: bool = False) -> str:
     """JS patches that hide attached CDP / Playwright runtime side-effects."""
+    if safari_mode:
+        # Same scrub without inventing window.chrome (Safari must not have it).
+        return r"""
+(() => { try {
+  try {
+    const proto = Navigator.prototype;
+    if (proto && 'webdriver' in proto) {
+      Object.defineProperty(proto, 'webdriver', { get: () => undefined, configurable: true });
+    }
+  } catch (e) {}
+  try {
+    const names = Object.getOwnPropertyNames(window);
+    for (const n of names) {
+      if (/^cdc_|__playwright|__pw_|__webdriver/i.test(n)) {
+        try { delete window[n]; } catch (e2) {}
+      }
+    }
+  } catch (e) {}
+  try {
+    if (Error.prepareStackTrace) Error.prepareStackTrace = undefined;
+  } catch (e) {}
+} catch (_kxE) {} })();
+"""
     return _CDP_STEALTH_JS
 
 
@@ -1510,23 +1533,31 @@ def webgl_align_js(cfg: Dict[str, Any]) -> str:
 # ══════════════════════════════════════════════════════════════════════
 # 20. HIGH-LEVEL ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════
-def build_v230_stealth_bundle() -> str:
+def build_v230_stealth_bundle(*, safari_mode: bool = False) -> str:
     """Return the concatenated JS blob for ALL 11 JS-based features.
     Caller passes this into a single `context.add_init_script(...)`
-    call — one round-trip instead of 11."""
-    return "\n".join([
-        cdp_stealth_js(),
+    call — one round-trip instead of 11.
+
+    safari_mode: skip Chromium-only surfaces (chrome.runtime, PDF plugins,
+    Privacy Sandbox Topics) so WebKit/iOS profiles stay Safari-shaped.
+    """
+    parts = [
+        cdp_stealth_js(safari_mode=safari_mode),
         bot_vendor_stealth_js(),
         mobile_signals_js(),
         webgl_extensions_js(),
         speech_voices_js(),
         battery_fluctuation_js(),
-        privacy_sandbox_js(),
-        extension_emulation_js(),
-        ad_blocker_realism_js(),
-        first_party_sets_js(),
-        post_conversion_js(),   # activates only on thank-you pages
-    ])
+    ]
+    if not safari_mode:
+        parts.extend([
+            privacy_sandbox_js(),
+            extension_emulation_js(),
+            ad_blocker_realism_js(),
+            first_party_sets_js(),
+        ])
+    parts.append(post_conversion_js())  # activates only on thank-you pages
+    return "\n".join(parts)
 
 
 async def apply_v230_stealth(
@@ -1535,6 +1566,7 @@ async def apply_v230_stealth(
     viewport: Optional[Dict[str, int]] = None,
     platform: str = "",
     sec_fetch_kind: str = "typed_url",
+    safari_mode: bool = False,
 ) -> Dict[str, Any]:
     """One-call orchestrator that wires every v2.3.0 JS feature into a
     Playwright browser context AND returns the header dict the caller
@@ -1545,14 +1577,16 @@ async def apply_v230_stealth(
         # Set extra HTTP headers (Sec-Fetch-* + Full Client Hints)
         headers = {}
         headers.update(sec_fetch_headers(sec_fetch_kind or "typed_url"))
-        headers.update(full_client_hints(ua, viewport))
+        # Safari/WebKit must NOT emit Chromium Sec-CH-UA brands
+        if not safari_mode:
+            headers.update(full_client_hints(ua, viewport))
+            report["http2_settings"] = http2_settings_for_ua(ua)
         report["headers"] = headers
-        report["http2_settings"] = http2_settings_for_ua(ua)
     except Exception as e:
         logger.debug(f"v230 header build failed: {e}")
 
     try:
-        js = build_v230_stealth_bundle()
+        js = build_v230_stealth_bundle(safari_mode=bool(safari_mode))
         await context.add_init_script(js)
         report["js_ok"] = True
     except Exception as e:

@@ -26,7 +26,9 @@ def test_apply_mobile_shell_starts_subprocess_before_thread():
     def _fake_loop(*_a, **_k):
         started["thread"] = True
 
-    with patch.object(shell, "_start_shell_process", side_effect=_fake_start), patch.object(
+    with patch.object(shell, "_IS_WINDOWS", True), patch.object(
+        shell, "_start_shell_process", side_effect=_fake_start
+    ), patch.object(
         shell, "_shell_apply_loop", side_effect=_fake_loop
     ), patch.object(shell, "_center_origin", return_value=(100, 80)):
         t = shell.apply_krexion_mobile_shell(
@@ -59,5 +61,11 @@ def test_wait_for_mobile_shell_eventually_true():
 def test_launcher_uses_wait_for_mobile_shell():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "wait_for_mobile_shell" in src
-    assert "timeout_sec=15.0" in src or "timeout_sec=30.0" in src
+    assert (
+        "timeout_sec=15.0" in src
+        or "timeout_sec=30.0" in src
+        or "timeout_sec=12.0" in src
+        or "timeout_sec=18.0" in src
+    )
     assert "is_mobile_shell_alive" in src
+    assert "wait_for_mobile_shell_embedded" in src

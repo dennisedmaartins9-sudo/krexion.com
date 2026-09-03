@@ -27,10 +27,12 @@ def test_icon_loop_skips_toolwindow_and_shell():
 
 def test_launcher_shell_before_icon_keeper():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
-    assert "Mobile shell FIRST" in src
+    # v2.7.105d — early phone chrome + stop icon keeper when shell embeds
+    assert "Early Krexion phone chrome" in src
     assert "stop_session_icon_keeper(str(session_id))" in src
     assert "session_lifetime=False" in src
     assert "is_mobile_shell_alive(session_id)" in src
+    assert "wait_for_mobile_shell_embedded" in src
 
 
 def test_shell_loop_does_not_kill_chrome_on_crash():

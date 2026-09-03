@@ -48,6 +48,9 @@ const DEFAULT_LAUNCH_AUTO = {
   self_heal: false,
   save_as_default: false,
   proxy_upload_id: "",
+  after_mode: "manual",
+  consume_mode: "on_submit",
+  claim_next: false,
 };
 const PAGE_SIZE = 50;
 
@@ -121,6 +124,7 @@ const DEFAULT_NEW = {
     use_proxyjet: false,
     proxyjet_country: "US",
     proxyjet_state: "",
+    proxy_type: "http",
     // v2.4.0 — Selected Proxy Provider (from Settings › Proxy Providers)
     provider_id: "",
   },
@@ -138,14 +142,22 @@ const DEFAULT_NEW = {
     audio_mode: "noise",
     font_mode: "noise",
     webrtc_mode: "proxy",
-    use_persistent_context: false,
+    // Full disk profile dir (better login persistence)
+    use_persistent_context: true,
     proxy_check_on_launch: true,
-    proxy_check_block_on_fail: false,
+    // Strict proxy ON for new profiles — never open on real IP if proxy dead
+    proxy_check_block_on_fail: true,
+    // Abort if phone chrome (mobile shell) cannot frame the browser
+    strict_mobile_shell: true,
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
     allow_extensions: false,
     extensions_dir: "",
+    // v2.7.105e — anti-detect hardening defaults
+    local_api_cdp: false,
+    disable_ipv6: true,
+    stealth_profile: "full",
   },
   referrer: { ...DEFAULT_PROFILE_REFERRER },
 };
@@ -759,9 +771,15 @@ export default function BrowserProfilesPage() {
     const h = p.health || {};
     const level = h.level || "unknown";
     const score = h.score != null ? h.score : "—";
+    const stale = h.proxy_check_stale ? " · proxy check stale" : "";
     return (
-      <Badge variant="outline" className={`text-[10px] ${healthBadgeClass(level)}`} title={(h.issues || []).join("; ")}>
-        {level} · {score}
+      <Badge
+        variant="outline"
+        className={`text-[10px] ${healthBadgeClass(level)}`}
+        title={`${(h.issues || []).join("; ")}${h.proxy_check_age_sec != null ? ` · checked ${Math.round(h.proxy_check_age_sec / 3600)}h ago` : ""}`}
+        data-testid={`bp-health-${p.id}`}
+      >
+        {level} · {score}{stale}
       </Badge>
     );
   };
@@ -780,12 +798,8 @@ export default function BrowserProfilesPage() {
   };
 
   const handleCreate = async () => {
-    // 2026-01: When NOT editing an existing profile, route through the
-    // new advanced-create endpoint so the form fully exploits the UA
-    // generator + ProxyJet integration (no need for the customer to
-    // pre-fill `user_agent` or proxy creds manually). The Edit flow
-    // keeps using the old `/` PUT — that just replaces existing config
-    // verbatim.
+    // Create uses advanced-create (UA generator + any Proxy Provider from Settings).
+    // Edit uses PUT / — replaces existing config verbatim.
     if (!editingId) {
       return handleAdvancedCreate();
     }
@@ -859,6 +873,7 @@ export default function BrowserProfilesPage() {
               smart_session: advProxy.smart_session !== false,
               country: (form.country || advProxy.country || "US").toUpperCase(),
               state: (advProxy.state || "").toUpperCase(),
+              sticky_minutes: Number(advProxy.sticky_minutes) || 0,
             };
           }
           if (advProxy.mode === "proxyjet") {
@@ -948,7 +963,9 @@ export default function BrowserProfilesPage() {
           data_file_id: bulkLaunchAuto.data_file_id || "",
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
-          after_mode: "manual",
+          after_mode: bulkLaunchAuto.after_mode || "manual",
+          consume_mode: bulkLaunchAuto.consume_mode || "on_submit",
+          claim_next: true,
           proxy_upload_id: bulkLaunchAuto.proxy_upload_id || "",
         };
       }
@@ -984,6 +1001,9 @@ export default function BrowserProfilesPage() {
           max_concurrent: maxConcurrent,
           skip_missing_steps: bulkLaunchAuto.skip_missing_steps !== false,
           self_heal: !!bulkLaunchAuto.self_heal,
+          after_mode: bulkLaunchAuto.after_mode || "manual",
+          consume_mode: bulkLaunchAuto.consume_mode || "on_submit",
+          claim_next: true,
         }),
       });
       if (!r.ok) throw new Error(await r.text());
@@ -1575,9 +1595,15 @@ export default function BrowserProfilesPage() {
           lead_row_index: Number(auto.lead_row_index) || 0,
           skip_missing_steps: auto.skip_missing_steps !== false,
           self_heal: !!auto.self_heal,
-          after_mode: "manual",
+          after_mode: auto.after_mode || "manual",
+          consume_mode: auto.consume_mode || "on_submit",
+          claim_next: !!auto.claim_next,
           save_as_default: !!auto.save_as_default,
+          proxy_upload_id: auto.proxy_upload_id || "",
         };
+      }
+      if (auto.recheck_proxy) {
+        payload.recheck_proxy = true;
       }
       const r = await fetch(`${API}/${id}/launch`, {
         method: "POST", headers: authHeaders,
@@ -1655,6 +1681,9 @@ export default function BrowserProfilesPage() {
           lead_row_index: Number(launchAuto.lead_row_index) || 0,
           skip_missing_steps: launchAuto.skip_missing_steps !== false,
           self_heal: !!launchAuto.self_heal,
+          after_mode: launchAuto.after_mode || "manual",
+          consume_mode: launchAuto.consume_mode || "on_submit",
+          claim_next: !!launchAuto.claim_next,
         }),
       });
       if (!r.ok) throw new Error(await r.text());
@@ -1953,6 +1982,11 @@ export default function BrowserProfilesPage() {
             (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
             app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
             Select multiple cards for bulk Launch / Stop / Delete.
+            <div className="mt-2 text-amber-100/90">
+              <span className="font-semibold">New defaults:</span> Strict proxy ON (dead proxy = no browser / no real-IP leak)
+              · Full profile save ON · iPhone/Android = desktop shell, not a real phone.
+              · Use <span className="text-amber-50">any</span> proxy provider from Settings (not locked to one vendor).
+            </div>
           </div>
         </div>
 
@@ -2149,8 +2183,48 @@ export default function BrowserProfilesPage() {
                       <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
                     ))}
                   </select>
+                  <select
+                    className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[110px]"
+                    value={bulkLaunchAuto.after_mode || "manual"}
+                    onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, after_mode: e.target.value }))}
+                    data-testid="bp-bulk-after-mode"
+                    title="After JSON finishes"
+                  >
+                    <option value="manual">Keep open</option>
+                    <option value="close">Close browser</option>
+                    <option value="next_lead">Next lead</option>
+                  </select>
+                  <select
+                    className="bg-zinc-950 border border-zinc-700 rounded px-1 py-0.5 text-zinc-200 max-w-[120px]"
+                    value={bulkLaunchAuto.consume_mode || "on_submit"}
+                    onChange={(e) => setBulkLaunchAuto((s) => ({ ...s, consume_mode: e.target.value }))}
+                    data-testid="bp-bulk-consume-mode"
+                    title="When to remove lead row"
+                  >
+                    <option value="on_submit">Consume on submit</option>
+                    <option value="on_start">Consume on start</option>
+                  </select>
                 </>
               )}
+              {bulkLaunchAuto.data_file_id && (() => {
+                const df = dataFileUploads.find((u) => u.id === bulkLaunchAuto.data_file_id);
+                const left = df?.available_count ?? df?.item_count ?? df?.row_count;
+                if (df && (df.depleted || left === 0)) {
+                  return (
+                    <span className="text-red-400 text-[10px]" data-testid="bp-bulk-leads-depleted">
+                      Lead file depleted
+                    </span>
+                  );
+                }
+                if (typeof left === "number" && left > 0 && left < selectedCount) {
+                  return (
+                    <span className="text-amber-400 text-[10px]" data-testid="bp-bulk-leads-short">
+                      Only {left} leads for {selectedCount} profiles
+                    </span>
+                  );
+                }
+                return null;
+              })()}
             </div>
             <Button size="sm" disabled={!selectedCount || bulkBusy || (bulkLaunchAuto.enabled && !bulkLaunchAuto.automation_upload_id)} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
@@ -2489,6 +2563,39 @@ export default function BrowserProfilesPage() {
                       ))}
                     </div>
                   )}
+                  {!!p.is_mobile && (p.status === "running" || p.status === "launching") && (
+                    <div
+                      className={`mt-2 text-[10px] rounded px-2 py-1 border ${
+                        p.mobile_shell_embedded
+                          ? "text-emerald-200 bg-emerald-950/30 border-emerald-800/40"
+                          : "text-amber-200 bg-amber-950/40 border-amber-800/50"
+                      }`}
+                      data-testid={`bp-mobile-honesty-${p.id}`}
+                    >
+                      {p.mobile_shell_embedded
+                        ? "Krexion phone chrome active (desktop frame — not a real device)"
+                        : p.mobile_shell_active
+                          ? "Phone chrome started — waiting to frame browser…"
+                          : "Desktop Chromium/WebKit — Krexion phone chrome off / unavailable"}
+                    </div>
+                  )}
+                  {p.proxy_check_stale && (
+                    <div className="mt-1 text-[10px] text-amber-400/90" data-testid={`bp-proxy-stale-${p.id}`}>
+                      Proxy check stale
+                      {typeof p.proxy_check_age_hours === "number"
+                        ? ` (${Math.round(p.proxy_check_age_hours)}h)`
+                        : ""} — recheck recommended
+                    </div>
+                  )}
+                  {(p.automation_status === "completed" || p.automation_status === "error" || p.automation_status === "stopped") && (
+                    <div className="mt-1 text-[10px] text-zinc-500" data-testid={`bp-auto-log-${p.id}`}>
+                      JSON {p.automation_status}
+                      {p.automation_step != null && p.automation_total_steps
+                        ? ` · ${p.automation_step}/${p.automation_total_steps}`
+                        : ""}
+                      {p.automation_error ? ` · ${String(p.automation_error).slice(0, 80)}` : ""}
+                    </div>
+                  )}
                   {(p.status === "error" || p.status === "queued" || p.status === "launching") && p.last_error && (
                     <div className="mt-2 space-y-1">
                       <div className="text-[10px] text-red-300/90 italic break-words" data-testid={`bp-last-error-${p.id}`}>
@@ -2669,6 +2776,13 @@ export default function BrowserProfilesPage() {
                           device_scale_factor: mob ? 3 : 1,
                           os: mob ? "android" : "windows",
                           viewport: newViewport,
+                          anti_detect: {
+                            ...form.anti_detect,
+                            // Mobile defaults to Strict phone chrome ON
+                            strict_mobile_shell: mob
+                              ? (form.anti_detect?.strict_mobile_shell !== false)
+                              : !!form.anti_detect?.strict_mobile_shell,
+                          },
                         });
                       }}
                       className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
@@ -2777,8 +2891,10 @@ export default function BrowserProfilesPage() {
                           </div>
                         </div>
                       )}
-                      <p className="text-[11px] text-zinc-500">
-                        iOS → Safari engine (real iPhone browsing). Android / Desktop → Chromium. Each profile gets a unique UA + device model.
+                      <p className="text-[11px] text-amber-200/90" data-testid="bp-ios-honesty">
+                        iOS uses Playwright WebKit + Krexion phone shell on your PC —{" "}
+                        <span className="font-semibold">not a real iPhone</span>.
+                        Android/Desktop use Chromium. Good for UX / manual checks; advanced trackers can still see it is a desktop browser.
                       </p>
                     </div>
                   )}
@@ -3089,7 +3205,9 @@ export default function BrowserProfilesPage() {
                                 ))}
                               </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
-                                proxy = leak via proxy IP; disabled = block; real = system WebRTC
+                                Keep <span className="text-zinc-300">proxy</span> when a proxy is on.
+                                &quot;proxy&quot; = Chromium UDP block (not exit-IP ICE rewrite).
+                                &quot;real&quot; can leak your real IP — launcher auto-forces proxy if needed.
                               </p>
                             </div>
                           </div>
@@ -3098,15 +3216,20 @@ export default function BrowserProfilesPage() {
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, tls_prewarm: e.target.checked } })} />
                             <span>
                               tls_prewarm
-                              <span className="block text-[9px] text-zinc-500">Warm TLS session to start URL before browse</span>
+                              <span className="block text-[9px] text-zinc-500">
+                                Cookie/origin seed only — does NOT change live browser JA3/H2 fingerprint.
+                              </span>
                             </span>
                           </label>
                           <label className="flex items-start gap-2">
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.use_persistent_context}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, use_persistent_context: e.target.checked } })} />
                             <span>
-                              use_persistent_context
-                              <span className="block text-[9px] text-zinc-500">Disk profile dir instead of ephemeral + storage_state</span>
+                              Full profile save (persistent folder)
+                              <span className="block text-[9px] text-zinc-500">
+                                AdsPower-style disk profile — logins / site data survive better than cookies-only.
+                                Keep ON for accounts you log into.
+                              </span>
                             </span>
                           </label>
                           <label className="flex items-start gap-2">
@@ -3117,14 +3240,71 @@ export default function BrowserProfilesPage() {
                               <span className="block text-[9px] text-zinc-500">Verify exit IP when launching</span>
                             </span>
                           </label>
-                          <label className="flex items-start gap-2">
+                          <label className="flex items-start gap-2" data-testid="bp-strict-proxy">
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.proxy_check_block_on_fail}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, proxy_check_block_on_fail: e.target.checked } })} />
                             <span>
-                              proxy_check_block_on_fail
-                              <span className="block text-[9px] text-zinc-500">Abort launch if proxy check fails</span>
+                              Strict proxy (never open without working proxy)
+                              <span className="block text-[9px] text-zinc-500">
+                                If proxy DNS/check fails, abort launch — do NOT open on your real IP.
+                                Recommended ON for agency / offer accounts.
+                              </span>
                             </span>
                           </label>
+                          <label className="flex items-start gap-2" data-testid="bp-strict-mobile-shell">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.strict_mobile_shell}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, strict_mobile_shell: e.target.checked } })} />
+                            <span>
+                              Strict mobile shell (abort if phone chrome fails)
+                              <span className="block text-[9px] text-zinc-500">
+                                Windows phone frame must embed the browser — otherwise launch aborts
+                                (no plain Chromium/WebKit fake). Default ON for mobile profiles.
+                              </span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2" data-testid="bp-local-api-cdp">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.local_api_cdp}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, local_api_cdp: e.target.checked } })} />
+                            <span>
+                              Local API CDP (remote debugging)
+                              <span className="block text-[9px] text-zinc-500">
+                                Opens --remote-debugging-port on 127.0.0.1 for automation. Default OFF — detection surface if unused.
+                              </span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2" data-testid="bp-disable-ipv6">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={form.anti_detect.disable_ipv6 !== false}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, disable_ipv6: e.target.checked } })} />
+                            <span>
+                              Disable IPv6
+                              <span className="block text-[9px] text-zinc-500">
+                                Prefer IPv4 — reduces dual-stack / WebRTC IPv6 leaks with proxies. Default ON.
+                              </span>
+                            </span>
+                          </label>
+                          <div>
+                            <Label className="text-zinc-400 text-[10px]">Stealth profile</Label>
+                            <select
+                              className="mt-1 w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
+                              value={form.anti_detect.stealth_profile || "full"}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, stealth_profile: e.target.value } })}
+                              data-testid="bp-stealth-profile"
+                            >
+                              <option value="full">Full (Chromium stack)</option>
+                              <option value="minimal">Minimal (fewer JS patches)</option>
+                              <option value="safari">Safari-shaped (WebKit / no chrome.*)</option>
+                            </select>
+                            <span className="block text-[9px] text-zinc-500 mt-0.5">
+                              WebKit iOS launches auto-use Safari-shaped. TLS prewarm = cookie seed only — not live JA3.
+                            </span>
+                          </div>
+                          {(form.is_mobile || form.device_type === "mobile") && (
+                            ["canvas_mode", "webgl_mode"].some((k) => ["real", "off"].includes(form.anti_detect?.[k])) && (
+                              <p className="text-[10px] text-amber-300/90" data-testid="bp-mode-mobile-warn">
+                                Mobile + canvas/webgl real/off: host GPU may not match UA — prefer noise unless Cloak quiet.
+                              </p>
+                            )
+                          )}
                           <label className="flex items-start gap-2">
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.allow_extensions}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, allow_extensions: e.target.checked } })} />
@@ -3198,11 +3378,16 @@ export default function BrowserProfilesPage() {
                           className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                       </div>
                     </div>
-                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                    <label className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer">
                       <input type="checkbox" checked={form.geo_follow_proxy !== false}
                         onChange={(e) => setForm({ ...form, geo_follow_proxy: e.target.checked })}
-                        className="w-4 h-4 rounded accent-fuchsia-500" />
-                      geo_follow_proxy
+                        className="w-4 h-4 rounded accent-fuchsia-500 mt-0.5" />
+                      <span>
+                        geo_follow_proxy
+                        <span className="block text-[9px] text-zinc-500">
+                          ON = timezone/locale follow proxy exit IP. OFF risks geo mismatch fraud signals.
+                        </span>
+                      </span>
                     </label>
                     <div>
                       <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>
@@ -3240,9 +3425,9 @@ export default function BrowserProfilesPage() {
                     <div className="pb-2 border-b border-cyan-500/20">
                       <ProxyProviderSelect
                         value={advProxy.provider_id}
-                        onChange={(v) => setAdvProxy({ ...advProxy, provider_id: v, mode: v ? "provider" : "none" })}
-                        label="Proxy provider (from Settings)"
-                        labelDefault="(pick a mode below instead)"
+                        onChange={(v) => setAdvProxy({ ...advProxy, provider_id: v, mode: v ? "provider" : (advProxy.mode === "provider" ? "none" : advProxy.mode) })}
+                        label="Proxy provider (Settings → add any provider: DataImpulse, Smartproxy, Oxylabs, etc.)"
+                        labelDefault="(or pick Manual / No Proxy below)"
                         testIdPrefix="bp-adv-proxy-provider"
                       />
                       {advProxy.mode === "provider" && advProxy.provider_id && (
@@ -3254,36 +3439,32 @@ export default function BrowserProfilesPage() {
                             onChange={(e) => setAdvProxy({ ...advProxy, smart_session: e.target.checked })}
                             data-testid="bp-adv-proxy-smart-session"
                           />
-                          Smart session — fresh provider IP at each launch (no bulk line pre-allocate)
+                          Smart session — fresh provider IP at each launch (recommended)
                         </label>
                       )}
+                      <p className="text-[10px] text-zinc-500 mt-1.5">
+                        Not locked to one vendor — use whatever proxy provider you added in Settings.
+                      </p>
                     </div>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-2 gap-2">
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "none" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="none" className="sr-only"
                           checked={advProxy.mode === "none"}
                           onChange={() => setAdvProxy({ ...advProxy, mode: "none", provider_id: "" })} />
                         <div className="font-semibold">No Proxy</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Direct connection</div>
-                      </label>
-                      <label data-testid="bp-proxy-mode-proxyjet" className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "proxyjet" ? "border-amber-400 bg-amber-500/15 text-amber-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
-                        <input type="radio" name="proxy_mode" value="proxyjet" className="sr-only"
-                          checked={advProxy.mode === "proxyjet"}
-                          onChange={() => setAdvProxy({ ...advProxy, mode: "proxyjet" })} />
-                        <div className="font-semibold">⚡ ProxyJet batch</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Pre-gen lines (optional) · launch fallback</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">Direct connection (real IP)</div>
                       </label>
                       <label className={`cursor-pointer p-2 rounded border text-center text-xs ${advProxy.mode === "manual" ? "border-cyan-400 bg-cyan-500/15 text-cyan-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}>
                         <input type="radio" name="proxy_mode" value="manual" className="sr-only"
                           checked={advProxy.mode === "manual"}
-                          onChange={() => setAdvProxy({ ...advProxy, mode: "manual" })} />
-                        <div className="font-semibold">Manual</div>
-                        <div className="text-[10px] mt-0.5 opacity-70">Paste host/port</div>
+                          onChange={() => setAdvProxy({ ...advProxy, mode: "manual", provider_id: "" })} />
+                        <div className="font-semibold">Manual line</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">Paste host:port:user:pass</div>
                       </label>
                     </div>
 
-                    {advProxy.mode === "proxyjet" && (
-                      <div className="grid grid-cols-3 gap-2">
+                    {advProxy.mode === "provider" && advProxy.provider_id && (
+                      <div className="grid grid-cols-3 gap-2" data-testid="bp-provider-targeting">
                         <div>
                           <Label className="text-zinc-300 text-[11px]">Country</Label>
                           <select data-testid="bp-pj-country" value={advProxy.country}
@@ -3294,11 +3475,6 @@ export default function BrowserProfilesPage() {
                         </div>
                         <div>
                           <Label className="text-zinc-300 text-[11px]">State <span className="text-zinc-500">(US only)</span></Label>
-                          {/* 2026-06 — Customer ask: state should be a
-                              dropdown, no typing. The dropdown is only
-                              meaningful when country=US, but we keep
-                              it visible (disabled+greyed) for non-US
-                              picks so the form layout stays stable. */}
                           <select
                             value={advProxy.state || ""}
                             onChange={(e) => setAdvProxy({ ...advProxy, state: e.target.value })}
@@ -3326,6 +3502,20 @@ export default function BrowserProfilesPage() {
                             <option value={120}>Sticky 120 min</option>
                           </select>
                         </div>
+                      </div>
+                    )}
+
+                    {advProxy.mode === "proxyjet" && (
+                      <div className="p-2 rounded border border-amber-700/40 bg-amber-950/20 text-[11px] text-amber-200" data-testid="bp-proxyjet-legacy-hint">
+                        Legacy batch mode is optional. Prefer picking your own provider above
+                        (DataImpulse / Smartproxy / Oxylabs / any gateway you added in Settings).
+                        <button
+                          type="button"
+                          className="ml-2 underline"
+                          onClick={() => setAdvProxy({ ...advProxy, mode: "none", provider_id: "" })}
+                        >
+                          Switch to provider / manual
+                        </button>
                       </div>
                     )}
 
@@ -3565,10 +3755,11 @@ export default function BrowserProfilesPage() {
                             proxy: {
                               ...form.proxy,
                               provider_id: v,
+                              // Legacy field name: means "auto from selected provider"
                               use_proxyjet: !!v,
                             },
                           })}
-                          label="Provider (optional)"
+                          label="Your proxy provider (any you added in Settings)"
                           labelDefault="(use manual proxy fields below)"
                           testIdPrefix="bp-proxy-provider"
                         />
@@ -3576,20 +3767,38 @@ export default function BrowserProfilesPage() {
                           <input type="checkbox" checked={form.proxy.use_proxyjet}
                             onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, use_proxyjet: e.target.checked } })}
                             className="w-4 h-4 rounded accent-cyan-500" />
-                          Auto-generate unique proxy via selected Provider (same as RUT)
+                          Auto-generate unique IP from selected provider each launch
                         </label>
                         {!form.proxy.use_proxyjet && (
                           <div className="grid grid-cols-2 gap-2">
-                            <Input placeholder="http://host:port" value={form.proxy.server}
+                            <div className="col-span-2">
+                              <Label className="text-zinc-400 text-[10px]">Type</Label>
+                              <select
+                                value={form.proxy.proxy_type || "http"}
+                                onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, proxy_type: e.target.value } })}
+                                className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
+                                data-testid="bp-form-proxy-type"
+                              >
+                                <option value="http">HTTP</option>
+                                <option value="https">HTTPS</option>
+                                <option value="socks5">SOCKS5</option>
+                                <option value="socks4">SOCKS4</option>
+                              </select>
+                            </div>
+                            <Input placeholder="http://host:port or socks5://host:port" value={form.proxy.server}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, server: e.target.value } })}
-                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
-                            <div />
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs col-span-2" />
                             <Input placeholder="username" value={form.proxy.username}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, username: e.target.value } })}
                               className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
-                            <Input placeholder="password" type="password" value={form.proxy.password}
+                            <Input
+                              placeholder={form.proxy.has_password ? "•••• saved (type to change)" : "password"}
+                              type="password"
+                              value={form.proxy.password || ""}
                               onChange={(e) => setForm({ ...form, proxy: { ...form.proxy, password: e.target.value } })}
-                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs" />
+                              className="bg-zinc-900 border-zinc-700 text-zinc-100 text-xs"
+                              autoComplete="new-password"
+                            />
                           </div>
                         )}
                       </div>
@@ -3840,12 +4049,37 @@ export default function BrowserProfilesPage() {
               <ul className="space-y-2 text-xs text-zinc-300 mb-4">
                 <li className="flex items-start gap-2">
                   <span className={launchChecklist.data.proxy_enabled ? "text-emerald-400" : "text-zinc-500"}>●</span>
-                  <span>Proxy: {launchChecklist.data.proxy_enabled ? (launchChecklist.data.exit_ip || "configured") : "none"}</span>
+                  <span>
+                    Proxy: {launchChecklist.data.proxy_enabled ? (launchChecklist.data.exit_ip || "configured") : "none"}
+                    {launchChecklist.data.strict_proxy !== false && launchChecklist.data.proxy_enabled && (
+                      <span className="text-emerald-500/80"> · strict</span>
+                    )}
+                    {typeof launchChecklist.data.proxy_check_age_hours === "number" && (
+                      <span className={launchChecklist.data.proxy_check_stale ? "text-amber-400" : "text-zinc-500"}>
+                        {" "}· checked {launchChecklist.data.proxy_check_age_hours < 1
+                          ? `${Math.round(launchChecklist.data.proxy_check_age_hours * 60)}m ago`
+                          : `${Math.round(launchChecklist.data.proxy_check_age_hours)}h ago`}
+                        {launchChecklist.data.proxy_check_stale ? " (stale)" : ""}
+                      </span>
+                    )}
+                  </span>
                 </li>
                 <li className="flex items-start gap-2">
                   <span className={launchChecklist.data.cookie_count > 0 ? "text-emerald-400" : "text-amber-400"}>●</span>
                   <span>Cookies: {launchChecklist.data.cookie_count || 0}</span>
                 </li>
+                {!!launchChecklist.data.is_mobile && (
+                  <li className="flex items-start gap-2" data-testid="bp-launch-mobile-honesty">
+                    <span className={launchChecklist.data.mobile_shell_embedded ? "text-emerald-400" : "text-amber-400"}>●</span>
+                    <span>
+                      {launchChecklist.data.mobile_shell_embedded
+                        ? "Last session: Krexion phone chrome framed the browser (desktop frame — not a real phone)"
+                        : launchChecklist.data.strict_mobile_shell !== false
+                          ? "Mobile + Strict shell ON — launch aborts if Krexion phone chrome cannot frame the browser (no plain Chromium/WebKit)."
+                          : "Mobile profile: without Strict shell, plain Chromium/WebKit may show if phone chrome fails. Shell is Windows-only."}
+                    </span>
+                  </li>
+                )}
                 <li className="flex items-start gap-2">
                   <span className={healthBadgeClass(launchChecklist.data.health?.level).includes("emerald") ? "text-emerald-400" : launchChecklist.data.health?.level === "bad" ? "text-red-400" : "text-amber-400"}>●</span>
                   <span>
@@ -3894,22 +4128,80 @@ export default function BrowserProfilesPage() {
                       >
                         <option value="">Static JSON only</option>
                         {dataFileUploads.map((u) => (
-                          <option key={u.id} value={u.id}>{u.name || u.filename || u.id.slice(0, 8)}</option>
+                          <option key={u.id} value={u.id}>
+                            {u.name || u.filename || u.id.slice(0, 8)}
+                            {typeof (u.available_count ?? u.item_count) === "number"
+                              ? ` (${u.available_count ?? u.item_count} left)`
+                              : ""}
+                            {u.depleted ? " — depleted" : ""}
+                          </option>
                         ))}
                       </select>
+                      {launchAuto.data_file_id && (() => {
+                        const df = dataFileUploads.find((u) => u.id === launchAuto.data_file_id);
+                        if (df && (df.depleted || (df.available_count ?? df.item_count) === 0)) {
+                          return (
+                            <p className="text-[10px] text-red-400 mt-1" data-testid="bp-launch-leads-depleted">
+                              This lead file is depleted — pick another or upload new rows.
+                            </p>
+                          );
+                        }
+                        return null;
+                      })()}
                     </div>
                     {launchAuto.data_file_id && (
-                      <div>
-                        <Label className="text-[10px] text-zinc-500">Lead row index</Label>
-                        <Input
-                          type="number"
-                          min={0}
-                          className="mt-1 h-7 text-xs bg-zinc-950 border-zinc-700"
-                          value={launchAuto.lead_row_index}
-                          onChange={(e) => setLaunchAuto((s) => ({ ...s, lead_row_index: Number(e.target.value) || 0 }))}
-                        />
-                      </div>
+                      <>
+                        <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="accent-fuchsia-500"
+                            checked={!!launchAuto.claim_next}
+                            onChange={(e) => setLaunchAuto((s) => ({ ...s, claim_next: e.target.checked }))}
+                            data-testid="bp-launch-claim-next"
+                          />
+                          Claim next free row (ignore index — race-safe)
+                        </label>
+                        {!launchAuto.claim_next && (
+                          <div>
+                            <Label className="text-[10px] text-zinc-500">Lead row index</Label>
+                            <Input
+                              type="number"
+                              min={0}
+                              className="mt-1 h-7 text-xs bg-zinc-950 border-zinc-700"
+                              value={launchAuto.lead_row_index}
+                              onChange={(e) => setLaunchAuto((s) => ({ ...s, lead_row_index: Number(e.target.value) || 0 }))}
+                            />
+                          </div>
+                        )}
+                      </>
                     )}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <Label className="text-[10px] text-zinc-500">After JSON</Label>
+                        <select
+                          className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                          value={launchAuto.after_mode || "manual"}
+                          onChange={(e) => setLaunchAuto((s) => ({ ...s, after_mode: e.target.value }))}
+                          data-testid="bp-launch-after-mode"
+                        >
+                          <option value="manual">Keep browser open</option>
+                          <option value="close">Close browser</option>
+                          <option value="next_lead">Run next lead</option>
+                        </select>
+                      </div>
+                      <div>
+                        <Label className="text-[10px] text-zinc-500">Consume lead</Label>
+                        <select
+                          className="mt-1 w-full bg-zinc-950 border border-zinc-700 rounded-md px-2 py-1.5 text-xs text-zinc-100"
+                          value={launchAuto.consume_mode || "on_submit"}
+                          onChange={(e) => setLaunchAuto((s) => ({ ...s, consume_mode: e.target.value }))}
+                          data-testid="bp-launch-consume-mode"
+                        >
+                          <option value="on_submit">On form submit</option>
+                          <option value="on_start">On automation start</option>
+                        </select>
+                      </div>
+                    </div>
                     <label className="flex items-center gap-2 text-[10px] text-zinc-400 cursor-pointer">
                       <input
                         type="checkbox"
@@ -3928,6 +4220,69 @@ export default function BrowserProfilesPage() {
                       />
                       Save as profile default (pre-select next time)
                     </label>
+                    <div className="flex gap-2 pt-1">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="border-zinc-700 text-zinc-300 h-7 text-[10px]"
+                        data-testid="bp-launch-validate-json"
+                        disabled={!launchAuto.automation_upload_id || uploadsLoading}
+                        onClick={async () => {
+                          try {
+                            const r = await fetch(`${API}/validate-automation`, {
+                              method: "POST",
+                              headers: authHeaders,
+                              body: JSON.stringify({
+                                automation_upload_id: launchAuto.automation_upload_id,
+                                data_file_id: launchAuto.data_file_id || "",
+                              }),
+                            });
+                            const d = await r.json();
+                            if (!r.ok) throw new Error(d.detail || JSON.stringify(d));
+                            if (d.ok) {
+                              toast.success(
+                                `JSON OK — ${d.total_steps} steps`
+                                + (d.row_count ? ` · ${d.row_count} leads` : "")
+                                + (d.warnings?.length ? ` · ${d.warnings.length} warning(s)` : ""),
+                              );
+                              (d.warnings || []).slice(0, 3).forEach((w) => toast.message(w));
+                            } else {
+                              toast.error((d.errors || ["Validation failed"]).join(" · "));
+                            }
+                          } catch (e) {
+                            toast.error(`Validate failed: ${e.message}`);
+                          }
+                        }}
+                      >
+                        Validate JSON
+                      </Button>
+                      {launchChecklist.data.proxy_enabled && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="border-zinc-700 text-zinc-300 h-7 text-[10px]"
+                          data-testid="bp-launch-recheck-proxy"
+                          onClick={async () => {
+                            try {
+                              const id = launchChecklist.id;
+                              const r = await fetch(`${API}/${id}/check-proxy`, { method: "POST", headers: authHeaders });
+                              if (!r.ok) throw new Error(await r.text());
+                              const d = await r.json();
+                              toast.success(d.ok !== false
+                                ? `Proxy OK${d.ip || d.exit_ip ? `: ${d.ip || d.exit_ip}` : ""}`
+                                : `Proxy check: ${d.error || "failed"}`);
+                              fetchProfiles();
+                            } catch (e) {
+                              toast.error(`Proxy recheck failed: ${e.message}`);
+                            }
+                          }}
+                        >
+                          Recheck proxy
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 )}
                 {!launchAuto.enabled && (

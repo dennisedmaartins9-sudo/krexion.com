@@ -28,8 +28,11 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_7():
-    # Superseded by later releases — keep suite green.
-    assert _read("VERSION").strip() == "2.7.10"
+    # Superseded by later releases — keep suite green with semver compare.
+    from releases_module import _parse
+
+    ver = _read("VERSION").strip()
+    assert _parse(ver) >= _parse("2.7.7")
 
 
 def test_rut_fallback_and_android_pool_chrome_136():

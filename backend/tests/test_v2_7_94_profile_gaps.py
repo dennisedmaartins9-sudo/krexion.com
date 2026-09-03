@@ -12,7 +12,12 @@ def test_launch_warnings_on_webkit_and_mobile_shell_fail():
     src = _read("browser_profile_launcher.py")
     assert "_launch_warnings" in src
     assert "launch_warnings" in src
-    assert "not a real iOS Safari fingerprint" in src or "NOT a real iOS Safari" in src
+    assert (
+        "not a real iOS Safari fingerprint" in src
+        or "NOT a real iOS Safari" in src
+        or "NOT a real iPhone/iOS Safari" in src
+        or "not a real iPhone/Android device" in src
+    )
     assert "not the branded iOS/Android shell" in src
 
 

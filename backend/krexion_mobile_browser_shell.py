@@ -6,7 +6,8 @@ Headed mobile profiles get Krexion-branded chrome with platform-native UX:
   • Android — Chrome-like top omnibox + bottom nav
 
 Playwright engine runs in the content area; pywebview renders chrome only.
-Failures are swallowed — launch must never abort.
+Shell success requires engine HWND embedded (not process-only).
+When strict_mobile_shell is ON, launch must abort if chrome fails.
 """
 from __future__ import annotations
 
@@ -494,6 +495,8 @@ def _start_shell_process(
                 "origin_y": origin_y,
                 "interactive": bool(interactive) and bool(cfg.get("interactive")),
                 "err_log": err_log,
+                "engine_embedded": False,
+                "engine_hwnd": 0,
             }
         return proc
     except Exception as exc:
@@ -516,6 +519,28 @@ def is_mobile_shell_alive(session_key: str) -> bool:
         return False
 
 
+def is_mobile_shell_embedded(session_key: str) -> bool:
+    """True only after an engine HWND was positioned inside the phone frame."""
+    with _LOCK:
+        rec = _ACTIVE.get(str(session_key or ""))
+    if not rec:
+        return False
+    if not is_mobile_shell_alive(session_key):
+        return False
+    return bool(rec.get("engine_embedded"))
+
+
+def mark_mobile_shell_embedded(session_key: str, *, hwnd: int = 0) -> None:
+    with _LOCK:
+        rec = _ACTIVE.get(str(session_key or ""))
+        if not rec:
+            return
+        rec["engine_embedded"] = True
+        if hwnd:
+            rec["engine_hwnd"] = int(hwnd)
+        rec["embedded_at"] = time.time()
+
+
 def wait_for_mobile_shell(session_key: str, *, timeout_sec: float = 30.0) -> bool:
     """Wait until pywebview chrome subprocess is registered and alive."""
     deadline = time.time() + max(2.0, float(timeout_sec or 30.0))
@@ -524,6 +549,44 @@ def wait_for_mobile_shell(session_key: str, *, timeout_sec: float = 30.0) -> boo
             return True
         time.sleep(0.2)
     return is_mobile_shell_alive(session_key)
+
+
+def wait_for_mobile_shell_embedded(
+    session_key: str,
+    *,
+    timeout_sec: float = 25.0,
+) -> bool:
+    """Wait until engine HWND is framed inside Krexion phone chrome."""
+    deadline = time.time() + max(3.0, float(timeout_sec or 25.0))
+    while time.time() < deadline:
+        if is_mobile_shell_embedded(session_key):
+            return True
+        if not is_mobile_shell_alive(session_key):
+            # Process died — no point waiting for embed
+            return False
+        time.sleep(0.25)
+    return is_mobile_shell_embedded(session_key)
+
+
+def preflight_mobile_shell() -> Dict[str, Any]:
+    """Check whether Windows + pywebview can host Krexion phone chrome."""
+    out: Dict[str, Any] = {
+        "ok": False,
+        "windows": bool(_IS_WINDOWS),
+        "webview": False,
+        "error": "",
+    }
+    if not _IS_WINDOWS:
+        out["error"] = "Mobile shell requires Windows (pywebview phone frame)."
+        return out
+    try:
+        import webview  # noqa: F401
+
+        out["webview"] = True
+        out["ok"] = True
+    except Exception as exc:
+        out["error"] = f"pywebview import failed: {exc}"[:200]
+    return out
 
 
 def _center_origin(layout: MobileShellLayout) -> Tuple[int, int]:
@@ -812,6 +875,7 @@ def _shell_apply_loop(
                     user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
                     user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
                     _positioned.add(int(hwnd))
+                    mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
                 else:
                     _set_window_pos(
                         hwnd,
@@ -990,6 +1054,7 @@ def apply_krexion_mobile_shell(
             rec = _ACTIVE.get(key)
             if rec is not None:
                 rec["stop_event"] = stop_ev
+                rec.setdefault("engine_embedded", False)
         return t
     except Exception as exc:
         logger.debug(f"[mobile-shell] apply failed: {exc}")
@@ -1011,3 +1076,16 @@ def should_use_mobile_shell(profile_os: str, is_mobile: bool) -> bool:
     if plat not in ("ios", "ipados", "android"):
         plat = "android"
     return plat in ("ios", "ipados", "android")
+
+
+def mobile_shell_status(session_key: str) -> Dict[str, Any]:
+    """Snapshot for launcher / UI honesty."""
+    key = str(session_key or "")
+    alive = is_mobile_shell_alive(key)
+    embedded = is_mobile_shell_embedded(key)
+    return {
+        "alive": alive,
+        "embedded": embedded,
+        "ok": bool(alive and embedded),
+        "windows": bool(_IS_WINDOWS),
+    }

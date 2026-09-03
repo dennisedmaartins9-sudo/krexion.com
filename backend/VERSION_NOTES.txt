@@ -1,3 +1,20 @@
+# v2.7.105 — 2026-09 — Browser Profiles anti-detect + shell visual guarantee
+#
+# - Safari/WebKit engine-aware stealth (no window.chrome / Sec-CH-UA / FP WIN).
+# - CDP opt-in only (local_api_cdp); Cloak + persistent disk profiles coexist.
+# - language → Accept-Language; disable IPv6; deepened paranoia; Strict migrate.
+# - Honesty warnings: WebRTC UDP-block ≠ exit-IP ICE; TLS prewarm ≠ live JA3;
+#   geo_follow_proxy OFF risk; mobile canvas/webgl real/off mismatch.
+# - Krexion phone chrome: early shell + HWND embed proof; strict abort not swallowed.
+# - Portable RESULTS_ROOT fallback (native/CI) so RUT/form_filler import never
+#   PermissionError on missing /app/backend.
+# - Data/JSON: atomic lead claim, after/consume modes; proxy redact/strict/SOCKS.
+#
+# v2.7.104 — 2026-09 — Browser Profiles ACL/cookies/naming hardening
+#
+# - ACL role validation; reject unparseable cookie import; preserve HttpOnly/
+#   SameSite; no manual-proxy IP reuse; consistent smart unique naming.
+#
 # v2.7.103 — 2026-09 — Dead proxy DNS soft-launch (BestGo ENOTFOUND) + iPhone opens
 #
 # - Root cause: unresolvable hosts (e.g. ca.rrp.bestgo.work) made every profile

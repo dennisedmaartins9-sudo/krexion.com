@@ -352,6 +352,10 @@ def _headed_launch_args(anti: Optional[Dict[str, Any]] = None) -> List[str]:
         args = [a for a in args if a != "--disable-extensions"]
         if ext_path and os.path.isdir(ext_path):
             args.append(f"--load-extension={ext_path}")
+    # Prefer IPv4 when proxy is used — dual-stack leaks are a common fail
+    if anti.get("disable_ipv6", True) is not False:
+        if "--disable-ipv6" not in args:
+            args.append("--disable-ipv6")
     return args
 
 
@@ -639,12 +643,25 @@ def _resolve_geo_for_profile(profile_config: Dict[str, Any]) -> Dict[str, Any]:
         loc, tz, al, lat, lon = _resolve_country_geo(country)
     except Exception:
         loc, tz, al, lat, lon = "en-US", "America/New_York", "en-US,en;q=0.9", 40.7128, -74.0060
+    # Wire profile.language → Accept-Language / navigator.languages when set
+    lang = str(profile_config.get("language") or "").strip()
+    accept = str(profile_config.get("accept_language") or "").strip()
+    if lang and not accept:
+        base = lang.split("-", 1)[0]
+        accept = f"{lang},{base};q=0.9" if "-" in lang else f"{lang},en;q=0.8"
+    elif lang and accept and lang.split(",")[0].strip() not in accept:
+        # Prefer explicit language as primary tag
+        accept = f"{lang},{accept}"
+    locale = str(profile_config.get("locale") or "").strip() or loc
+    if lang and not profile_config.get("locale"):
+        locale = lang if "-" in lang else locale
     return {
-        "locale": profile_config.get("locale") or loc,
+        "locale": locale,
         "timezone": profile_config.get("timezone") or tz,
-        "accept_language": profile_config.get("accept_language") or al,
+        "accept_language": accept or al,
         "lat": lat,
         "lon": lon,
+        "language": lang,
     }
 
 
@@ -1817,8 +1834,51 @@ async def _launch_profile_session_inner(
     font_mode = str(anti.get("font_mode") or "noise").lower().strip()
     webrtc_mode = str(anti.get("webrtc_mode") or "proxy").lower().strip()
     proxy_check_on_launch = bool(anti.get("proxy_check_on_launch", True))
-    proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail", False))
-    use_persistent_context = bool(anti.get("use_persistent_context", False))
+    # Default True when proxy is enabled — old profiles without the flag
+    # used to soft-open on real IP; that leak is closed unless Strict is
+    # explicitly turned OFF (proxy_check_block_on_fail=False).
+    _proxy_cfg_early = profile_config.get("proxy") if isinstance(profile_config.get("proxy"), dict) else {}
+    _proxy_on = bool(
+        (_proxy_cfg_early or {}).get("enabled")
+        or str((_proxy_cfg_early or {}).get("server") or "").strip()
+        or str((_proxy_cfg_early or {}).get("provider_id") or "").strip()
+        or (_proxy_cfg_early or {}).get("use_proxyjet")
+    )
+    if "proxy_check_block_on_fail" in anti:
+        proxy_check_block_on_fail = bool(anti.get("proxy_check_block_on_fail"))
+    else:
+        proxy_check_block_on_fail = bool(_proxy_on)
+    if anti.get("strict_proxy") is True:
+        proxy_check_block_on_fail = True
+    if anti.get("strict_proxy") is False and "proxy_check_block_on_fail" not in anti:
+        proxy_check_block_on_fail = False
+    strict_mobile_shell = bool(anti.get("strict_mobile_shell"))
+    # Default ON — matches AntiDetectConfig; old code used False and broke persistence
+    use_persistent_context = bool(anti.get("use_persistent_context", True))
+    local_api_cdp = bool(
+        anti.get("local_api_cdp")
+        or profile_config.get("local_api_cdp")
+        or os.environ.get("KREXION_PROFILE_CDP", "").strip() == "1"
+    )
+    disable_ipv6 = bool(anti.get("disable_ipv6", True))
+    stealth_profile = str(anti.get("stealth_profile") or "full").lower().strip()
+    if stealth_profile not in ("full", "minimal", "safari"):
+        stealth_profile = "full"
+    if paranoia_mode:
+        # Deepen paranoia: no CDP, force WebRTC proxy, IPv6 off, Strict proxy
+        local_api_cdp = False
+        disable_ipv6 = True
+        if webrtc_mode == "real":
+            webrtc_mode = "proxy"
+        anti = dict(anti)
+        anti["fingerprint_win"] = True
+        anti["proxy_check_block_on_fail"] = True
+        anti["disable_ipv6"] = True
+        proxy_check_block_on_fail = True
+    anti = dict(anti) if not isinstance(anti, dict) else dict(anti)
+    anti["disable_ipv6"] = disable_ipv6
+    anti["local_api_cdp"] = local_api_cdp
+    anti["stealth_profile"] = stealth_profile
 
     try:
         from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
@@ -1832,6 +1892,10 @@ async def _launch_profile_session_inner(
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
     _launch_warnings: List[str] = []
+    if paranoia_mode:
+        _launch_warnings.append(
+            "Paranoia mode: CDP off, WebRTC proxy, IPv6 disabled, Strict proxy ON."
+        )
     _lppw = str(profile_config.get("_launch_proxy_probe_warning") or "").strip()
     if _lppw:
         _launch_warnings.append(_lppw)
@@ -2072,15 +2136,82 @@ async def _launch_profile_session_inner(
         proxy_diag["ok"] = False
         proxy_diag["error"] = (
             "Proxy enabled but no server URL could be resolved "
-            "(check Settings → Proxy Providers or ProxyJet credentials)"
+            "(check Settings → Proxy Providers credentials, or paste a manual line)"
         )
+
+    # Proxy ON + webrtc=real would leak the customer's real IP via STUN.
+    try:
+        from browser_profile_module import proxy_is_active as _pia_webrtc
+        _proxy_on_for_webrtc = _pia_webrtc(proxy_cfg) or bool(proxy_arg)
+    except Exception:
+        _proxy_on_for_webrtc = bool(proxy_arg) or bool(_proxy_enabled)
+    if _proxy_on_for_webrtc and webrtc_mode == "real":
+        webrtc_mode = "proxy"
+        _launch_warnings.append(
+            "WebRTC was set to 'real' while a proxy is enabled — forced to "
+            "'proxy' so your real IP cannot leak through WebRTC/STUN."
+        )
+    if _proxy_on_for_webrtc and webrtc_mode == "proxy":
+        _launch_warnings.append(
+            "WebRTC mode 'proxy' blocks non-proxied UDP (host ICE). "
+            "It does NOT rewrite ICE candidates to the proxy exit IP."
+        )
+    if tls_prewarm:
+        _launch_warnings.append(
+            "TLS prewarm seeds cookies via curl_cffi — it does NOT change the "
+            "live browser JA3/H2 fingerprint (Playwright/Cloak Chromium still applies)."
+        )
+    if profile_config.get("geo_follow_proxy") is False and (_proxy_on_for_webrtc or _proxy_enabled):
+        _launch_warnings.append(
+            "geo_follow_proxy is OFF — timezone/locale may disagree with proxy exit IP "
+            "(strong fraud signal on many sites)."
+        )
+    if is_mobile and (webgl_mode in ("real", "off") or canvas_mode in ("real", "off")):
+        _launch_warnings.append(
+            f"Mobile profile with canvas={canvas_mode}/webgl={webgl_mode}: "
+            "host GPU/fonts may not match the mobile UA — prefer 'noise' unless using Cloak quiet."
+        )
+    if _profile_engine == "webkit":
+        _launch_warnings.append(
+            "WebKit engine: Safari-shaped stealth (no window.chrome / Sec-CH-UA). "
+            "Still desktop MiniBrowser — not a physical iPhone."
+        )
+
+    # Persist Strict proxy flag for old profiles that never saved it (one-shot migrate)
+    if (
+        _proxy_on
+        and proxy_check_block_on_fail
+        and "proxy_check_block_on_fail" not in (profile_config.get("anti_detect") or {})
+        and on_session_update
+    ):
+        try:
+            await on_session_update({
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "status": "launching",
+                "anti_detect_patch": {"proxy_check_block_on_fail": True},
+            })
+        except Exception:
+            pass
 
     # v2.7.103 — Dead DNS (BestGo ENOTFOUND etc.): never open browser through
     # an unresolvable gateway. Soft-disable proxy so iPhone/Android still open
     # with Krexion mobile shell; operator fixes host in Proxy Providers.
+    # Strict proxy (proxy_check_block_on_fail): abort instead — never leak real IP.
     if proxy_arg and proxy_arg.get("server"):
         _dns_err = _proxy_dns_failure(str(proxy_arg.get("server") or ""))
         if _dns_err:
+            if proxy_check_block_on_fail:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Strict proxy: proxy host could not be resolved "
+                        f"({_dns_err}). Fix Settings → Proxy Providers "
+                        "(working host like gw.dataimpulse.com) or paste a "
+                        "fresh manual line, then relaunch. Browser was NOT "
+                        "opened on your real IP."
+                    ),
+                )
             logger.warning(
                 f"[profile-launch] proxy DNS soft-disable: {_dns_err} "
                 f"session={(session_id or '')[:8]}"
@@ -2244,13 +2375,10 @@ async def _launch_profile_session_inner(
                         except Exception as _retry_err:
                             logger.warning(f"[profile-launch] chromium retry failed: {_retry_err}")
                     raise _lex2 from _lex
-        # v2.7.13 — Local API CDP: optional remote debugging for Playwright connect
+        # v2.7.13 / v2.7.105e — CDP opt-in ONLY (Local API / env / anti_detect.local_api_cdp).
+        # Native/local used to always open --remote-debugging-port → automation surface.
         _cdp_port: Optional[int] = None
-        _want_cdp = bool(
-            profile_config.get("local_api_cdp")
-            or os.environ.get("KREXION_PROFILE_CDP", "").strip() == "1"
-            or (os.environ.get("KREXION_MODE") or "").lower().strip() in ("native", "local")
-        )
+        _want_cdp = bool(local_api_cdp)
         if _want_cdp and _profile_engine != "webkit":
             try:
                 import socket as _sock
@@ -2260,6 +2388,10 @@ async def _launch_profile_session_inner(
                     _cdp_port = int(_s.getsockname()[1])
                 launch_kwargs["args"].append(f"--remote-debugging-port={_cdp_port}")
                 launch_kwargs["args"].append("--remote-debugging-address=127.0.0.1")
+                _launch_warnings.append(
+                    "Local API CDP is ON — remote debugging port is open on 127.0.0.1 "
+                    "(automation surface). Turn off anti_detect.local_api_cdp if unused."
+                )
             except Exception as _cdp_bind_err:
                 logger.debug(f"[profile-launch] CDP port bind skipped: {_cdp_bind_err}")
                 _cdp_port = None
@@ -2273,6 +2405,9 @@ async def _launch_profile_session_inner(
 
         if _profile_engine == "webkit":
             # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
+            # Force Safari stealth profile unless user set minimal.
+            if stealth_profile == "full":
+                stealth_profile = "safari"
             wk_kwargs: Dict[str, Any] = {"headless": False}
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
@@ -2283,7 +2418,9 @@ async def _launch_profile_session_inner(
                 )
                 _launch_warnings.append(
                     "Safari/WebKit engine unavailable — running Chromium instead. "
-                    "This is NOT a real iOS Safari fingerprint."
+                    "This is NOT a real iPhone/iOS Safari. It is a desktop browser "
+                    "with a mobile shell (viewport + UA). Advanced trackers can still "
+                    "tell it is not a physical iPhone."
                 )
                 _profile_engine = "chromium"
                 try:
@@ -2334,14 +2471,14 @@ async def _launch_profile_session_inner(
             )
             if _force_sys_chrome:
                 channel = "chrome"
-            # v2.7.15 — Optional persistent context (native/local WIN/Linux only)
+            # v2.7.15 / v2.7.105e — Persistent context works WITH Cloak executable_path
+            # (previously Cloak blocked user-data-dir — AdsPower-class save never ran).
             _krx_mode = (os.environ.get("KREXION_MODE") or "").lower()
             _want_persist = (
                 use_persistent_context
                 and _profile_engine not in ("webkit", "firefox")
                 and (sys.platform.startswith("win") or sys.platform.startswith("linux"))
                 and _krx_mode in ("native", "local", "desktop")
-                and not bool(_kernel_plan.get("executable_path"))
             )
             _persistent_mode = False
             browser = None  # type: ignore
@@ -2402,9 +2539,29 @@ async def _launch_profile_session_inner(
 
         # 2026-07 / v2.7.11 — Krexion taskbar brand (Windows).
         # v2.7.13 — Numbered badge = open-profile slot (top-left).
-        _launch_ui_meta: Dict[str, Any] = {"mobile_shell": False, "webkit": _profile_engine == "webkit"}
+        # v2.7.105d — Early shell + HWND-embed proof; strict abort not swallowed.
+        _launch_ui_meta: Dict[str, Any] = {
+            "mobile_shell": False,
+            "mobile_shell_embedded": False,
+            "webkit": _profile_engine == "webkit",
+        }
+        # Mobile profiles: Strict shell ON unless explicitly disabled
+        if is_mobile and "strict_mobile_shell" not in anti:
+            strict_mobile_shell = True
+        elif is_mobile and anti.get("strict_mobile_shell") is None:
+            strict_mobile_shell = True
 
-        def _brand_krexion_taskbar(*, mobile_shell: bool = False) -> None:
+        def _brand_krexion_taskbar(
+            *,
+            mobile_shell: bool = False,
+            require_embed: bool = True,
+            allow_restart: bool = True,
+        ) -> None:
+            """Apply Krexion phone frame / taskbar brand.
+
+            For mobile: success requires shell process AND engine HWND embedded
+            inside the frame (not process-alive alone).
+            """
             try:
                 from krexion_window_icon import (
                     apply_krexion_icon_to_pids,
@@ -2432,7 +2589,7 @@ async def _launch_profile_session_inner(
                 _include_webkit = False
                 if _profile_engine == "webkit":
                     _include_webkit = True
-                    _title_markers = ["[WebKit]", "Safari"]
+                    _title_markers = ["[WebKit]", "Safari", "Krexion"]
                 else:
                     _cmd_markers = ["--window-name=Krexion"]
                 _family_pids = sorted(
@@ -2452,72 +2609,166 @@ async def _launch_profile_session_inner(
                     except Exception:
                         _will_try_mobile_shell = False
 
-                # Mobile shell FIRST — then stop engine icon keeper so it cannot
-                # fight TOOLWINDOW / ShowWindow and flicker the taskbar.
                 _use_mobile_shell = bool(mobile_shell and _will_try_mobile_shell)
                 if _use_mobile_shell:
                     try:
                         from krexion_mobile_browser_shell import (
                             apply_krexion_mobile_shell,
                             wait_for_mobile_shell,
+                            wait_for_mobile_shell_embedded,
                             is_mobile_shell_alive,
+                            is_mobile_shell_embedded,
+                            preflight_mobile_shell,
+                            mobile_shell_status,
                         )
 
-                        _shell_active = False
-                        for _shell_try in range(3):
-                            apply_krexion_mobile_shell(
-                                _family_pids,
-                                session_key=str(session_id),
-                                parent_pid=int(_driver_pid) if _driver_pid else None,
-                                platform=str(profile_os or "android"),
-                                viewport_width=int(viewport.get("width", 393)),
-                                viewport_height=int(viewport.get("height", 852)),
-                                profile_label=str(_profile_label)[:60] or "Profile",
-                                profile_slot=int(_taskbar_slot),
-                                poll_seconds=_poll,
-                                webkit=_profile_engine == "webkit",
-                                home_url=str(start_url or "https://www.google.com/")[:512],
-                            )
-                            _shell_active = wait_for_mobile_shell(
-                                session_id, timeout_sec=15.0,
-                            )
-                            if _shell_active and is_mobile_shell_alive(session_id):
-                                break
-                            time.sleep(0.7)
-                        if _shell_active and is_mobile_shell_alive(session_id):
+                        # Already framed from early pass — just verify / refresh meta
+                        if is_mobile_shell_embedded(session_id):
                             _launch_ui_meta["mobile_shell"] = True
+                            _launch_ui_meta["mobile_shell_embedded"] = True
                             stop_session_icon_keeper(str(session_id))
-                            logger.info(
-                                f"[profile-launch] mobile shell ON session={session_id[:8]}"
-                            )
-                            # Brief brand only for shell chrome; engine stays TOOLWINDOW.
-                            apply_krexion_icon_to_pids(
-                                _family_pids,
-                                profile_label=str(_profile_label)[:60] or "Profile",
-                                parent_pid=int(_driver_pid) if _driver_pid else None,
-                                poll_seconds=12.0,
-                                profile_slot=int(_taskbar_slot),
-                                cmdline_markers=_cmd_markers,
-                                window_title_markers=_title_markers,
-                                include_webkit=_include_webkit,
-                                platform=str(profile_os or ""),
-                                session_key=str(session_id),
-                                skip_toolwindow=True,
-                                session_lifetime=False,
-                            )
                             return
-                        logger.warning(
-                            f"[profile-launch] mobile shell failed to start "
-                            f"session={session_id[:8]} — using engine window only"
-                        )
-                        _launch_warnings.append(
-                            "Krexion mobile device shell did not start — "
-                            "you are seeing the plain browser window, not the branded iOS/Android shell."
-                        )
+
+                        if is_mobile_shell_alive(session_id) and not allow_restart:
+                            _embedded = wait_for_mobile_shell_embedded(
+                                session_id, timeout_sec=20.0,
+                            ) if require_embed else False
+                            if _embedded or is_mobile_shell_embedded(session_id):
+                                _launch_ui_meta["mobile_shell"] = True
+                                _launch_ui_meta["mobile_shell_embedded"] = True
+                                stop_session_icon_keeper(str(session_id))
+                                return
+                            # Fall through to restart if embed never arrived
+
+                        _pf = preflight_mobile_shell()
+                        if not _pf.get("ok"):
+                            _msg = str(_pf.get("error") or "Mobile shell preflight failed")
+                            _launch_warnings.append(_msg)
+                            if strict_mobile_shell:
+                                raise RuntimeError(
+                                    f"Strict mobile shell: {_msg} Launch aborted — "
+                                    "plain Chromium/WebKit would have opened instead."
+                                )
+                            _use_mobile_shell = False
+                        else:
+                            _shell_active = False
+                            _embedded_ok = False
+                            for _shell_try in range(3):
+                                apply_krexion_mobile_shell(
+                                    _family_pids,
+                                    session_key=str(session_id),
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    platform=str(profile_os or "android"),
+                                    viewport_width=int(viewport.get("width", 393)),
+                                    viewport_height=int(viewport.get("height", 852)),
+                                    profile_label=str(_profile_label)[:60] or "Profile",
+                                    profile_slot=int(_taskbar_slot),
+                                    poll_seconds=_poll,
+                                    webkit=_profile_engine == "webkit",
+                                    home_url=str(start_url or "https://www.google.com/")[:512],
+                                )
+                                _shell_active = wait_for_mobile_shell(
+                                    session_id, timeout_sec=12.0,
+                                )
+                                if _shell_active and is_mobile_shell_alive(session_id):
+                                    if require_embed:
+                                        _embedded_ok = wait_for_mobile_shell_embedded(
+                                            session_id, timeout_sec=18.0,
+                                        )
+                                    else:
+                                        _embedded_ok = is_mobile_shell_embedded(session_id)
+                                    if _embedded_ok or not require_embed:
+                                        break
+                                time.sleep(0.55)
+
+                            _st = mobile_shell_status(session_id)
+                            # Early pass (require_embed=False): process alive is enough to continue;
+                            # post-nav pass requires HWND embed for success.
+                            _early_ok = bool(_shell_active and not require_embed)
+                            if _st.get("ok") or (_shell_active and _embedded_ok) or _early_ok:
+                                _launch_ui_meta["mobile_shell"] = True
+                                _launch_ui_meta["mobile_shell_embedded"] = bool(
+                                    _st.get("embedded") or _embedded_ok
+                                )
+                                stop_session_icon_keeper(str(session_id))
+                                logger.info(
+                                    f"[profile-launch] mobile shell "
+                                    f"{'EMBEDDED' if _launch_ui_meta['mobile_shell_embedded'] else 'STARTED'} "
+                                    f"session={session_id[:8]}"
+                                )
+                                if _launch_ui_meta["mobile_shell_embedded"]:
+                                    _launch_warnings.append(
+                                        "Mobile shell is a desktop browser framed like a phone — "
+                                        "not a real iPhone/Android device. Use for UX testing; "
+                                        "do not assume undetectable mobile fingerprint."
+                                    )
+                                apply_krexion_icon_to_pids(
+                                    _family_pids,
+                                    profile_label=str(_profile_label)[:60] or "Profile",
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    poll_seconds=12.0,
+                                    profile_slot=int(_taskbar_slot),
+                                    cmdline_markers=_cmd_markers,
+                                    window_title_markers=_title_markers,
+                                    include_webkit=_include_webkit,
+                                    platform=str(profile_os or ""),
+                                    session_key=str(session_id),
+                                    skip_toolwindow=True,
+                                    session_lifetime=False,
+                                )
+                                return
+
+                            # Process up but HWND never framed — treat as failure (post-nav / strict)
+                            if _shell_active and not _embedded_ok:
+                                logger.warning(
+                                    f"[profile-launch] mobile shell process alive but "
+                                    f"engine HWND not embedded session={session_id[:8]}"
+                                )
+                                _launch_warnings.append(
+                                    "Krexion phone chrome started but the browser window "
+                                    "was not framed inside it — you may see plain Chromium/WebKit."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[profile-launch] mobile shell failed to start "
+                                    f"session={session_id[:8]} — using engine window only"
+                                )
+                                _launch_warnings.append(
+                                    "Krexion mobile device shell did not start — "
+                                    "you are seeing the plain browser window, not the branded iOS/Android shell."
+                                )
+                            if strict_mobile_shell:
+                                raise RuntimeError(
+                                    "Strict mobile shell: Krexion phone chrome did not "
+                                    "frame the browser. Launch aborted so plain Chromium/"
+                                    "WebKit is not shown as a real device."
+                                )
+                    except RuntimeError:
+                        raise
                     except Exception as _ms_err:
                         logger.warning(f"[profile-launch] mobile shell skipped: {_ms_err}")
                         _launch_warnings.append(
                             "Mobile device shell could not be applied — not a real device shell UI."
+                        )
+                        if strict_mobile_shell:
+                            raise RuntimeError(
+                                f"Strict mobile shell: {str(_ms_err)[:200]}"
+                            ) from _ms_err
+
+                # Non-Windows / shell not attempted: honesty warning for mobile profiles
+                if (
+                    bool(is_mobile)
+                    and not _launch_ui_meta.get("mobile_shell_embedded")
+                    and not _launch_ui_meta.get("mobile_shell")
+                ):
+                    _launch_warnings.append(
+                        "Desktop Chromium/WebKit — not a real iPhone/Android device. "
+                        "Krexion phone chrome is Windows-only; fingerprint sites may detect desktop."
+                    )
+                    if strict_mobile_shell and not _use_mobile_shell:
+                        raise RuntimeError(
+                            "Strict mobile shell: mobile chrome is unavailable on this host "
+                            "(Windows + pywebview required). Launch aborted."
                         )
 
                 apply_krexion_icon_to_pids(
@@ -2534,13 +2785,18 @@ async def _launch_profile_session_inner(
                     skip_toolwindow=True,
                     session_lifetime=True,
                 )
-                # Legacy Safari overlay removed — it caused a second window + wrong zoom.
-                # Krexion mobile shell is the only branded mobile UI on Windows.
+            except RuntimeError:
+                raise
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
+                if strict_mobile_shell and is_mobile and mobile_shell:
+                    raise RuntimeError(
+                        f"Strict mobile shell: branding failed ({str(_icon_err)[:160]}). "
+                        "Launch aborted."
+                    ) from _icon_err
 
-        # Branding + mobile shell run ONCE after navigation (see below).
-        # Early branding here caused duplicate Safari/Chrome windows + icon flicker.
+        # Early shell start happens after first page (see below) to shrink
+        # the plain Chromium/WebKit window before navigation finishes.
 
         # Publish CDP websocket for Local API automation clients
         _cdp_ws = ""
@@ -2601,6 +2857,15 @@ async def _launch_profile_session_inner(
                     or "proxy" in _ctx_msg.lower()
                     or "tunnel" in _ctx_msg.lower()
                 ):
+                    if proxy_check_block_on_fail:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "Strict proxy: browser could not start with proxy "
+                                f"({_ctx_msg[:180]}). Fix Proxy Providers / password, "
+                                "then relaunch. Browser was NOT opened on your real IP."
+                            ),
+                        ) from _ctx_err
                     logger.warning(
                         f"[profile-launch] context+proxy failed ({_ctx_msg[:120]}) "
                         "— retrying WITHOUT proxy so iOS/Android still open"
@@ -2800,10 +3065,13 @@ async def _launch_profile_session_inner(
                     skip_webgl_align=_skip_webgl_align,
                     fingerprint_win=bool(anti.get("fingerprint_win", True)),
                     cloak_quiet=_cloak_quiet,
+                    engine=str(_profile_engine or "chromium"),
+                    stealth_profile=stealth_profile,
                 )
                 logger.info(
                     f"[profile-launch] RUT-parity stealth ON — "
                     f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
+                    f"engine={_profile_engine} stealth_profile={stealth_profile} "
                     f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]} "
                     f"canvas={canvas_mode} webrtc={webrtc_mode} "
                     f"fp_win={bool(anti.get('fingerprint_win', True))} "
@@ -2811,10 +3079,16 @@ async def _launch_profile_session_inner(
                 )
 
                 if paranoia_mode:
-                    await context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                        "window.chrome = window.chrome || { runtime: {} };"
-                    )
+                    # Never invent window.chrome on WebKit/Safari path
+                    if _profile_engine == "webkit" or stealth_profile == "safari":
+                        await context.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        )
+                    else:
+                        await context.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                            "window.chrome = window.chrome || { runtime: {} };"
+                        )
             except Exception as e:
                 logger.warning(f"anti-detect script injection failed: {e}")
                 try:
@@ -2825,12 +3099,20 @@ async def _launch_profile_session_inner(
                 # (headed Profile soft-fails with warning; visit still opens)
                 try:
                     from anti_detect_v230 import apply_v230_stealth
+                    _v230_safari = (
+                        _profile_engine == "webkit" or stealth_profile == "safari"
+                    )
                     _v230_report = await apply_v230_stealth(
-                        context, ua=ua, viewport=viewport, platform=""
+                        context,
+                        ua=ua,
+                        viewport=viewport,
+                        platform="",
+                        safari_mode=_v230_safari,
                     )
                     _extra_hdrs = dict(_ctx_hdrs)
                     _extra_hdrs.update(_v230_report.get("headers") or {})
-                    _extra_hdrs.update(_profile_ch_hints)
+                    if not _v230_safari:
+                        _extra_hdrs.update(_profile_ch_hints)
                     _extra_hdrs["Accept-Language"] = accept_lang
                     await context.set_extra_http_headers(_extra_hdrs)
                 except Exception:
@@ -2842,12 +3124,20 @@ async def _launch_profile_session_inner(
             # Master anti-detect off — still apply v2.3.0 baseline when possible.
             try:
                 from anti_detect_v230 import apply_v230_stealth
+                _v230_safari = (
+                    _profile_engine == "webkit" or stealth_profile == "safari"
+                )
                 _v230_report = await apply_v230_stealth(
-                    context, ua=ua, viewport=viewport, platform=""
+                    context,
+                    ua=ua,
+                    viewport=viewport,
+                    platform="",
+                    safari_mode=_v230_safari,
                 )
                 _extra_hdrs = dict(_ctx_hdrs)
                 _extra_hdrs.update(_v230_report.get("headers") or {})
-                _extra_hdrs.update(_profile_ch_hints)
+                if not _v230_safari:
+                    _extra_hdrs.update(_profile_ch_hints)
                 _extra_hdrs["Accept-Language"] = accept_lang
                 await context.set_extra_http_headers(_extra_hdrs)
             except Exception as _v230_err:
@@ -2862,6 +3152,43 @@ async def _launch_profile_session_inner(
             logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
+
+        # v2.7.105d — Early Krexion phone chrome (mobile): start shell as soon as
+        # the engine window exists so plain Chromium/WebKit is not left visible
+        # through the whole first navigation. require_embed=False here so we
+        # don't block forever before goto; post-nav pass verifies HWND embed.
+        if is_mobile:
+            try:
+                await asyncio.sleep(0.45)
+                _brand_krexion_taskbar(
+                    mobile_shell=True,
+                    require_embed=False,
+                    allow_restart=True,
+                )
+            except RuntimeError as _early_shell_err:
+                # Strict abort — close browser before user mistakes it for Krexion design
+                logger.error(f"[profile-launch] strict mobile shell abort: {_early_shell_err}")
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    if browser is not None and not _persistent_mode:
+                        await browser.close()
+                except Exception:
+                    pass
+                raise
+            except Exception as _early_brand_err:
+                logger.debug(f"[profile-launch] early shell skipped: {_early_brand_err}")
+
+        # WebKit MiniBrowser: rename window ASAP so taskbar/title is Krexion, not [WebKit]
+        if _profile_engine == "webkit":
+            try:
+                await page.evaluate(
+                    f"""() => {{ try {{ document.title = {json.dumps('Krexion — ' + str(_profile_label or 'Profile')[:40])}; }} catch (e) {{}} }}"""
+                )
+            except Exception:
+                pass
 
         # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
         _last_tls_prewarm_ok = None
@@ -3044,12 +3371,21 @@ async def _launch_profile_session_inner(
                     f"[profile-launch] proxy health probe outer failed: {proxy_diag['error']}"
                 )
 
-        # v2.7.15 — Hard-abort when proxy check failed and block_on_fail is set
-        if (
-            proxy_arg is not None
-            and proxy_check_on_launch
-            and proxy_check_block_on_fail
-            and proxy_diag.get("ok") is False
+        # v2.7.15 — Hard-abort when proxy check failed and block_on_fail is set.
+        # Also abort when soft_disabled stripped the proxy (real-IP leak path) —
+        # previously soft_disabled set proxy_arg=None so this gate never fired.
+        if proxy_check_block_on_fail and (
+            proxy_diag.get("soft_disabled")
+            or (
+                proxy_arg is not None
+                and proxy_check_on_launch
+                and proxy_diag.get("ok") is False
+            )
+            or (
+                proxy_diag.get("requested")
+                and proxy_arg is None
+                and proxy_diag.get("ok") is False
+            )
         ):
             _abort_msg = str(proxy_diag.get("error") or "proxy check failed")[:300]
             logger.warning(
@@ -3061,9 +3397,10 @@ async def _launch_profile_session_inner(
                         "profile_id": profile_id,
                         "session_id": session_id,
                         "status": "error",
-                        "error_message": f"Proxy check failed: {_abort_msg}",
+                        "error_message": f"Strict proxy: {_abort_msg}",
                         "last_proxy_check": proxy_diag,
                         "last_tls_prewarm_ok": _last_tls_prewarm_ok,
+                        "launch_warnings": list(_launch_warnings),
                     })
                 except Exception:
                     pass
@@ -3080,8 +3417,11 @@ async def _launch_profile_session_inner(
             return {
                 "ok": False,
                 "session_id": session_id,
-                "error": f"Proxy check failed: {_abort_msg}",
+                "error": (
+                    f"Strict proxy: {_abort_msg}. Browser was NOT opened on your real IP."
+                ),
                 "proxy_diag": proxy_diag,
+                "launch_warnings": list(_launch_warnings),
             }
 
         # If proxy was REQUESTED but FAILED the probe, show a
@@ -3289,13 +3629,30 @@ async def _launch_profile_session_inner(
                 except Exception as _de:
                     logger.warning(f"[profile-launch] post-goto diagnostic page render failed: {_de}")
 
-        # Single branding pass — after page content exists (prevents duplicate windows).
+        # Finalize branding — verify HWND embed after navigation (early pass may
+        # have started the phone chrome already; do not tear it down).
         try:
             await asyncio.sleep(0.35)
-            _brand_krexion_taskbar(mobile_shell=True)
+            _brand_krexion_taskbar(
+                mobile_shell=True,
+                require_embed=True,
+                allow_restart=not bool(_launch_ui_meta.get("mobile_shell")),
+            )
             if session_id in _RUNNING_SESSIONS:
                 _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
                 _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
+        except RuntimeError as _brand_strict_err:
+            logger.error(f"[profile-launch] strict mobile shell abort (post-nav): {_brand_strict_err}")
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None and not _persistent_mode:
+                    await browser.close()
+            except Exception:
+                pass
+            raise
         except Exception as _brand_post_err:
             logger.debug(f"[profile-launch] post-nav branding skipped: {_brand_post_err}")
 
@@ -3313,7 +3670,11 @@ async def _launch_profile_session_inner(
                     "last_proxy_check": proxy_diag if proxy_diag.get("requested") else {},
                     "browser_kernel": str(_kernel_plan.get("kernel_label") or ""),
                     "launch_warnings": list(_launch_warnings),
-                    "mobile_shell_active": bool(_launch_ui_meta.get("mobile_shell")),
+                    "mobile_shell_active": bool(
+                        _launch_ui_meta.get("mobile_shell_embedded")
+                        or _launch_ui_meta.get("mobile_shell")
+                    ),
+                    "mobile_shell_embedded": bool(_launch_ui_meta.get("mobile_shell_embedded")),
                     "engine_used": str(_profile_engine or "chromium"),
                 })
             except Exception:
@@ -3600,30 +3961,101 @@ async def _run_profile_automation_if_configured(
         except Exception:
             _profile_db = None
 
+    _max_next_leads = 50
+    _next_loops = 0
     try:
-        from browser_profile_automation import run_profile_automation
-
-        await run_profile_automation(
-            page,
-            list(spec.get("steps") or []),
-            dict(spec.get("lead_row") or {}),
-            user_id=uid,
-            session_id=session_id,
-            profile_id=profile_id,
-            on_session_update=on_session_update,
-            skip_missing_steps=spec.get("skip_missing_steps", True) is not False,
-            self_heal=bool(spec.get("self_heal")),
-            should_cancel=_should_cancel,
-            data_file_id=str(spec.get("data_file_id") or ""),
-            lead_row_index=spec.get("lead_row_index"),
-            db=_profile_db,
-            smart_funnel_enabled=bool(spec.get("smart_funnel_enabled")),
-            smart_funnel_pattern=str(spec.get("smart_funnel_pattern") or "auto"),
-            smart_funnel_min_deals=int(spec.get("smart_funnel_min_deals") or 2),
-            smart_funnel_wait_until_conversion=bool(
-                spec.get("smart_funnel_wait_until_conversion", True)
-            ),
+        from browser_profile_automation import (
+            run_profile_automation,
+            claim_next_data_file_row,
+            release_reserved_data_file_row,
+            _normalize_after_mode,
         )
+
+        while True:
+            result = await run_profile_automation(
+                page,
+                list(spec.get("steps") or []),
+                dict(spec.get("lead_row") or {}),
+                user_id=uid,
+                session_id=session_id,
+                profile_id=profile_id,
+                on_session_update=on_session_update,
+                skip_missing_steps=spec.get("skip_missing_steps", True) is not False,
+                self_heal=bool(spec.get("self_heal")),
+                should_cancel=_should_cancel,
+                data_file_id=str(spec.get("data_file_id") or ""),
+                lead_row_index=spec.get("lead_row_index"),
+                db=_profile_db,
+                smart_funnel_enabled=bool(spec.get("smart_funnel_enabled")),
+                smart_funnel_pattern=str(spec.get("smart_funnel_pattern") or "auto"),
+                smart_funnel_min_deals=int(spec.get("smart_funnel_min_deals") or 2),
+                smart_funnel_wait_until_conversion=bool(
+                    spec.get("smart_funnel_wait_until_conversion", True)
+                ),
+                consume_mode=str(spec.get("consume_mode") or "on_submit"),
+                lead_consumed_already=bool(spec.get("lead_consumed_already")),
+                lead_fingerprint=str(spec.get("lead_fingerprint") or ""),
+                after_mode=str(spec.get("after_mode") or "manual"),
+            )
+
+            after = _normalize_after_mode(
+                (result or {}).get("after_mode") or spec.get("after_mode") or "manual"
+            )
+            status = str((result or {}).get("automation_status") or (result or {}).get("status") or "")
+
+            if after == "next_lead" and status in ("completed", "ok", "captcha") and _next_loops < _max_next_leads:
+                dfid = str(spec.get("data_file_id") or "").strip()
+                if not dfid or _profile_db is None:
+                    break
+                try:
+                    lead, idx, meta = await claim_next_data_file_row(
+                        _profile_db,
+                        uid,
+                        dfid,
+                        consume_now=str(spec.get("consume_mode") or "") == "on_start",
+                    )
+                    spec["lead_row"] = lead
+                    spec["lead_row_index"] = idx
+                    spec["lead_fingerprint"] = str(meta.get("fingerprint") or "")
+                    spec["lead_consumed_already"] = bool(meta.get("consumed_now"))
+                    profile_config["_launch_automation"] = spec
+                    _next_loops += 1
+                    if on_session_update:
+                        try:
+                            await on_session_update({
+                                "profile_id": profile_id,
+                                "session_id": session_id,
+                                "status": "running",
+                                "automation_status": "running",
+                                "automation_action": "next_lead",
+                                "automation_error": "",
+                            })
+                        except Exception:
+                            pass
+                    continue
+                except Exception as _nl_err:
+                    logger.info(f"[profile-automation] next_lead stopped: {_nl_err}")
+                    if on_session_update:
+                        try:
+                            await on_session_update({
+                                "profile_id": profile_id,
+                                "session_id": session_id,
+                                "status": "running",
+                                "automation_status": "completed",
+                                "automation_error": f"next_lead ended: {str(_nl_err)[:200]}",
+                            })
+                        except Exception:
+                            pass
+                    break
+
+            if after == "close":
+                # Request browser stop after JSON finishes (keep open on error/stop).
+                if status in ("completed", "ok", "captcha"):
+                    try:
+                        request_stop(session_id)
+                    except Exception as _cls_err:
+                        logger.debug(f"[profile-automation] after_mode close skipped: {_cls_err}")
+            break
     except asyncio.CancelledError:
         if on_session_update:
             try:
@@ -3636,6 +4068,18 @@ async def _run_profile_automation_if_configured(
                 })
             except Exception:
                 pass
+        # Release soft reservation if lead was never consumed
+        try:
+            if _profile_db and not bool(spec.get("lead_consumed_already")):
+                await release_reserved_data_file_row(
+                    _profile_db,
+                    uid,
+                    str(spec.get("data_file_id") or ""),
+                    lead_row_index=spec.get("lead_row_index"),
+                    fingerprint=str(spec.get("lead_fingerprint") or ""),
+                )
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning(f"[profile-automation] run failed: {exc}")
         if on_session_update:
@@ -3992,6 +4436,10 @@ async def warm_profile_cookies(
                         identity_label=profile_id,
                         fingerprint_win=bool((profile_config.get("anti_detect") or {}).get("fingerprint_win", True)),
                         cloak_quiet=False,
+                        engine="chromium",
+                        stealth_profile=str(
+                            (profile_config.get("anti_detect") or {}).get("stealth_profile") or "full"
+                        ),
                     )
                 except Exception as _st_err:
                     logger.debug(f"[cookie-robot] stealth skipped: {_st_err}")
