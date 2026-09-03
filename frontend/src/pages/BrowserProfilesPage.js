@@ -147,8 +147,8 @@ const DEFAULT_NEW = {
     proxy_check_on_launch: true,
     // Strict proxy ON for new profiles — never open on real IP if proxy dead
     proxy_check_block_on_fail: true,
-    // Abort if phone chrome (mobile shell) cannot start
-    strict_mobile_shell: false,
+    # Abort if phone chrome (mobile shell) cannot frame the browser
+    strict_mobile_shell: true,
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
@@ -2559,12 +2559,20 @@ export default function BrowserProfilesPage() {
                       ))}
                     </div>
                   )}
-                  {!!p.is_mobile && !p.mobile_shell_active && (p.status === "running" || p.status === "launching") && (
+                  {!!p.is_mobile && (p.status === "running" || p.status === "launching") && (
                     <div
-                      className="mt-2 text-[10px] text-amber-200 bg-amber-950/40 border border-amber-800/50 rounded px-2 py-1"
+                      className={`mt-2 text-[10px] rounded px-2 py-1 border ${
+                        p.mobile_shell_embedded
+                          ? "text-emerald-200 bg-emerald-950/30 border-emerald-800/40"
+                          : "text-amber-200 bg-amber-950/40 border-amber-800/50"
+                      }`}
                       data-testid={`bp-mobile-honesty-${p.id}`}
                     >
-                      Desktop Chromium — not a real phone. Mobile shell off / unavailable.
+                      {p.mobile_shell_embedded
+                        ? "Krexion phone chrome active (desktop frame — not a real device)"
+                        : p.mobile_shell_active
+                          ? "Phone chrome started — waiting to frame browser…"
+                          : "Desktop Chromium/WebKit — Krexion phone chrome off / unavailable"}
                     </div>
                   )}
                   {p.proxy_check_stale && (
@@ -2764,6 +2772,13 @@ export default function BrowserProfilesPage() {
                           device_scale_factor: mob ? 3 : 1,
                           os: mob ? "android" : "windows",
                           viewport: newViewport,
+                          anti_detect: {
+                            ...form.anti_detect,
+                            // Mobile defaults to Strict phone chrome ON
+                            strict_mobile_shell: mob
+                              ? (form.anti_detect?.strict_mobile_shell !== false)
+                              : !!form.anti_detect?.strict_mobile_shell,
+                          },
                         });
                       }}
                       className="w-full mt-1 bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-sm">
@@ -3235,7 +3250,8 @@ export default function BrowserProfilesPage() {
                             <span>
                               Strict mobile shell (abort if phone chrome fails)
                               <span className="block text-[9px] text-zinc-500">
-                                Windows phone frame must start — otherwise launch aborts (no plain Chromium fake).
+                                Windows phone frame must embed the browser — otherwise launch aborts
+                                (no plain Chromium/WebKit fake). Default ON for mobile profiles.
                               </span>
                             </span>
                           </label>
@@ -3999,11 +4015,13 @@ export default function BrowserProfilesPage() {
                 </li>
                 {!!launchChecklist.data.is_mobile && (
                   <li className="flex items-start gap-2" data-testid="bp-launch-mobile-honesty">
-                    <span className={launchChecklist.data.mobile_shell_active ? "text-emerald-400" : "text-amber-400"}>●</span>
+                    <span className={launchChecklist.data.mobile_shell_embedded ? "text-emerald-400" : "text-amber-400"}>●</span>
                     <span>
-                      {launchChecklist.data.mobile_shell_active
-                        ? "Mobile shell was active last session (desktop frame — not a real phone)"
-                        : "Mobile profile: Desktop Chromium — not a real iPhone/Android. Shell is Windows-only."}
+                      {launchChecklist.data.mobile_shell_embedded
+                        ? "Last session: Krexion phone chrome framed the browser (desktop frame — not a real phone)"
+                        : launchChecklist.data.strict_mobile_shell !== false
+                          ? "Mobile + Strict shell ON — launch aborts if Krexion phone chrome cannot frame the browser (no plain Chromium/WebKit)."
+                          : "Mobile profile: without Strict shell, plain Chromium/WebKit may show if phone chrome fails. Shell is Windows-only."}
                     </span>
                   </li>
                 )}

@@ -133,7 +133,7 @@ def test_launcher_wires_after_mode_and_strict_mobile():
     assert "next_lead" in src
     assert "strict_mobile_shell" in src
     assert "request_stop(session_id)" in src
-    assert "Desktop Chromium — not a real iPhone/Android" in src
+    assert "not a real iPhone/Android" in src
 
 
 def test_module_validate_route_and_models():
@@ -175,4 +175,5 @@ def test_anti_detect_config_has_strict_mobile():
 
     cfg = AntiDetectConfig()
     assert cfg.proxy_check_block_on_fail is True
-    assert cfg.strict_mobile_shell is False
+    # v2.7.105d — default ON so mobile launches abort instead of plain Chromium
+    assert cfg.strict_mobile_shell is True

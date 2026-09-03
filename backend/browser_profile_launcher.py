@@ -2447,9 +2447,29 @@ async def _launch_profile_session_inner(
 
         # 2026-07 / v2.7.11 — Krexion taskbar brand (Windows).
         # v2.7.13 — Numbered badge = open-profile slot (top-left).
-        _launch_ui_meta: Dict[str, Any] = {"mobile_shell": False, "webkit": _profile_engine == "webkit"}
+        # v2.7.105d — Early shell + HWND-embed proof; strict abort not swallowed.
+        _launch_ui_meta: Dict[str, Any] = {
+            "mobile_shell": False,
+            "mobile_shell_embedded": False,
+            "webkit": _profile_engine == "webkit",
+        }
+        # Mobile profiles: Strict shell ON unless explicitly disabled
+        if is_mobile and "strict_mobile_shell" not in anti:
+            strict_mobile_shell = True
+        elif is_mobile and anti.get("strict_mobile_shell") is None:
+            strict_mobile_shell = True
 
-        def _brand_krexion_taskbar(*, mobile_shell: bool = False) -> None:
+        def _brand_krexion_taskbar(
+            *,
+            mobile_shell: bool = False,
+            require_embed: bool = True,
+            allow_restart: bool = True,
+        ) -> None:
+            """Apply Krexion phone frame / taskbar brand.
+
+            For mobile: success requires shell process AND engine HWND embedded
+            inside the frame (not process-alive alone).
+            """
             try:
                 from krexion_window_icon import (
                     apply_krexion_icon_to_pids,
@@ -2477,7 +2497,7 @@ async def _launch_profile_session_inner(
                 _include_webkit = False
                 if _profile_engine == "webkit":
                     _include_webkit = True
-                    _title_markers = ["[WebKit]", "Safari"]
+                    _title_markers = ["[WebKit]", "Safari", "Krexion"]
                 else:
                     _cmd_markers = ["--window-name=Krexion"]
                 _family_pids = sorted(
@@ -2497,78 +2517,140 @@ async def _launch_profile_session_inner(
                     except Exception:
                         _will_try_mobile_shell = False
 
-                # Mobile shell FIRST — then stop engine icon keeper so it cannot
-                # fight TOOLWINDOW / ShowWindow and flicker the taskbar.
                 _use_mobile_shell = bool(mobile_shell and _will_try_mobile_shell)
                 if _use_mobile_shell:
                     try:
                         from krexion_mobile_browser_shell import (
                             apply_krexion_mobile_shell,
                             wait_for_mobile_shell,
+                            wait_for_mobile_shell_embedded,
                             is_mobile_shell_alive,
+                            is_mobile_shell_embedded,
+                            preflight_mobile_shell,
+                            mobile_shell_status,
                         )
 
-                        _shell_active = False
-                        for _shell_try in range(3):
-                            apply_krexion_mobile_shell(
-                                _family_pids,
-                                session_key=str(session_id),
-                                parent_pid=int(_driver_pid) if _driver_pid else None,
-                                platform=str(profile_os or "android"),
-                                viewport_width=int(viewport.get("width", 393)),
-                                viewport_height=int(viewport.get("height", 852)),
-                                profile_label=str(_profile_label)[:60] or "Profile",
-                                profile_slot=int(_taskbar_slot),
-                                poll_seconds=_poll,
-                                webkit=_profile_engine == "webkit",
-                                home_url=str(start_url or "https://www.google.com/")[:512],
-                            )
-                            _shell_active = wait_for_mobile_shell(
-                                session_id, timeout_sec=15.0,
-                            )
-                            if _shell_active and is_mobile_shell_alive(session_id):
-                                break
-                            time.sleep(0.7)
-                        if _shell_active and is_mobile_shell_alive(session_id):
+                        # Already framed from early pass — just verify / refresh meta
+                        if is_mobile_shell_embedded(session_id):
                             _launch_ui_meta["mobile_shell"] = True
+                            _launch_ui_meta["mobile_shell_embedded"] = True
                             stop_session_icon_keeper(str(session_id))
-                            logger.info(
-                                f"[profile-launch] mobile shell ON session={session_id[:8]}"
-                            )
-                            _launch_warnings.append(
-                                "Mobile shell is a desktop browser framed like a phone — "
-                                "not a real iPhone/Android device. Use for UX testing; "
-                                "do not assume undetectable mobile fingerprint."
-                            )
-                            # Brief brand only for shell chrome; engine stays TOOLWINDOW.
-                            apply_krexion_icon_to_pids(
-                                _family_pids,
-                                profile_label=str(_profile_label)[:60] or "Profile",
-                                parent_pid=int(_driver_pid) if _driver_pid else None,
-                                poll_seconds=12.0,
-                                profile_slot=int(_taskbar_slot),
-                                cmdline_markers=_cmd_markers,
-                                window_title_markers=_title_markers,
-                                include_webkit=_include_webkit,
-                                platform=str(profile_os or ""),
-                                session_key=str(session_id),
-                                skip_toolwindow=True,
-                                session_lifetime=False,
-                            )
                             return
-                        logger.warning(
-                            f"[profile-launch] mobile shell failed to start "
-                            f"session={session_id[:8]} — using engine window only"
-                        )
-                        _launch_warnings.append(
-                            "Krexion mobile device shell did not start — "
-                            "you are seeing the plain browser window, not the branded iOS/Android shell."
-                        )
-                        if strict_mobile_shell:
-                            raise RuntimeError(
-                                "Strict mobile shell: device chrome failed to start. "
-                                "Aborting so this is not mistaken for a real phone browser."
-                            )
+
+                        if is_mobile_shell_alive(session_id) and not allow_restart:
+                            _embedded = wait_for_mobile_shell_embedded(
+                                session_id, timeout_sec=20.0,
+                            ) if require_embed else False
+                            if _embedded or is_mobile_shell_embedded(session_id):
+                                _launch_ui_meta["mobile_shell"] = True
+                                _launch_ui_meta["mobile_shell_embedded"] = True
+                                stop_session_icon_keeper(str(session_id))
+                                return
+                            # Fall through to restart if embed never arrived
+
+                        _pf = preflight_mobile_shell()
+                        if not _pf.get("ok"):
+                            _msg = str(_pf.get("error") or "Mobile shell preflight failed")
+                            _launch_warnings.append(_msg)
+                            if strict_mobile_shell:
+                                raise RuntimeError(
+                                    f"Strict mobile shell: {_msg} Launch aborted — "
+                                    "plain Chromium/WebKit would have opened instead."
+                                )
+                            _use_mobile_shell = False
+                        else:
+                            _shell_active = False
+                            _embedded_ok = False
+                            for _shell_try in range(3):
+                                apply_krexion_mobile_shell(
+                                    _family_pids,
+                                    session_key=str(session_id),
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    platform=str(profile_os or "android"),
+                                    viewport_width=int(viewport.get("width", 393)),
+                                    viewport_height=int(viewport.get("height", 852)),
+                                    profile_label=str(_profile_label)[:60] or "Profile",
+                                    profile_slot=int(_taskbar_slot),
+                                    poll_seconds=_poll,
+                                    webkit=_profile_engine == "webkit",
+                                    home_url=str(start_url or "https://www.google.com/")[:512],
+                                )
+                                _shell_active = wait_for_mobile_shell(
+                                    session_id, timeout_sec=12.0,
+                                )
+                                if _shell_active and is_mobile_shell_alive(session_id):
+                                    if require_embed:
+                                        _embedded_ok = wait_for_mobile_shell_embedded(
+                                            session_id, timeout_sec=18.0,
+                                        )
+                                    else:
+                                        _embedded_ok = is_mobile_shell_embedded(session_id)
+                                    if _embedded_ok or not require_embed:
+                                        break
+                                time.sleep(0.55)
+
+                            _st = mobile_shell_status(session_id)
+                            # Early pass (require_embed=False): process alive is enough to continue;
+                            # post-nav pass requires HWND embed for success.
+                            _early_ok = bool(_shell_active and not require_embed)
+                            if _st.get("ok") or (_shell_active and _embedded_ok) or _early_ok:
+                                _launch_ui_meta["mobile_shell"] = True
+                                _launch_ui_meta["mobile_shell_embedded"] = bool(
+                                    _st.get("embedded") or _embedded_ok
+                                )
+                                stop_session_icon_keeper(str(session_id))
+                                logger.info(
+                                    f"[profile-launch] mobile shell "
+                                    f"{'EMBEDDED' if _launch_ui_meta['mobile_shell_embedded'] else 'STARTED'} "
+                                    f"session={session_id[:8]}"
+                                )
+                                if _launch_ui_meta["mobile_shell_embedded"]:
+                                    _launch_warnings.append(
+                                        "Mobile shell is a desktop browser framed like a phone — "
+                                        "not a real iPhone/Android device. Use for UX testing; "
+                                        "do not assume undetectable mobile fingerprint."
+                                    )
+                                apply_krexion_icon_to_pids(
+                                    _family_pids,
+                                    profile_label=str(_profile_label)[:60] or "Profile",
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    poll_seconds=12.0,
+                                    profile_slot=int(_taskbar_slot),
+                                    cmdline_markers=_cmd_markers,
+                                    window_title_markers=_title_markers,
+                                    include_webkit=_include_webkit,
+                                    platform=str(profile_os or ""),
+                                    session_key=str(session_id),
+                                    skip_toolwindow=True,
+                                    session_lifetime=False,
+                                )
+                                return
+
+                            # Process up but HWND never framed — treat as failure (post-nav / strict)
+                            if _shell_active and not _embedded_ok:
+                                logger.warning(
+                                    f"[profile-launch] mobile shell process alive but "
+                                    f"engine HWND not embedded session={session_id[:8]}"
+                                )
+                                _launch_warnings.append(
+                                    "Krexion phone chrome started but the browser window "
+                                    "was not framed inside it — you may see plain Chromium/WebKit."
+                                )
+                            else:
+                                logger.warning(
+                                    f"[profile-launch] mobile shell failed to start "
+                                    f"session={session_id[:8]} — using engine window only"
+                                )
+                                _launch_warnings.append(
+                                    "Krexion mobile device shell did not start — "
+                                    "you are seeing the plain browser window, not the branded iOS/Android shell."
+                                )
+                            if strict_mobile_shell:
+                                raise RuntimeError(
+                                    "Strict mobile shell: Krexion phone chrome did not "
+                                    "frame the browser. Launch aborted so plain Chromium/"
+                                    "WebKit is not shown as a real device."
+                                )
                     except RuntimeError:
                         raise
                     except Exception as _ms_err:
@@ -2583,12 +2665,13 @@ async def _launch_profile_session_inner(
 
                 # Non-Windows / shell not attempted: honesty warning for mobile profiles
                 if (
-                    bool(profile_config.get("is_mobile"))
+                    bool(is_mobile)
+                    and not _launch_ui_meta.get("mobile_shell_embedded")
                     and not _launch_ui_meta.get("mobile_shell")
                 ):
                     _launch_warnings.append(
-                        "Desktop Chromium — not a real iPhone/Android device. "
-                        "Mobile shell is Windows-only; fingerprint sites may detect desktop."
+                        "Desktop Chromium/WebKit — not a real iPhone/Android device. "
+                        "Krexion phone chrome is Windows-only; fingerprint sites may detect desktop."
                     )
                     if strict_mobile_shell and not _use_mobile_shell:
                         raise RuntimeError(
@@ -2610,13 +2693,18 @@ async def _launch_profile_session_inner(
                     skip_toolwindow=True,
                     session_lifetime=True,
                 )
-                # Legacy Safari overlay removed — it caused a second window + wrong zoom.
-                # Krexion mobile shell is the only branded mobile UI on Windows.
+            except RuntimeError:
+                raise
             except Exception as _icon_err:
                 logger.debug(f"Krexion taskbar-icon override skipped: {_icon_err}")
+                if strict_mobile_shell and is_mobile and mobile_shell:
+                    raise RuntimeError(
+                        f"Strict mobile shell: branding failed ({str(_icon_err)[:160]}). "
+                        "Launch aborted."
+                    ) from _icon_err
 
-        # Branding + mobile shell run ONCE after navigation (see below).
-        # Early branding here caused duplicate Safari/Chrome windows + icon flicker.
+        # Early shell start happens after first page (see below) to shrink
+        # the plain Chromium/WebKit window before navigation finishes.
 
         # Publish CDP websocket for Local API automation clients
         _cdp_ws = ""
@@ -2947,6 +3035,43 @@ async def _launch_profile_session_inner(
             logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
+
+        # v2.7.105d — Early Krexion phone chrome (mobile): start shell as soon as
+        # the engine window exists so plain Chromium/WebKit is not left visible
+        # through the whole first navigation. require_embed=False here so we
+        # don't block forever before goto; post-nav pass verifies HWND embed.
+        if is_mobile:
+            try:
+                await asyncio.sleep(0.45)
+                _brand_krexion_taskbar(
+                    mobile_shell=True,
+                    require_embed=False,
+                    allow_restart=True,
+                )
+            except RuntimeError as _early_shell_err:
+                # Strict abort — close browser before user mistakes it for Krexion design
+                logger.error(f"[profile-launch] strict mobile shell abort: {_early_shell_err}")
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    if browser is not None and not _persistent_mode:
+                        await browser.close()
+                except Exception:
+                    pass
+                raise
+            except Exception as _early_brand_err:
+                logger.debug(f"[profile-launch] early shell skipped: {_early_brand_err}")
+
+        # WebKit MiniBrowser: rename window ASAP so taskbar/title is Krexion, not [WebKit]
+        if _profile_engine == "webkit":
+            try:
+                await page.evaluate(
+                    f"""() => {{ try {{ document.title = {json.dumps('Krexion — ' + str(_profile_label or 'Profile')[:40])}; }} catch (e) {{}} }}"""
+                )
+            except Exception:
+                pass
 
         # v2.6.32 — TLS prewarm seeds cookies before first navigation (RUT parity).
         _last_tls_prewarm_ok = None
@@ -3387,13 +3512,30 @@ async def _launch_profile_session_inner(
                 except Exception as _de:
                     logger.warning(f"[profile-launch] post-goto diagnostic page render failed: {_de}")
 
-        # Single branding pass — after page content exists (prevents duplicate windows).
+        # Finalize branding — verify HWND embed after navigation (early pass may
+        # have started the phone chrome already; do not tear it down).
         try:
             await asyncio.sleep(0.35)
-            _brand_krexion_taskbar(mobile_shell=True)
+            _brand_krexion_taskbar(
+                mobile_shell=True,
+                require_embed=True,
+                allow_restart=not bool(_launch_ui_meta.get("mobile_shell")),
+            )
             if session_id in _RUNNING_SESSIONS:
                 _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()
                 _RUNNING_SESSIONS[session_id].update(_launch_ui_meta)
+        except RuntimeError as _brand_strict_err:
+            logger.error(f"[profile-launch] strict mobile shell abort (post-nav): {_brand_strict_err}")
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None and not _persistent_mode:
+                    await browser.close()
+            except Exception:
+                pass
+            raise
         except Exception as _brand_post_err:
             logger.debug(f"[profile-launch] post-nav branding skipped: {_brand_post_err}")
 
@@ -3411,7 +3553,11 @@ async def _launch_profile_session_inner(
                     "last_proxy_check": proxy_diag if proxy_diag.get("requested") else {},
                     "browser_kernel": str(_kernel_plan.get("kernel_label") or ""),
                     "launch_warnings": list(_launch_warnings),
-                    "mobile_shell_active": bool(_launch_ui_meta.get("mobile_shell")),
+                    "mobile_shell_active": bool(
+                        _launch_ui_meta.get("mobile_shell_embedded")
+                        or _launch_ui_meta.get("mobile_shell")
+                    ),
+                    "mobile_shell_embedded": bool(_launch_ui_meta.get("mobile_shell_embedded")),
                     "engine_used": str(_profile_engine or "chromium"),
                 })
             except Exception:

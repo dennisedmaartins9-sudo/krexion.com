@@ -1136,6 +1136,7 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
         "automation_error",
         "launch_warnings",
         "mobile_shell_active",
+        "mobile_shell_embedded",
         "engine_used",
     ):
         if _ak in body:
@@ -1143,6 +1144,7 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
     if status in ("stopped", "closed", "error"):
         prof_update.setdefault("launch_warnings", [])
         prof_update["mobile_shell_active"] = False
+        prof_update["mobile_shell_embedded"] = False
     if prof_update:
         await _DB.browser_profiles.update_one(
             {"id": profile_id},
@@ -1195,8 +1197,10 @@ class AntiDetectConfig(BaseModel):
     # Strict proxy: never open the browser without a live proxy when proxy is
     # enabled (blocks DNS soft-launch / "open without proxy" real-IP leak).
     proxy_check_block_on_fail: bool = True
-    # Abort launch if mobile device shell cannot start (Windows phone chrome).
-    strict_mobile_shell: bool = False
+    # Abort launch if mobile device shell cannot frame the browser.
+    # Default ON for new configs — mobile profiles must not soft-open as
+    # plain Chromium/WebKit. Explicit False still allowed for power users.
+    strict_mobile_shell: bool = True
     # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
     browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
@@ -1685,7 +1689,7 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     pid = str(uuid.uuid4())
     # 2026-01 — auto-generate unique name if blank
     name = (body.name or "").strip() or _auto_name(body.country, body.device_type)
-    return {
+    doc = {
         "id": pid,
         "user_id": user_id,
         "name": name,
@@ -1729,6 +1733,13 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
+    # Mobile: Strict phone chrome ON unless user explicitly turned it off
+    _anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
+    if is_mobile and "strict_mobile_shell" not in _anti:
+        _anti = dict(_anti)
+        _anti["strict_mobile_shell"] = True
+        doc["anti_detect"] = _anti
+    return doc
 
 
 def _not_deleted_filter() -> Dict[str, Any]:
@@ -1777,7 +1788,11 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     # Hint: strict when proxy enabled (default ON for unset / old profiles)
     d["strict_proxy"] = _strict_proxy_mode(doc if isinstance(doc, dict) else d)
     _anti = d.get("anti_detect") if isinstance(d.get("anti_detect"), dict) else {}
-    d["strict_mobile_shell"] = bool((_anti or {}).get("strict_mobile_shell"))
+    d["strict_mobile_shell"] = bool((_anti or {}).get("strict_mobile_shell", True)) if bool(d.get("is_mobile")) else bool((_anti or {}).get("strict_mobile_shell"))
+    # Effective: mobile + unset → strict ON
+    if bool(d.get("is_mobile")) and "strict_mobile_shell" not in (_anti or {}):
+        d["strict_mobile_shell"] = True
+    d["mobile_shell_embedded"] = bool(d.get("mobile_shell_embedded"))
     # Proxy check age for UI badge
     _lpc = d.get("last_proxy_check") if isinstance(d.get("last_proxy_check"), dict) else {}
     _checked_at = str(
@@ -4297,12 +4312,14 @@ async def launch_preview(request: Request, profile_id: str):
         "is_mobile": bool(doc.get("is_mobile")),
         "os": str(doc.get("os") or ""),
         "mobile_shell_active": bool(view.get("mobile_shell_active")),
+        "mobile_shell_embedded": bool(view.get("mobile_shell_embedded")),
         "device": doc.get("device_model") or doc.get("device_type") or "",
         "last_proxy_check": view.get("last_proxy_check") or {},
         "ready": health.get("level") in ("good", "warn", "unknown"),
         "default_automation_upload_id": str(doc.get("default_automation_upload_id") or ""),
         "default_data_file_id": str(doc.get("default_data_file_id") or ""),
         "launch_warnings": list(view.get("launch_warnings") or []),
+        "engine_used": str(view.get("engine_used") or ""),
     }
 
 @router.post("/{profile_id}/clone")
