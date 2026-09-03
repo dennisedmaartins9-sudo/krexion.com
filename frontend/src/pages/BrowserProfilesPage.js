@@ -789,11 +789,8 @@ export default function BrowserProfilesPage() {
   };
 
   const handleCreate = async () => {
-    // 2026-01: When NOT editing an existing profile, route through the
-    // new advanced-create endpoint so the form fully exploits the UA
-    // generator + any Proxy Provider the user added in Settings.
-    // keeps using the old `/` PUT — that just replaces existing config
-    // verbatim.
+    // Create uses advanced-create (UA generator + any Proxy Provider from Settings).
+    // Edit uses PUT / — replaces existing config verbatim.
     if (!editingId) {
       return handleAdvancedCreate();
     }
