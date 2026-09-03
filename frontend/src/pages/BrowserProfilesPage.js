@@ -147,13 +147,17 @@ const DEFAULT_NEW = {
     proxy_check_on_launch: true,
     // Strict proxy ON for new profiles — never open on real IP if proxy dead
     proxy_check_block_on_fail: true,
-    # Abort if phone chrome (mobile shell) cannot frame the browser
+    // Abort if phone chrome (mobile shell) cannot frame the browser
     strict_mobile_shell: true,
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
     allow_extensions: false,
     extensions_dir: "",
+    // v2.7.105e — anti-detect hardening defaults
+    local_api_cdp: false,
+    disable_ipv6: true,
+    stealth_profile: "full",
   },
   referrer: { ...DEFAULT_PROFILE_REFERRER },
 };
@@ -3202,6 +3206,7 @@ export default function BrowserProfilesPage() {
                               </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
                                 Keep <span className="text-zinc-300">proxy</span> when a proxy is on.
+                                &quot;proxy&quot; = Chromium UDP block (not exit-IP ICE rewrite).
                                 &quot;real&quot; can leak your real IP — launcher auto-forces proxy if needed.
                               </p>
                             </div>
@@ -3211,7 +3216,9 @@ export default function BrowserProfilesPage() {
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, tls_prewarm: e.target.checked } })} />
                             <span>
                               tls_prewarm
-                              <span className="block text-[9px] text-zinc-500">Warm TLS session to start URL before browse</span>
+                              <span className="block text-[9px] text-zinc-500">
+                                Cookie/origin seed only — does NOT change live browser JA3/H2 fingerprint.
+                              </span>
                             </span>
                           </label>
                           <label className="flex items-start gap-2">
@@ -3255,6 +3262,49 @@ export default function BrowserProfilesPage() {
                               </span>
                             </span>
                           </label>
+                          <label className="flex items-start gap-2" data-testid="bp-local-api-cdp">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.local_api_cdp}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, local_api_cdp: e.target.checked } })} />
+                            <span>
+                              Local API CDP (remote debugging)
+                              <span className="block text-[9px] text-zinc-500">
+                                Opens --remote-debugging-port on 127.0.0.1 for automation. Default OFF — detection surface if unused.
+                              </span>
+                            </span>
+                          </label>
+                          <label className="flex items-start gap-2" data-testid="bp-disable-ipv6">
+                            <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={form.anti_detect.disable_ipv6 !== false}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, disable_ipv6: e.target.checked } })} />
+                            <span>
+                              Disable IPv6
+                              <span className="block text-[9px] text-zinc-500">
+                                Prefer IPv4 — reduces dual-stack / WebRTC IPv6 leaks with proxies. Default ON.
+                              </span>
+                            </span>
+                          </label>
+                          <div>
+                            <Label className="text-zinc-400 text-[10px]">Stealth profile</Label>
+                            <select
+                              className="mt-1 w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100"
+                              value={form.anti_detect.stealth_profile || "full"}
+                              onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, stealth_profile: e.target.value } })}
+                              data-testid="bp-stealth-profile"
+                            >
+                              <option value="full">Full (Chromium stack)</option>
+                              <option value="minimal">Minimal (fewer JS patches)</option>
+                              <option value="safari">Safari-shaped (WebKit / no chrome.*)</option>
+                            </select>
+                            <span className="block text-[9px] text-zinc-500 mt-0.5">
+                              WebKit iOS launches auto-use Safari-shaped. TLS prewarm = cookie seed only — not live JA3.
+                            </span>
+                          </div>
+                          {(form.is_mobile || form.device_type === "mobile") && (
+                            ["canvas_mode", "webgl_mode"].some((k) => ["real", "off"].includes(form.anti_detect?.[k])) && (
+                              <p className="text-[10px] text-amber-300/90" data-testid="bp-mode-mobile-warn">
+                                Mobile + canvas/webgl real/off: host GPU may not match UA — prefer noise unless Cloak quiet.
+                              </p>
+                            )
+                          )}
                           <label className="flex items-start gap-2">
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.allow_extensions}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, allow_extensions: e.target.checked } })} />
@@ -3328,11 +3378,16 @@ export default function BrowserProfilesPage() {
                           className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                       </div>
                     </div>
-                    <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                    <label className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer">
                       <input type="checkbox" checked={form.geo_follow_proxy !== false}
                         onChange={(e) => setForm({ ...form, geo_follow_proxy: e.target.checked })}
-                        className="w-4 h-4 rounded accent-fuchsia-500" />
-                      geo_follow_proxy
+                        className="w-4 h-4 rounded accent-fuchsia-500 mt-0.5" />
+                      <span>
+                        geo_follow_proxy
+                        <span className="block text-[9px] text-zinc-500">
+                          ON = timezone/locale follow proxy exit IP. OFF risks geo mismatch fraud signals.
+                        </span>
+                      </span>
                     </label>
                     <div>
                       <Label className="text-zinc-300 text-xs">Quick links <span className="text-zinc-500">(one URL per line)</span></Label>

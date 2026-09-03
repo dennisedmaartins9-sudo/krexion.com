@@ -3763,16 +3763,41 @@ async def _rut_apply_context_stealth(
     skip_webgl_align: bool = False,
     fingerprint_win: bool = True,
     cloak_quiet: bool = False,
+    engine: str = "chromium",
+    stealth_profile: str = "full",
 ) -> bool:
     """Full RUT stealth stack — shared by main, context-retry, tunnel-retry paths.
 
     Returns True on success. On hard failure sets `context._krx_stealth_degraded`
     and returns False (or re-raises for the initial stealth script build).
+
+    engine=webkit / stealth_profile=safari → Safari-shaped inject (no window.chrome).
+    stealth_profile=minimal → skip Fingerprint WIN + natural canvas double layer.
     """
+    _engine = str(engine or "chromium").lower().strip()
+    _safari = _engine in ("webkit", "wkwebview") or str(stealth_profile or "").lower() == "safari"
+    _minimal = str(stealth_profile or "").lower() in ("minimal", "lite")
+    if _safari:
+        # Force Safari honesty — never claim Chromium UA surfaces
+        fp = dict(fp or {})
+        fp["is_chromium_ua"] = False
+        fp["vendor"] = "Apple Computer, Inc."
+        if not str(fp.get("webgl_vendor") or "").startswith("Apple"):
+            fp["webgl_vendor"] = "Apple Computer, Inc."
+            fp.setdefault(
+                "webgl_renderer",
+                "Apple GPU",
+            )
+        fingerprint_win = False  # chrome.runtime pack is Chromium-only
+        cloak_quiet = True  # skip natural canvas layering on Safari path
+
     try:
         await context.add_init_script(
             _build_stealth_script(
-                fp, geo, fp_hash_override=fp_hash_override, skip_canvas_noise=True,
+                fp, geo,
+                fp_hash_override=fp_hash_override,
+                skip_canvas_noise=True,
+                safari_mode=_safari,
             )
         )
     except Exception as _stealth_err:
@@ -3803,7 +3828,7 @@ async def _rut_apply_context_stealth(
         # Legacy RUT: natural canvas only when WebGL cfg present.
         # Profile modes may skip WebGL align while still wanting canvas noise.
         # v2.7.20 — Cloak quiet: skip natural canvas (C++ kernel owns it)
-        if cloak_quiet:
+        if cloak_quiet or _minimal or _safari:
             skip_natural_canvas = True
         if not skip_natural_canvas and (
             bool(_wgl.get("vendor") and _wgl.get("renderer")) or skip_webgl_align
@@ -3825,6 +3850,7 @@ async def _rut_apply_context_stealth(
                             _build_stealth_script(
                                 fp, geo, fp_hash_override=fp_hash_override,
                                 skip_canvas_noise=False,
+                                safari_mode=_safari,
                             )
                         )
                     except Exception as _fb_err:
@@ -3853,6 +3879,7 @@ async def _rut_apply_context_stealth(
             ua=ua,
             viewport=_vp,
             platform=platform or "",
+            safari_mode=_safari,
         )
         _v_hdrs = _v230_r.get("headers") or {}
         if _v_hdrs:
@@ -3863,7 +3890,8 @@ async def _rut_apply_context_stealth(
         logger.warning(f"v2.3.0 stealth apply failed (continuing): {_v230_err}")
 
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (iframe/Worker/OffscreenCanvas/chrome)
-    if fingerprint_win:
+    # Skip on Safari/WebKit and minimal profile (Chromium chrome.runtime pack).
+    if fingerprint_win and not _safari and not _minimal:
         try:
             from fingerprint_win import build_fingerprint_win_js
 
@@ -5662,6 +5690,7 @@ def _build_stealth_script(
     *,
     fp_hash_override: Optional[int] = None,
     skip_canvas_noise: bool = False,
+    safari_mode: bool = False,
 ) -> str:
     import json as _json
     explicit_locale = str(fp.get("explicit_locale") or "").strip()
@@ -5747,10 +5776,13 @@ def _build_stealth_script(
         ),
         "connectionType": str(fp.get("connection_type") or "wifi"),
         "isChromiumUa": bool(
-            fp.get("is_chromium_ua")
-            if "is_chromium_ua" in fp
-            else re.search(r"(?:Chrome|CriOS|Chromium)/", str(fp.get("ua") or ""), re.I)
+            False if safari_mode else (
+                fp.get("is_chromium_ua")
+                if "is_chromium_ua" in fp
+                else re.search(r"(?:Chrome|CriOS|Chromium)/", str(fp.get("ua") or ""), re.I)
+            )
         ),
+        "safariMode": bool(safari_mode),
         "skipCanvasNoise": bool(skip_canvas_noise),
         "historyLength": max(
             2,
@@ -5830,6 +5862,7 @@ safe(() => {
 
 // ── plugins / mimeTypes (real Chrome has PDF viewer plugin) ────
 safe(() => {
+  if (!__KX.isChromiumUa || __KX.safariMode) return;
   if (navigator.plugins.length === 0) {
     const fakePlugins = [
       { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },

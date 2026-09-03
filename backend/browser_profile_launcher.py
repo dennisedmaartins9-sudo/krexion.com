@@ -352,6 +352,10 @@ def _headed_launch_args(anti: Optional[Dict[str, Any]] = None) -> List[str]:
         args = [a for a in args if a != "--disable-extensions"]
         if ext_path and os.path.isdir(ext_path):
             args.append(f"--load-extension={ext_path}")
+    # Prefer IPv4 when proxy is used — dual-stack leaks are a common fail
+    if anti.get("disable_ipv6", True) is not False:
+        if "--disable-ipv6" not in args:
+            args.append("--disable-ipv6")
     return args
 
 
@@ -639,12 +643,25 @@ def _resolve_geo_for_profile(profile_config: Dict[str, Any]) -> Dict[str, Any]:
         loc, tz, al, lat, lon = _resolve_country_geo(country)
     except Exception:
         loc, tz, al, lat, lon = "en-US", "America/New_York", "en-US,en;q=0.9", 40.7128, -74.0060
+    # Wire profile.language → Accept-Language / navigator.languages when set
+    lang = str(profile_config.get("language") or "").strip()
+    accept = str(profile_config.get("accept_language") or "").strip()
+    if lang and not accept:
+        base = lang.split("-", 1)[0]
+        accept = f"{lang},{base};q=0.9" if "-" in lang else f"{lang},en;q=0.8"
+    elif lang and accept and lang.split(",")[0].strip() not in accept:
+        # Prefer explicit language as primary tag
+        accept = f"{lang},{accept}"
+    locale = str(profile_config.get("locale") or "").strip() or loc
+    if lang and not profile_config.get("locale"):
+        locale = lang if "-" in lang else locale
     return {
-        "locale": profile_config.get("locale") or loc,
+        "locale": locale,
         "timezone": profile_config.get("timezone") or tz,
-        "accept_language": profile_config.get("accept_language") or al,
+        "accept_language": accept or al,
         "lat": lat,
         "lon": lon,
+        "language": lang,
     }
 
 
@@ -1836,7 +1853,32 @@ async def _launch_profile_session_inner(
     if anti.get("strict_proxy") is False and "proxy_check_block_on_fail" not in anti:
         proxy_check_block_on_fail = False
     strict_mobile_shell = bool(anti.get("strict_mobile_shell"))
-    use_persistent_context = bool(anti.get("use_persistent_context", False))
+    # Default ON — matches AntiDetectConfig; old code used False and broke persistence
+    use_persistent_context = bool(anti.get("use_persistent_context", True))
+    local_api_cdp = bool(
+        anti.get("local_api_cdp")
+        or profile_config.get("local_api_cdp")
+        or os.environ.get("KREXION_PROFILE_CDP", "").strip() == "1"
+    )
+    disable_ipv6 = bool(anti.get("disable_ipv6", True))
+    stealth_profile = str(anti.get("stealth_profile") or "full").lower().strip()
+    if stealth_profile not in ("full", "minimal", "safari"):
+        stealth_profile = "full"
+    if paranoia_mode:
+        # Deepen paranoia: no CDP, force WebRTC proxy, IPv6 off, Strict proxy
+        local_api_cdp = False
+        disable_ipv6 = True
+        if webrtc_mode == "real":
+            webrtc_mode = "proxy"
+        anti = dict(anti)
+        anti["fingerprint_win"] = True
+        anti["proxy_check_block_on_fail"] = True
+        anti["disable_ipv6"] = True
+        proxy_check_block_on_fail = True
+    anti = dict(anti) if not isinstance(anti, dict) else dict(anti)
+    anti["disable_ipv6"] = disable_ipv6
+    anti["local_api_cdp"] = local_api_cdp
+    anti["stealth_profile"] = stealth_profile
 
     try:
         from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
@@ -1850,6 +1892,10 @@ async def _launch_profile_session_inner(
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
     _launch_warnings: List[str] = []
+    if paranoia_mode:
+        _launch_warnings.append(
+            "Paranoia mode: CDP off, WebRTC proxy, IPv6 disabled, Strict proxy ON."
+        )
     _lppw = str(profile_config.get("_launch_proxy_probe_warning") or "").strip()
     if _lppw:
         _launch_warnings.append(_lppw)
@@ -2105,6 +2151,48 @@ async def _launch_profile_session_inner(
             "WebRTC was set to 'real' while a proxy is enabled — forced to "
             "'proxy' so your real IP cannot leak through WebRTC/STUN."
         )
+    if _proxy_on_for_webrtc and webrtc_mode == "proxy":
+        _launch_warnings.append(
+            "WebRTC mode 'proxy' blocks non-proxied UDP (host ICE). "
+            "It does NOT rewrite ICE candidates to the proxy exit IP."
+        )
+    if tls_prewarm:
+        _launch_warnings.append(
+            "TLS prewarm seeds cookies via curl_cffi — it does NOT change the "
+            "live browser JA3/H2 fingerprint (Playwright/Cloak Chromium still applies)."
+        )
+    if profile_config.get("geo_follow_proxy") is False and (_proxy_on_for_webrtc or _proxy_enabled):
+        _launch_warnings.append(
+            "geo_follow_proxy is OFF — timezone/locale may disagree with proxy exit IP "
+            "(strong fraud signal on many sites)."
+        )
+    if is_mobile and (webgl_mode in ("real", "off") or canvas_mode in ("real", "off")):
+        _launch_warnings.append(
+            f"Mobile profile with canvas={canvas_mode}/webgl={webgl_mode}: "
+            "host GPU/fonts may not match the mobile UA — prefer 'noise' unless using Cloak quiet."
+        )
+    if _profile_engine == "webkit":
+        _launch_warnings.append(
+            "WebKit engine: Safari-shaped stealth (no window.chrome / Sec-CH-UA). "
+            "Still desktop MiniBrowser — not a physical iPhone."
+        )
+
+    # Persist Strict proxy flag for old profiles that never saved it (one-shot migrate)
+    if (
+        _proxy_on
+        and proxy_check_block_on_fail
+        and "proxy_check_block_on_fail" not in (profile_config.get("anti_detect") or {})
+        and on_session_update
+    ):
+        try:
+            await on_session_update({
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "status": "launching",
+                "anti_detect_patch": {"proxy_check_block_on_fail": True},
+            })
+        except Exception:
+            pass
 
     # v2.7.103 — Dead DNS (BestGo ENOTFOUND etc.): never open browser through
     # an unresolvable gateway. Soft-disable proxy so iPhone/Android still open
@@ -2287,13 +2375,10 @@ async def _launch_profile_session_inner(
                         except Exception as _retry_err:
                             logger.warning(f"[profile-launch] chromium retry failed: {_retry_err}")
                     raise _lex2 from _lex
-        # v2.7.13 — Local API CDP: optional remote debugging for Playwright connect
+        # v2.7.13 / v2.7.105e — CDP opt-in ONLY (Local API / env / anti_detect.local_api_cdp).
+        # Native/local used to always open --remote-debugging-port → automation surface.
         _cdp_port: Optional[int] = None
-        _want_cdp = bool(
-            profile_config.get("local_api_cdp")
-            or os.environ.get("KREXION_PROFILE_CDP", "").strip() == "1"
-            or (os.environ.get("KREXION_MODE") or "").lower().strip() in ("native", "local")
-        )
+        _want_cdp = bool(local_api_cdp)
         if _want_cdp and _profile_engine != "webkit":
             try:
                 import socket as _sock
@@ -2303,6 +2388,10 @@ async def _launch_profile_session_inner(
                     _cdp_port = int(_s.getsockname()[1])
                 launch_kwargs["args"].append(f"--remote-debugging-port={_cdp_port}")
                 launch_kwargs["args"].append("--remote-debugging-address=127.0.0.1")
+                _launch_warnings.append(
+                    "Local API CDP is ON — remote debugging port is open on 127.0.0.1 "
+                    "(automation surface). Turn off anti_detect.local_api_cdp if unused."
+                )
             except Exception as _cdp_bind_err:
                 logger.debug(f"[profile-launch] CDP port bind skipped: {_cdp_bind_err}")
                 _cdp_port = None
@@ -2316,6 +2405,9 @@ async def _launch_profile_session_inner(
 
         if _profile_engine == "webkit":
             # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
+            # Force Safari stealth profile unless user set minimal.
+            if stealth_profile == "full":
+                stealth_profile = "safari"
             wk_kwargs: Dict[str, Any] = {"headless": False}
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
@@ -2379,14 +2471,14 @@ async def _launch_profile_session_inner(
             )
             if _force_sys_chrome:
                 channel = "chrome"
-            # v2.7.15 — Optional persistent context (native/local WIN/Linux only)
+            # v2.7.15 / v2.7.105e — Persistent context works WITH Cloak executable_path
+            # (previously Cloak blocked user-data-dir — AdsPower-class save never ran).
             _krx_mode = (os.environ.get("KREXION_MODE") or "").lower()
             _want_persist = (
                 use_persistent_context
                 and _profile_engine not in ("webkit", "firefox")
                 and (sys.platform.startswith("win") or sys.platform.startswith("linux"))
                 and _krx_mode in ("native", "local", "desktop")
-                and not bool(_kernel_plan.get("executable_path"))
             )
             _persistent_mode = False
             browser = None  # type: ignore
@@ -2973,10 +3065,13 @@ async def _launch_profile_session_inner(
                     skip_webgl_align=_skip_webgl_align,
                     fingerprint_win=bool(anti.get("fingerprint_win", True)),
                     cloak_quiet=_cloak_quiet,
+                    engine=str(_profile_engine or "chromium"),
+                    stealth_profile=stealth_profile,
                 )
                 logger.info(
                     f"[profile-launch] RUT-parity stealth ON — "
                     f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
+                    f"engine={_profile_engine} stealth_profile={stealth_profile} "
                     f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]} "
                     f"canvas={canvas_mode} webrtc={webrtc_mode} "
                     f"fp_win={bool(anti.get('fingerprint_win', True))} "
@@ -2984,10 +3079,16 @@ async def _launch_profile_session_inner(
                 )
 
                 if paranoia_mode:
-                    await context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                        "window.chrome = window.chrome || { runtime: {} };"
-                    )
+                    # Never invent window.chrome on WebKit/Safari path
+                    if _profile_engine == "webkit" or stealth_profile == "safari":
+                        await context.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        )
+                    else:
+                        await context.add_init_script(
+                            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                            "window.chrome = window.chrome || { runtime: {} };"
+                        )
             except Exception as e:
                 logger.warning(f"anti-detect script injection failed: {e}")
                 try:
@@ -2998,12 +3099,20 @@ async def _launch_profile_session_inner(
                 # (headed Profile soft-fails with warning; visit still opens)
                 try:
                     from anti_detect_v230 import apply_v230_stealth
+                    _v230_safari = (
+                        _profile_engine == "webkit" or stealth_profile == "safari"
+                    )
                     _v230_report = await apply_v230_stealth(
-                        context, ua=ua, viewport=viewport, platform=""
+                        context,
+                        ua=ua,
+                        viewport=viewport,
+                        platform="",
+                        safari_mode=_v230_safari,
                     )
                     _extra_hdrs = dict(_ctx_hdrs)
                     _extra_hdrs.update(_v230_report.get("headers") or {})
-                    _extra_hdrs.update(_profile_ch_hints)
+                    if not _v230_safari:
+                        _extra_hdrs.update(_profile_ch_hints)
                     _extra_hdrs["Accept-Language"] = accept_lang
                     await context.set_extra_http_headers(_extra_hdrs)
                 except Exception:
@@ -3015,12 +3124,20 @@ async def _launch_profile_session_inner(
             # Master anti-detect off — still apply v2.3.0 baseline when possible.
             try:
                 from anti_detect_v230 import apply_v230_stealth
+                _v230_safari = (
+                    _profile_engine == "webkit" or stealth_profile == "safari"
+                )
                 _v230_report = await apply_v230_stealth(
-                    context, ua=ua, viewport=viewport, platform=""
+                    context,
+                    ua=ua,
+                    viewport=viewport,
+                    platform="",
+                    safari_mode=_v230_safari,
                 )
                 _extra_hdrs = dict(_ctx_hdrs)
                 _extra_hdrs.update(_v230_report.get("headers") or {})
-                _extra_hdrs.update(_profile_ch_hints)
+                if not _v230_safari:
+                    _extra_hdrs.update(_profile_ch_hints)
                 _extra_hdrs["Accept-Language"] = accept_lang
                 await context.set_extra_http_headers(_extra_hdrs)
             except Exception as _v230_err:
@@ -4319,6 +4436,10 @@ async def warm_profile_cookies(
                         identity_label=profile_id,
                         fingerprint_win=bool((profile_config.get("anti_detect") or {}).get("fingerprint_win", True)),
                         cloak_quiet=False,
+                        engine="chromium",
+                        stealth_profile=str(
+                            (profile_config.get("anti_detect") or {}).get("stealth_profile") or "full"
+                        ),
                     )
                 except Exception as _st_err:
                     logger.debug(f"[cookie-robot] stealth skipped: {_st_err}")

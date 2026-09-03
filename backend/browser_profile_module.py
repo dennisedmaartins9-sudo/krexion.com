@@ -1141,6 +1141,16 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
     ):
         if _ak in body:
             prof_update[_ak] = body[_ak]
+    # One-shot migrate: persist Strict proxy when launch reported the patch
+    _ad_patch = body.get("anti_detect_patch")
+    if isinstance(_ad_patch, dict) and _ad_patch:
+        try:
+            doc0 = await _DB.browser_profiles.find_one({"id": profile_id}, {"_id": 0, "anti_detect": 1})
+            cur_anti = dict((doc0 or {}).get("anti_detect") or {})
+            cur_anti.update({k: v for k, v in _ad_patch.items() if k})
+            prof_update["anti_detect"] = cur_anti
+        except Exception:
+            pass
     if status in ("stopped", "closed", "error"):
         prof_update.setdefault("launch_warnings", [])
         prof_update["mobile_shell_active"] = False
@@ -1201,6 +1211,13 @@ class AntiDetectConfig(BaseModel):
     # Default ON for new configs — mobile profiles must not soft-open as
     # plain Chromium/WebKit. Explicit False still allowed for power users.
     strict_mobile_shell: bool = True
+    # Opt-in Local API CDP (--remote-debugging-port). Default OFF — was a
+    # detection surface when always-on for native/local.
+    local_api_cdp: bool = False
+    # Prefer IPv4 (avoid dual-stack / WebRTC IPv6 leaks with proxies).
+    disable_ipv6: bool = True
+    # full | minimal | safari — safari auto for WebKit; minimal skips FP WIN layer
+    stealth_profile: str = "full"
     # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
     browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
