@@ -1130,9 +1130,13 @@ class AntiDetectConfig(BaseModel):
     audio_mode: str = "noise"       # off | noise | real
     font_mode: str = "noise"        # off | noise | real
     webrtc_mode: str = "proxy"      # disabled | proxy | real
-    use_persistent_context: bool = False
+    # Full Chromium user-data dir (AdsPower-class persistence). Default ON
+    # for new profiles so logins/extensions survive better than storage_state alone.
+    use_persistent_context: bool = True
     proxy_check_on_launch: bool = True
-    proxy_check_block_on_fail: bool = False
+    # Strict proxy: never open the browser without a live proxy when proxy is
+    # enabled (blocks DNS soft-launch / "open without proxy" real-IP leak).
+    proxy_check_block_on_fail: bool = True
     # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
     browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
@@ -1758,6 +1762,9 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
             exp = int(float(expires))
         except Exception:
             exp = -1
+        # Classic Netscape has no SameSite column — do NOT invent "Lax"
+        # (forces logout on sites that issued Strict/None). Playwright
+        # applies its own default when sameSite is omitted.
         ck: Dict[str, Any] = {
             "name": name,
             "value": value,
@@ -1765,12 +1772,31 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
             "path": path or "/",
             "secure": str(secure).upper() in ("TRUE", "1", "YES"),
             "httpOnly": _http_only,
-            "sameSite": "Lax",
         }
         if exp > 0:
             ck["expires"] = exp
         out.append(ck)
     return out
+
+
+def _normalize_same_site(raw: Any) -> Optional[str]:
+    """Preserve Strict / Lax / None; never invent a default."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    key = s.lower().replace("_", "")
+    if key in ("strict",):
+        return "Strict"
+    if key in ("lax",):
+        return "Lax"
+    if key in ("none", "no_restriction", "norestriction"):
+        return "None"
+    # Already canonical?
+    if s in ("Strict", "Lax", "None"):
+        return s
+    return None
 
 
 def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
@@ -1794,8 +1820,11 @@ def _normalize_cookie_list(cookies: List[Any]) -> List[Dict[str, Any]]:
                 item["expires"] = float(c["expires"])
             except Exception:
                 pass
-        if c.get("sameSite"):
-            item["sameSite"] = c["sameSite"]
+        ss = _normalize_same_site(
+            c.get("sameSite") if c.get("sameSite") is not None else c.get("same_site")
+        )
+        if ss:
+            item["sameSite"] = ss
         out.append(item)
     return out
 
@@ -1912,8 +1941,31 @@ def _rotate_manual_proxy_session(proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _strict_proxy_mode(doc_or_anti: Optional[Dict[str, Any]]) -> bool:
+    """True when profile must never soft-open without a working proxy.
+
+    Reads anti_detect.proxy_check_block_on_fail (UI: Strict proxy) or
+    anti_detect.strict_proxy alias. Existing profiles without the flag
+    keep legacy soft-launch behaviour.
+    """
+    if not isinstance(doc_or_anti, dict):
+        return False
+    anti = doc_or_anti.get("anti_detect") if "anti_detect" in doc_or_anti else doc_or_anti
+    if not isinstance(anti, dict):
+        return False
+    if anti.get("proxy_check_block_on_fail") is True:
+        return True
+    if anti.get("strict_proxy") is True:
+        return True
+    return False
+
+
 def _proxy_ready_for_soft_launch(proxy_cfg: Dict[str, Any]) -> bool:
-    """Launch may proceed without pre-bound exit IP when proxy line resolved."""
+    """Launch may proceed without pre-bound exit IP when proxy line resolved.
+
+    Note: this still keeps the proxy on the browser — it only skips the
+    pre-bound unique exit-IP gate. It does NOT mean "open on real IP".
+    """
     if not str(proxy_cfg.get("server") or "").strip():
         return False
     if str(proxy_cfg.get("password") or "").strip():
@@ -3579,12 +3631,17 @@ async def export_cookies(request: Request, profile_id: str):
 
 @router.put("/{profile_id}/cookies")
 async def import_cookies(request: Request, profile_id: str, body: CookieImportBody):
-    """Import cookies (replace or merge)."""
+    """Import cookies (replace or merge). Owner-only — matches export ACL."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    # Use ACL helper so shared users get 403 (not misleading 404), then
+    # require ownership — same policy as cookie export.
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
+    if str(doc.get("user_id") or "") != str(uid):
+        raise HTTPException(
+            status_code=403,
+            detail="Cookie import is owner-only for shared profiles",
+        )
     existing = dict(doc.get("storage_state") or {})
     cookies: List[Dict[str, Any]] = []
     origins = list(existing.get("origins") or [])
@@ -3655,9 +3712,7 @@ async def fingerprint_preview(request: Request, profile_id: str):
     """Coherence panel data from stored profile fields — no browser launch."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
-    doc = await _DB.browser_profiles.find_one({"id": profile_id, "user_id": uid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    doc = await _get_profile_for_user(profile_id, uid, min_role="viewer")
     pub = _public_view(doc)
     anti = doc.get("anti_detect") or {}
     if not isinstance(anti, dict):
@@ -3699,9 +3754,9 @@ async def fingerprint_preview(request: Request, profile_id: str):
             "audio_mode": str(anti.get("audio_mode") or "noise"),
             "font_mode": str(anti.get("font_mode") or "noise"),
             "webrtc_mode": str(anti.get("webrtc_mode") or "proxy"),
-            "use_persistent_context": bool(anti.get("use_persistent_context", False)),
+            "use_persistent_context": bool(anti.get("use_persistent_context", True)),
             "proxy_check_on_launch": bool(anti.get("proxy_check_on_launch", True)),
-            "proxy_check_block_on_fail": bool(anti.get("proxy_check_block_on_fail", False)),
+            "proxy_check_block_on_fail": bool(anti.get("proxy_check_block_on_fail", True)),
             "browser_kernel": str(anti.get("browser_kernel") or "auto"),
             "fingerprint_win": bool(anti.get("fingerprint_win", True)),
             "fingerprint_win_prefer_real": bool(anti.get("fingerprint_win_prefer_real", True)),

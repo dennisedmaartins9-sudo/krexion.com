@@ -138,9 +138,11 @@ const DEFAULT_NEW = {
     audio_mode: "noise",
     font_mode: "noise",
     webrtc_mode: "proxy",
-    use_persistent_context: false,
+    // Full disk profile dir (better login persistence)
+    use_persistent_context: true,
     proxy_check_on_launch: true,
-    proxy_check_block_on_fail: false,
+    // Strict proxy ON for new profiles — never open on real IP if proxy dead
+    proxy_check_block_on_fail: true,
     browser_kernel: "auto",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
@@ -1953,6 +1955,10 @@ export default function BrowserProfilesPage() {
             (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
             app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
             Select multiple cards for bulk Launch / Stop / Delete.
+            <div className="mt-2 text-amber-100/90">
+              <span className="font-semibold">New defaults:</span> Strict proxy ON (dead proxy = no browser / no real-IP leak)
+              · Full profile save ON (persistent disk folder) · iPhone/Android = desktop shell, not a real phone.
+            </div>
           </div>
         </div>
 
@@ -2777,8 +2783,10 @@ export default function BrowserProfilesPage() {
                           </div>
                         </div>
                       )}
-                      <p className="text-[11px] text-zinc-500">
-                        iOS → Safari engine (real iPhone browsing). Android / Desktop → Chromium. Each profile gets a unique UA + device model.
+                      <p className="text-[11px] text-amber-200/90" data-testid="bp-ios-honesty">
+                        iOS uses Playwright WebKit + Krexion phone shell on your PC —{" "}
+                        <span className="font-semibold">not a real iPhone</span>.
+                        Android/Desktop use Chromium. Good for UX / manual checks; advanced trackers can still see it is a desktop browser.
                       </p>
                     </div>
                   )}
@@ -3105,8 +3113,11 @@ export default function BrowserProfilesPage() {
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.use_persistent_context}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, use_persistent_context: e.target.checked } })} />
                             <span>
-                              use_persistent_context
-                              <span className="block text-[9px] text-zinc-500">Disk profile dir instead of ephemeral + storage_state</span>
+                              Full profile save (persistent folder)
+                              <span className="block text-[9px] text-zinc-500">
+                                AdsPower-style disk profile — logins / site data survive better than cookies-only.
+                                Keep ON for accounts you log into.
+                              </span>
                             </span>
                           </label>
                           <label className="flex items-start gap-2">
@@ -3117,12 +3128,15 @@ export default function BrowserProfilesPage() {
                               <span className="block text-[9px] text-zinc-500">Verify exit IP when launching</span>
                             </span>
                           </label>
-                          <label className="flex items-start gap-2">
+                          <label className="flex items-start gap-2" data-testid="bp-strict-proxy">
                             <input type="checkbox" className="accent-fuchsia-500 mt-0.5" checked={!!form.anti_detect.proxy_check_block_on_fail}
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, proxy_check_block_on_fail: e.target.checked } })} />
                             <span>
-                              proxy_check_block_on_fail
-                              <span className="block text-[9px] text-zinc-500">Abort launch if proxy check fails</span>
+                              Strict proxy (never open without working proxy)
+                              <span className="block text-[9px] text-zinc-500">
+                                If proxy DNS/check fails, abort launch — do NOT open on your real IP.
+                                Recommended ON for agency / offer accounts.
+                              </span>
                             </span>
                           </label>
                           <label className="flex items-start gap-2">

@@ -2078,9 +2078,21 @@ async def _launch_profile_session_inner(
     # v2.7.103 — Dead DNS (BestGo ENOTFOUND etc.): never open browser through
     # an unresolvable gateway. Soft-disable proxy so iPhone/Android still open
     # with Krexion mobile shell; operator fixes host in Proxy Providers.
+    # Strict proxy (proxy_check_block_on_fail): abort instead — never leak real IP.
     if proxy_arg and proxy_arg.get("server"):
         _dns_err = _proxy_dns_failure(str(proxy_arg.get("server") or ""))
         if _dns_err:
+            if proxy_check_block_on_fail:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Strict proxy: proxy host could not be resolved "
+                        f"({_dns_err}). Fix Settings → Proxy Providers "
+                        "(working host like gw.dataimpulse.com) or paste a "
+                        "fresh manual line, then relaunch. Browser was NOT "
+                        "opened on your real IP."
+                    ),
+                )
             logger.warning(
                 f"[profile-launch] proxy DNS soft-disable: {_dns_err} "
                 f"session={(session_id or '')[:8]}"
@@ -2283,7 +2295,9 @@ async def _launch_profile_session_inner(
                 )
                 _launch_warnings.append(
                     "Safari/WebKit engine unavailable — running Chromium instead. "
-                    "This is NOT a real iOS Safari fingerprint."
+                    "This is NOT a real iPhone/iOS Safari. It is a desktop browser "
+                    "with a mobile shell (viewport + UA). Advanced trackers can still "
+                    "tell it is not a physical iPhone."
                 )
                 _profile_engine = "chromium"
                 try:
@@ -2490,6 +2504,11 @@ async def _launch_profile_session_inner(
                             logger.info(
                                 f"[profile-launch] mobile shell ON session={session_id[:8]}"
                             )
+                            _launch_warnings.append(
+                                "Mobile shell is a desktop browser framed like a phone — "
+                                "not a real iPhone/Android device. Use for UX testing; "
+                                "do not assume undetectable mobile fingerprint."
+                            )
                             # Brief brand only for shell chrome; engine stays TOOLWINDOW.
                             apply_krexion_icon_to_pids(
                                 _family_pids,
@@ -2601,6 +2620,15 @@ async def _launch_profile_session_inner(
                     or "proxy" in _ctx_msg.lower()
                     or "tunnel" in _ctx_msg.lower()
                 ):
+                    if proxy_check_block_on_fail:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "Strict proxy: browser could not start with proxy "
+                                f"({_ctx_msg[:180]}). Fix Proxy Providers / password, "
+                                "then relaunch. Browser was NOT opened on your real IP."
+                            ),
+                        ) from _ctx_err
                     logger.warning(
                         f"[profile-launch] context+proxy failed ({_ctx_msg[:120]}) "
                         "— retrying WITHOUT proxy so iOS/Android still open"
@@ -3044,12 +3072,21 @@ async def _launch_profile_session_inner(
                     f"[profile-launch] proxy health probe outer failed: {proxy_diag['error']}"
                 )
 
-        # v2.7.15 — Hard-abort when proxy check failed and block_on_fail is set
-        if (
-            proxy_arg is not None
-            and proxy_check_on_launch
-            and proxy_check_block_on_fail
-            and proxy_diag.get("ok") is False
+        # v2.7.15 — Hard-abort when proxy check failed and block_on_fail is set.
+        # Also abort when soft_disabled stripped the proxy (real-IP leak path) —
+        # previously soft_disabled set proxy_arg=None so this gate never fired.
+        if proxy_check_block_on_fail and (
+            proxy_diag.get("soft_disabled")
+            or (
+                proxy_arg is not None
+                and proxy_check_on_launch
+                and proxy_diag.get("ok") is False
+            )
+            or (
+                proxy_diag.get("requested")
+                and proxy_arg is None
+                and proxy_diag.get("ok") is False
+            )
         ):
             _abort_msg = str(proxy_diag.get("error") or "proxy check failed")[:300]
             logger.warning(
@@ -3061,9 +3098,10 @@ async def _launch_profile_session_inner(
                         "profile_id": profile_id,
                         "session_id": session_id,
                         "status": "error",
-                        "error_message": f"Proxy check failed: {_abort_msg}",
+                        "error_message": f"Strict proxy: {_abort_msg}",
                         "last_proxy_check": proxy_diag,
                         "last_tls_prewarm_ok": _last_tls_prewarm_ok,
+                        "launch_warnings": list(_launch_warnings),
                     })
                 except Exception:
                     pass
@@ -3080,8 +3118,11 @@ async def _launch_profile_session_inner(
             return {
                 "ok": False,
                 "session_id": session_id,
-                "error": f"Proxy check failed: {_abort_msg}",
+                "error": (
+                    f"Strict proxy: {_abort_msg}. Browser was NOT opened on your real IP."
+                ),
                 "proxy_diag": proxy_diag,
+                "launch_warnings": list(_launch_warnings),
             }
 
         # If proxy was REQUESTED but FAILED the probe, show a
