@@ -700,11 +700,16 @@ def _remove_menu_bar(hwnd: int) -> None:
 
 
 def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
+    """Match headed engine HWND — minimized OK (IsWindow), Chromium class included.
+
+    v2.7.106: previously required IsWindowVisible which missed MiniBrowser /
+    Chromium windows during first paint → embed never marked → Strict abort.
+    """
     try:
         import ctypes
 
         user32 = ctypes.windll.user32
-        if not user32.IsWindowVisible(hwnd):
+        if not user32.IsWindow(hwnd):
             return False
         buf = ctypes.create_unicode_buffer(512)
         user32.GetWindowTextW(hwnd, buf, 512)
@@ -712,20 +717,23 @@ def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
         cls = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(hwnd, cls, 256)
         cname = (cls.value or "").lower()
-        if title.strip().lower() == "playwright":
+        tlow = title.strip().lower()
+        if tlow == "playwright":
             return False
         if webkit:
             return (
-                "[webkit]" in title.lower()
-                or "safari" in title.lower()
-                or "krexion orbit" in title.lower()
+                "[webkit]" in tlow
+                or "safari" in tlow
+                or "krexion orbit" in tlow
+                or "krexion" in tlow
                 or "webkit" in cname
                 or "minibrowser" in cname
             )
         return (
             "chrome" in cname
+            or "chromium" in cname
             or title.startswith("Krexion")
-            or "krexion orbit" in title.lower()
+            or "krexion orbit" in tlow
         )
     except Exception:
         return False
@@ -827,7 +835,9 @@ def _shell_apply_loop(
             pid_set |= collect_profile_process_tree(int(parent_pid))
         if webkit:
             pid_set |= find_webkit_browser_pids(parent_pid)
-            pid_set |= find_pids_by_window_title_substrings("[WebKit]", "Safari")
+            pid_set |= find_pids_by_window_title_substrings(
+                "[WebKit]", "Safari", "Krexion Orbit"
+            )
 
         dpi = _win_dpi_scale()
         fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
@@ -835,6 +845,7 @@ def _shell_apply_loop(
         eng_w, eng_h = _engine_window_size(layout)
         _positioned: Set[int] = set()
         _shell_branded = False
+        _stable_embed_ticks = 0
 
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -843,6 +854,10 @@ def _shell_apply_loop(
                 pid_set |= collect_profile_process_tree(int(parent_pid))
             if webkit:
                 pid_set |= find_webkit_browser_pids(parent_pid)
+                # Refresh every tick — MiniBrowser often appears after first paint
+                pid_set |= find_pids_by_window_title_substrings(
+                    "[WebKit]", "Safari", "Krexion Orbit"
+                )
 
             engine_hwnds: List[int] = []
 
@@ -890,6 +905,10 @@ def _shell_apply_loop(
                     pass
 
             embedded = set(engine_hwnds)
+            if embedded:
+                _stable_embed_ticks += 1
+            else:
+                _stable_embed_ticks = 0
 
             def _hide_stray_cb(hwnd, _lparam):
                 try:
@@ -911,7 +930,9 @@ def _shell_apply_loop(
                     pass
                 return True
 
-            if embedded:
+            # Only hide strays after stable embed — avoids killing the real
+            # content HWND before the first successful frame pass.
+            if embedded and _stable_embed_ticks >= 2:
                 user32.EnumWindows(EnumWindowsProc(_hide_stray_cb), 0)
 
             handles = _load_shell_handles(session_key)
@@ -1076,6 +1097,106 @@ def should_use_mobile_shell(profile_os: str, is_mobile: bool) -> bool:
     if plat not in ("ios", "ipados", "android"):
         plat = "android"
     return plat in ("ios", "ipados", "android")
+
+
+def force_discover_and_mark_embedded(
+    session_key: str,
+    *,
+    parent_pid: Optional[int] = None,
+    seed_pids: Optional[List[int]] = None,
+    webkit: bool = False,
+    profile_slot: int = 1,
+) -> bool:
+    """One-shot EnumWindows + SetWindowPos + mark. Used before Strict abort.
+
+    Returns True if engine HWND found and marked embedded while shell is alive.
+    """
+    if not _IS_WINDOWS:
+        return False
+    key = str(session_key or "")
+    if not is_mobile_shell_alive(key):
+        return False
+    if is_mobile_shell_embedded(key):
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from krexion_window_icon import (
+            collect_profile_process_tree,
+            find_pids_by_window_title_substrings,
+            find_webkit_browser_pids,
+            hide_hwnd_from_taskbar,
+        )
+
+        with _LOCK:
+            rec = _ACTIVE.get(key)
+        if not rec:
+            return False
+        layout = rec.get("layout")
+        if not isinstance(layout, MobileShellLayout):
+            return False
+        ox = int(rec.get("origin_x") or 120)
+        oy = int(rec.get("origin_y") or 80)
+        content_x, content_y = _shell_content_origin(layout, (ox, oy))
+        eng_w, eng_h = _engine_window_size(layout)
+
+        pid_set: Set[int] = {int(p) for p in (seed_pids or []) if p}
+        if parent_pid:
+            pid_set |= collect_profile_process_tree(int(parent_pid))
+        if webkit:
+            pid_set |= find_webkit_browser_pids(parent_pid)
+            pid_set |= find_pids_by_window_title_substrings(
+                "[WebKit]", "Safari", "Krexion Orbit"
+            )
+        if not pid_set:
+            return False
+
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+        found: List[int] = []
+
+        def _cb(hwnd, _lparam):
+            try:
+                win_pid = wintypes.DWORD(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if win_pid.value not in pid_set:
+                    return True
+                if _is_engine_content_hwnd(int(hwnd), webkit=webkit):
+                    found.append(int(hwnd))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+        if not found:
+            return False
+        hwnd = found[0]
+        _remove_menu_bar(hwnd)
+        _strip_native_caption(hwnd)
+        _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+        user32.ShowWindow(int(hwnd), 8)
+        try:
+            user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
+        except Exception:
+            pass
+        try:
+            hide_hwnd_from_taskbar(int(hwnd))
+        except Exception:
+            pass
+        mark_mobile_shell_embedded(key, hwnd=int(hwnd))
+        return is_mobile_shell_embedded(key)
+    except Exception as exc:
+        logger.debug(f"[mobile-shell] force discover failed: {exc}")
+        return False
 
 
 def mobile_shell_status(session_key: str) -> Dict[str, Any]:

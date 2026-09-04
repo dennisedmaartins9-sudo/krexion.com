@@ -1,3 +1,10 @@
+# v2.7.106 — 2026-09 — Mobile shell embed permanent fix + unique IP at create
+#
+# - Shell: IsWindow (not Visible-only) HWND discover; WebKit title PID every tick;
+#   delayed stray-hide; force_discover before Strict abort; longer embed waits.
+# - Create: probe + rotate until team-unique exit IP BEFORE save; skip slots that
+#   cannot get a unique IP (no wasted profiles at launch).
+#
 # v2.7.105 — 2026-09 — Browser Profiles anti-detect + shell visual guarantee
 #
 # - Safari/WebKit engine-aware stealth (no window.chrome / Sec-CH-UA / FP WIN).

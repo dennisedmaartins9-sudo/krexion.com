@@ -923,20 +923,31 @@ export default function BrowserProfilesPage() {
       }
       const d = await r.json();
       const n = d.created || 0;
+      const skipped = Array.isArray(d.skipped) ? d.skipped.length : 0;
+      const ips = Number(d.unique_ips_bound || 0);
       const mixLabel = d.mix
         ? ` (iOS ${d.mix.ios || 0} · Android ${d.mix.android || 0} · Desktop ${d.mix.desktop || 0})`
         : "";
-      toast.success(
-        n === 1
-          ? `Profile "${d.profiles?.[0]?.name || ""}" created`
-          : `${n} unique profiles created${mixLabel}`,
-      );
-      if (Array.isArray(d.proxy_warnings) && d.proxy_warnings.length) {
-        toast.warning(`Proxy note: ${d.proxy_warnings.join(" · ")}`, { duration: 9000 });
+      if (n === 0 && skipped > 0) {
+        toast.error(
+          `No profiles saved — ${skipped} skipped (unique exit IP unavailable). Fix proxy / pool and retry.`,
+          { duration: 10000 },
+        );
+      } else {
+        toast.success(
+          n === 1
+            ? `Profile "${d.profiles?.[0]?.name || ""}" created${ips ? ` · IP ${d.profiles?.[0]?.exit_ip || "bound"}` : ""}`
+            : `${n} unique profiles created${mixLabel}${ips ? ` · ${ips} unique IPs bound` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+        );
       }
-      closeCreateModal(true);
-      resetAdvCreateForm();
-      fetchProfiles();
+      if (Array.isArray(d.proxy_warnings) && d.proxy_warnings.length) {
+        toast.warning(`Proxy note: ${d.proxy_warnings.slice(0, 4).join(" · ")}`, { duration: 9000 });
+      }
+      if (n > 0) {
+        closeCreateModal(true);
+        resetAdvCreateForm();
+        fetchProfiles();
+      }
     } catch (e) {
       toast.error(`Create failed: ${e.message}`);
     } finally {
@@ -3419,7 +3430,7 @@ export default function BrowserProfilesPage() {
                   <div className="p-3 rounded-lg border border-cyan-500/30 bg-cyan-950/10 space-y-3">
                     <div className="flex items-center justify-between">
                       <span className="text-cyan-300 text-sm font-semibold">🌍 Proxy</span>
-                      <span className="text-[10px] text-zinc-500">Team-unique exit IP at create — IP isolation ledger (duplicate block)</span>
+                      <span className="text-[10px] text-zinc-500">Unique exit IP verified before save — duplicates skipped (no wasted profiles)</span>
                     </div>
                     {/* v2.4.0 — Provider dropdown at the very top of Proxy section */}
                     <div className="pb-2 border-b border-cyan-500/20">
