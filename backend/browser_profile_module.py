@@ -2304,7 +2304,58 @@ def _friendly_proxy_probe_error(raw: str, gateway_host: str = "") -> str:
             "DNS could not resolve the proxy gateway host. "
             "Open Proxies → edit provider → check Gateway host + port."
         )
+    if "geo endpoints returned no ip" in low or "ip endpoints returned no ip" in low:
+        hint = f" via '{host}'" if host else ""
+        return (
+            f"Exit IP check failed{hint} — gateway reachable but IP endpoints "
+            "returned nothing. Check provider balance / country targeting / "
+            "password, then retry Create."
+        )
     return msg[:240]
+
+
+async def _quick_http_exit_ip_via_proxy(proxy: Dict[str, Any], ua: str = "") -> str:
+    """Launcher-style plain HTTP exit-IP probe (create-gate fallback)."""
+    try:
+        from real_user_traffic import _proxy_url_for_http  # type: ignore
+        import httpx
+    except Exception:
+        return ""
+    server = _proxy_url_for_http(proxy)
+    if not server:
+        return ""
+    probe_ua = (ua or "").strip() or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+    urls = (
+        "http://api.ipify.org/?format=text",
+        "http://checkip.amazonaws.com/",
+        "http://icanhazip.com",
+        "http://ifconfig.me/ip",
+    )
+    try:
+        async with httpx.AsyncClient(
+            proxy=server,
+            timeout=httpx.Timeout(12.0, connect=8.0),
+            headers={"User-Agent": probe_ua},
+            verify=False,
+            http2=False,
+            trust_env=False,
+        ) as cli:
+            for url in urls:
+                try:
+                    r = await cli.get(url)
+                    if r.status_code != 200:
+                        continue
+                    body = (r.text or "").strip().split()[0].strip().strip('"')
+                    if body and _is_valid_exit_ip(body):
+                        return body
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.debug(f"[browser-profile] quick HTTP exit-IP fallback failed: {exc}")
+    return ""
 
 
 async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any]:
@@ -2372,8 +2423,14 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
         )
         return result
 
+    _default_probe_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
     try:
-        geo = await _probe_proxy_geo(dict(proxy), ua="", user_id=cred_uid or None)
+        geo = await _probe_proxy_geo(
+            dict(proxy), ua=_default_probe_ua, user_id=cred_uid or None,
+        )
         exit_ip = str(geo.get("exit_ip") or "").strip()
         if geo.get("ok") and _is_valid_exit_ip(exit_ip):
             result["ok"] = True
@@ -2395,10 +2452,28 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
             except Exception:
                 pass
         else:
-            raw_err = str(geo.get("probe_error") or geo.get("error") or "").strip()
-            result["error"] = _friendly_proxy_probe_error(raw_err, gateway_host)
+            # v2.7.109 — RUT geo can still fail on flaky residential TLS;
+            # one more launcher-style HTTP ipify pass before giving up.
+            fallback_ip = await _quick_http_exit_ip_via_proxy(proxy, _default_probe_ua)
+            if _is_valid_exit_ip(fallback_ip):
+                result["ok"] = True
+                result["exit_ip"] = fallback_ip
+                result["probe_path"] = "quick_http_fallback"
+                logger.info(
+                    f"[browser-profile] exit IP via quick HTTP fallback: {fallback_ip} "
+                    f"host={gateway_host}"
+                )
+            else:
+                raw_err = str(geo.get("probe_error") or geo.get("error") or "").strip()
+                result["error"] = _friendly_proxy_probe_error(raw_err, gateway_host)
     except Exception as e:
-        result["error"] = _friendly_proxy_probe_error(str(e), gateway_host)
+        fallback_ip = await _quick_http_exit_ip_via_proxy(proxy, _default_probe_ua)
+        if _is_valid_exit_ip(fallback_ip):
+            result["ok"] = True
+            result["exit_ip"] = fallback_ip
+            result["probe_path"] = "quick_http_fallback"
+        else:
+            result["error"] = _friendly_proxy_probe_error(str(e), gateway_host)
     return result
 
 

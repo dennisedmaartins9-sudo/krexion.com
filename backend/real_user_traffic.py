@@ -4610,6 +4610,46 @@ def _is_smartproxy_gateway_host(host: str) -> bool:
     )
 
 
+def _prefer_http_first_geo_probe(host: str) -> bool:
+    """Residential rotating gateways need plain-HTTP IP probes first.
+
+    curl_cffi TLS + HTTPS CONNECT through DataImpulse / Oxylabs / etc. often
+    hangs or returns empty bodies, which made create-time unique-IP binding
+    skip every profile with "geo endpoints returned no IP". Match the launch
+    path: HTTP api.ipify.org first, skip TLS fingerprint probe.
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if _is_smartproxy_gateway_host(h):
+        return True
+    return any(
+        h == dom or h.endswith("." + dom)
+        for dom in (
+            "dataimpulse.com",
+            "oxylabs.io",
+            "brightdata.com",
+            "superproxy.io",
+            "brd.superproxy.io",
+            "lum-superproxy.io",
+            "iproyal.com",
+            "soax.com",
+            "webshare.io",
+            "packetstream.io",
+            "netnut.io",
+            "rayobyte.com",
+            "proxy-cheap.com",
+            "proxysale.com",
+            "geosurf.io",
+            "shifter.io",
+            "nimbleway.com",
+            "infatica.io",
+            "ip2world.com",
+            "spaceproxy.net",
+        )
+    )
+
+
 async def _enrich_geo_from_exit_ip(result: Dict[str, Any]) -> None:
     """Fill region/country when a minimal probe returned only the exit IP."""
     ip = (result.get("exit_ip") or "").strip()
@@ -5097,6 +5137,13 @@ async def _probe_proxy_geo(
 
     _probe_host = _host_from_proxy_server(server).lower()
     _is_decodo = _is_smartproxy_gateway_host(_probe_host)
+    # v2.7.109 — DataImpulse + other residential: same fast HTTP-first path
+    # as Decodo (create unique-IP gate was failing with geo endpoints / no IP).
+    _http_first = _prefer_http_first_geo_probe(_probe_host)
+    _probe_ua = (ua or "").strip() or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
 
     # Some commercial residential proxies (proxy-jet, brightdata, etc.) ONLY accept
     # HTTPS CONNECT tunnels and reject plain `GET http://…` forward-proxy requests,
@@ -5178,28 +5225,45 @@ async def _probe_proxy_geo(
             logger.debug(f"ip-api.com probe failed: {e}")
         return False
 
+    def _extract_plain_ip(body: str) -> str:
+        text = (body or "").strip()
+        if not text or text.startswith("<") or len(text) > 64:
+            return ""
+        if text.startswith("{"):
+            try:
+                import json as _json
+
+                data = _json.loads(text)
+                text = str((data or {}).get("ip") or (data or {}).get("query") or "").strip()
+            except Exception:
+                return ""
+        text = text.split()[0].strip().strip('"').strip("'")
+        if 7 <= len(text) <= 45:
+            return text
+        return ""
+
     async def _try_minimal_ip(cli: httpx.AsyncClient) -> bool:
-        """Last-resort exit-IP discovery when geo APIs return no body."""
+        """Exit-IP discovery — HTTP-first (same order as profile launch probe)."""
         for url in (
-            "https://api.ipify.org?format=json",
-            "https://ifconfig.me/ip",
+            "http://api.ipify.org/?format=text",
+            "http://checkip.amazonaws.com/",
+            "http://ifconfig.me/ip",
+            "http://icanhazip.com",
             "http://ip-api.com/json/?fields=status,query",
+            "https://api.ipify.org/?format=text",
         ):
             try:
                 r = await cli.get(url)
                 if r.status_code != 200:
                     continue
                 ip = ""
-                if "ipify" in url:
-                    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                    ip = str((data or {}).get("ip") or "").strip()
-                elif "ifconfig" in url:
-                    ip = (r.text or "").strip()
-                else:
+                if "ip-api.com" in url:
                     data = r.json() or {}
                     if data.get("status") == "success":
                         ip = str(data.get("query") or "").strip()
-                if ip and len(ip) <= 45 and not ip.startswith("<"):
+                else:
+                    ip = _extract_plain_ip(r.text or "")
+                if ip:
                     result["exit_ip"] = ip
                     await _enrich_geo_from_exit_ip(result)
                     return bool(result.get("exit_ip"))
@@ -5218,14 +5282,18 @@ async def _probe_proxy_geo(
         # CONNECT through rotating residential gateways often hangs 20–30s
         # per attempt, so Live Activity sits on "dialing…" while httpx
         # alone succeeds in ~2s. Prefer fast httpx for these hosts.
+        #
+        # v2.7.109 — Also skip TLS for DataImpulse / Oxylabs / Bright Data
+        # etc. Create-time unique-IP bind was skipping all profiles when
+        # TLS hung and HTTPS geo endpoints returned empty bodies.
         ok = False
-        if _TLS_AD_OK and _tls_ad is not None and not _is_decodo:
+        if _TLS_AD_OK and _tls_ad is not None and not _http_first:
             try:
                 # Attempt 1: HTTPS ipwho.is via TLS-spoofed session
                 if not ok:
                     data_iw = await _tls_ad.get_json(
                         "https://ipwho.is/",
-                        proxy=proxy, ua=ua, timeout=30.0,
+                        proxy=proxy, ua=_probe_ua, timeout=30.0,
                     )
                     if data_iw and data_iw.get("success") is True:
                         result["exit_ip"] = data_iw.get("ip")
@@ -5259,7 +5327,7 @@ async def _probe_proxy_geo(
                     data_ia = await _tls_ad.get_json(
                         "http://ip-api.com/json/?fields=status,country,countryCode,region,"
                         "regionName,city,timezone,lat,lon,query,proxy,hosting,isp,org,as,asname,mobile",
-                        proxy=proxy, ua=ua, timeout=30.0,
+                        proxy=proxy, ua=_probe_ua, timeout=30.0,
                     )
                     if data_ia and data_ia.get("status") == "success":
                         result["exit_ip"] = data_ia.get("query")
@@ -5283,7 +5351,7 @@ async def _probe_proxy_geo(
                 if not ok:
                     data_ipify = await _tls_ad.get_json(
                         "https://api.ipify.org?format=json",
-                        proxy=proxy, ua=ua, timeout=30.0,
+                        proxy=proxy, ua=_probe_ua, timeout=30.0,
                     )
                     if data_ipify and (data_ipify.get("ip") or "").strip():
                         result["exit_ip"] = str(data_ipify.get("ip")).strip()
@@ -5302,13 +5370,14 @@ async def _probe_proxy_geo(
         # v2.6.85 — Smartproxy/Decodo: short timeouts + single retry +
         # http-only scheme. These gateways answer in ~1–3s when healthy;
         # long CONNECT timeouts made ROW-FIRST look "stuck on dialing".
-        if _is_decodo:
+        # v2.7.109 — same fast path for DataImpulse / other residential.
+        if _http_first:
             # Keep the whole probe under the 28s wait_for in ROW-FIRST.
             # Sequential decodo+ipwho+ipapi at 12s each used to exceed
             # that budget → "geo probe timed out after 28s" even when
             # the gateway was healthy.
-            timeout_cfg = httpx.Timeout(8.0, connect=5.0)
-            _probe_attempts = 2
+            timeout_cfg = httpx.Timeout(10.0, connect=6.0)
+            _probe_attempts = 3
             _scheme_urls = [server] if server else []
         else:
             timeout_cfg = httpx.Timeout(30.0, connect=20.0)
@@ -5322,16 +5391,21 @@ async def _probe_proxy_geo(
                         async with httpx.AsyncClient(
                             proxy=_scheme_url,
                             timeout=timeout_cfg,
-                            headers={"User-Agent": ua},
+                            headers={"User-Agent": _probe_ua},
                             verify=False,
                             http2=False,
                             trust_env=False,
                         ) as cli:
                             ok = False
-                            if _is_decodo:
-                                ok = await _try_decodo_ip(cli)
+                            if _http_first:
+                                # HTTP plain-IP first (launch-path order), then geo.
+                                ok = await _try_minimal_ip(cli)
+                                if not ok and _is_decodo:
+                                    ok = await _try_decodo_ip(cli)
                                 if not ok:
-                                    ok = await _try_minimal_ip(cli)
+                                    ok = await _try_http_ipapi(cli)
+                                if not ok:
+                                    ok = await _try_https_ipwhois(cli)
                             else:
                                 ok = await _try_https_ipwhois(cli)
                                 if not ok:
@@ -5350,7 +5424,7 @@ async def _probe_proxy_geo(
                     break
                 # Brief backoff before next attempt
                 if attempt < (_probe_attempts - 1):
-                    await asyncio.sleep(0.4 if _is_decodo else (1.5 * (attempt + 1)))
+                    await asyncio.sleep(0.4 if _http_first else (1.5 * (attempt + 1)))
         if not ok and _last_probe_err:
             result["probe_error"] = _last_probe_err
         if ok:

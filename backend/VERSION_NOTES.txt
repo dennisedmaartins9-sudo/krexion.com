@@ -1,3 +1,12 @@
+# v2.7.109 — 2026-09 — Create profiles: DataImpulse exit-IP probe (no more all-skipped)
+# - Root cause: unique-IP-before-save used RUT geo probe (TLS + HTTPS first).
+#   DataImpulse rotating gateways often return empty bodies on that path →
+#   "geo endpoints returned no IP" → every profile skipped, none saved.
+# - Fix: HTTP-first exit-IP endpoints (api.ipify / checkip / icanhazip) for
+#   DataImpulse + other residential hosts; skip curl_cffi TLS on those hosts.
+# - Create/Proxy Check: launcher-style quick HTTP fallback if geo still fails.
+# - Clearer operator error when balance / targeting / password is the issue.
+#
 # v2.7.108 — 2026-09 — Launch: fresh proxy sessid + phone chrome framing recovery
 #
 # - Proxy: clear create-bound raw_line/sessid at launch + Retry so DataImpulse

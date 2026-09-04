@@ -27,6 +27,7 @@ def test_smartproxy_net_host_detected_in_source():
     assert "smartproxy.net" in src
     assert "def _is_smartproxy_gateway_host(" in src
     assert "_is_decodo = _is_smartproxy_gateway_host(_probe_host)" in src
+    assert "def _prefer_http_first_geo_probe(" in src
 
 
 def test_minimal_ip_and_enrich_helpers_exist():
@@ -34,3 +35,4 @@ def test_minimal_ip_and_enrich_helpers_exist():
     assert "async def _try_minimal_ip(" in src
     assert "async def _enrich_geo_from_exit_ip(" in src
     assert "api.ipify.org" in src
+    assert "http://api.ipify.org/?format=text" in src
