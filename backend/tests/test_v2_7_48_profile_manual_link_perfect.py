@@ -111,7 +111,8 @@ def test_route_handler_adds_profile_session_header_on_krexion_link():
     route.continue_.assert_awaited_once()
     headers = route.continue_.await_args.kwargs.get("headers") or {}
     assert headers.get(KREXION_PROFILE_SESSION_HEADER.lower()) == "sess-abc-123"
-    assert headers.get("referer") == state.referer_url
+    # Playwright continues with canonical "Referer" casing
+    assert (headers.get("Referer") or headers.get("referer")) == state.referer_url
 
 
 def test_validate_profile_perfect_session():

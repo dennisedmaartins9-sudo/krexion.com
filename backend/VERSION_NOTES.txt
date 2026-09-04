@@ -1,3 +1,10 @@
+# v2.7.111 — 2026-09 — Suite green: stale asserts + Linux chromium path tests
+# - Semver-fix VERSION string compares (`2.7.110` < `2.7.20` as text).
+# - Chromium bundle tests use platform dirs (chrome-linux on CI, win64 on native).
+# - Proxy probe test accepts httpx 0.28 `proxy=` API; Referer casing; HTTP-first TLS skip.
+# - Stale v2.6 collection/asserts aligned (UTM variations, burnt offer scope,
+#   tracker probe message, team claim retry chunk, List typing in AST extract).
+#
 # v2.7.110 — 2026-09 — No-proxy iOS launch: fix zoomed WebKit + shell frame
 # - Symptom: Create without proxy → launch opens bare MiniBrowser titled
 #   "Google [WebKit]" with File/View menus; Google page heavily zoomed/cropped.

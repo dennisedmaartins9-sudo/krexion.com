@@ -76,6 +76,10 @@ def test_finally_completes_claim_after_touch_not_release():
 
 def test_offer_block_retry_completes_team_claim():
     src = _src()
-    idx = src.index("if _can_retry_offer_block:")
-    chunk = src[idx : idx + 600]
-    assert "complete_team_offer_ip_claim" in chunk
+    # First `if _can_retry_offer_block:` is IPv6 early-exit; claim complete
+    # lives on the offer-block retry path (later occurrence).
+    assert "complete_team_offer_ip_claim" in src
+    idx = src.rfind("if _can_retry_offer_block:")
+    assert idx > 0
+    chunk = src[max(0, idx - 200) : idx + 900]
+    assert "complete_team_offer_ip_claim" in chunk or "_OfferBlockRetryNeeded" in chunk

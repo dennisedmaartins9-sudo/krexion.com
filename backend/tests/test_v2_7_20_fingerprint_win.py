@@ -82,5 +82,7 @@ def test_frontend_fingerprint_win_ui():
 
 
 def test_version_2_7_20_or_newer():
+    from releases_module import _parse
+
     ver = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    assert ver >= "2.7.20"
+    assert _parse(ver) >= _parse("2.7.20")

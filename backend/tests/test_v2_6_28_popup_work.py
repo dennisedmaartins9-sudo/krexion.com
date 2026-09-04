@@ -26,15 +26,27 @@ import requests
 
 
 def _read_base_url():
-    p = "/app/frontend/.env"
-    with open(p) as f:
-        for ln in f:
-            if ln.strip().startswith("REACT_APP_BACKEND_URL="):
-                return ln.strip().split("=", 1)[1].strip().rstrip("/")
-    raise RuntimeError("REACT_APP_BACKEND_URL not found")
+    candidates = [
+        Path("/app/frontend/.env"),
+        Path(__file__).resolve().parents[2] / "frontend" / ".env",
+        Path(__file__).resolve().parents[2] / "frontend" / ".env.local",
+    ]
+    for p in candidates:
+        if not p.is_file():
+            continue
+        with open(p, encoding="utf-8") as f:
+            for ln in f:
+                if ln.strip().startswith("REACT_APP_BACKEND_URL="):
+                    return ln.strip().split("=", 1)[1].strip().rstrip("/")
+    return ""
 
 
 BASE_URL = _read_base_url()
+if not BASE_URL:
+    pytest.skip(
+        "REACT_APP_BACKEND_URL not found (live backend tests skipped)",
+        allow_module_level=True,
+    )
 FIXTURE_DIR = Path(__file__).parent / "_popup_fixtures"
 # find a free port at import time so parallel runs don't collide
 def _pick_port():

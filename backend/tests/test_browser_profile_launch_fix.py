@@ -36,6 +36,9 @@ import types
 _pw_stub = types.ModuleType("playwright")
 _pw_async_stub = types.ModuleType("playwright.async_api")
 _pw_async_stub.async_playwright = lambda: None  # type: ignore[attr-defined]
+_pw_async_stub.Page = object  # type: ignore[attr-defined]
+_pw_async_stub.BrowserContext = object  # type: ignore[attr-defined]
+_pw_async_stub.Browser = object  # type: ignore[attr-defined]
 sys.modules.setdefault("playwright", _pw_stub)
 sys.modules.setdefault("playwright.async_api", _pw_async_stub)
 
@@ -51,6 +54,28 @@ class _UpdateCollector:
 
 
 # ─────────────────────────── Tests ────────────────────────────────────
+
+# Helper: headed Chromium preflight must not block unit tests that only
+# exercise the crash-visibility wrapper around `_launch_profile_session_inner`.
+_READY_ENGINE = {"status": "ready", "message": "stub"}
+
+
+def _patch_launch_preflight():
+    return (
+        patch(
+            "real_user_traffic.get_headed_engine_status",
+            return_value=dict(_READY_ENGINE),
+        ),
+        patch(
+            "real_user_traffic._full_chromium_binary_path",
+            return_value=Path("/tmp/fake-chrome"),
+        ),
+        patch(
+            "real_user_traffic.normalize_playwright_browsers_path",
+            return_value="/tmp/pw",
+        ),
+    )
+
 
 @pytest.mark.asyncio
 async def test_playwright_import_failure_notifies_error():
@@ -69,12 +94,11 @@ async def test_playwright_import_failure_notifies_error():
             on_session_update=collector,
         )
     finally:
-        # Restore stubs so subsequent tests can run
+        # Restore stubs so subsequent tests / modules can import playwright
         sys.modules.pop("playwright.async_api", None)
-        if _saved[0]:
-            sys.modules["playwright.async_api"] = _saved[0]
-        if _saved[1]:
-            sys.modules["playwright"] = _saved[1]
+        sys.modules.pop("playwright", None)
+        sys.modules["playwright"] = _pw_stub
+        sys.modules["playwright.async_api"] = _pw_async_stub
     assert result["ok"] is False
     assert "Playwright" in result["error"]
     # Critical assertion — cloud was notified, profile card will un-stick
@@ -97,7 +121,8 @@ async def test_inner_launch_crash_notifies_and_cleans_up():
     async def _crash(*_args, **_kwargs):
         raise RuntimeError("simulated chromium launch failed")
 
-    with patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
+    p1, p2, p3 = _patch_launch_preflight()
+    with p1, p2, p3, patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
         result = await bpl.launch_profile_session(
             {"id": "p2"},
             session_id="s2",
@@ -130,7 +155,8 @@ async def test_inner_launch_crash_without_callback_still_cleans_up():
     async def _crash(*_args, **_kwargs):
         raise ValueError("oops")
 
-    with patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
+    p1, p2, p3 = _patch_launch_preflight()
+    with p1, p2, p3, patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
         result = await bpl.launch_profile_session(
             {"id": "p3"},
             session_id="s3",
@@ -152,7 +178,8 @@ async def test_successful_inner_result_returned_verbatim():
     async def _ok(*_args, **_kwargs):
         return {"ok": True, "session_id": "s4", "duration_sec": 12.3}
 
-    with patch.object(bpl, "_launch_profile_session_inner", side_effect=_ok):
+    p1, p2, p3 = _patch_launch_preflight()
+    with p1, p2, p3, patch.object(bpl, "_launch_profile_session_inner", side_effect=_ok):
         result = await bpl.launch_profile_session(
             {"id": "p4"},
             session_id="s4",
@@ -179,7 +206,8 @@ async def test_callback_failure_does_not_raise_during_error_notify():
     async def _crash(*_args, **_kwargs):
         raise RuntimeError("inner crash")
 
-    with patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
+    p1, p2, p3 = _patch_launch_preflight()
+    with p1, p2, p3, patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash):
         result = await bpl.launch_profile_session(
             {"id": "p5"},
             session_id="s5",
@@ -202,7 +230,8 @@ async def test_concurrent_launches_isolate_sessions():
         await asyncio.sleep(0.05)
         raise RuntimeError("boom")
 
-    with patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash_after_delay):
+    p1, p2, p3 = _patch_launch_preflight()
+    with p1, p2, p3, patch.object(bpl, "_launch_profile_session_inner", side_effect=_crash_after_delay):
         r1, r2 = await asyncio.gather(
             bpl.launch_profile_session(
                 {"id": "pA"}, session_id="sA", start_url="x", on_session_update=c1

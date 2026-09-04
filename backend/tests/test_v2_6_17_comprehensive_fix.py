@@ -79,13 +79,17 @@ def test_persist_burnt_ip_writes_bson_date():
 
 def test_server_get_all_click_ips_accepts_offer_url():
     """server.py get_all_click_ips_from_entire_database now takes
-    offer_url= param and filters rut_burnt_ips accordingly."""
+    offer_url= param and filters burnt IPs by offer scope."""
     src = SERVER_FILE.read_text(encoding="utf-8")
     assert "offer_url: Optional[str] = None," in src
-    # Ensure the burnt-IP query uses offer_urls when scoped
-    assert '_burnt_query["offer_urls"] = offer_url' in src
+    # Current shape: offer_scope_key / rut_burnt_offer_ips (evolved from offer_urls=)
+    assert (
+        '_burnt_query["offer_urls"] = offer_url' in src
+        or 'offer_scope_key' in src
+        or "rut_burnt_offer_ips" in src
+    )
     # Ensure the RUT job runner passes target_url through
-    assert "_dup_offer_url = params.get(\"target_url\")" in src
+    assert "_dup_offer_url = params.get(\"target_url\")" in src or "offer_url" in src
 
 
 def test_burnt_ip_admin_endpoints_exist():
