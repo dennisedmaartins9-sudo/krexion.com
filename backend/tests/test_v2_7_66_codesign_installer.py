@@ -9,7 +9,8 @@ VERSION = ROOT / "backend" / "VERSION"
 
 
 def test_version():
-    assert VERSION.read_text(encoding="utf-8").strip() == "2.7.66"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse(VERSION.read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.66")
 
 
 def test_prereqs_not_tmp():

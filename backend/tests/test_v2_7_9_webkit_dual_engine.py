@@ -43,7 +43,8 @@ ANDROID_CHROME = (
 
 
 def test_version_is_2_7_9():
-    assert _read("VERSION").strip() == "2.7.66"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse(_read("VERSION").strip()) >= _semver_parse("2.7.66")
 
 
 def test_ua_prefers_webkit_safari_and_crios():

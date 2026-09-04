@@ -26,7 +26,8 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_54():
-    assert _read("VERSION").strip() == "2.7.66"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse(_read("VERSION").strip()) >= _semver_parse("2.7.66")
 
 
 def test_ios_safari_shell_module_exports():
@@ -39,13 +40,16 @@ def test_ios_safari_shell_module_exports():
 
 
 def test_profile_launcher_wires_ios_safari_shell():
+    """v2.7.106 — iOS uses Krexion mobile shell (supersedes legacy Safari chrome)."""
     src = _read("browser_profile_launcher.py")
-    assert "apply_ios_safari_shell_to_pids" in src
-    assert 'profile_os or "").lower() in' in src or "profile_os" in src
+    assert "apply_krexion_mobile_shell" in src
+    assert "krexion_mobile_browser_shell" in src
     assert "webkit" in src
+    assert "profile_os" in src
 
 
 def test_frontend_does_not_expose_webkit_to_users():
+    """Honesty banners may name WebKit; create UI must keep Safari wording."""
     fe = (
         Path(__file__).resolve().parent.parent.parent
         / "frontend"
@@ -53,9 +57,11 @@ def test_frontend_does_not_expose_webkit_to_users():
         / "pages"
         / "BrowserProfilesPage.js"
     ).read_text(encoding="utf-8")
-    assert "WebKit" not in fe
     assert "Safari" in fe
     assert "Chromium" in fe
+    # Engine picker / create flow should not push raw WebKit as a user choice label
+    assert 'value="webkit"' not in fe.lower()
+    assert ">WebKit<" not in fe
 
 
 def test_apply_ios_safari_shell_starts_thread_on_windows():

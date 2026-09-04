@@ -44,7 +44,8 @@ ANDROID_CHROME = (
 
 def test_version_is_2_7_8():
     # Superseded by later releases — keep suite green.
-    assert _read("VERSION").strip() == "2.7.10"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse(_read("VERSION").strip()) >= _semver_parse("2.7.10")
 
 
 def test_is_ios_webkit_ua_safari_and_wkwebview():

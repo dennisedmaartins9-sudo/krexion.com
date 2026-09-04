@@ -18,7 +18,8 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_58():
-    assert _read("VERSION").strip() == "2.7.96"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse(_read("VERSION").strip()) >= _semver_parse("2.7.96")
 
 
 def test_generic_mobile_browser_uses_real_device_not_k():

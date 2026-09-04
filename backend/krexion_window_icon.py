@@ -301,7 +301,11 @@ def build_profile_taskbar_ico(slot: int = 1, platform: str = "") -> str:
 
 
 def browser_icon_data_uri(platform: str = "", size: int = 32) -> str:
-    """Inline PNG for mobile shell HTML (official art, unchanged)."""
+    """Inline PNG for mobile shell HTML (official art, unchanged).
+
+    Falls back to raw asset bytes when Pillow is unavailable so shell chrome
+    still gets the Krexion mark on lean native installs / CI.
+    """
     import base64
     import io
 
@@ -315,8 +319,18 @@ def browser_icon_data_uri(platform: str = "", size: int = 32) -> str:
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         return f"data:image/png;base64,{b64}"
     except Exception as exc:
-        logger.debug(f"[krexion-icon] data-uri build skipped: {exc}")
-        return ""
+        logger.debug(f"[krexion-icon] data-uri PIL path skipped: {exc}")
+    try:
+        found = _find_existing(_browser_png_candidates())
+        if found and os.path.isfile(found):
+            with open(found, "rb") as fh:
+                raw = fh.read()
+            if len(raw) > 200:
+                b64 = base64.b64encode(raw).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+    except Exception as exc2:
+        logger.debug(f"[krexion-icon] data-uri file fallback skipped: {exc2}")
+    return ""
 
 
 def browser_icon_file_uri(platform: str = "") -> str:

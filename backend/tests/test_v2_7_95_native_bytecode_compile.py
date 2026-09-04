@@ -13,4 +13,5 @@ def test_compile_strip_uses_embedded_python_not_host_compileall():
 
 
 def test_version_is_2_7_96():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.96")

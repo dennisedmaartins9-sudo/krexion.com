@@ -7,7 +7,8 @@ WORKER = ROOT.parent / "krexion-cpi-worker" / "krexion_cpi_worker"
 
 
 def test_version_2_7_18():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() >= "2.7.18"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.18")
 
 
 def test_cpi_backend_action_and_cloud_routes():

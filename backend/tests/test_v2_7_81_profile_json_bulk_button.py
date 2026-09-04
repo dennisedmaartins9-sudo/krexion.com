@@ -10,7 +10,8 @@ if str(ROOT) not in sys.path:
 
 
 def test_version_is_2_7_81():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() >= "2.7.81"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.81")
 
 
 def test_bulk_run_json_endpoint_registered():

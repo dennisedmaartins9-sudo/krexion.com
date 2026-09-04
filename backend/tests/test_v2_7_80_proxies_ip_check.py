@@ -54,7 +54,8 @@ def _format_ip_quality_row(ip: str, result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def test_version_is_2_7_80():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() >= "2.7.80"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.80")
 
 
 def test_parse_ip_for_quality_check_ipv4():

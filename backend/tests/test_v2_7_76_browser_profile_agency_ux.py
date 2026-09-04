@@ -70,7 +70,8 @@ def test_shell_ipc_roundtrip(tmp_path):
 
 
 def test_version_is_2_7_76():
-        assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
+        from releases_module import _parse as _semver_parse
+        assert _semver_parse((ROOT / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.96")
 
 
 def test_soft_delete_and_restore():

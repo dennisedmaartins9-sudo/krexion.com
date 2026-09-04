@@ -1,3 +1,10 @@
+# v2.7.107 — 2026-09 — Suite green + icon data-uri fallback + UI hygiene
+#
+# - browser_icon_data_uri falls back to raw PNG when Pillow missing (shell mark).
+# - White-label: remove AdsPower competitor names from Browser Profiles UI.
+# - Cookie Robot / Fingerprint data-testids restored; stale version asserts → semver.
+# - Outdated shell/branding source tests aligned to Krexion mobile shell path.
+#
 # v2.7.106 — 2026-09 — Mobile shell embed permanent fix + unique IP at create
 #
 # - Shell: IsWindow (not Visible-only) HWND discover; WebKit title PID every tick;
@@ -6,8 +13,7 @@
 #   cannot get a unique IP (no wasted profiles at launch).
 #
 # v2.7.105 — 2026-09 — Browser Profiles anti-detect + shell visual guarantee
-#
-# - Safari/WebKit engine-aware stealth (no window.chrome / Sec-CH-UA / FP WIN).
+## - Safari/WebKit engine-aware stealth (no window.chrome / Sec-CH-UA / FP WIN).
 # - CDP opt-in only (local_api_cdp); Cloak + persistent disk profiles coexist.
 # - language → Accept-Language; disable IPv6; deepened paranoia; Strict migrate.
 # - Honesty warnings: WebRTC UDP-block ≠ exit-IP ICE; TLS prewarm ≠ live JA3;

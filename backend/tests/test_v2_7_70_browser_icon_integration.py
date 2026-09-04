@@ -6,7 +6,8 @@ from pathlib import Path
 
 def test_version_is_2_7_76():
     root = Path(__file__).resolve().parents[1]
-    assert (root / "VERSION").read_text(encoding="utf-8").strip() == "2.7.96"
+    from releases_module import _parse as _semver_parse
+    assert _semver_parse((root / "VERSION").read_text(encoding="utf-8").strip()) >= _semver_parse("2.7.96")
 
 
 def test_official_browser_icon_asset_exists():
