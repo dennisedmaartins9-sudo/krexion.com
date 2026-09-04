@@ -658,12 +658,123 @@ def _shell_content_origin(
     layout: MobileShellLayout,
     origin_xy: Tuple[int, int],
 ) -> Tuple[int, int]:
-    """Content area origin inside the phone frame (logical px, no extra DPI multiply)."""
+    """Content area origin inside the phone frame (logical px, no extra DPI multiply).
+
+    v2.7.110 — Do not multiply ``oy`` by frame_scale twice (was
+    ``(oy + top*fs + bezel) * fs`` which shoved the engine off the chrome).
+    """
     ox, oy = origin_xy
     fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
-    content_x = int(round((ox + layout.bezel) * fs))
-    content_y = int(round((oy + layout.top_h * fs + layout.bezel) * fs))
+    content_x = int(round(ox + layout.bezel * fs))
+    content_y = int(round(oy + (layout.top_h + layout.bezel) * fs))
     return content_x, content_y
+
+
+def polish_webkit_phone_fallback(
+    *,
+    parent_pid: Optional[int] = None,
+    seed_pids: Optional[List[int]] = None,
+    viewport_width: int = 393,
+    viewport_height: int = 852,
+    profile_slot: int = 1,
+    profile_label: str = "Profile",
+) -> bool:
+    """When Krexion phone chrome cannot embed: strip MiniBrowser chrome + phone-size window.
+
+    Prevents the zoomed File/View/History WebKit window the operator saw on
+    no-proxy iOS launches when soft-continue left a bare engine visible.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from krexion_window_icon import (
+            collect_profile_process_tree,
+            find_pids_by_window_title_substrings,
+            find_webkit_browser_pids,
+            hide_hwnd_from_taskbar,
+        )
+
+        vw = max(320, min(1200, int(viewport_width or 393)))
+        vh = max(568, min(1600, int(viewport_height or 852)))
+        win_w = max(280, vw)
+        win_h = max(480, vh + 28)  # tiny status strip, no full menu bar
+
+        pid_set: Set[int] = {int(p) for p in (seed_pids or []) if p}
+        if parent_pid:
+            pid_set |= collect_profile_process_tree(int(parent_pid))
+        pid_set |= find_webkit_browser_pids(parent_pid)
+        pid_set |= find_pids_by_window_title_substrings(
+            "[WebKit]", "Safari", "Krexion Orbit", "Krexion"
+        )
+        if not pid_set:
+            return False
+
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+        found: List[int] = []
+
+        def _cb(hwnd, _lparam):
+            try:
+                win_pid = wintypes.DWORD(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if win_pid.value not in pid_set:
+                    return True
+                if _is_engine_content_hwnd(int(hwnd), webkit=True):
+                    found.append(int(hwnd))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+        if not found:
+            return False
+
+        sw = int(user32.GetSystemMetrics(0) or 1920)
+        sh = int(user32.GetSystemMetrics(1) or 1080)
+        x = max(0, (sw - win_w) // 2)
+        y = max(0, (sh - win_h) // 2)
+        ok_any = False
+        for hwnd in found:
+            try:
+                _remove_menu_bar(int(hwnd))
+                _strip_native_caption(int(hwnd))
+                _set_window_pos(int(hwnd), x, y, win_w, win_h)
+                user32.SetWindowTextW(
+                    int(hwnd),
+                    f"Krexion Orbit ({int(profile_slot or 1)})",
+                )
+                try:
+                    hide_hwnd_from_taskbar(int(hwnd))
+                except Exception:
+                    pass
+                try:
+                    from krexion_window_icon import brand_single_hwnd_krexion
+
+                    brand_single_hwnd_krexion(
+                        int(hwnd),
+                        profile_slot=int(profile_slot or 1),
+                        profile_label=str(profile_label or "Profile")[:60],
+                        platform="ios",
+                    )
+                except Exception:
+                    pass
+                ok_any = True
+            except Exception as _pol_err:
+                logger.debug(f"[mobile-shell] webkit polish hwnd={hwnd}: {_pol_err}")
+        return ok_any
+    except Exception as exc:
+        logger.debug(f"[mobile-shell] polish_webkit_phone_fallback failed: {exc}")
+        return False
 
 
 def _strip_native_caption(hwnd: int) -> None:
@@ -842,7 +953,6 @@ def _shell_apply_loop(
         else:
             pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
 
-        dpi = _win_dpi_scale()
         fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
         content_x, content_y = _shell_content_origin(layout, (ox, oy))
         eng_w, eng_h = _engine_window_size(layout)
@@ -943,11 +1053,14 @@ def _shell_apply_loop(
             handles = _load_shell_handles(session_key)
             top_hwnd = int(handles.get("top") or 0)
             bottom_hwnd = int(handles.get("bottom") or 0)
-            outer_w = int(round(layout.outer_w * dpi * fs))
-            top_h = int(round(layout.top_h * dpi * fs))
-            bottom_h = int(round(layout.bottom_h * dpi * fs))
-            origin_x = int(round(ox * dpi))
-            origin_y = int(round(oy * dpi))
+            # v2.7.110 — same logical px space as engine HWND (no DPI multiply).
+            # Host + engine use CSS viewport units; *dpi here misaligned chrome
+            # on 125%/150% Windows scaling and left bare WebKit floating.
+            outer_w = int(round(layout.outer_w * fs))
+            top_h = int(round(layout.top_h * fs))
+            bottom_h = int(round(layout.bottom_h * fs))
+            origin_x = int(ox)
+            origin_y = int(oy)
             if top_hwnd:
                 _set_window_pos(top_hwnd, origin_x, origin_y, outer_w, top_h)
                 if not _shell_branded:

@@ -2666,6 +2666,22 @@ async def _launch_profile_session_inner(
                                     "Krexion phone chrome started but the browser window "
                                     "was not framed inside it — session kept open."
                                 )
+                                if _profile_engine == "webkit":
+                                    try:
+                                        from krexion_mobile_browser_shell import (
+                                            polish_webkit_phone_fallback,
+                                        )
+
+                                        polish_webkit_phone_fallback(
+                                            parent_pid=int(_driver_pid) if _driver_pid else None,
+                                            seed_pids=_family_pids,
+                                            viewport_width=int(viewport.get("width", 393)),
+                                            viewport_height=int(viewport.get("height", 852)),
+                                            profile_slot=int(_taskbar_slot),
+                                            profile_label=str(_profile_label)[:60] or "Profile",
+                                        )
+                                    except Exception:
+                                        pass
                                 _launch_ui_meta["mobile_shell"] = True
                                 _launch_ui_meta["mobile_shell_embedded"] = False
                                 stop_session_icon_keeper(str(session_id))
@@ -2793,6 +2809,8 @@ async def _launch_profile_session_inner(
                                 )
                             # Soft-continue when engine is up — aborting wastes the
                             # profile; honesty warning beats endless Strict fail.
+                            # v2.7.110 — still polish bare WebKit (strip menus +
+                            # phone size) so operator does not see zoomed MiniBrowser.
                             try:
                                 from krexion_window_icon import profile_engine_window_exists
                                 _engine_up = profile_engine_window_exists(
@@ -2801,6 +2819,24 @@ async def _launch_profile_session_inner(
                                 )
                             except Exception:
                                 _engine_up = bool(_driver_pid)
+                            if _profile_engine == "webkit":
+                                try:
+                                    from krexion_mobile_browser_shell import (
+                                        polish_webkit_phone_fallback,
+                                    )
+
+                                    polish_webkit_phone_fallback(
+                                        parent_pid=int(_driver_pid) if _driver_pid else None,
+                                        seed_pids=_family_pids,
+                                        viewport_width=int(viewport.get("width", 393)),
+                                        viewport_height=int(viewport.get("height", 852)),
+                                        profile_slot=int(_taskbar_slot),
+                                        profile_label=str(_profile_label)[:60] or "Profile",
+                                    )
+                                except Exception as _pol_err:
+                                    logger.debug(
+                                        f"[profile-launch] webkit polish fallback skipped: {_pol_err}"
+                                    )
                             if strict_mobile_shell and not _engine_up:
                                 raise RuntimeError(
                                     "Strict mobile shell: Krexion phone chrome did not "
@@ -2833,6 +2869,22 @@ async def _launch_profile_session_inner(
                             )
                         except Exception:
                             _engine_up = bool(_driver_pid)
+                        if _profile_engine == "webkit":
+                            try:
+                                from krexion_mobile_browser_shell import (
+                                    polish_webkit_phone_fallback,
+                                )
+
+                                polish_webkit_phone_fallback(
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    seed_pids=_family_pids,
+                                    viewport_width=int(viewport.get("width", 393)),
+                                    viewport_height=int(viewport.get("height", 852)),
+                                    profile_slot=int(_taskbar_slot),
+                                    profile_label=str(_profile_label)[:60] or "Profile",
+                                )
+                            except Exception:
+                                pass
                         if strict_mobile_shell and not _engine_up:
                             raise RuntimeError(
                                 f"Strict mobile shell: {str(_ms_err)[:200]}"
@@ -2916,7 +2968,12 @@ async def _launch_profile_session_inner(
         context_kwargs: Dict[str, Any] = {
             "user_agent": ua,
             "viewport": {"width": int(viewport.get("width", 1920)), "height": int(viewport.get("height", 1080))},
-            "device_scale_factor": dsf,
+            # v2.7.110 — WebKit MiniBrowser with DSF>1 zooms/crops the page
+            # (Google logo cut off, giant ALL/IMAGES). Use DSF=1 for real
+            # rendering; stealth fingerprint still reports the real DPR.
+            "device_scale_factor": (
+                1.0 if (_profile_engine == "webkit" and is_mobile and float(dsf) > 1.01) else dsf
+            ),
             "is_mobile": is_mobile,
             "has_touch": has_touch,
             "locale": locale,
@@ -2928,6 +2985,13 @@ async def _launch_profile_session_inner(
             "permissions": ["geolocation"],
             "extra_http_headers": {"Accept-Language": accept_lang},
         }
+        if _profile_engine == "webkit" and is_mobile and float(dsf) > 1.01:
+            _launch_ui_meta["webkit_dsf_context"] = 1.0
+            _launch_ui_meta["webkit_dsf_spoof"] = float(dsf)
+            logger.info(
+                "[profile-launch] WebKit mobile context DSF=1.0 (spoof DPR=%.2f)",
+                float(dsf),
+            )
         if proxy_arg:
             context_kwargs["proxy"] = proxy_arg
         if storage_state and (storage_state.get("cookies") or storage_state.get("origins")):
@@ -3238,6 +3302,29 @@ async def _launch_profile_session_inner(
             logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
+
+        # v2.7.110 — Re-assert CSS viewport (WebKit can ignore first paint size)
+        # and spoof devicePixelRatio when context DSF was forced to 1.0.
+        try:
+            await page.set_viewport_size({
+                "width": int(viewport.get("width", 1920)),
+                "height": int(viewport.get("height", 1080)),
+            })
+        except Exception as _svp_err:
+            logger.debug(f"[profile-launch] set_viewport_size skipped: {_svp_err}")
+        if _profile_engine == "webkit" and is_mobile and float(dsf) > 1.01:
+            try:
+                await context.add_init_script(
+                    f"""(() => {{
+  try {{
+    Object.defineProperty(window, 'devicePixelRatio', {{
+      configurable: true, enumerable: true, get: () => {float(dsf)}
+    }});
+  }} catch (e) {{}}
+}})();"""
+                )
+            except Exception as _dpr_err:
+                logger.debug(f"[profile-launch] WebKit DPR spoof skipped: {_dpr_err}")
 
         # v2.7.105d — Early Krexion phone chrome (mobile): start shell as soon as
         # the engine window exists so plain Chromium/WebKit is not left visible

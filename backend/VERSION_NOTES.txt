@@ -1,3 +1,15 @@
+# v2.7.110 — 2026-09 — No-proxy iOS launch: fix zoomed WebKit + shell frame
+# - Symptom: Create without proxy → launch opens bare MiniBrowser titled
+#   "Google [WebKit]" with File/View menus; Google page heavily zoomed/cropped.
+# - Cause A: Playwright WebKit + device_scale_factor=3 paints CSS viewport
+#   incorrectly (content looks 2–3× zoomed). Context now uses DSF=1.0 for
+#   WebKit mobile; real DPR spoofed via init script + stealth fingerprint.
+# - Cause B: Soft-continue left unframed WebKit visible. Now calls
+#   polish_webkit_phone_fallback (strip menus/caption, phone-size window).
+# - Cause C: Shell chrome reposition used *dpi while engine did not →
+#   misaligned frame on 125%/150% Windows scaling. Unified to logical px.
+# - Cause D: _shell_content_origin multiplied oy by frame_scale twice.
+#
 # v2.7.109 — 2026-09 — Create profiles: DataImpulse exit-IP probe (no more all-skipped)
 # - Root cause: unique-IP-before-save used RUT geo probe (TLS + HTTPS first).
 #   DataImpulse rotating gateways often return empty bodies on that path →
