@@ -1,3 +1,12 @@
+# v2.7.108 — 2026-09 — Launch: fresh proxy sessid + phone chrome framing recovery
+#
+# - Proxy: clear create-bound raw_line/sessid at launch + Retry so DataImpulse
+#   smart_session actually rotates (fixes sticky dead session → bad·27).
+# - Shell: title PID scan uses IsWindow; Chromium --window-name=Krexion PID union;
+#   soft-continue when engine is up (no endless Strict abort wasting profiles).
+# - Tray pickup timeout 120s; persist last_proxy_check on local session mirror;
+#   health penalizes create exit_ip without launch re-verify.
+#
 # v2.7.107 — 2026-09 — Suite green + icon data-uri fallback + UI hygiene
 #
 # - browser_icon_data_uri falls back to raw PNG when Pillow missing (shell mark).
@@ -6,8 +15,7 @@
 # - Outdated shell/branding source tests aligned to Krexion mobile shell path.
 #
 # v2.7.106 — 2026-09 — Mobile shell embed permanent fix + unique IP at create
-#
-# - Shell: IsWindow (not Visible-only) HWND discover; WebKit title PID every tick;
+## - Shell: IsWindow (not Visible-only) HWND discover; WebKit title PID every tick;
 #   delayed stray-hide; force_discover before Strict abort; longer embed waits.
 # - Create: probe + rotate until team-unique exit IP BEFORE save; skip slots that
 #   cannot get a unique IP (no wasted profiles at launch).

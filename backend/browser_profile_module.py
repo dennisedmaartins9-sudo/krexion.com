@@ -1138,6 +1138,8 @@ async def _mirror_profile_session(uid: str, profile_id: str, session_id: str, bo
         "mobile_shell_active",
         "mobile_shell_embedded",
         "engine_used",
+        "last_proxy_check",
+        "exit_ip",
     ):
         if _ak in body:
             prof_update[_ak] = body[_ak]
@@ -2856,10 +2858,23 @@ async def _ensure_profile_launch_proxy(
     cred_uid = str(doc.get("user_id") or uid).strip() or uid
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
 
-    # Rotating providers: always request a fresh session line at launch.
-    if provider_id:
+    # Rotating providers / smart_session / ProxyJet: ALWAYS fresh sessid at launch.
+    # v2.7.108 — must clear raw_line too; hydrate_proxy_credentials restores server
+    # from create-bound sticky sessid and blocks new IP allocation.
+    _fresh_rotating = bool(
+        provider_id
+        or proxy_cfg.get("smart_session")
+        or proxy_cfg.get("use_proxyjet")
+        or _is_rotating_gateway_proxy(proxy_cfg)
+    )
+    if _fresh_rotating:
         proxy_cfg.pop("exit_ip", None)
+        proxy_cfg.pop("raw_line", None)
+        proxy_cfg.pop("raw", None)
         proxy_cfg["server"] = ""
+        # Keep provider_id / password; username comes from newly allocated line
+        if provider_id or proxy_cfg.get("use_proxyjet"):
+            proxy_cfg["username"] = ""
         proxy_cfg = await resolve_profile_proxy_for_launch(
             cred_uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
         )
@@ -4201,8 +4216,15 @@ async def refresh_profile_proxy(request: Request, profile_id: str):
     proxy.pop("exit_ip", None)
     patch_doc["exit_ip"] = ""
     provider_id = str(proxy.get("provider_id") or "").strip()
-    if provider_id or proxy.get("use_proxyjet"):
+    # v2.7.108 — clear sticky create sessid so Retry actually rotates IP
+    proxy.pop("raw_line", None)
+    proxy.pop("raw", None)
+    if provider_id or proxy.get("use_proxyjet") or _is_rotating_gateway_proxy(proxy):
         proxy["server"] = ""
+        if provider_id or proxy.get("use_proxyjet"):
+            proxy["username"] = ""
+        elif _is_rotating_gateway_proxy(proxy):
+            proxy = _rotate_manual_proxy_session(proxy)
         patch_doc["proxy"] = proxy
         patch_doc["proxy"] = await resolve_profile_proxy_for_launch(
             uid, user, patch_doc["proxy"], profile_country=patch_doc.get("country"),

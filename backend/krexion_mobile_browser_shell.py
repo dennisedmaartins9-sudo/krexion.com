@@ -792,6 +792,7 @@ def _shell_apply_loop(
         from krexion_window_icon import (
             brand_single_hwnd_krexion,
             collect_profile_process_tree,
+            find_chromium_pids_by_cmdline_substrings,
             find_pids_by_window_title_substrings,
             find_webkit_browser_pids,
             hide_hwnd_from_taskbar,
@@ -838,6 +839,8 @@ def _shell_apply_loop(
             pid_set |= find_pids_by_window_title_substrings(
                 "[WebKit]", "Safari", "Krexion Orbit"
             )
+        else:
+            pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
 
         dpi = _win_dpi_scale()
         fs = max(0.55, min(1.5, float(layout.frame_scale or 1.0)))
@@ -858,6 +861,8 @@ def _shell_apply_loop(
                 pid_set |= find_pids_by_window_title_substrings(
                     "[WebKit]", "Safari", "Krexion Orbit"
                 )
+            else:
+                pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
 
             engine_hwnds: List[int] = []
 
@@ -1124,6 +1129,7 @@ def force_discover_and_mark_embedded(
 
         from krexion_window_icon import (
             collect_profile_process_tree,
+            find_chromium_pids_by_cmdline_substrings,
             find_pids_by_window_title_substrings,
             find_webkit_browser_pids,
             hide_hwnd_from_taskbar,
@@ -1149,6 +1155,8 @@ def force_discover_and_mark_embedded(
             pid_set |= find_pids_by_window_title_substrings(
                 "[WebKit]", "Safari", "Krexion Orbit"
             )
+        else:
+            pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
         if not pid_set:
             return False
 

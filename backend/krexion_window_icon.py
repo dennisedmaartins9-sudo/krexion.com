@@ -764,7 +764,11 @@ def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
 
 
 def find_pids_by_window_title_substrings(*needles: str) -> Set[int]:
-    """Map visible top-level HWND titles → owning PIDs (WebKit ``[WebKit]`` titles)."""
+    """Map top-level HWND titles → owning PIDs (WebKit MiniBrowser / Safari titles).
+
+    v2.7.108: use IsWindow (not IsWindowVisible) so first-paint / cloaked
+    MiniBrowser windows still join the PID set for phone-chrome framing.
+    """
     clean = [str(n).strip() for n in needles if str(n or "").strip()]
     if not _IS_WINDOWS or not clean:
         return set()
@@ -786,7 +790,7 @@ def find_pids_by_window_title_substrings(*needles: str) -> Set[int]:
 
         def _cb(hwnd, _lparam):
             try:
-                if not user32.IsWindowVisible(hwnd):
+                if not user32.IsWindow(hwnd):
                     return True
                 title_buf = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title_buf, 512)

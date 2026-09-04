@@ -78,9 +78,9 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
             hours = proxy_age // 3600
             issues.append(f"proxy check stale ({hours}h ago — re-check)")
         elif proxy_age is None and exit_ip:
-            # Have an exit IP from launch but no dated check row
-            score -= 3
-            issues.append("proxy check age unknown")
+            # Create-bound exit_ip without a launch-time check is NOT verified
+            score -= 12
+            issues.append("proxy exit IP not re-verified at launch")
     elif proxy.get("enabled") is not False:
         score -= 5
         issues.append("no proxy configured")
