@@ -2550,11 +2550,10 @@ async def _finalize_doc_proxy_and_ip(
 
 
 def _prepare_proxy_for_profile_create(doc: Dict[str, Any]) -> None:
-    """Persist proxy intent only — never live-probe or bind exit IP at create.
+    """Normalize proxy intent on a draft doc (credentials / raw_line).
 
-    Recurring customer failure: advanced-create returned 502 when provider
-    gateway was slow, batch IP dedupe failed, or ProxyJet could not pre-gen N
-    lines. Launch already runs _ensure_profile_launch_proxy / smart_session.
+    v2.7.106 — Exit IP bind is done by `_bind_unique_exit_ip_at_create`
+    before insert. This helper only hydrates config shape.
     """
     proxy = dict(doc.get("proxy") or {})
     if not proxy_is_active(proxy):
@@ -2571,9 +2570,113 @@ def _prepare_proxy_for_profile_create(doc: Dict[str, Any]) -> None:
     raw = _canonical_proxy_raw_line(proxy)
     if raw:
         proxy["raw_line"] = raw
+    # Binder sets exit_ip after probe — never keep a stale bind here
     proxy.pop("exit_ip", None)
     doc["proxy"] = proxy
     doc.pop("exit_ip", None)
+
+
+async def _bind_unique_exit_ip_at_create(
+    uid: str,
+    user: dict,
+    doc: Dict[str, Any],
+    *,
+    used_ips: Set[str],
+    batch_assigned: Set[str],
+    targeting: Optional[Dict[str, Any]] = None,
+    max_retries: int = 8,
+) -> Dict[str, Any]:
+    """Probe exit IP before insert — only unique IPs become saved profiles.
+
+    Rotates provider/manual gateway sessions until team+batch unique.
+    Returns {"ok": True, "exit_ip": "..."} or {"ok": False, "reason": "..."}.
+    Profiles without proxy are ok (no IP to bind).
+    """
+    _prepare_proxy_for_profile_create(doc)
+    proxy_cfg = dict(doc.get("proxy") or {})
+    if not proxy_is_active(proxy_cfg):
+        doc.pop("exit_ip", None)
+        return {"ok": True, "exit_ip": "", "skipped_proxy": True}
+
+    provider_id = str(proxy_cfg.get("provider_id") or "").strip()
+    rotating_manual = _is_rotating_gateway_proxy(proxy_cfg) and not provider_id
+    profile_id = str(doc.get("id") or "").strip()
+    attempts = max(1, int(max_retries or 8))
+    last_err = "exit IP probe failed"
+
+    for attempt in range(attempts):
+        # Provider: allocate a fresh unique line each attempt
+        if provider_id:
+            try:
+                lines = await _allocate_provider_proxy_lines(
+                    uid, provider_id, 1, used_ips | batch_assigned, targeting=targeting,
+                )
+                proxy_cfg = _apply_resolved_line_to_proxy_cfg(
+                    proxy_cfg, lines[0], provider_id=provider_id,
+                )
+                proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+            except HTTPException as he:
+                last_err = str(he.detail or he)[:200]
+                break
+            except Exception as exc:
+                last_err = str(exc)[:200]
+                break
+
+        doc["proxy"] = dict(proxy_cfg)
+        probe = await _probe_profile_proxy(
+            {"proxy": proxy_cfg, "user_id": uid, "id": profile_id, "name": doc.get("name")},
+            user,
+        )
+        exit_ip = str(probe.get("exit_ip") or "").strip()
+        if not exit_ip:
+            last_err = str(probe.get("error") or "exit IP probe failed")[:200]
+            if (provider_id or rotating_manual) and attempt < attempts - 1:
+                if rotating_manual:
+                    proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                    proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+                    await asyncio.sleep(0.2)
+                continue
+            break
+
+        try:
+            canonical = await _assert_unique_team_profile_ip(
+                uid,
+                exit_ip,
+                used_ips,
+                profile_id=profile_id,
+                batch_assigned=batch_assigned,
+            )
+            doc["exit_ip"] = canonical
+            doc["proxy"] = dict(proxy_cfg)
+            doc["proxy"]["exit_ip"] = canonical
+            doc["proxy"]["sticky_session"] = True
+            raw = _canonical_proxy_raw_line(doc["proxy"])
+            if raw:
+                doc["proxy"]["raw_line"] = raw
+            logger.info(
+                f"[browser-profile create] unique exit_ip={canonical} "
+                f"profile={profile_id[:8]} attempt={attempt + 1}"
+            )
+            return {"ok": True, "exit_ip": canonical}
+        except HTTPException as exc:
+            last_err = str(exc.detail or exc)[:200]
+            if exc.status_code != 409 or attempt >= attempts - 1:
+                break
+            # Duplicate — rotate for next attempt
+            if rotating_manual:
+                proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+                await asyncio.sleep(0.2)
+            elif not provider_id:
+                # Static manual: cannot rotate to a new IP
+                break
+            # provider: next loop allocates a new line
+
+    return {
+        "ok": False,
+        "reason": last_err or "could not reserve a unique exit IP",
+        "name": str(doc.get("name") or ""),
+    }
 
 
 async def _pick_ua_line_from_upload(uid: str, upload_id: str) -> Optional[str]:
@@ -3015,11 +3118,27 @@ async def list_trash_profiles(request: Request, limit: int = Query(default=200, 
 
 @router.post("/")
 async def create_profile(request: Request, body: ProfileBody):
-    """Create a new browser profile."""
+    """Create a new browser profile — unique exit IP verified before save."""
     user = await _resolve_user(request)
     uid = _resolve_user_or_401(user)
     doc = _profile_doc(uid, body)
-    _prepare_proxy_for_profile_create(doc)
+    if proxy_is_active(doc.get("proxy") or {}):
+        used_ips = await _load_team_profile_used_ips(uid)
+        batch_assigned: Set[str] = set()
+        bind = await _bind_unique_exit_ip_at_create(
+            uid, user, doc, used_ips=used_ips, batch_assigned=batch_assigned,
+        )
+        if not bind.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Could not reserve a unique exit IP before create — "
+                    f"{str(bind.get('reason') or 'probe failed')[:200]}. "
+                    "Profile was NOT saved (no wasted profile)."
+                ),
+            )
+    else:
+        _prepare_proxy_for_profile_create(doc)
     await _DB.browser_profiles.insert_one(doc)
     return {"profile": _public_view(doc), "id": doc["id"]}
 
@@ -5219,15 +5338,13 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         )
         ua_cursors[plat] = 0
 
-    # ── Proxies — bind at launch, not at create (permanent 502 fix) ──
+    # ── Proxies — bind UNIQUE exit IP at create (v2.7.106) ──
     proxy_lines: List[str] = []
     provider_lines: List[str] = []
     proxy_mode = (body.proxy.mode or "none").lower()
     proxy_warnings: List[str] = []
 
-    # v2.7.104 — Manual proxy: warn (and never silently reuse) when the
-    # user pasted fewer lines than profiles. Extra profiles are created
-    # proxy-less so no two profiles share the same exit IP.
+    # Manual: warn when fewer lines than profiles (extras created proxy-less)
     if proxy_mode == "manual":
         _manual_lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
         if _manual_lines and len(_manual_lines) < count:
@@ -5236,14 +5353,25 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 f"profiles — {count - len(_manual_lines)} profile(s) created "
                 "WITHOUT a proxy to avoid IP reuse. Paste one line per profile."
             )
+        if (not _manual_lines) and body.proxy.server and count > 1:
+            if not _is_rotating_gateway_proxy({
+                "enabled": True,
+                "server": body.proxy.server,
+                "username": body.proxy.username or "",
+                "password": body.proxy.password or "",
+            }):
+                proxy_warnings.append(
+                    "Same static manual proxy for multiple profiles — only the first "
+                    "unique exit IP is kept; duplicates are skipped (not saved)."
+                )
 
     if proxy_mode == "provider" and body.proxy.provider_id:
-        # Never bulk-allocate or probe at create — launch resolves fresh IP.
+        # Lines allocated per-slot inside unique-IP binder
         provider_lines = []
     elif proxy_mode == "proxyjet":
         if _PROXYJET_GEN is None:
             proxy_warnings.append(
-                "ProxyJet not configured — profiles saved; add ProxyJet creds before launch."
+                "ProxyJet not configured — profiles need ProxyJet creds before create."
             )
         else:
             try:
@@ -5261,7 +5389,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 if len(proxy_lines) < count:
                     proxy_warnings.append(
                         f"ProxyJet returned {len(proxy_lines)}/{count} lines — "
-                        "missing slots will dial at launch."
+                        "slots without a unique IP will be skipped."
                     )
             except HTTPException as he:
                 logger.warning(f"advanced_create: ProxyJet soft-fail: {he.detail}")
@@ -5292,8 +5420,16 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
     pad = max(2, len(str(count)))
     docs: List[Dict[str, Any]] = []
+    skipped_profiles: List[Dict[str, str]] = []
     used_device_ids: Set[str] = set()
     seen_ua: Set[str] = set()
+    used_ips: Set[str] = await _load_team_profile_used_ips(uid)
+    batch_assigned: Set[str] = set()
+    unique_ips_bound = 0
+    _targeting = {
+        "country": (body.proxy.country or body.country or "US").upper()[:2],
+        "state": (body.proxy.state or "").upper(),
+    }
 
     for i, plat in enumerate(platform_slots):
         is_mobile = plat in ("ios", "android")
@@ -5421,7 +5557,34 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 _pline = _mlines[i]
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
-        _prepare_proxy_for_profile_create(doc)
+
+        # v2.7.106 — Only save profiles with a verified unique exit IP
+        # (or no proxy). Failed probes / duplicates are skipped, not inserted.
+        if proxy_is_active(doc.get("proxy") or {}):
+            bind = await _bind_unique_exit_ip_at_create(
+                uid,
+                user,
+                doc,
+                used_ips=used_ips,
+                batch_assigned=batch_assigned,
+                targeting=_targeting,
+                max_retries=8,
+            )
+            if not bind.get("ok"):
+                skipped_profiles.append({
+                    "name": str(doc.get("name") or name),
+                    "reason": str(bind.get("reason") or "unique exit IP unavailable")[:240],
+                })
+                proxy_warnings.append(
+                    f"Skipped {doc.get('name') or name}: "
+                    f"{str(bind.get('reason') or 'no unique IP')[:160]}"
+                )
+                continue
+            if bind.get("exit_ip"):
+                unique_ips_bound += 1
+        else:
+            _prepare_proxy_for_profile_create(doc)
+
         docs.append(doc)
 
     if docs:
@@ -5429,13 +5592,14 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
     return {
         "created": len(docs),
         "profiles": [_public_view(d) for d in docs],
+        "skipped": skipped_profiles,
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
-        "proxies_allocated": len(provider_lines or proxy_lines) if proxy_mode in ("proxyjet", "provider") else 0,
+        "proxies_allocated": unique_ips_bound if proxy_mode in ("proxyjet", "provider", "manual") else 0,
         "smart_session": bool(proxy_mode == "provider" and body.proxy.provider_id),
-        "proxy_bind_deferred": proxy_mode in ("provider", "proxyjet", "manual"),
+        "proxy_bind_deferred": False,
         "proxy_warnings": proxy_warnings,
-        "unique_ips_bound": 0,
+        "unique_ips_bound": unique_ips_bound,
         "mix": {plat: n for plat, n in (mix_plan or [])},
     }
 

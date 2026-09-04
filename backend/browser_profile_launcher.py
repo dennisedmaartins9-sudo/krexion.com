@@ -2620,7 +2620,10 @@ async def _launch_profile_session_inner(
                             is_mobile_shell_embedded,
                             preflight_mobile_shell,
                             mobile_shell_status,
+                            force_discover_and_mark_embedded,
                         )
+
+                        _embed_wait = 45.0 if _profile_engine == "webkit" else 30.0
 
                         # Already framed from early pass — just verify / refresh meta
                         if is_mobile_shell_embedded(session_id):
@@ -2630,15 +2633,52 @@ async def _launch_profile_session_inner(
                             return
 
                         if is_mobile_shell_alive(session_id) and not allow_restart:
+                            # Keep living chrome — force discover + longer wait
+                            force_discover_and_mark_embedded(
+                                str(session_id),
+                                parent_pid=int(_driver_pid) if _driver_pid else None,
+                                seed_pids=_family_pids,
+                                webkit=_profile_engine == "webkit",
+                                profile_slot=int(_taskbar_slot),
+                            )
                             _embedded = wait_for_mobile_shell_embedded(
-                                session_id, timeout_sec=20.0,
+                                session_id, timeout_sec=_embed_wait,
                             ) if require_embed else False
                             if _embedded or is_mobile_shell_embedded(session_id):
                                 _launch_ui_meta["mobile_shell"] = True
                                 _launch_ui_meta["mobile_shell_embedded"] = True
                                 stop_session_icon_keeper(str(session_id))
                                 return
-                            # Fall through to restart if embed never arrived
+                            if require_embed:
+                                # Last chance without tearing down shell
+                                if force_discover_and_mark_embedded(
+                                    str(session_id),
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    seed_pids=_family_pids,
+                                    webkit=_profile_engine == "webkit",
+                                    profile_slot=int(_taskbar_slot),
+                                ):
+                                    _launch_ui_meta["mobile_shell"] = True
+                                    _launch_ui_meta["mobile_shell_embedded"] = True
+                                    stop_session_icon_keeper(str(session_id))
+                                    return
+                                if strict_mobile_shell:
+                                    raise RuntimeError(
+                                        "Strict mobile shell: Krexion phone chrome did not "
+                                        "frame the browser. Launch aborted so plain Chromium/"
+                                        "WebKit is not shown as a real device."
+                                    )
+                                _launch_warnings.append(
+                                    "Krexion phone chrome started but the browser window "
+                                    "was not framed inside it — you may see plain Chromium/WebKit."
+                                )
+                                _launch_ui_meta["mobile_shell"] = True
+                                stop_session_icon_keeper(str(session_id))
+                                return
+                            # Soft early pass: process alive is enough
+                            _launch_ui_meta["mobile_shell"] = True
+                            stop_session_icon_keeper(str(session_id))
+                            return
 
                         _pf = preflight_mobile_shell()
                         if not _pf.get("ok"):
@@ -2673,8 +2713,16 @@ async def _launch_profile_session_inner(
                                 if _shell_active and is_mobile_shell_alive(session_id):
                                     if require_embed:
                                         _embedded_ok = wait_for_mobile_shell_embedded(
-                                            session_id, timeout_sec=18.0,
+                                            session_id, timeout_sec=_embed_wait,
                                         )
+                                        if not _embedded_ok:
+                                            _embedded_ok = force_discover_and_mark_embedded(
+                                                str(session_id),
+                                                parent_pid=int(_driver_pid) if _driver_pid else None,
+                                                seed_pids=_family_pids,
+                                                webkit=_profile_engine == "webkit",
+                                                profile_slot=int(_taskbar_slot),
+                                            )
                                     else:
                                         _embedded_ok = is_mobile_shell_embedded(session_id)
                                     if _embedded_ok or not require_embed:
@@ -2718,8 +2766,19 @@ async def _launch_profile_session_inner(
                                 )
                                 return
 
-                            # Process up but HWND never framed — treat as failure (post-nav / strict)
+                            # Process up but HWND never framed — last force discover
                             if _shell_active and not _embedded_ok:
+                                if force_discover_and_mark_embedded(
+                                    str(session_id),
+                                    parent_pid=int(_driver_pid) if _driver_pid else None,
+                                    seed_pids=_family_pids,
+                                    webkit=_profile_engine == "webkit",
+                                    profile_slot=int(_taskbar_slot),
+                                ):
+                                    _launch_ui_meta["mobile_shell"] = True
+                                    _launch_ui_meta["mobile_shell_embedded"] = True
+                                    stop_session_icon_keeper(str(session_id))
+                                    return
                                 logger.warning(
                                     f"[profile-launch] mobile shell process alive but "
                                     f"engine HWND not embedded session={session_id[:8]}"
