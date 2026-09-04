@@ -1814,11 +1814,13 @@ export default function BrowserProfilesPage() {
           Run history
         </button>
         <button type="button" className={itemClass} disabled={showTrash}
-          onClick={() => { openFingerprintModal(p.id); setCardMenuId(null); }}>
+          onClick={() => { openFingerprintModal(p.id); setCardMenuId(null); }}
+          data-testid={`bp-fingerprint-${p.id}`}>
           Fingerprint
         </button>
         <button type="button" className={itemClass} disabled={busy || showTrash || cookieRobotBusy === p.id}
-          onClick={() => { handleCookieRobot(p.id); setCardMenuId(null); }}>
+          onClick={() => { handleCookieRobot(p.id); setCardMenuId(null); }}
+          data-testid={`bp-cookie-robot-${p.id}`}>
           Cookie Robot
         </button>
         <button type="button" className={itemClass} disabled={showTrash}
@@ -3238,7 +3240,7 @@ export default function BrowserProfilesPage() {
                             <span>
                               Full profile save (persistent folder)
                               <span className="block text-[9px] text-zinc-500">
-                                AdsPower-style disk profile — logins / site data survive better than cookies-only.
+                                Full disk profile folder — logins / site data survive better than cookies-only.
                                 Keep ON for accounts you log into.
                               </span>
                             </span>
@@ -3932,7 +3934,7 @@ export default function BrowserProfilesPage() {
               onClick={(e) => e.stopPropagation()}>
               <h3 className="text-sm font-semibold text-zinc-100 mb-3">Krexion Android / Cloud phone</h3>
               <p className="text-[10px] text-zinc-500 mb-3 leading-relaxed">
-                Binds a device URL or CPI Android id for queued URL opens — not full remote control like AdsPower.
+                Binds a device URL or CPI Android id for queued URL opens — not full remote phone control.
                 Use <span className="text-zinc-400">Open on Device</span> after binding.
               </p>
               <Label className="text-zinc-300 text-xs">Provider</Label>

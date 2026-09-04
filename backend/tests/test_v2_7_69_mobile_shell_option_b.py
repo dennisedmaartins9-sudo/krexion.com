@@ -20,6 +20,7 @@ def test_mobile_shell_module():
         compute_mobile_shell_layout,
         should_use_mobile_shell,
     )
+    import krexion_mobile_browser_shell as shell
 
     lay = compute_mobile_shell_layout("ios", 393, 852)
     assert lay.top_h == 28
@@ -29,6 +30,8 @@ def test_mobile_shell_module():
     lay_a = compute_mobile_shell_layout("android", 393, 852)
     assert lay_a.top_h == 56
     assert lay_a.bottom_h == 52
+    # Windows-only feature; force the platform gate for CI/Linux
+    shell._IS_WINDOWS = True
     assert should_use_mobile_shell("ios", True) is True
     assert should_use_mobile_shell("android", True) is True
     assert should_use_mobile_shell("windows", True) is True

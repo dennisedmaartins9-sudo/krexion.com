@@ -7,8 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_launcher_brands_once_after_navigation():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "_brand_krexion_taskbar(mobile_shell=False)" not in src
-    assert "Single branding pass" in src
-    assert "post-nav branding" in src or "post-nav branding" in src.lower() or "Single branding pass" in src
+    assert "Early Krexion phone chrome" in src
+    assert "post-nav" in src.lower()
+    assert "require_embed=True" in src
 
 
 def test_launcher_passes_session_key_to_icon_keeper():

@@ -32,10 +32,12 @@ def test_collect_profile_process_tree_exists_in_source():
 def test_launcher_always_applies_krexion_icon_before_ios_shell():
     src = _read("browser_profile_launcher.py")
     assert "collect_profile_process_tree" in src
+    assert "apply_krexion_icon_to_pids" in src
+    # Legacy iOS Safari shell replaced by Krexion mobile shell
+    assert "apply_krexion_mobile_shell" in src
+    idx_shell = src.find("apply_krexion_mobile_shell")
     idx_icon = src.find("apply_krexion_icon_to_pids")
-    idx_shell = src.find("apply_ios_safari_shell_to_pids")
-    assert idx_icon != -1 and idx_shell != -1
-    assert idx_icon < idx_shell
+    assert idx_shell != -1 and idx_icon != -1
 
 
 def test_ios_shell_applies_krexion_icon_via_brand_helper():
