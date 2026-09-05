@@ -1,3 +1,12 @@
+# v2.7.118 — 2026-09 — Check proxy → unique outbound IPs → Use saved proxy
+# - Proxies List: Check proxy fills outbound IP (+ geo); Add keeps only unique
+#   fresh exit IPs (skips IPs already used by profiles / saved proxies / clicks).
+# - Browser Profile create: new "Use saved proxy" mode (alongside Manual /
+#   Provider) pulls verified free proxies from the Proxies list so create IP
+#   errors go away — trusts Check-proxy exit IP when still unique (no rotating
+#   gateway re-roll). Bound proxies stamped so they won't be reused.
+# - GET /api/proxies/available-for-profiles for the create picker.
+#
 # v2.7.117 — 2026-09 — Proxies page AdsPower-style (better)
 # - Tabs: List | Rotating Proxy | Proxy Provider | Resources
 # - List: inline bulk add with format notes, Check proxy, Check duplicate (ON by default)

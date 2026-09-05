@@ -240,16 +240,22 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
         prev.map((row) => {
           const hit = byRaw.get(row.raw);
           if (!hit) return row;
+          const country = hit.country || hit.country_code || "";
+          const region = hit.region || hit.region_name || "";
+          const city = hit.city || "";
           return {
             ...row,
             exitIp: hit.exit_ip || "",
+            exitCountry: country,
+            exitRegion: region,
+            exitCity: city,
             ok: row.ok && hit.ok !== false,
             error: hit.error || row.error,
           };
         })
       );
       toast.success(
-        `Checked ${res.data?.total || 0} — ${res.data?.ok || 0} ok, ${res.data?.failed || 0} failed`
+        `Checked ${res.data?.total || 0} — ${res.data?.ok || 0} ok with outbound IP, ${res.data?.failed || 0} failed`
       );
     } catch (err) {
       toast.error(err.response?.data?.detail || "Check proxy failed");
@@ -259,13 +265,40 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
   };
 
   const handleAdd = async () => {
-    const rows = rebuildPreview();
-    let toAdd = rows.filter((r) => r.ok);
+    // Keep probe results (exitIp) — rebuildPreview() would wipe them.
+    let toAdd = preview.filter((r) => r.ok);
     if (checkDuplicate) toAdd = toAdd.filter((r) => !r.isDuplicate);
+
+    // AdsPower flow: Check proxy first → only save unique fresh outbound IPs.
+    const unchecked = toAdd.filter((r) => !r.exitIp);
+    if (checkDuplicate && unchecked.length > 0) {
+      toast.error(
+        `Press Check proxy first — ${unchecked.length} line(s) have no outbound IP yet. Only verified unique IPs are saved.`
+      );
+      return;
+    }
+
+    // Within-batch: one line per unique exit IP
+    const seenExit = new Set();
+    const uniqueExit = [];
+    let skippedUsedExit = 0;
+    for (const row of toAdd) {
+      const ip = String(row.exitIp || "").trim();
+      if (ip) {
+        if (seenExit.has(ip)) {
+          skippedUsedExit += 1;
+          continue;
+        }
+        seenExit.add(ip);
+      }
+      uniqueExit.push(row);
+    }
+    toAdd = uniqueExit;
+
     if (toAdd.length === 0) {
       toast.error(
         checkDuplicate
-          ? "Nothing to add — all lines invalid or duplicates (Check duplicate is ON)"
+          ? "Nothing to add — all lines invalid, duplicates, or already-used outbound IPs"
           : "Nothing to add — fix invalid lines"
       );
       return;
@@ -273,21 +306,30 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
     setSaving(true);
     try {
       const token = localStorage.getItem("token");
+      const exitIps = {};
+      for (const row of toAdd) {
+        if (row.exitIp) exitIps[row.raw] = row.exitIp;
+      }
       const res = await axios.post(
         `${API}/proxies/upload`,
         {
           proxy_list: toAdd.map((r) => r.raw),
           proxy_type: proxyType,
           skip_duplicates: checkDuplicate,
+          skip_used_exit_ips: true,
+          exit_ips: exitIps,
           tags: tags.trim() || undefined,
         },
         { headers: { Authorization: `Bearer ${token}` }, timeout: 120000 }
       );
       const added = Array.isArray(res.data) ? res.data.length : 0;
-      const skippedDupes = rows.filter((r) => r.ok && r.isDuplicate).length;
-      const skippedInvalid = rows.filter((r) => !r.ok).length;
-      let msg = `Added ${added} prox${added === 1 ? "y" : "ies"}`;
-      if (checkDuplicate && skippedDupes) msg += ` · skipped ${skippedDupes} duplicate`;
+      const skippedDupes = preview.filter((r) => r.ok && r.isDuplicate).length;
+      const skippedInvalid = preview.filter((r) => !r.ok).length;
+      const skippedServer = Math.max(0, toAdd.length - added);
+      let msg = `Added ${added} unique prox${added === 1 ? "y" : "ies"}`;
+      if (checkDuplicate && skippedDupes) msg += ` · skipped ${skippedDupes} duplicate line`;
+      if (skippedUsedExit) msg += ` · skipped ${skippedUsedExit} duplicate outbound IP`;
+      if (skippedServer) msg += ` · skipped ${skippedServer} already-used IP`;
       if (skippedInvalid) msg += ` · ${skippedInvalid} invalid`;
       toast.success(msg);
       setText("");
@@ -330,6 +372,11 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
               <li>
                 <span className="text-emerald-400">Check duplicate ON</span> = identical
                 host:port:user already in your list will not be added again.
+              </li>
+              <li>
+                Press <span className="text-cyan-300">Check proxy</span> first — outbound IP
+                fills in. Add only keeps <span className="text-emerald-400">unique fresh</span> exit IPs
+                (already-used IPs are skipped).
               </li>
             </ol>
           </div>
@@ -503,7 +550,19 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
                     {row.remark || "—"}
                   </TableCell>
                   <TableCell className="font-mono text-xs text-emerald-400">
-                    {row.exitIp || "—"}
+                    {row.exitIp ? (
+                      <span className="inline-flex flex-col gap-0.5">
+                        <span className="inline-flex items-center gap-1.5">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                          {row.exitCountry || row.exitRegion
+                            ? `${row.exitCountry || ""}${row.exitCountry && row.exitCity ? " · " : ""}${row.exitCity || row.exitRegion || ""}`
+                            : "OK"}
+                        </span>
+                        <span>{row.exitIp}</span>
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </TableCell>
                   <TableCell>
                     {!row.ok ? (
@@ -517,11 +576,11 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
                       </Badge>
                     ) : row.exitIp ? (
                       <Badge className="bg-emerald-500/20 text-emerald-300 text-[10px]">
-                        ok
+                        fresh IP
                       </Badge>
                     ) : (
                       <Badge variant="outline" className="text-[10px]">
-                        ready
+                        check first
                       </Badge>
                     )}
                   </TableCell>

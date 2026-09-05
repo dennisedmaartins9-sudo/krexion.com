@@ -2752,6 +2752,11 @@ class ProxyUpload(BaseModel):
     # v2.7.117 — AdsPower-parity "Check duplicate": when True (default),
     # identical lines already in the user's proxy list are NOT inserted again.
     skip_duplicates: bool = True
+    # v2.7.118 — After Check proxy: skip exit IPs already used by profiles /
+    # other saved proxies / clicks so only fresh unique outbound IPs are stored.
+    skip_used_exit_ips: bool = True
+    # Map of raw paste line → verified outbound exit IP from Check proxy.
+    exit_ips: Optional[Dict[str, str]] = None
     tags: Optional[str] = None
     remark: Optional[str] = None
 
@@ -2765,6 +2770,9 @@ class ProxyResponse(BaseModel):
     response_time: Optional[float] = None
     detected_ip: Optional[str] = None
     all_detected_ips: Optional[List[str]] = None
+    exit_country: Optional[str] = None
+    exit_region: Optional[str] = None
+    bound_profile_id: Optional[str] = None
     is_duplicate: Optional[bool] = False
     is_duplicate_proxy: Optional[bool] = False
     is_duplicate_click: Optional[bool] = False
@@ -17909,6 +17917,43 @@ def _build_proxy_url(proxy_string: str, proxy_type: str) -> str:
     raise ValueError(f"Invalid proxy format: cannot parse {ps!r}")
 
 
+
+async def _collect_used_exit_ips(user_db, main_user_id: str, click_ips: set) -> set:
+    """Exit IPs already claimed by profiles, saved proxies, or clicks."""
+    used = set()
+    for ip in (click_ips or set()):
+        if ip:
+            used.add(str(ip).strip())
+    try:
+        async for doc in user_db.browser_profiles.find(
+            {"user_id": main_user_id, "exit_ip": {"$exists": True, "$ne": ""}},
+            {"_id": 0, "exit_ip": 1, "proxy.exit_ip": 1, "proxy.detected_ip": 1},
+        ):
+            for key in ("exit_ip",):
+                v = str(doc.get(key) or "").strip()
+                if v:
+                    used.add(v)
+            px = doc.get("proxy") or {}
+            for key in ("exit_ip", "detected_ip"):
+                v = str(px.get(key) or "").strip()
+                if v:
+                    used.add(v)
+    except Exception:
+        pass
+    try:
+        async for doc in user_db.proxies.find(
+            {"user_id": main_user_id},
+            {"_id": 0, "detected_ip": 1, "proxy_ip": 1},
+        ):
+            for key in ("detected_ip",):
+                v = str(doc.get(key) or "").strip()
+                if v and ":" not in v:  # prefer IPv4 exit, skip hostnames
+                    used.add(v)
+    except Exception:
+        pass
+    return used
+
+
 @api_router.post("/proxies/upload", response_model=List[ProxyResponse])
 async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_current_user_with_fresh_data)):
     check_user_feature(user, "proxies")
@@ -17945,8 +17990,13 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
     all_click_ips = await get_all_click_ips_from_entire_database(user_id=_dup_scope_uid)
     
     skip_dupes = bool(getattr(proxy_upload, "skip_duplicates", True))
+    skip_used_exit = bool(getattr(proxy_upload, "skip_used_exit_ips", True))
+    exit_ip_map = dict(getattr(proxy_upload, "exit_ips", None) or {})
     existing_identity_keys = {_normalize_proxy_identity(s) for s in existing_proxy_strings if s}
+    used_exit_ips = await _collect_used_exit_ips(user_db, main_user_id, all_click_ips) if skip_used_exit else set()
+    batch_exit_ips: set = set()
     skipped_duplicates = 0
+    skipped_used_exit = 0
     skipped_invalid = 0
     batch_tags = (getattr(proxy_upload, "tags", None) or "").strip() or None
     batch_remark = (getattr(proxy_upload, "remark", None) or "").strip() or None
@@ -17972,9 +18022,22 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
             continue
         
         proxy_ip = extract_ip_from_proxy(cleaned_proxy)
+
+        # Prefer verified outbound IP from Check proxy (AdsPower flow).
+        verified_exit = str(
+            exit_ip_map.get(proxy_string)
+            or exit_ip_map.get(cleaned_proxy)
+            or ""
+        ).strip()
+        if skip_used_exit and verified_exit:
+            if verified_exit in used_exit_ips or verified_exit in batch_exit_ips:
+                skipped_used_exit += 1
+                continue
         
         # Check if this proxy's IP is already in clicks database (duplicate click check)
         is_duplicate_click = proxy_ip in all_click_ips if proxy_ip else False
+        if verified_exit and verified_exit in all_click_ips:
+            is_duplicate_click = True
         
         # Skip VPN check during upload for speed - will be checked during testing
         # Only do quick local IP check
@@ -17985,10 +18048,10 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
             "proxy_string": cleaned_proxy,
             "proxy_ip": proxy_ip,
             "proxy_type": proxy_upload.proxy_type,
-            "status": "pending",
+            "status": "alive" if verified_exit else "pending",
             "response_time": None,
-            "detected_ip": None,
-            "all_detected_ips": None,
+            "detected_ip": verified_exit or None,
+            "all_detected_ips": [verified_exit] if verified_exit else None,
             "is_duplicate": is_duplicate_proxy or is_duplicate_click,  # Combined duplicate status
             "is_duplicate_proxy": is_duplicate_proxy,
             "is_duplicate_click": is_duplicate_click,  # IP found in clicks database
@@ -18005,6 +18068,10 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
             existing_proxy_strings.add(cleaned_proxy)
             if identity:
                 existing_identity_keys.add(identity)
+        if verified_exit:
+            batch_exit_ips.add(verified_exit)
+            used_exit_ips.add(verified_exit)
+            proxy_doc["exit_ip_verified_at_save"] = True
         if batch_tags:
             proxy_doc["tags"] = batch_tags
         if batch_remark:
@@ -18016,7 +18083,7 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
     
     logger.info(
         f"Uploaded {len(proxy_docs)} proxies for user {main_user_id} "
-        f"(skipped_duplicates={skipped_duplicates}, skipped_invalid={skipped_invalid}, "
+        f"(skipped_duplicates={skipped_duplicates}, skipped_used_exit={skipped_used_exit}, skipped_invalid={skipped_invalid}, "
         f"skip_duplicates={skip_dupes}; VPN check during testing)"
     )
     
@@ -18761,6 +18828,50 @@ async def bulk_delete_proxies(proxy_ids: List[str], user: dict = Depends(get_cur
     return {"message": f"Deleted {total_deleted} proxies", "deleted_count": total_deleted}
 
 
+
+@api_router.get("/proxies/available-for-profiles")
+async def proxies_available_for_profiles(
+    user: dict = Depends(get_current_user_with_fresh_data),
+    only_verified: bool = True,
+):
+    """v2.7.118 — Saved proxies that are free for Browser Profile create.
+
+    Returns proxies not bound to a profile and whose detected_ip is not
+    already used by another team profile (fresh unique outbound IPs).
+    """
+    check_user_feature(user, "proxies")
+    user_db = get_db_for_user(user)
+    main_uid = user.get("parent_user_id") or user["id"]
+    used = await _collect_used_exit_ips(user_db, main_uid, set())
+    # Profiles already claim exit IPs — also exclude proxies bound to a profile
+    q = {"user_id": user["id"]}
+    if user.get("is_sub_user"):
+        q["created_by"] = user.get("sub_user_id")
+    out = []
+    async for doc in user_db.proxies.find(q, {"_id": 0}):
+        if doc.get("bound_profile_id"):
+            continue
+        dip = str(doc.get("detected_ip") or "").strip()
+        if only_verified and not dip:
+            continue
+        if dip and dip in used:
+            continue
+        # Host-only gateway lines without verified exit still usable if not only_verified
+        out.append({
+            "id": doc.get("id"),
+            "proxy_string": doc.get("proxy_string"),
+            "proxy_type": doc.get("proxy_type") or "http",
+            "detected_ip": dip,
+            "status": doc.get("status") or "pending",
+            "tags": doc.get("tags") or "",
+            "exit_country": doc.get("exit_country") or "",
+            "exit_region": doc.get("exit_region") or "",
+        })
+        if len(out) >= 2000:
+            break
+    return {"proxies": out, "total": len(out), "used_exit_ip_count": len(used)}
+
+
 @api_router.post("/proxies/probe-lines")
 async def probe_proxy_lines(payload: dict, user: dict = Depends(get_current_user_with_fresh_data)):
     """v2.7.117 — Pre-save Check Proxy (AdsPower parity, better feedback).
@@ -18826,6 +18937,25 @@ async def probe_proxy_lines(payload: dict, user: dict = Depends(get_current_user
                     ip = (r.text or "").strip().split()[0] if r.status_code == 200 else ""
                     if ip and 7 <= len(ip) <= 45:
                         row["exit_ip"] = ip
+                        try:
+                            async with _httpx.AsyncClient(
+                                timeout=_httpx.Timeout(6.0, connect=4.0),
+                                trust_env=False,
+                            ) as direct:
+                                gr = await direct.get(
+                                    f"http://ip-api.com/json/{ip}"
+                                    "?fields=status,country,countryCode,region,regionName,city"
+                                )
+                                if gr.status_code == 200:
+                                    gd = gr.json() or {}
+                                    if gd.get("status") == "success":
+                                        row["country"] = gd.get("countryCode") or ""
+                                        row["country_name"] = gd.get("country") or ""
+                                        row["region"] = gd.get("region") or ""
+                                        row["region_name"] = gd.get("regionName") or ""
+                                        row["city"] = gd.get("city") or ""
+                        except Exception:
+                            pass
                     else:
                         row["ok"] = False
                         row["error"] = f"no_exit_ip status={r.status_code}"
@@ -25446,6 +25576,7 @@ try:
         bridge_enqueue=_bp_bridge_enqueue,
         ua_generate_func=generate_user_agents,
         proxyjet_generate_func=proxyjet_generate_batch,
+        get_db_for_user=get_db_for_user,
     )
     app.include_router(_bp_router)
     logger.info("Browser Profiles module loaded — /api/browser-profiles/*")

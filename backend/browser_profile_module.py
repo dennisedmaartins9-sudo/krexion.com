@@ -70,12 +70,13 @@ _BRIDGE_QUEUE: Any = None
 _GET_USER: Any = None
 _UA_GEN: Any = None
 _PROXYJET_GEN: Any = None
+_GET_DB_FOR_USER: Any = None  # v2.7.118 — Proxies page list lives in per-tenant DB
 
 router = APIRouter(prefix="/api/browser-profiles", tags=["browser-profiles"])
 
 
 def _bind(*, db, get_current_user, bridge_enqueue=None, ua_generate_func=None,
-          proxyjet_generate_func=None):
+          proxyjet_generate_func=None, get_db_for_user=None):
     """Called once by server.py at import time.
 
     `proxyjet_generate_func` (2026-01) is the bound coroutine that
@@ -83,13 +84,27 @@ def _bind(*, db, get_current_user, bridge_enqueue=None, ua_generate_func=None,
     the new advanced-create flow: when a user enables ProxyJet mode
     we call it to allocate N unique exit-IPs so every profile gets a
     truly-distinct outbound proxy.
+
+    `get_db_for_user` (v2.7.118) resolves the per-tenant Mongo DB where
+    the Proxies page list is stored (same as /api/proxies/*).
     """
-    global _DB, _BRIDGE_QUEUE, _GET_USER, _UA_GEN, _PROXYJET_GEN
+    global _DB, _BRIDGE_QUEUE, _GET_USER, _UA_GEN, _PROXYJET_GEN, _GET_DB_FOR_USER
     _DB = db
     _GET_USER = get_current_user
     _BRIDGE_QUEUE = bridge_enqueue
     _UA_GEN = ua_generate_func
     _PROXYJET_GEN = proxyjet_generate_func
+    _GET_DB_FOR_USER = get_db_for_user
+
+
+def _proxies_db_for_user(user: dict):
+    """DB that holds the Proxies page list. Falls back to main _DB."""
+    if _GET_DB_FOR_USER is not None and user:
+        try:
+            return _GET_DB_FOR_USER(user)
+        except Exception:
+            pass
+    return _DB
 
 
 # Wrapper used as FastAPI Depends — resolves to the bound real dep at
@@ -1349,6 +1364,8 @@ class AdvProxyCfg(BaseModel):
         "provider" → resolve the proxy from a user-configured provider
                      (see /api/proxy-providers). Falls through to legacy
                      if the provider fails / is disabled.
+        "saved"    → v2.7.118 pull from Proxies page list (verified unique
+                     outbound IPs). Empty saved_proxy_ids = auto-pick free ones.
     """
     mode: str = "none"
     # Manual proxy
@@ -1357,6 +1374,8 @@ class AdvProxyCfg(BaseModel):
     password: str = ""
     # v2.7.13 — multiline paste: one proxy line per profile (unique IPs)
     lines: Optional[List[str]] = None
+    # v2.7.118 — Proxies page saved pool
+    saved_proxy_ids: Optional[List[str]] = None
     # ProxyJet on-demand
     country: Optional[str] = None
     state: Optional[str] = None
@@ -5912,6 +5931,71 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "state": (body.proxy.state or "").upper(),
     }
 
+    # v2.7.118 — Saved Proxies pool (Proxies page Check-proxy → unique outbound IPs)
+    saved_lines: List[str] = []
+    saved_meta: List[Dict[str, Any]] = []  # parallel to saved_lines
+    if proxy_mode == "saved":
+        try:
+            want_ids = [str(x).strip() for x in (body.proxy.saved_proxy_ids or []) if str(x).strip()]
+            px_db = _proxies_db_for_user(user)
+            q: Dict[str, Any] = {"user_id": uid}
+            if user.get("is_sub_user"):
+                q["created_by"] = user.get("sub_user_id")
+            else:
+                q["created_by"] = None
+            if want_ids:
+                q["id"] = {"$in": want_ids}
+            else:
+                q["detected_ip"] = {"$exists": True, "$nin": [None, ""]}
+                q["$or"] = [
+                    {"bound_profile_id": {"$exists": False}},
+                    {"bound_profile_id": None},
+                    {"bound_profile_id": ""},
+                ]
+            cursor = px_db.proxies.find(q, {"_id": 0}).limit(max(count * 3, 50))
+            candidates = [d async for d in cursor]
+            used_now = set(used_ips)
+            picked: List[Dict[str, Any]] = []
+            for pdoc in candidates:
+                dip = str(pdoc.get("detected_ip") or "").strip()
+                if dip and dip in used_now:
+                    continue
+                if not str(pdoc.get("proxy_string") or "").strip():
+                    continue
+                if pdoc.get("bound_profile_id") and not want_ids:
+                    continue
+                picked.append(pdoc)
+                if dip:
+                    used_now.add(dip)
+                if len(picked) >= count:
+                    break
+            if want_ids:
+                by_id = {str(d.get("id")): d for d in candidates}
+                ordered: List[Dict[str, Any]] = []
+                for pid in want_ids:
+                    d = by_id.get(pid)
+                    if d and d not in ordered:
+                        ordered.append(d)
+                picked = (ordered[:count] if ordered else picked)[:count]
+            saved_meta = picked
+            saved_lines = [
+                str(d.get("proxy_string") or "").strip() for d in picked if d.get("proxy_string")
+            ]
+            if len(saved_lines) < count:
+                proxy_warnings.append(
+                    f"Only {len(saved_lines)} free saved prox{'y' if len(saved_lines) == 1 else 'ies'} "
+                    f"for {count} profiles — extras skipped. "
+                    "Add more via Proxies → Check proxy → Add (unique outbound IPs)."
+                )
+            if not saved_lines:
+                proxy_warnings.append(
+                    "No free saved proxies with verified outbound IP. "
+                    "Open Proxies → paste lines → Check proxy → Add to list."
+                )
+        except Exception as e:
+            logger.warning(f"advanced_create: saved proxy pool failed: {e}")
+            proxy_warnings.append(f"Saved proxy pool failed: {str(e)[:120]}")
+
     for i, plat in enumerate(platform_slots):
         is_mobile = plat in ("ios", "android")
         device = _pick_device(
@@ -5957,13 +6041,10 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 if i < len(lines):
                     proxy_cfg = _parse_proxy_line_to_cfg(lines[i])
                 # else: leave proxy-less on purpose (no IP reuse)
-            elif body.proxy.server:
-                proxy_cfg = ProxyConfig(
-                    enabled=True,
-                    server=body.proxy.server.strip(),
-                    username=body.proxy.username or "",
-                    password=body.proxy.password or "",
-                )
+        elif proxy_mode == "saved":
+            if i < len(saved_lines):
+                proxy_cfg = _parse_proxy_line_to_cfg(saved_lines[i])
+            # else: leave proxy-less (warning already emitted)
         elif proxy_mode == "proxyjet":
             if i < len(proxy_lines):
                 proxy_cfg = _parse_proxy_line_to_cfg(
@@ -6028,6 +6109,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         doc["device_label"] = str(device.get("label") or "")
         doc["device_catalog_id"] = str(device.get("id") or "")
         _pline = ""
+        _saved_proxy_id = ""
+        _saved_exit_hint = ""
         if proxy_mode == "provider" and body.proxy.provider_id:
             pass
         elif proxy_mode == "proxyjet" and i < len(proxy_lines):
@@ -6036,21 +6119,66 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             _mlines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
             if _mlines and i < len(_mlines):
                 _pline = _mlines[i]
+        elif proxy_mode == "saved" and i < len(saved_lines):
+            _pline = saved_lines[i]
+            meta = saved_meta[i] if i < len(saved_meta) else {}
+            _saved_proxy_id = str(meta.get("id") or "").strip()
+            _saved_exit_hint = str(meta.get("detected_ip") or "").strip()
+            if _saved_proxy_id:
+                doc.setdefault("proxy", {})["saved_proxy_id"] = _saved_proxy_id
+            if meta.get("exit_country"):
+                doc.setdefault("proxy", {})["exit_ip_country"] = str(meta.get("exit_country") or "")[:8]
+            if meta.get("exit_region"):
+                doc.setdefault("proxy", {})["exit_ip_region"] = str(meta.get("exit_region") or "")[:32]
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
 
         # v2.7.106/114 — RUT-quality unique exit IP before save (no soft-defer).
+        # v2.7.118 — Saved pool: trust Check-proxy verified outbound IP when still unique
+        # (avoids rotating-gateway re-roll that caused create IP errors).
         if proxy_is_active(doc.get("proxy") or {}):
-            # v2.7.114 — RUT-quality: unique + non-VPN + selected state before save
-            bind = await _bind_unique_exit_ip_at_create(
-                uid,
-                user,
-                doc,
-                used_ips=used_ips,
-                batch_assigned=batch_assigned,
-                targeting=_targeting,
-                max_retries=24,
-            )
+            bind: Dict[str, Any] = {"ok": False}
+            if proxy_mode == "saved" and _saved_exit_hint:
+                try:
+                    _prepare_proxy_for_profile_create(doc)
+                    canonical = await _assert_unique_team_profile_ip(
+                        uid,
+                        _saved_exit_hint,
+                        used_ips,
+                        profile_id=str(doc.get("id") or ""),
+                        batch_assigned=batch_assigned,
+                    )
+                    doc["exit_ip"] = canonical
+                    doc.setdefault("proxy", {})["exit_ip"] = canonical
+                    doc["proxy"]["sticky_session"] = True
+                    doc["proxy"]["exit_ip_verified_at_create"] = True
+                    doc["proxy"]["from_saved_proxy"] = True
+                    if _pline:
+                        doc["proxy"]["raw_line"] = _pline
+                    bind = {"ok": True, "exit_ip": canonical, "from_saved": True}
+                except HTTPException as he:
+                    bind = {
+                        "ok": False,
+                        "reason": str(he.detail or he)[:200],
+                    }
+                except Exception as exc:
+                    bind = {"ok": False, "reason": str(exc)[:200]}
+            if not bind.get("ok") and not (proxy_mode == "saved" and bind.get("reason")):
+                # Normal RUT bind (provider / manual / proxyjet, or saved without hint)
+                if proxy_mode == "saved" and not _saved_exit_hint:
+                    pass  # fall through to probe bind
+                bind = await _bind_unique_exit_ip_at_create(
+                    uid,
+                    user,
+                    doc,
+                    used_ips=used_ips,
+                    batch_assigned=batch_assigned,
+                    targeting=_targeting,
+                    max_retries=24,
+                )
+            elif proxy_mode == "saved" and not bind.get("ok") and _saved_exit_hint:
+                # Hint was already used — do not soft-save; skip profile
+                pass
             if not bind.get("ok"):
                 skipped_profiles.append({
                     "name": str(doc.get("name") or name),
@@ -6080,13 +6208,37 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
     if docs:
         await _DB.browser_profiles.insert_many(docs)
+        # Stamp Proxies list rows as bound so they won't be reused
+        px_db = _proxies_db_for_user(user)
+        for d in docs:
+            px = d.get("proxy") or {}
+            spid = str(px.get("saved_proxy_id") or "").strip()
+            if not spid:
+                continue
+            try:
+                await px_db.proxies.update_one(
+                    {"id": spid, "user_id": uid},
+                    {
+                        "$set": {
+                            "bound_profile_id": d.get("id"),
+                            "bound_at": _now_iso(),
+                            "detected_ip": d.get("exit_ip") or px.get("exit_ip") or None,
+                        }
+                    },
+                )
+            except Exception as _bind_exc:
+                logger.debug(f"saved proxy bind stamp skipped: {_bind_exc}")
     return {
         "created": len(docs),
         "profiles": [_public_view(d) for d in docs],
         "skipped": skipped_profiles,
         "ua_source": "live_generator" if _UA_GEN else "fallback_pool",
         "proxy_mode": proxy_mode,
-        "proxies_allocated": unique_ips_bound if proxy_mode in ("proxyjet", "provider", "manual") else 0,
+        "proxies_allocated": (
+            unique_ips_bound
+            if proxy_mode in ("proxyjet", "provider", "manual", "saved")
+            else 0
+        ),
         "smart_session": bool(proxy_mode == "provider" and body.proxy.provider_id),
         "proxy_bind_deferred": deferred_count > 0,
         "deferred_exit_ip_count": deferred_count,

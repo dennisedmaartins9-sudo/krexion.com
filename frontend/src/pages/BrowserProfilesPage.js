@@ -204,6 +204,7 @@ const ADV_CREATE_DEFAULTS = {
     paste_input: "",
     provider_id: "",
     smart_session: true,
+    saved_proxy_ids: [],
   },
   advAntiDetect: true,
   advMix: { ios: 0, android: 0, desktop: 100 },
@@ -271,7 +272,7 @@ export default function BrowserProfilesPage() {
     region: "US",
   });
   const [advProxy, setAdvProxy] = useState({
-    mode: "none",        // none | manual | proxyjet | provider
+    mode: "none",        // none | manual | proxyjet | provider | saved
     country: "US",
     state: "",
     sticky_minutes: 0,   // 0 = rotating
@@ -285,7 +286,11 @@ export default function BrowserProfilesPage() {
     paste_input: "",     // one-line paste-and-parse buffer
     // v2.4.0 — Selected Proxy Provider (from Settings › Proxy Providers)
     provider_id: "",
+    // v2.7.118 — Proxies page saved pool
+    saved_proxy_ids: [],
   });
+  const [savedProxyPool, setSavedProxyPool] = useState([]);
+  const [savedProxyPoolLoading, setSavedProxyPoolLoading] = useState(false);
   const [advAntiDetect, setAdvAntiDetect] = useState(true);
   const [advCreating, setAdvCreating] = useState(false);
   // v2.7.12 — Mix % + device/resolution + multi-select
@@ -476,6 +481,32 @@ export default function BrowserProfilesPage() {
     fetchTemplates();
     fetchAutomationUploads();
   }, []);
+
+  // v2.7.118 — Load free verified proxies from Proxies list for "Use saved proxy"
+  useEffect(() => {
+    if (!showCreate || editingId || advProxy.mode !== "saved") return undefined;
+    let cancelled = false;
+    (async () => {
+      setSavedProxyPoolLoading(true);
+      try {
+        const base = process.env.REACT_APP_BACKEND_URL;
+        const r = await fetch(`${base}/api/proxies/available-for-profiles?only_verified=true`, {
+          headers: authHeaders,
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const d = await r.json();
+        if (!cancelled) setSavedProxyPool(Array.isArray(d.proxies) ? d.proxies : []);
+      } catch (_) {
+        if (!cancelled) {
+          setSavedProxyPool([]);
+          toast.error("Could not load saved proxies — open Proxies page and Check proxy first");
+        }
+      } finally {
+        if (!cancelled) setSavedProxyPoolLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [showCreate, editingId, advProxy.mode, authHeaders]);
 
   useEffect(() => {
     if (!jsonMenuOpen) return undefined;
@@ -897,6 +928,15 @@ export default function BrowserProfilesPage() {
             };
             if (lines.length) base.lines = lines;
             return base;
+          }
+          if (advProxy.mode === "saved") {
+            const ids = Array.isArray(advProxy.saved_proxy_ids)
+              ? advProxy.saved_proxy_ids.filter(Boolean)
+              : [];
+            return {
+              mode: "saved",
+              ...(ids.length ? { saved_proxy_ids: ids } : {}),
+            };
           }
           return { mode: "none" };
         })(),
@@ -3483,7 +3523,76 @@ export default function BrowserProfilesPage() {
                         <div className="font-semibold">Manual line</div>
                         <div className="text-[10px] mt-0.5 opacity-70">Paste host:port:user:pass</div>
                       </label>
+                      <label
+                        className={`cursor-pointer p-2 rounded border text-center text-xs col-span-2 ${advProxy.mode === "saved" ? "border-emerald-400 bg-emerald-500/15 text-emerald-200" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}
+                        data-testid="bp-adv-proxy-saved"
+                      >
+                        <input type="radio" name="proxy_mode" value="saved" className="sr-only"
+                          checked={advProxy.mode === "saved"}
+                          onChange={() => setAdvProxy({ ...advProxy, mode: "saved", provider_id: "", saved_proxy_ids: [] })} />
+                        <div className="font-semibold">Use saved proxy</div>
+                        <div className="text-[10px] mt-0.5 opacity-70">
+                          From Proxies list (Check proxy → unique outbound IP) — kills create IP errors
+                        </div>
+                      </label>
                     </div>
+
+                    {advProxy.mode === "saved" && (
+                      <div className="space-y-2 p-2.5 rounded-md border border-emerald-700/40 bg-emerald-950/20" data-testid="bp-saved-proxy-panel">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] text-emerald-100/90">
+                            {savedProxyPoolLoading
+                              ? "Loading free verified proxies…"
+                              : `${savedProxyPool.length} free prox${savedProxyPool.length === 1 ? "y" : "ies"} with unique outbound IP`}
+                          </p>
+                          <button
+                            type="button"
+                            className="text-[10px] underline text-emerald-300"
+                            onClick={() => setAdvProxy({ ...advProxy, mode: "saved", saved_proxy_ids: [] })}
+                          >
+                            Auto-pick {advCount} free
+                          </button>
+                        </div>
+                        {!savedProxyPoolLoading && savedProxyPool.length === 0 && (
+                          <p className="text-[11px] text-amber-200">
+                            No free saved proxies. Open <span className="font-semibold">Proxies</span> → paste lines →
+                            {" "}Check proxy → Add (only unique outbound IPs are stored).
+                          </p>
+                        )}
+                        {savedProxyPool.length > 0 && (
+                          <div className="max-h-40 overflow-y-auto space-y-1 pr-1">
+                            {savedProxyPool.slice(0, 40).map((p) => {
+                              const id = p.id;
+                              const checked = (advProxy.saved_proxy_ids || []).includes(id);
+                              const label = [
+                                p.exit_country || "",
+                                p.detected_ip || "",
+                                (p.proxy_string || "").slice(0, 42),
+                              ].filter(Boolean).join(" · ");
+                              return (
+                                <label key={id} className="flex items-start gap-2 text-[11px] text-zinc-300 cursor-pointer hover:bg-zinc-900/50 rounded px-1 py-0.5">
+                                  <input
+                                    type="checkbox"
+                                    className="mt-0.5 accent-emerald-500"
+                                    checked={checked}
+                                    onChange={(e) => {
+                                      const cur = new Set(advProxy.saved_proxy_ids || []);
+                                      if (e.target.checked) cur.add(id);
+                                      else cur.delete(id);
+                                      setAdvProxy({ ...advProxy, saved_proxy_ids: [...cur] });
+                                    }}
+                                  />
+                                  <span className="font-mono leading-snug break-all">{label}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        )}
+                        <p className="text-[10px] text-zinc-500">
+                          Leave unchecked to auto-assign free unique IPs (one per profile). Checked rows are preferred in order.
+                        </p>
+                      </div>
+                    )}
 
                     {advProxy.mode === "provider" && advProxy.provider_id && (
                       <div className="grid grid-cols-3 gap-2" data-testid="bp-provider-targeting">
