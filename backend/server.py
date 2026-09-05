@@ -17921,8 +17921,20 @@ def _build_proxy_url(proxy_string: str, proxy_type: str) -> str:
 
 
 
-async def _collect_used_exit_ips(user_db, main_user_id: str, click_ips: set) -> set:
-    """Exit IPs already claimed by profiles, saved proxies, or clicks."""
+async def _collect_used_exit_ips(
+    user_db,
+    main_user_id: str,
+    click_ips: set,
+    *,
+    include_proxy_list_ips: bool = True,
+) -> set:
+    """Exit IPs already claimed by profiles and/or clicks.
+
+    `include_proxy_list_ips=True` (upload): also treat other saved proxies'
+    detected_ip as used so Add skips duplicate outbound IPs.
+    `include_proxy_list_ips=False` (available-for-profiles): do NOT self-exclude
+    free pool rows — only profile + click IPs count as used.
+    """
     used = set()
     for ip in (click_ips or set()):
         if ip:
@@ -17943,17 +17955,18 @@ async def _collect_used_exit_ips(user_db, main_user_id: str, click_ips: set) -> 
                     used.add(v)
     except Exception:
         pass
-    try:
-        async for doc in user_db.proxies.find(
-            {"user_id": main_user_id},
-            {"_id": 0, "detected_ip": 1, "proxy_ip": 1},
-        ):
-            for key in ("detected_ip",):
-                v = str(doc.get(key) or "").strip()
-                if v and ":" not in v:  # prefer IPv4 exit, skip hostnames
-                    used.add(v)
-    except Exception:
-        pass
+    if include_proxy_list_ips:
+        try:
+            async for doc in user_db.proxies.find(
+                {"user_id": main_user_id},
+                {"_id": 0, "detected_ip": 1, "proxy_ip": 1},
+            ):
+                for key in ("detected_ip",):
+                    v = str(doc.get(key) or "").strip()
+                    if v and ":" not in v:  # prefer IPv4 exit, skip hostnames
+                        used.add(v)
+        except Exception:
+            pass
     return used
 
 
@@ -18002,7 +18015,7 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
     skipped_used_exit = 0
     skipped_invalid = 0
     skipped_unverified = 0
-    require_verified = bool(getattr(proxy_upload, "require_verified_exit", True))
+    require_verified = True  # v2.7.120 — always required; client cannot bypass
     batch_tags = (getattr(proxy_upload, "tags", None) or "").strip() or None
     batch_remark = (getattr(proxy_upload, "remark", None) or "").strip() or None
 
@@ -18877,12 +18890,13 @@ async def proxies_available_for_profiles(
     user_db = get_db_for_user(user)
     main_uid = user.get("parent_user_id") or user["id"]
     click_ips = await get_all_click_ips_from_entire_database(user_id=main_uid)
-    used = await _collect_used_exit_ips(user_db, main_uid, set(click_ips or set()))
+    used = await _collect_used_exit_ips(user_db, main_uid, set(click_ips or set()), include_proxy_list_ips=False)
     # Profiles already claim exit IPs — also exclude proxies bound to a profile
     q = {"user_id": user["id"]}
     if user.get("is_sub_user"):
         q["created_by"] = user.get("sub_user_id")
     out = []
+    seen_exit = set()
     async for doc in user_db.proxies.find(q, {"_id": 0}):
         if doc.get("bound_profile_id"):
             continue
@@ -18890,6 +18904,8 @@ async def proxies_available_for_profiles(
         if only_verified and not dip:
             continue
         if dip and dip in used:
+            continue
+        if dip and dip in seen_exit:
             continue
         # Host-only gateway lines without verified exit still usable if not only_verified
         out.append({
@@ -18902,6 +18918,8 @@ async def proxies_available_for_profiles(
             "exit_country": doc.get("exit_country") or "",
             "exit_region": doc.get("exit_region") or "",
         })
+        if dip:
+            seen_exit.add(dip)
         if len(out) >= 2000:
             break
     return {"proxies": out, "total": len(out), "used_exit_ip_count": len(used)}

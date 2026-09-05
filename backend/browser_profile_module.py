@@ -6249,8 +6249,21 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             if not spid:
                 continue
             try:
-                # Prefer exact user scope; fall back to id-only so the row
-                # always leaves the Proxies list once assigned to a profile.
+                # v2.7.121 — Atomic claim then delete (reduces concurrent double-assign)
+                claimed = await px_db.proxies.find_one_and_update(
+                    {
+                        "id": spid,
+                        "$or": [
+                            {"bound_profile_id": {"$exists": False}},
+                            {"bound_profile_id": None},
+                            {"bound_profile_id": ""},
+                        ],
+                    },
+                    {"$set": {"bound_profile_id": d.get("id"), "bound_at": _now_iso()}},
+                )
+                if claimed is None:
+                    # Already claimed by a concurrent create — still try delete leftovers
+                    pass
                 res = await px_db.proxies.delete_one({"id": spid, "user_id": uid})
                 if not getattr(res, "deleted_count", 0):
                     res = await px_db.proxies.delete_one({"id": spid})

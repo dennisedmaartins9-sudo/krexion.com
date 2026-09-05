@@ -1,3 +1,10 @@
+# v2.7.121 — 2026-09 — Fix available-for-profiles self-exclude (empty pool)
+# - available-for-profiles no longer treats free pool detected_ips as "used"
+#   (that made the Use saved proxy picker always show 0). Used = profiles + clicks.
+# - Dedupe identical exit IPs within the picker response.
+# - require_verified_exit enforced server-side (client cannot bypass).
+# - Saved assign: atomic bound_profile_id claim before delete (race harden).
+#
 # v2.7.120 — 2026-09 — Saved-proxy hard gates (no proxy-less / no unverified)
 # - Use saved proxy: if free verified proxies < profile count → HTTP 400, ZERO
 #   profiles created. UI blocks submit + shows count mismatch banner.
