@@ -101,6 +101,92 @@ def hide_hwnd_from_taskbar(hwnd: int) -> None:
         logger.debug(f"[krexion-icon] hide hwnd from taskbar skipped: {exc}")
 
 
+
+def show_hwnd_on_taskbar(hwnd: int) -> None:
+    """Restore APPWINDOW so a fallback engine stays visible on the taskbar."""
+    if not _IS_WINDOWS or not hwnd:
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_APPWINDOW = 0x00040000
+        style = int(user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE) or 0)
+        new_style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+        if new_style == style:
+            return
+        user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, new_style)
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+        user32.SetWindowPos(
+            int(hwnd), 0, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    except Exception:
+        pass
+
+
+def profile_engine_visible_on_taskbar(
+    driver_pid: Optional[int],
+    *,
+    webkit: bool = False,
+) -> bool:
+    """True when a profile engine HWND still has a taskbar button (not TOOLWINDOW)."""
+    if not _IS_WINDOWS or not driver_pid:
+        return False
+    pid_set = collect_profile_process_tree(int(driver_pid))
+    if webkit:
+        try:
+            pid_set |= find_webkit_browser_pids(int(driver_pid))
+        except Exception:
+            pass
+    if not pid_set:
+        return False
+    visible = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        def _cb(hwnd, _lparam):
+            nonlocal visible
+            if visible:
+                return True
+            try:
+                win_pid = wintypes.DWORD(0)
+                GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+                if win_pid.value not in pid_set:
+                    return True
+                if not _is_profile_engine_hwnd(int(hwnd), webkit=webkit):
+                    return True
+                if not _hwnd_is_toolwindow(int(hwnd)):
+                    visible = True
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    except Exception:
+        # Conservative: if we cannot inspect styles, fall back to existence.
+        return bool(profile_engine_window_exists(int(driver_pid), webkit=webkit))
+    return visible
+
+
 def _app_id_for_slot(slot: int) -> str:
     n = max(1, int(slot or 1))
     return f"{_KREXION_APP_ID_BASE}.{n}"

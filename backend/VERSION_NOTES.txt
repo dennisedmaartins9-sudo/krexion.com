@@ -1,3 +1,12 @@
+# v2.7.125 — 2026-09 — Permanent proxy Sign-in + phone-chrome ghost fixes
+# - Manual proxy: create/launch REQUIRE username+password (never host-only).
+# - Parse host:port:user:pass correctly when password contains "@".
+# - Host-only line apply no longer wipes stored auth.
+# - FE synthesizes auth line from split fields; Parse & fill writes Unique lines.
+# - Launch aborts if proxy server without creds (blocks Chromium Sign-in popup).
+# - Mobile shell: fix dpi NameError in apply loop; polish fallback keeps taskbar
+#   button (no TOOLWINDOW hide); ghost "running" when shell dead + hidden = idle.
+#
 # v2.7.124 — 2026-09 — Ship-gate verified green (anti-detect + saved-proxy locked)
 # - Official ship gate: tests/test_v2_*.py + test_browser_profile* → all green
 #   (987 passed / 5 skipped).

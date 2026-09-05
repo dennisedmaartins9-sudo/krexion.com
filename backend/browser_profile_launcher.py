@@ -151,17 +151,27 @@ def _profile_user_closed_ui(
             from krexion_mobile_browser_shell import is_mobile_shell_alive
 
             if not is_mobile_shell_alive(session_id):
-                # Shell subprocess can restart — keep session if engine window exists.
+                # v2.7.125 — If shell is dead and engine was hidden from the
+                # taskbar (TOOLWINDOW polish fallback), do NOT keep a ghost
+                # "running" card. Operator already lost the window.
                 if driver_pid:
                     try:
-                        from krexion_window_icon import profile_engine_window_exists
+                        from krexion_window_icon import (
+                            profile_engine_window_exists,
+                            profile_engine_visible_on_taskbar,
+                        )
 
                         if profile_engine_window_exists(
                             int(driver_pid), webkit=bool(sess.get("webkit"))
                         ):
-                            sess["mobile_shell"] = False
-                            _RUNNING_SESSIONS[session_id] = sess
-                            return False
+                            # Visible taskbar button → keep; hidden TOOLWINDOW → closed
+                            if profile_engine_visible_on_taskbar(
+                                int(driver_pid), webkit=bool(sess.get("webkit"))
+                            ):
+                                sess["mobile_shell"] = False
+                                _RUNNING_SESSIONS[session_id] = sess
+                                return False
+                            return True
                     except Exception:
                         pass
                 if in_grace:
@@ -2110,27 +2120,29 @@ async def _launch_profile_session_inner(
             if "://" not in raw_server:
                 raw_server = f"http://{raw_server}"
 
-        proxy_arg = {"server": raw_server}
-        if username:
-            proxy_arg["username"] = username
-        if password:
-            proxy_arg["password"] = password
-        elif username and _proxy_enabled:
-            logger.warning(
-                "[profile-launch] proxy username set but password missing — "
-                "Chromium will show a manual proxy sign-in dialog"
-            )
-        proxy_diag["requested"] = True
-        proxy_diag["server"] = raw_server
-        if username and not password:
+        username = (username or "").strip()
+        password = (password or "").strip()
+        # v2.7.125 — NEVER launch with a proxy server but missing auth.
+        # That is exactly what opens Chromium's "Sign in" dialog for
+        # gw.dataimpulse.com / residential gateways.
+        if not username or not password:
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "Proxy username is set but password is missing. "
-                    "Edit the profile → Proxy → re-enter password (or paste "
-                    "host:port:user:pass as one line), then launch again."
+                    "Proxy server is set but username/password is missing. "
+                    "Edit the profile → Proxy → paste a full line "
+                    "(user:pass@host:port or host:port:user:pass), then launch again. "
+                    "Launch is blocked so Chromium cannot show a proxy Sign-in popup "
+                    "or leak your real IP."
                 ),
             )
+        proxy_arg = {
+            "server": raw_server,
+            "username": username,
+            "password": password,
+        }
+        proxy_diag["requested"] = True
+        proxy_diag["server"] = raw_server
     elif _proxy_enabled and not proxy_cfg.get("server"):
         proxy_diag["requested"] = True
         proxy_diag["ok"] = False
@@ -4547,11 +4559,16 @@ async def warm_profile_cookies(
         raw = str(proxy_cfg["server"]).strip()
         if "://" not in raw:
             raw = f"http://{raw}"
-        proxy_arg = {"server": raw}
-        if proxy_cfg.get("username"):
-            proxy_arg["username"] = str(proxy_cfg["username"])
-        if proxy_cfg.get("password"):
-            proxy_arg["password"] = str(proxy_cfg["password"])
+        _u = str(proxy_cfg.get("username") or "").strip()
+        _p = str(proxy_cfg.get("password") or "").strip()
+        if not _u or not _p:
+            logger.warning(
+                "[cookie-robot] proxy server set without username/password — "
+                "skipping proxy for warm (would trigger Chromium Sign-in)"
+            )
+            proxy_arg = None
+        else:
+            proxy_arg = {"server": raw, "username": _u, "password": _p}
 
     headless = str(os.environ.get("KREXION_COOKIE_ROBOT_HEADED", "")).strip() != "1"
     try:

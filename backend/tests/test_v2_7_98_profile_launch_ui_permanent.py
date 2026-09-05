@@ -37,9 +37,10 @@ def test_mobile_shell_hides_engine_from_taskbar():
     assert "stop_event" in src
 
 
-def test_shell_death_does_not_kill_session_when_engine_alive():
+def test_shell_death_keeps_session_only_if_engine_on_taskbar():
+    # v2.7.125 — hidden TOOLWINDOW engines must NOT stay "running" (ghost).
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
-    assert "Shell subprocess can restart" in src
+    assert "profile_engine_visible_on_taskbar" in src
     assert 'sess["mobile_shell"] = False' in src
 
 

@@ -932,15 +932,28 @@ export default function BrowserProfilesPage() {
             };
           }
           if (advProxy.mode === "manual") {
-            const lines = (advProxyLines || "")
+            let lines = (advProxyLines || "")
               .split(/\r?\n/)
               .map((l) => l.trim())
               .filter(Boolean);
+            const server = (advProxy.server || "").trim();
+            const username = (advProxy.username || "").trim();
+            const password = (advProxy.password || "").trim();
+            // v2.7.125 — always send a full auth line so backend never
+            // stores host-only proxies that trigger Chromium Sign-in.
+            if (!lines.length && server && username && password) {
+              const hostport = server.includes("://") ? server.split("://").slice(1).join("://") : server;
+              const scheme = server.includes("://") ? server.split("://")[0] : "http";
+              lines = [`${scheme}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${hostport}`];
+            }
+            if ((server || lines.length) && (!username || !password) && !lines.some((l) => l.includes("@") || l.split(":").length >= 4)) {
+              throw new Error("Manual proxy needs username AND password (or paste user:pass@host:port).");
+            }
             const base = {
               mode: "manual",
-              server: advProxy.server || "",
-              username: advProxy.username || "",
-              password: advProxy.password || "",
+              server: server,
+              username: username,
+              password: password,
             };
             if (lines.length) base.lines = lines;
             return base;
@@ -3701,7 +3714,8 @@ export default function BrowserProfilesPage() {
                             placeholder={"http://user:pass@host:port\nhost:port:user:pass"}
                           />
                           <p className="text-[10px] text-zinc-500 mt-1">
-                            When lines are set, each profile gets the next unique proxy. Single server below is still supported as fallback.
+                            When lines are set, each profile gets the next unique proxy. Always include username:password —
+                            host-only lines are blocked so Chromium never shows a proxy Sign-in popup.
                           </p>
                         </div>
 
@@ -3766,6 +3780,7 @@ export default function BrowserProfilesPage() {
                                     toast.error("Could not extract host or port from that string");
                                     return;
                                   }
+                                  const nextServer = `${protocol}://${host}:${port}`;
                                   setAdvProxy({
                                     ...advProxy,
                                     protocol,
@@ -3773,8 +3788,16 @@ export default function BrowserProfilesPage() {
                                     port,
                                     username,
                                     password,
-                                    server: `${protocol}://${host}:${port}`,
+                                    server: nextServer,
                                   });
+                                  // v2.7.125 — also push into Unique proxies lines so create path persists auth
+                                  if (username && password) {
+                                    const authLine = `${protocol}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+                                    const existing = (advProxyLines || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                                    if (!existing.includes(authLine)) {
+                                      setAdvProxyLines(existing.concat(authLine).join("\n"));
+                                    }
+                                  }
                                   toast.success(`Parsed: ${protocol}://${host}:${port}${username ? " (with auth)" : ""}`);
                                 } catch (e) {
                                   toast.error("Parse failed: " + (e.message || "unknown"));
@@ -3860,7 +3883,7 @@ export default function BrowserProfilesPage() {
                             />
                           </div>
                           <div className="col-span-6">
-                            <Label className="text-zinc-300 text-[11px] mb-1 block">Username <span className="text-zinc-500">(optional)</span></Label>
+                            <Label className="text-zinc-300 text-[11px] mb-1 block">Username <span className="text-amber-400/90">(required with proxy)</span></Label>
                             <Input
                               data-testid="bp-manual-proxy-user"
                               placeholder="proxy username"
@@ -3870,7 +3893,7 @@ export default function BrowserProfilesPage() {
                             />
                           </div>
                           <div className="col-span-6">
-                            <Label className="text-zinc-300 text-[11px] mb-1 block">Password <span className="text-zinc-500">(optional)</span></Label>
+                            <Label className="text-zinc-300 text-[11px] mb-1 block">Password <span className="text-amber-400/90">(required with proxy)</span></Label>
                             <Input
                               data-testid="bp-manual-proxy-pass"
                               placeholder="proxy password"

@@ -477,6 +477,11 @@ def _parse_proxy_line(line: str, proxy_type: str = "http") -> Dict[str, str]:
 
     Preserves socks5/socks4 when the line (or proxy_type) says so — do not
     force everything to http:// (breaks SOCKS providers).
+
+    v2.7.125 — Prefer host:port:user:pass colon form BEFORE urlparse when the
+    password itself contains '@' (e.g. gw.dataimpulse.com:10004:user:p@ss).
+    Previously prepending http:// made urlparse treat '@' as userinfo delimiter
+    and mangled host/user/pass → Chromium proxy Sign-in dialog.
     """
     line = (line or "").strip()
     server = ""
@@ -493,11 +498,53 @@ def _parse_proxy_line(line: str, proxy_type: str = "http") -> Dict[str, str]:
         default_scheme = ptype
     else:
         default_scheme = "http"
+
+    def _colon_host_port_user_pass(raw: str, scheme: str):
+        rest = raw
+        sch = scheme
+        if "://" in rest:
+            sch, rest = rest.split("://", 1)
+            sch = sch or scheme
+        # True user:pass@host:port — leave for urlparse / rsplit('@') path.
+        if "@" in rest:
+            hostpart = rest.rsplit("@", 1)[-1]
+            hp = hostpart.split(":")
+            if len(hp) == 1 and hp[0] and ("." in hp[0] or hp[0] == "localhost"):
+                return None
+            if len(hp) == 2 and hp[1].isdigit():
+                return None
+            # '@' only inside password of host:port:user:pass — continue colon parse
+        parts = rest.split(":")
+        if len(parts) >= 4 and parts[1].isdigit() and parts[0]:
+            host, port, user = parts[0], parts[1], parts[2]
+            pwd = ":".join(parts[3:])
+            return {
+                "server": f"{sch}://{host}:{port}",
+                "username": user,
+                "password": pwd,
+            }
+        return None
+
+    # Try colon form first (handles '@' inside password).
+    early = _colon_host_port_user_pass(line, default_scheme)
+    if early and early.get("username"):
+        return early
+
     try:
         from urllib.parse import unquote, urlparse
 
         probe = line if "://" in line else f"{default_scheme}://{line}"
-        if "://" in probe and "@" in probe.split("://", 1)[-1]:
+        rest_after_scheme = probe.split("://", 1)[-1] if "://" in probe else probe
+        # Only treat '@' as userinfo when host after last '@' looks like host[:port]
+        _use_urlparse_auth = False
+        if "@" in rest_after_scheme:
+            hostpart = rest_after_scheme.rsplit("@", 1)[-1]
+            hp = hostpart.split(":")
+            if (len(hp) == 1 and hp[0] and ("." in hp[0] or hp[0] == "localhost")) or (
+                len(hp) == 2 and hp[1].isdigit()
+            ):
+                _use_urlparse_auth = True
+        if _use_urlparse_auth:
             parsed = urlparse(probe)
             if parsed.hostname:
                 scheme = parsed.scheme or default_scheme
@@ -902,9 +949,10 @@ def _apply_resolved_line_to_proxy_cfg(
     out["enabled"] = True
     if provider_id:
         out["provider_id"] = provider_id
-    out["server"] = parsed.get("server") or ""
-    out["username"] = parsed.get("username") or ""
-    out["password"] = parsed.get("password") or ""
+    out["server"] = parsed.get("server") or out.get("server") or ""
+    # v2.7.125 — never wipe stored auth when operator pastes host:port only
+    out["username"] = parsed.get("username") or out.get("username") or ""
+    out["password"] = parsed.get("password") or out.get("password") or ""
     out["raw_line"] = str(line).strip()
     if not out["server"]:
         raw = str(line).strip()
@@ -6052,11 +6100,32 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             # One UNIQUE line per profile. Never reuse a line across
             # profiles (silent IP reuse defeats anti-detect) — extra
             # profiles are created proxy-less instead (warning emitted).
+            # v2.7.125 — Also honour AdvProxyCfg.server/username/password when
+            # lines are empty (Parse & fill / split fields path).
             lines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
             if lines:
                 if i < len(lines):
                     proxy_cfg = _parse_proxy_line_to_cfg(lines[i])
                 # else: leave proxy-less on purpose (no IP reuse)
+            elif str(body.proxy.server or "").strip():
+                _srv = str(body.proxy.server or "").strip()
+                _user = str(body.proxy.username or "").strip()
+                _pwd = str(body.proxy.password or "").strip()
+                if not _user or not _pwd:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Manual proxy requires username AND password "
+                            "(or paste host:port:user:pass / user:pass@host:port as lines). "
+                            "Without auth Chromium shows a Sign-in dialog."
+                        ),
+                    )
+                proxy_cfg = ProxyConfig(
+                    enabled=True,
+                    server=_srv if "://" in _srv else f"http://{_srv}",
+                    username=_user,
+                    password=_pwd,
+                )
         elif proxy_mode == "saved":
             if i < len(saved_lines):
                 proxy_cfg = _parse_proxy_line_to_cfg(saved_lines[i])
@@ -6135,6 +6204,12 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             _mlines = [str(x).strip() for x in (body.proxy.lines or []) if str(x).strip()]
             if _mlines and i < len(_mlines):
                 _pline = _mlines[i]
+            elif str(body.proxy.server or "").strip() and str(body.proxy.username or "").strip():
+                _pline = _canonical_proxy_raw_line({
+                    "server": str(body.proxy.server or "").strip(),
+                    "username": str(body.proxy.username or "").strip(),
+                    "password": str(body.proxy.password or "").strip(),
+                }) or ""
         elif proxy_mode == "saved" and i < len(saved_lines):
             _pline = saved_lines[i]
             meta = saved_meta[i] if i < len(saved_meta) else {}

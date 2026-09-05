@@ -753,8 +753,11 @@ def polish_webkit_phone_fallback(
                     int(hwnd),
                     f"Krexion Orbit ({int(profile_slot or 1)})",
                 )
+                # v2.7.125 — Do NOT hide engine from taskbar when shell
+                # failed to embed. Hiding caused "running but gone" ghosts.
                 try:
-                    hide_hwnd_from_taskbar(int(hwnd))
+                    from krexion_window_icon import show_hwnd_on_taskbar
+                    show_hwnd_on_taskbar(int(hwnd))
                 except Exception:
                     pass
                 try:
@@ -1078,7 +1081,7 @@ def _shell_apply_loop(
                 _set_window_pos(
                     bottom_hwnd,
                     origin_x,
-                    origin_y + top_h + int(round(layout.bezel * 2 * dpi * fs)) + eng_h,
+                    origin_y + top_h + int(round(layout.bezel * 2 * fs)) + eng_h,
                     outer_w,
                     bottom_h,
                 )
