@@ -6206,9 +6206,10 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
 
         docs.append(doc)
 
+    proxies_removed_from_list = 0
     if docs:
         await _DB.browser_profiles.insert_many(docs)
-        # Stamp Proxies list rows as bound so they won't be reused
+        # v2.7.119 — Remove used saved proxies from Proxies list (consumed on assign)
         px_db = _proxies_db_for_user(user)
         for d in docs:
             px = d.get("proxy") or {}
@@ -6216,18 +6217,15 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             if not spid:
                 continue
             try:
-                await px_db.proxies.update_one(
-                    {"id": spid, "user_id": uid},
-                    {
-                        "$set": {
-                            "bound_profile_id": d.get("id"),
-                            "bound_at": _now_iso(),
-                            "detected_ip": d.get("exit_ip") or px.get("exit_ip") or None,
-                        }
-                    },
-                )
+                # Prefer exact user scope; fall back to id-only so the row
+                # always leaves the Proxies list once assigned to a profile.
+                res = await px_db.proxies.delete_one({"id": spid, "user_id": uid})
+                if not getattr(res, "deleted_count", 0):
+                    res = await px_db.proxies.delete_one({"id": spid})
+                if getattr(res, "deleted_count", 0):
+                    proxies_removed_from_list += 1
             except Exception as _bind_exc:
-                logger.debug(f"saved proxy bind stamp skipped: {_bind_exc}")
+                logger.debug(f"saved proxy remove after assign skipped: {_bind_exc}")
     return {
         "created": len(docs),
         "profiles": [_public_view(d) for d in docs],
@@ -6244,6 +6242,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "deferred_exit_ip_count": deferred_count,
         "proxy_warnings": proxy_warnings,
         "unique_ips_bound": unique_ips_bound,
+        "proxies_removed_from_list": proxies_removed_from_list,
         "mix": {plat: n for plat, n in (mix_plan or [])},
     }
 

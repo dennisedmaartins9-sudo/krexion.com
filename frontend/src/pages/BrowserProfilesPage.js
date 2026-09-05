@@ -969,6 +969,7 @@ export default function BrowserProfilesPage() {
       const mixLabel = d.mix
         ? ` (iOS ${d.mix.ios || 0} · Android ${d.mix.android || 0} · Desktop ${d.mix.desktop || 0})`
         : "";
+      const removed = Number(d.proxies_removed_from_list || 0);
       if (n === 0 && skipped > 0) {
         const why = Array.isArray(d.proxy_warnings) && d.proxy_warnings.length
           ? ` ${String(d.proxy_warnings[0]).slice(0, 160)}`
@@ -979,14 +980,14 @@ export default function BrowserProfilesPage() {
         );
       } else if (n > 0 && deferred > 0 && ips === 0) {
         toast.success(
-          `${n} profiles saved · exit IP check deferred (verified on first launch)${skipped ? ` · ${skipped} skipped` : ""}`,
+          `${n} profiles saved · exit IP check deferred (verified on first launch)${skipped ? ` · ${skipped} skipped` : ""}${removed ? ` · ${removed} used proxies removed from list` : ""}`,
           { duration: 9000 },
         );
       } else {
         toast.success(
           n === 1
-            ? `Profile "${d.profiles?.[0]?.name || ""}" created${ips ? ` · IP ${d.profiles?.[0]?.exit_ip || "bound"}` : ""}`
-            : `${n} unique profiles created${mixLabel}${ips ? ` · ${ips} unique IPs bound` : ""}${deferred ? ` · ${deferred} IP deferred` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+            ? `Profile "${d.profiles?.[0]?.name || ""}" created${ips ? ` · IP ${d.profiles?.[0]?.exit_ip || "bound"}` : ""}${removed ? " · used proxy removed from list" : ""}`
+            : `${n} unique profiles created${mixLabel}${ips ? ` · ${ips} unique IPs bound` : ""}${deferred ? ` · ${deferred} IP deferred` : ""}${skipped ? ` · ${skipped} skipped` : ""}${removed ? ` · ${removed} used proxies removed from list` : ""}`,
         );
       }
       if (Array.isArray(d.proxy_warnings) && d.proxy_warnings.length) {

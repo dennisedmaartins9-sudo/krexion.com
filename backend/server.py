@@ -18128,8 +18128,13 @@ async def get_proxies(user: dict = Depends(get_current_user_with_fresh_data), fi
     all_proxies = {p["id"]: p for p in proxies_main_db}
     for p in proxies_user_db:
         all_proxies[p["id"]] = p  # User_db takes precedence
-    
-    return [ProxyResponse(**proxy) for proxy in all_proxies.values()]
+
+    # v2.7.119 — Hide proxies already consumed by a profile (bound leftovers)
+    visible = [
+        p for p in all_proxies.values()
+        if not p.get("bound_profile_id")
+    ]
+    return [ProxyResponse(**proxy) for proxy in visible]
 
 # Helper function for fast proxy testing
 async def _test_proxy_fast(proxy_string: str, proxy_type: str, timeout: float = 3) -> dict:

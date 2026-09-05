@@ -1,3 +1,9 @@
+# v2.7.119 — 2026-09 — Used saved proxies removed from Proxies list
+# - Profile create with "Use saved proxy": after assign, that proxy row is
+#   deleted from the Proxies list (consumed — not left as "bound" clutter).
+# - GET /proxies also hides any leftover bound_profile_id rows.
+# - Create toast reports how many used proxies were removed.
+#
 # v2.7.118 — 2026-09 — Check proxy → unique outbound IPs → Use saved proxy
 # - Proxies List: Check proxy fills outbound IP (+ geo); Add keeps only unique
 #   fresh exit IPs (skips IPs already used by profiles / saved proxies / clicks).
