@@ -69,7 +69,15 @@ def test_bind_unique_exit_ip_at_create_success():
     async def _run():
         with patch(
             "browser_profile_module._probe_profile_proxy",
-            new=AsyncMock(return_value={"exit_ip": "203.0.113.10", "ok": True}),
+            new=AsyncMock(
+                return_value={
+                    "exit_ip": "203.0.113.10",
+                    "ok": True,
+                    "is_vpn": False,
+                    "country": "US",
+                    "region": "NY",
+                }
+            ),
         ), patch(
             "browser_profile_module._assert_unique_team_profile_ip",
             new=AsyncMock(return_value="203.0.113.10"),
@@ -79,9 +87,13 @@ def test_bind_unique_exit_ip_at_create_success():
         ), patch(
             "browser_profile_module.hydrate_proxy_credentials",
             side_effect=lambda cfg: cfg,
+        ), patch(
+            "browser_profile_module._apply_create_geo_targeting",
+            side_effect=lambda cfg, t, variant_index=0: cfg,
         ):
             return await _bind_unique_exit_ip_at_create(
                 "uid1", {"id": "uid1"}, doc, used_ips=used, batch_assigned=batch,
+                targeting={"country": "US"},
             )
 
     out = asyncio.run(_run())
@@ -112,7 +124,15 @@ def test_bind_unique_skips_on_duplicate_static():
     async def _run():
         with patch(
             "browser_profile_module._probe_profile_proxy",
-            new=AsyncMock(return_value={"exit_ip": "203.0.113.99", "ok": True}),
+            new=AsyncMock(
+                return_value={
+                    "exit_ip": "203.0.113.99",
+                    "ok": True,
+                    "is_vpn": False,
+                    "country": "US",
+                    "region": "TX",
+                }
+            ),
         ), patch(
             "browser_profile_module._assert_unique_team_profile_ip",
             new=AsyncMock(side_effect=HTTPException(status_code=409, detail="Duplicate")),
@@ -122,9 +142,13 @@ def test_bind_unique_skips_on_duplicate_static():
         ), patch(
             "browser_profile_module.hydrate_proxy_credentials",
             side_effect=lambda cfg: cfg,
+        ), patch(
+            "browser_profile_module._apply_create_geo_targeting",
+            side_effect=lambda cfg, t, variant_index=0: cfg,
         ):
             return await _bind_unique_exit_ip_at_create(
                 "uid1", {"id": "uid1"}, doc, used_ips=used, batch_assigned=batch,
+                targeting={"country": "US"},
                 max_retries=2,
             )
 

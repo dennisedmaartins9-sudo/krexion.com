@@ -2477,7 +2477,20 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
             result["ok"] = True
             result["exit_ip"] = exit_ip
             result["country"] = str(geo.get("country") or geo.get("country_name") or "").strip()
+            result["region"] = str(geo.get("region") or geo.get("region_name") or "").strip()
+            result["city"] = str(geo.get("city") or "").strip()
             result["timezone"] = str(geo.get("timezone") or "").strip()
+            result["is_vpn"] = bool(geo.get("is_vpn"))
+            result["vpn_reason"] = str(geo.get("vpn_reason") or "").strip()
+            try:
+                from real_user_traffic import _assess_ip_quality  # type: ignore
+                q = _assess_ip_quality(geo) or {}
+                result["is_low_quality"] = bool(q.get("is_low_quality") or q.get("is_datacenter"))
+                result["ip_quality_score"] = int(q.get("ip_quality_score") or 0)
+                if result["is_low_quality"] and not result["is_vpn"]:
+                    result["is_vpn"] = bool(q.get("is_datacenter"))
+            except Exception:
+                result["is_low_quality"] = bool(geo.get("is_low_quality"))
             try:
                 from fraud_provider_module import check_ip_for_user  # type: ignore
                 fr = await check_ip_for_user(user, exit_ip)
@@ -2485,6 +2498,9 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
                     result["fraud_score"] = fr.get("fraud_score") or fr.get("score")
                     if not result["country"]:
                         result["country"] = fr.get("country") or fr.get("country_code") or ""
+                    if fr.get("is_vpn") or fr.get("is_proxy"):
+                        result["is_vpn"] = True
+                        result["vpn_reason"] = result["vpn_reason"] or "flagged by fraud provider"
                     result["raw_fraud"] = {
                         k: fr.get(k)
                         for k in ("provider", "is_proxy", "is_vpn", "risk")
@@ -2493,16 +2509,45 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
             except Exception:
                 pass
         else:
-            # v2.7.109 — RUT geo can still fail on flaky residential TLS;
-            # one more launcher-style HTTP ipify pass before giving up.
+            # v2.7.109/114 — HTTP ipify fallback, then enrich geo/VPN like RUT.
             fallback_ip = await _quick_http_exit_ip_via_proxy(proxy, _default_probe_ua)
             if _is_valid_exit_ip(fallback_ip):
+                enrich = {
+                    "exit_ip": fallback_ip,
+                    "ok": False,
+                    "is_vpn": False,
+                    "country": "",
+                    "region": "",
+                    "city": "",
+                    "timezone": "",
+                }
+                try:
+                    from real_user_traffic import (  # type: ignore
+                        _assess_ip_quality,
+                        _enrich_geo_from_exit_ip,
+                    )
+                    await _enrich_geo_from_exit_ip(enrich)
+                    q = _assess_ip_quality(enrich) or {}
+                    enrich["is_low_quality"] = bool(q.get("is_low_quality") or q.get("is_datacenter"))
+                    enrich["ip_quality_score"] = int(q.get("ip_quality_score") or 0)
+                    if enrich["is_low_quality"]:
+                        enrich["is_vpn"] = True
+                        enrich["vpn_reason"] = "datacenter/hosting ISP"
+                except Exception as _enr:
+                    logger.debug(f"[browser-profile] exit-IP enrich skipped: {_enr}")
                 result["ok"] = True
                 result["exit_ip"] = fallback_ip
                 result["probe_path"] = "quick_http_fallback"
+                result["country"] = str(enrich.get("country") or "").strip()
+                result["region"] = str(enrich.get("region") or enrich.get("region_name") or "").strip()
+                result["city"] = str(enrich.get("city") or "").strip()
+                result["timezone"] = str(enrich.get("timezone") or "").strip()
+                result["is_vpn"] = bool(enrich.get("is_vpn"))
+                result["vpn_reason"] = str(enrich.get("vpn_reason") or "").strip()
+                result["is_low_quality"] = bool(enrich.get("is_low_quality"))
                 logger.info(
                     f"[browser-profile] exit IP via quick HTTP fallback: {fallback_ip} "
-                    f"host={gateway_host}"
+                    f"host={gateway_host} vpn={result['is_vpn']}"
                 )
             else:
                 raw_err = str(geo.get("probe_error") or geo.get("error") or "").strip()
@@ -2510,9 +2555,22 @@ async def _probe_profile_proxy(doc: Dict[str, Any], user: dict) -> Dict[str, Any
     except Exception as e:
         fallback_ip = await _quick_http_exit_ip_via_proxy(proxy, _default_probe_ua)
         if _is_valid_exit_ip(fallback_ip):
+            enrich = {"exit_ip": fallback_ip, "ok": False, "is_vpn": False}
+            try:
+                from real_user_traffic import _enrich_geo_from_exit_ip, _assess_ip_quality  # type: ignore
+                await _enrich_geo_from_exit_ip(enrich)
+                q = _assess_ip_quality(enrich) or {}
+                if q.get("is_low_quality") or q.get("is_datacenter"):
+                    enrich["is_vpn"] = True
+            except Exception:
+                pass
             result["ok"] = True
             result["exit_ip"] = fallback_ip
             result["probe_path"] = "quick_http_fallback"
+            result["country"] = str(enrich.get("country") or "").strip()
+            result["region"] = str(enrich.get("region") or "").strip()
+            result["is_vpn"] = bool(enrich.get("is_vpn"))
+            result["is_low_quality"] = bool(enrich.get("is_low_quality") or enrich.get("is_vpn"))
         else:
             result["error"] = _friendly_proxy_probe_error(str(e), gateway_host)
     return result
@@ -2694,6 +2752,121 @@ def _prepare_proxy_for_profile_create(doc: Dict[str, Any]) -> None:
     doc.pop("exit_ip", None)
 
 
+
+def _normalize_create_target_state(raw: Any) -> str:
+    """Normalize UI state to 2-letter US code when possible."""
+    s = str(raw or "").strip().upper()
+    if not s or s in ("ANY", "ALL", "*"):
+        return ""
+    if len(s) == 2 and s.isalpha():
+        return s
+    # Accept "ALABAMA" / "New York" / "state.alabama"
+    s2 = s.replace("STATE.", "").replace("REGION.", "").replace("_", " ").replace("-", " ")
+    try:
+        from real_user_traffic import _normalize_state  # type: ignore
+        return str(_normalize_state(s2) or _normalize_state(s) or "").strip().upper()[:2]
+    except Exception:
+        return s[:2] if len(s) >= 2 and s[:2].isalpha() else ""
+
+
+def _apply_create_geo_targeting(
+    proxy_cfg: Dict[str, Any],
+    targeting: Optional[Dict[str, Any]],
+    *,
+    variant_index: int = 0,
+) -> Dict[str, Any]:
+    """Inject country/state + fresh sessid into rotating gateway username (RUT parity)."""
+    cfg = dict(proxy_cfg or {})
+    tgt = dict(targeting or {})
+    country = str(tgt.get("country") or cfg.get("proxyjet_country") or "US").strip().upper()[:2] or "US"
+    state = _normalize_create_target_state(tgt.get("state") or cfg.get("proxyjet_state") or "")
+    if not state and not country:
+        return cfg
+    if not (
+        _is_rotating_gateway_proxy(cfg)
+        or str(cfg.get("provider_id") or "").strip()
+        or cfg.get("use_proxyjet")
+    ):
+        # Static datacenter line — cannot rewrite geo DSL
+        return cfg
+    try:
+        from real_user_traffic import _build_state_targeted_proxy  # type: ignore
+        probe = dict(cfg)
+        probe["is_rotating_gateway"] = True
+        # RUT helper expects username/password keys
+        if not probe.get("username") and probe.get("user"):
+            probe["username"] = probe.get("user")
+        out = _build_state_targeted_proxy(
+            probe,
+            state,
+            country,
+            state_variant_index=int(variant_index or 0),
+        )
+        if not out:
+            return cfg
+        cfg.update({k: out[k] for k in ("server", "username", "password", "raw") if k in out and out[k]})
+        if out.get("raw") and not cfg.get("raw_line"):
+            cfg["raw_line"] = out["raw"]
+        if state:
+            cfg["proxyjet_state"] = state
+            cfg["state"] = state
+        cfg["proxyjet_country"] = country
+        cfg["country"] = country
+        return cfg
+    except Exception as exc:
+        logger.debug(f"[browser-profile create] geo targeting inject skipped: {exc}")
+        return cfg
+
+
+def _create_probe_passes_rut_gates(
+    probe: Dict[str, Any],
+    targeting: Optional[Dict[str, Any]],
+) -> tuple:
+    """RUT-quality gates: IPv4 + non-VPN + country + selected state.
+
+    Returns (ok, reason). Empty reason when ok.
+    """
+    exit_ip = str(probe.get("exit_ip") or "").strip()
+    if not exit_ip or not _is_valid_exit_ip(exit_ip):
+        return False, str(probe.get("error") or "exit IP probe failed")[:200]
+    if ":" in exit_ip:
+        return False, f"IPv6 exit {exit_ip} rejected — need IPv4"
+    if probe.get("is_vpn") or probe.get("is_low_quality"):
+        why = str(probe.get("vpn_reason") or "VPN/datacenter/hosting").strip()
+        return False, f"exit IP {exit_ip} flagged {why} — rotating for clean residential"
+    tgt = dict(targeting or {})
+    want_cc = str(tgt.get("country") or "").strip().upper()[:2]
+    want_st = _normalize_create_target_state(tgt.get("state") or "")
+    geo = {
+        "country": probe.get("country") or "",
+        "region": probe.get("region") or "",
+        "region_name": probe.get("region") or "",
+        "city": probe.get("city") or "",
+        "exit_ip": exit_ip,
+        "is_vpn": bool(probe.get("is_vpn")),
+    }
+    try:
+        from real_user_traffic import (  # type: ignore
+            _geo_exit_state_code,
+            _geo_matches_target_country,
+            _heal_california_canada_collision,
+        )
+        _heal_california_canada_collision(geo)
+        if want_cc and not _geo_matches_target_country(geo, want_cc):
+            got = str(geo.get("country") or "?").upper()
+            return False, f"exit country {got} != requested {want_cc} — rotating"
+        if want_st:
+            got_st = _geo_exit_state_code(geo)
+            if not got_st or got_st != want_st:
+                return False, (
+                    f"exit state {got_st or '?'} != requested {want_st} — "
+                    "rotating for correct geo"
+                )
+    except Exception as exc:
+        logger.debug(f"[browser-profile create] geo gate skipped: {exc}")
+    return True, ""
+
+
 async def _bind_unique_exit_ip_at_create(
     uid: str,
     user: dict,
@@ -2704,16 +2877,10 @@ async def _bind_unique_exit_ip_at_create(
     targeting: Optional[Dict[str, Any]] = None,
     max_retries: int = 8,
 ) -> Dict[str, Any]:
-    """Probe exit IP before insert — prefer unique IPs; soft-defer when gateway flakes.
+    """RUT-grade bind before save: unique + non-VPN + selected country/state.
 
-    Rotates provider/manual gateway sessions until team+batch unique.
-    Returns {"ok": True, "exit_ip": "..."} or {"ok": False, "reason": "..."}.
-    Profiles without proxy are ok (no IP to bind).
-
-    v2.7.112 — When a rotating provider/manual gateway is allocated but every
-    IP endpoint returns empty (BestGo / DataImpulse flaky balance windows),
-    soft-save with exit_ip_deferred instead of skipping the whole batch.
-    Unique IP is enforced again at first launch.
+    v2.7.114 — Soft-defer removed. Profiles are NOT saved until a clean
+    residential exit IP is verified (same quality bar as Real User Traffic).
     """
     _prepare_proxy_for_profile_create(doc)
     proxy_cfg = dict(doc.get("proxy") or {})
@@ -2724,49 +2891,67 @@ async def _bind_unique_exit_ip_at_create(
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
     rotating_manual = _is_rotating_gateway_proxy(proxy_cfg) and not provider_id
     profile_id = str(doc.get("id") or "").strip()
-    attempts = max(1, int(max_retries or 8))
+    tgt = dict(targeting or {})
+    # Prefer proxyjet_* already on cfg when targeting empty
+    if not tgt.get("country"):
+        tgt["country"] = str(
+            proxy_cfg.get("proxyjet_country") or doc.get("country") or "US"
+        ).upper()[:2]
+    if not tgt.get("state"):
+        tgt["state"] = str(proxy_cfg.get("proxyjet_state") or "").upper()
+    want_state = _normalize_create_target_state(tgt.get("state") or "")
+    # Deeper retries when state geo must match (RUT ROW-FIRST style)
+    base_attempts = max(1, int(max_retries or 8))
+    attempts = max(base_attempts, 24 if want_state else base_attempts)
     last_err = "exit IP probe failed"
-    had_allocated_line = False
-    last_empty_ip_err = False
 
     for attempt in range(attempts):
-        # Provider: allocate a fresh unique line each attempt
         if provider_id:
             try:
                 lines = await _allocate_provider_proxy_lines(
-                    uid, provider_id, 1, used_ips | batch_assigned, targeting=targeting,
+                    uid, provider_id, 1, used_ips | batch_assigned, targeting=tgt,
                 )
                 proxy_cfg = _apply_resolved_line_to_proxy_cfg(
                     proxy_cfg, lines[0], provider_id=provider_id,
                 )
+                proxy_cfg = _apply_create_geo_targeting(
+                    proxy_cfg, tgt, variant_index=attempt,
+                )
                 proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
-                had_allocated_line = True
             except HTTPException as he:
                 last_err = str(he.detail or he)[:200]
-                break
+                if attempt >= attempts - 1:
+                    break
+                await asyncio.sleep(0.2)
+                continue
             except Exception as exc:
                 last_err = str(exc)[:200]
                 break
-        elif str(proxy_cfg.get("server") or "").strip():
-            had_allocated_line = True
+        elif str(proxy_cfg.get("server") or "").strip() or str(proxy_cfg.get("raw_line") or "").strip():
+            proxy_cfg = hydrate_proxy_credentials(proxy_cfg)
+            if rotating_manual or _is_rotating_gateway_proxy(proxy_cfg):
+                proxy_cfg = _apply_create_geo_targeting(
+                    proxy_cfg, tgt, variant_index=attempt,
+                )
+                if attempt > 0:
+                    try:
+                        proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                    except Exception:
+                        pass
+            proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+        else:
+            last_err = "proxy enabled but no server/line to probe"
+            break
 
         doc["proxy"] = dict(proxy_cfg)
         probe = await _probe_profile_proxy(
             {"proxy": proxy_cfg, "user_id": uid, "id": profile_id, "name": doc.get("name")},
             user,
         )
-        exit_ip = str(probe.get("exit_ip") or "").strip()
-        if not exit_ip:
-            last_err = str(probe.get("error") or "exit IP probe failed")[:200]
-            err_l = last_err.lower()
-            last_empty_ip_err = (
-                "geo endpoints returned no ip" in err_l
-                or "ip endpoints returned no ip" in err_l
-                or "exit ip check failed" in err_l
-                or "returned nothing" in err_l
-            )
+        gate_ok, gate_reason = _create_probe_passes_rut_gates(probe, tgt)
+        if not gate_ok:
+            last_err = gate_reason or "exit IP failed quality/geo gate"
             if (provider_id or rotating_manual) and attempt < attempts - 1:
-                # Rotate session on the current line before next allocate
                 if rotating_manual or provider_id:
                     try:
                         proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
@@ -2777,6 +2962,7 @@ async def _bind_unique_exit_ip_at_create(
                 continue
             break
 
+        exit_ip = str(probe.get("exit_ip") or "").strip()
         try:
             canonical = await _assert_unique_team_profile_ip(
                 uid,
@@ -2789,21 +2975,29 @@ async def _bind_unique_exit_ip_at_create(
             doc["proxy"] = dict(proxy_cfg)
             doc["proxy"]["exit_ip"] = canonical
             doc["proxy"]["sticky_session"] = True
+            doc["proxy"]["exit_ip_verified_at_create"] = True
+            doc["proxy"]["exit_ip_country"] = str(probe.get("country") or "")[:8]
+            doc["proxy"]["exit_ip_region"] = str(probe.get("region") or "")[:32]
             doc.pop("exit_ip_deferred", None)
             doc.get("proxy", {}).pop("exit_ip_deferred", None)
             raw = _canonical_proxy_raw_line(doc["proxy"])
             if raw:
                 doc["proxy"]["raw_line"] = raw
             logger.info(
-                f"[browser-profile create] unique exit_ip={canonical} "
+                f"[browser-profile create] RUT-quality exit_ip={canonical} "
+                f"cc={probe.get('country')} st={probe.get('region')} "
                 f"profile={profile_id[:8]} attempt={attempt + 1}"
             )
-            return {"ok": True, "exit_ip": canonical}
+            return {
+                "ok": True,
+                "exit_ip": canonical,
+                "country": str(probe.get("country") or ""),
+                "region": str(probe.get("region") or ""),
+            }
         except HTTPException as exc:
             last_err = str(exc.detail or exc)[:200]
             if exc.status_code != 409 or attempt >= attempts - 1:
                 break
-            # Duplicate — rotate for next attempt
             if rotating_manual or provider_id:
                 try:
                     proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
@@ -2812,38 +3006,12 @@ async def _bind_unique_exit_ip_at_create(
                     pass
                 await asyncio.sleep(0.2)
             elif not provider_id:
-                # Static manual: cannot rotate to a new IP
                 break
-            # provider: next loop allocates a new line
 
-    # Soft-defer: rotating gateway line exists but IP endpoints flaked —
-    # still save so Create is not a total waste; launch re-binds unique IP.
-    if had_allocated_line and last_empty_ip_err and (provider_id or rotating_manual):
-        doc["proxy"] = dict(proxy_cfg)
-        doc.pop("exit_ip", None)
-        doc["exit_ip_deferred"] = True
-        doc["proxy"]["exit_ip_deferred"] = True
-        doc["proxy"].pop("exit_ip", None)
-        raw = _canonical_proxy_raw_line(doc["proxy"])
-        if raw:
-            doc["proxy"]["raw_line"] = raw
-        logger.warning(
-            f"[browser-profile create] exit IP deferred profile={profile_id[:8]} "
-            f"reason={last_err[:120]}"
-        )
-        return {
-            "ok": True,
-            "exit_ip": "",
-            "deferred": True,
-            "warning": (
-                "Exit IP check flaked — profile saved; unique IP will be "
-                f"verified on first launch. ({last_err[:120]})"
-            ),
-        }
-
+    # Hard fail — never soft-save without a verified clean unique IP.
     return {
         "ok": False,
-        "reason": last_err or "could not reserve a unique exit IP",
+        "reason": last_err or "could not reserve a unique clean exit IP",
         "name": str(doc.get("name") or ""),
     }
 
@@ -3025,6 +3193,81 @@ async def _ensure_profile_launch_proxy(
     cred_uid = str(doc.get("user_id") or uid).strip() or uid
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
     use_proxyjet = bool(proxy_cfg.get("use_proxyjet"))
+
+    # v2.7.114 — Prefer create-verified sticky line (unique/non-VPN/geo already
+    # checked). Do not wipe server/raw_line and re-roll a different IP on open.
+    _create_verified = bool(
+        proxy_cfg.get("exit_ip_verified_at_create")
+        or (
+            proxy_cfg.get("sticky_session")
+            and str(doc.get("exit_ip") or proxy_cfg.get("exit_ip") or "").strip()
+            and not proxy_cfg.get("exit_ip_deferred")
+        )
+    )
+    if _create_verified and (
+        str(proxy_cfg.get("server") or "").strip()
+        or str(proxy_cfg.get("raw_line") or proxy_cfg.get("raw") or "").strip()
+    ):
+        proxy_cfg = hydrate_proxy_credentials(proxy_cfg)
+        proxy_cfg = await _finalize_proxy_cfg_for_launch(cred_uid, user, proxy_cfg)
+        if str(proxy_cfg.get("server") or "").strip():
+            probe = await _probe_profile_proxy(
+                {
+                    "proxy": proxy_cfg,
+                    "user_id": cred_uid,
+                    "id": profile_id,
+                    "name": doc.get("name"),
+                },
+                user,
+            )
+            tgt = {
+                "country": str(
+                    proxy_cfg.get("proxyjet_country")
+                    or proxy_cfg.get("exit_ip_country")
+                    or profile_country
+                    or doc.get("country")
+                    or "US"
+                ).upper()[:2],
+                "state": str(
+                    proxy_cfg.get("proxyjet_state")
+                    or proxy_cfg.get("exit_ip_region")
+                    or ""
+                ).upper(),
+            }
+            gate_ok, gate_reason = _create_probe_passes_rut_gates(probe, tgt)
+            exit_ip = str(probe.get("exit_ip") or "").strip()
+            stored = str(doc.get("exit_ip") or proxy_cfg.get("exit_ip") or "").strip()
+            if gate_ok and exit_ip:
+                # Keep sticky when still clean; allow same profile IP.
+                try:
+                    used = await _load_team_profile_used_ips(cred_uid)
+                    used.discard(stored)
+                    used.discard(exit_ip)
+                    canonical = await _assert_unique_team_profile_ip(
+                        cred_uid,
+                        exit_ip,
+                        used,
+                        profile_id=profile_id,
+                        batch_assigned=set(),
+                    )
+                    proxy_cfg["exit_ip"] = canonical
+                    proxy_cfg["sticky_session"] = True
+                    doc["exit_ip"] = canonical
+                    logger.info(
+                        f"[browser-profile launch] reused create-verified "
+                        f"exit_ip={canonical} profile={profile_id[:8]}"
+                    )
+                    return proxy_cfg
+                except Exception as _sticky_exc:
+                    logger.warning(
+                        f"[browser-profile launch] sticky reuse unique-check "
+                        f"failed ({_sticky_exc}) — rotating"
+                    )
+            else:
+                logger.warning(
+                    f"[browser-profile launch] create-sticky failed re-check "
+                    f"({gate_reason or 'probe failed'}) — rotating"
+                )
 
     # v2.7.113 — Manual rotating gateways (DataImpulse paste, etc.) keep host:port
     # and only rotate sessid. v2.7.108 wiped server+raw_line for ALL rotating
@@ -3326,8 +3569,23 @@ async def create_profile(request: Request, body: ProfileBody):
     if proxy_is_active(doc.get("proxy") or {}):
         used_ips = await _load_team_profile_used_ips(uid)
         batch_assigned: Set[str] = set()
+        _tgt = {
+            "country": str(
+                (doc.get("proxy") or {}).get("proxyjet_country")
+                or doc.get("country")
+                or "US"
+            ).upper()[:2],
+            "state": str(
+                (doc.get("proxy") or {}).get("proxyjet_state")
+                or ""
+            ).upper(),
+        }
         bind = await _bind_unique_exit_ip_at_create(
-            uid, user, doc, used_ips=used_ips, batch_assigned=batch_assigned,
+            uid, user, doc,
+            used_ips=used_ips,
+            batch_assigned=batch_assigned,
+            targeting=_tgt,
+            max_retries=24,
         )
         if not bind.get("ok"):
             raise HTTPException(
@@ -5777,9 +6035,9 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
 
-        # v2.7.106/112 — Prefer verified unique exit IP before save.
-        # Soft-defer when rotating gateway flakes (BestGo empty IP endpoints).
+        # v2.7.106/114 — RUT-quality unique exit IP before save (no soft-defer).
         if proxy_is_active(doc.get("proxy") or {}):
+            # v2.7.114 — RUT-quality: unique + non-VPN + selected state before save
             bind = await _bind_unique_exit_ip_at_create(
                 uid,
                 user,
@@ -5787,7 +6045,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 used_ips=used_ips,
                 batch_assigned=batch_assigned,
                 targeting=_targeting,
-                max_retries=8,
+                max_retries=24,
             )
             if not bind.get("ok"):
                 skipped_profiles.append({

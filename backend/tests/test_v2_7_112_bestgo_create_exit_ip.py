@@ -48,7 +48,8 @@ def test_probe_uses_username_for_http_first():
     assert "_prefer_http_first_geo_probe(_probe_host, _proxy_user)" in src
 
 
-def test_bind_soft_defers_when_empty_ip_endpoints():
+def test_bind_hard_fails_when_empty_ip_endpoints():
+    """v2.7.114 — soft-defer removed; empty IP endpoints skip the profile."""
     from browser_profile_module import _bind_unique_exit_ip_at_create
 
     async def _run():
@@ -120,12 +121,11 @@ def test_bind_soft_defers_when_empty_ip_endpoints():
             ), doc
 
     bind, doc = asyncio.run(_run())
-    assert bind.get("ok") is True
-    assert bind.get("deferred") is True
+    assert bind.get("ok") is False
+    assert not bind.get("deferred")
     assert not bind.get("exit_ip")
-    assert doc.get("exit_ip_deferred") is True
-    assert doc.get("proxy", {}).get("exit_ip_deferred") is True
-    assert "Exit IP check flaked" in str(bind.get("warning") or "")
+    assert not doc.get("exit_ip_deferred")
+    assert "returned nothing" in str(bind.get("reason") or "").lower() or "exit ip" in str(bind.get("reason") or "").lower()
 
 
 def test_advanced_create_returns_deferred_count():

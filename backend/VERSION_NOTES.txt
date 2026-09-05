@@ -1,3 +1,11 @@
+# v2.7.114 — 2026-09 — Create = RUT-quality IP before save (no soft-defer)
+# - Soft-defer removed: profiles are NOT saved until exit IP is verified.
+# - Same bar as Real User Traffic: unique team IP + non-VPN/datacenter +
+#   selected country/state match (user-picked state from provider).
+# - Deeper retries (24) with geo targeting inject + session rotate.
+# - Launch reuses create-verified sticky line (no accidental IP re-roll).
+# - Probe returns is_vpn/region; HTTP fallback enriches geo before accept.
+#
 # v2.7.113 — 2026-09 — Manual DataImpulse launch: keep server URL + geo sessid
 # - Symptom: Create with pasted DataImpulse lines succeeded, Launch failed with
 #   "proxy enabled but no server URL could be resolved".

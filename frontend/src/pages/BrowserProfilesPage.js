@@ -930,9 +930,12 @@ export default function BrowserProfilesPage() {
         ? ` (iOS ${d.mix.ios || 0} · Android ${d.mix.android || 0} · Desktop ${d.mix.desktop || 0})`
         : "";
       if (n === 0 && skipped > 0) {
+        const why = Array.isArray(d.proxy_warnings) && d.proxy_warnings.length
+          ? ` ${String(d.proxy_warnings[0]).slice(0, 160)}`
+          : "";
         toast.error(
-          `No profiles saved — ${skipped} skipped (unique exit IP unavailable). Fix proxy / pool and retry.`,
-          { duration: 10000 },
+          `No profiles saved — ${skipped} skipped (need unique clean residential IP for selected state).${why} Fix proxy balance / geo / password, then retry.`,
+          { duration: 12000 },
         );
       } else if (n > 0 && deferred > 0 && ips === 0) {
         toast.success(
