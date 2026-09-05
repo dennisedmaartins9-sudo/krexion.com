@@ -1,3 +1,10 @@
+# v2.7.117 — 2026-09 — Proxies page AdsPower-style (better)
+# - Tabs: List | Rotating Proxy | Proxy Provider | Resources
+# - List: inline bulk add with format notes, Check proxy, Check duplicate (ON by default)
+# - Backend skip_duplicates=True skips identical host:port:user already in list
+# - /proxies/probe-lines pre-save exit-IP check (no save)
+# - Clearer provider-host mismatch guidance to cut empty exit-IP create skips
+#
 # v2.7.116 — 2026-09 — BestGo host DSL (fix DataImpulse label → empty exit IP)
 # - Symptom: Create with provider labeled "dataimpulse …" but gateway
 #   ca.rrp.bestgo.work → "Exit IP check failed… IP endpoints returned nothing"

@@ -8,10 +8,13 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { Plus, Play, Trash2, RefreshCw, Copy, Square, Clock, ChevronDown, Check, RotateCcw, Globe, AlertTriangle, CheckCircle, Shield } from "lucide-react";
+import { Plus, Play, Trash2, RefreshCw, Copy, Square, Clock, ChevronDown, Check, RotateCcw, Globe, AlertTriangle, CheckCircle, Shield, List, RefreshCcw, Server, BookOpen, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "../components/ui/popover";
 import { Checkbox } from "../components/ui/checkbox";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import MyProxyProvidersCard from "../components/MyProxyProvidersCard";
+import ProxyBulkAddPanel from "../components/ProxyBulkAddPanel";
+import ProxyProvidersTab from "./ProxyProvidersTab";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -86,6 +89,9 @@ export default function ProxiesPage() {
   const [ipCheckText, setIpCheckText] = useState("");
   const [ipCheckLoading, setIpCheckLoading] = useState(false);
   const [ipCheckResults, setIpCheckResults] = useState(null);
+  // v2.7.117 — AdsPower-style Proxies tabs + inline bulk add
+  const [mainTab, setMainTab] = useState("list");
+  const [showAddPanel, setShowAddPanel] = useState(true);
 
   // Poll live progress while a bulk test is running
   useEffect(() => {
@@ -289,18 +295,22 @@ export default function ProxiesPage() {
       const token = localStorage.getItem("token");
       const response = await axios.post(
         `${API}/proxies/upload`,
-        { proxy_list: proxyList, proxy_type: proxyType },
+        { proxy_list: proxyList, proxy_type: proxyType, skip_duplicates: true },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
-      const uploaded = response.data;
+      const uploaded = response.data || [];
       const uniqueCount = uploaded.filter(p => !p.is_duplicate).length;
       const duplicateProxyCount = uploaded.filter(p => p.is_duplicate_proxy).length;
       const duplicateClickCount = uploaded.filter(p => p.is_duplicate_click).length;
+      const skippedAsDupes = Math.max(0, proxyList.length - uploaded.length);
       
-      let message = `Uploaded: ${uniqueCount} unique`;
+      let message = `Uploaded: ${uploaded.length} added`;
+      if (skippedAsDupes > 0) {
+        message += `, ${skippedAsDupes} skipped (Check duplicate)`;
+      }
       if (duplicateProxyCount > 0) {
-        message += `, ${duplicateProxyCount} duplicate proxies`;
+        message += `, ${duplicateProxyCount} marked duplicate`;
       }
       if (duplicateClickCount > 0) {
         message += `, ${duplicateClickCount} match click IPs`;
@@ -749,9 +759,39 @@ export default function ProxiesPage() {
 
   return (
     <div className="space-y-6" data-testid="proxies-page">
-      {/* v2.6.1 — Customer's own proxy providers (Settings › Proxy Providers) */}
-      {/* ProxyJet-specific card removed — providers now handle every proxy source. */}
-      <MyProxyProvidersCard />
+      <div className="flex flex-col gap-1">
+        <h2 className="text-2xl font-bold tracking-tight">Proxies</h2>
+        <p className="text-sm text-zinc-400">
+          AdsPower-style Proxy List — manual add with Check duplicate, plus Rotating gateways and Providers.
+          Safer defaults so wrong host/DSL mix-ups are harder to create.
+        </p>
+      </div>
+
+      <Tabs value={mainTab} onValueChange={setMainTab} className="w-full" data-testid="proxies-main-tabs">
+        <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4 h-auto gap-1 bg-zinc-900/80 p-1 border border-[var(--brand-border)]">
+          <TabsTrigger value="list" data-testid="proxies-tab-list" className="gap-2 data-[state=active]:bg-zinc-800">
+            <List size={14} /> List
+          </TabsTrigger>
+          <TabsTrigger value="rotating" data-testid="proxies-tab-rotating" className="gap-2 data-[state=active]:bg-zinc-800">
+            <RefreshCcw size={14} /> Rotating Proxy
+          </TabsTrigger>
+          <TabsTrigger value="providers" data-testid="proxies-tab-providers" className="gap-2 data-[state=active]:bg-zinc-800">
+            <Server size={14} /> Proxy Provider
+          </TabsTrigger>
+          <TabsTrigger value="resources" data-testid="proxies-tab-resources" className="gap-2 data-[state=active]:bg-zinc-800">
+            <BookOpen size={14} /> Resources
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="list" className="space-y-6 mt-4" data-testid="proxies-tab-list-content">
+          {showAddPanel && (
+            <ProxyBulkAddPanel
+              existingProxies={proxies}
+              onAdded={() => {
+                fetchProxies();
+              }}
+            />
+          )}
 
       {/* Bulk Test Summary Dialog */}
       <Dialog open={showBulkTestSummary} onOpenChange={setShowBulkTestSummary}>
@@ -1125,11 +1165,19 @@ export default function ProxiesPage() {
               )}
             </DialogContent>
           </Dialog>
+          <Button
+            variant={showAddPanel ? "secondary" : "default"}
+            data-testid="upload-proxies-button"
+            onClick={() => setShowAddPanel((v) => !v)}
+          >
+            {showAddPanel ? <X size={16} className="mr-2" /> : <Plus size={16} className="mr-2" />}
+            {showAddPanel ? "Hide Add Panel" : "Add Proxy"}
+          </Button>
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
-              <Button data-testid="upload-proxies-button">
+              <Button variant="outline" data-testid="upload-proxies-legacy-button" className="hidden sm:inline-flex">
                 <Plus size={16} className="mr-2" />
-                Upload Proxies
+                Classic Upload
               </Button>
             </DialogTrigger>
             <DialogContent className="bg-[var(--brand-card)] border-[var(--brand-border)] max-w-2xl">
@@ -1577,6 +1625,54 @@ export default function ProxiesPage() {
           </div>
         </CardContent>
       </Card>
+        </TabsContent>
+
+        <TabsContent value="rotating" className="mt-4 space-y-4" data-testid="proxies-tab-rotating-content">
+          <div className="rounded-lg border border-[var(--brand-border)] bg-zinc-950/50 p-4 text-sm text-zinc-400">
+            <p className="text-white font-medium mb-1">Rotating / residential gateways</p>
+            <p>
+              Generate unique session lines from your saved providers (DataImpulse, BestGo, Bright Data, etc.).
+              Gateway host must match the provider brand — a label saying DataImpulse with a BestGo host will fail exit-IP checks.
+            </p>
+          </div>
+          <MyProxyProvidersCard />
+        </TabsContent>
+
+        <TabsContent value="providers" className="mt-4" data-testid="proxies-tab-providers-content">
+          <ProxyProvidersTab />
+        </TabsContent>
+
+        <TabsContent value="resources" className="mt-4 space-y-4" data-testid="proxies-tab-resources-content">
+          <Card className="bg-[var(--brand-card)] border-[var(--brand-border)]">
+            <CardHeader>
+              <CardTitle className="text-base">Proxy Resources — better than AdsPower defaults</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm text-zinc-400">
+              <div>
+                <p className="text-white font-medium">1. List tab (manual proxies)</p>
+                <p>Paste lines → Check duplicate stays ON → Add. Identical host:port:user already in your list is skipped (no wasted rows).</p>
+              </div>
+              <div>
+                <p className="text-white font-medium">2. Rotating Proxy tab</p>
+                <p>Use for residential gateways. Pick provider, set country/state, generate lines. Always verify Gateway host matches the real vendor.</p>
+              </div>
+              <div>
+                <p className="text-white font-medium">3. Proxy Provider tab</p>
+                <p>Save credentials once. Prefer one-click catalog presets so host + DSL stay aligned (avoids BestGo empty exit-IP skips).</p>
+              </div>
+              <div>
+                <p className="text-white font-medium">4. Supported paste formats</p>
+                <ul className="list-disc list-inside font-mono text-xs text-cyan-300/90 space-y-1 mt-1">
+                  <li>host:port:user:pass{'{'}Remark{'}'}</li>
+                  <li>user:pass@host:port</li>
+                  <li>protocol://user:pass@host:port[Change IP URL]{'{'}Remark{'}'}</li>
+                  <li>http://host:port:user:pass</li>
+                </ul>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

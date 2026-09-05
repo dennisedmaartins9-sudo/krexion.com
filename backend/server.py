@@ -2749,6 +2749,11 @@ class ConversionResponse(BaseModel):
 class ProxyUpload(BaseModel):
     proxy_list: List[str]
     proxy_type: str = "http"
+    # v2.7.117 — AdsPower-parity "Check duplicate": when True (default),
+    # identical lines already in the user's proxy list are NOT inserted again.
+    skip_duplicates: bool = True
+    tags: Optional[str] = None
+    remark: Optional[str] = None
 
 class ProxyResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -17793,6 +17798,42 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         revenue_by_date=[{"date": item["_id"], "revenue": round(item["revenue"], 2)} for item in revenue_by_date]
     )
 
+
+def _normalize_proxy_identity(proxy_string: str) -> str:
+    """Canonical identity for duplicate detection (host:port:user).
+
+    Ignores scheme differences (http vs https) and strips AdsPower-style
+    `{remark}` / `[change-ip-url]` suffixes so paste variants still match.
+    """
+    s = (proxy_string or "").strip()
+    if not s:
+        return ""
+    # Strip remark / change-IP URL wrappers AdsPower supports
+    s = re.sub(r"\{[^}]*\}\s*$", "", s).strip()
+    s = re.sub(r"\[[^\]]*\]\s*$", "", s).strip()
+    low = s.lower()
+    for scheme in ("http://", "https://", "socks5://", "socks5h://", "socks4://", "ssh://"):
+        if low.startswith(scheme):
+            s = s[len(scheme):]
+            low = s.lower()
+            break
+    user = ""
+    hostport = s
+    if "@" in s:
+        auth, hostport = s.rsplit("@", 1)
+        user = auth.split(":", 1)[0].strip().lower()
+    else:
+        parts = hostport.split(":")
+        # host:port:user:pass  OR host:port
+        if len(parts) >= 4:
+            hostport = f"{parts[0]}:{parts[1]}"
+            user = parts[2].strip().lower()
+        elif len(parts) == 3 and not parts[1].isdigit():
+            # rare user:pass:host forms — leave as raw lower
+            return s.lower()
+    return f"{hostport.strip().lower()}|{user}"
+
+
 def extract_ip_from_proxy(proxy_string: str) -> str:
     """Extract IP address from proxy string. Handles all 5 accepted
     input shapes (see v2.2.2 / v2.2.6 parser doc-strings):
@@ -17903,12 +17944,32 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
     _dup_scope_uid = user.get("parent_user_id") or user["id"]
     all_click_ips = await get_all_click_ips_from_entire_database(user_id=_dup_scope_uid)
     
+    skip_dupes = bool(getattr(proxy_upload, "skip_duplicates", True))
+    existing_identity_keys = {_normalize_proxy_identity(s) for s in existing_proxy_strings if s}
+    skipped_duplicates = 0
+    skipped_invalid = 0
+    batch_tags = (getattr(proxy_upload, "tags", None) or "").strip() or None
+    batch_remark = (getattr(proxy_upload, "remark", None) or "").strip() or None
+
     for proxy_string in proxy_upload.proxy_list:
         cleaned_proxy = proxy_string.strip()
         if not cleaned_proxy:
             continue
-            
-        is_duplicate_proxy = cleaned_proxy in existing_proxy_strings
+        # Strip AdsPower remark / change-IP wrappers from stored line
+        cleaned_proxy = re.sub(r"\{[^}]*\}\s*$", "", cleaned_proxy).strip()
+        cleaned_proxy = re.sub(r"\[[^\]]*\]\s*$", "", cleaned_proxy).strip()
+        if not cleaned_proxy:
+            skipped_invalid += 1
+            continue
+
+        identity = _normalize_proxy_identity(cleaned_proxy)
+        is_duplicate_proxy = (
+            cleaned_proxy in existing_proxy_strings
+            or (identity and identity in existing_identity_keys)
+        )
+        if skip_dupes and is_duplicate_proxy:
+            skipped_duplicates += 1
+            continue
         
         proxy_ip = extract_ip_from_proxy(cleaned_proxy)
         
@@ -17942,12 +18003,22 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
         
         if not is_duplicate_proxy:
             existing_proxy_strings.add(cleaned_proxy)
+            if identity:
+                existing_identity_keys.add(identity)
+        if batch_tags:
+            proxy_doc["tags"] = batch_tags
+        if batch_remark:
+            proxy_doc["remark"] = batch_remark
     
     if proxy_docs:
         # Save to user's database
         await user_db.proxies.insert_many(proxy_docs)
     
-    logger.info(f"Uploaded {len(proxy_docs)} proxies for user {main_user_id} (duplicate/VPN check will happen during testing)")
+    logger.info(
+        f"Uploaded {len(proxy_docs)} proxies for user {main_user_id} "
+        f"(skipped_duplicates={skipped_duplicates}, skipped_invalid={skipped_invalid}, "
+        f"skip_duplicates={skip_dupes}; VPN check during testing)"
+    )
     
     return [ProxyResponse(**proxy) for proxy in proxy_docs]
 
@@ -18688,6 +18759,87 @@ async def bulk_delete_proxies(proxy_ids: List[str], user: dict = Depends(get_cur
     result_main_db = await db.proxies.delete_many(query)
     total_deleted = result_user_db.deleted_count + result_main_db.deleted_count
     return {"message": f"Deleted {total_deleted} proxies", "deleted_count": total_deleted}
+
+
+@api_router.post("/proxies/probe-lines")
+async def probe_proxy_lines(payload: dict, user: dict = Depends(get_current_user_with_fresh_data)):
+    """v2.7.117 — Pre-save Check Proxy (AdsPower parity, better feedback).
+
+    Parses pasted lines and optionally does a quick HTTP exit-IP probe
+    (max 30 lines, short timeout). Does NOT save anything.
+    """
+    check_user_feature(user, "proxies")
+    raw_lines = payload.get("proxy_list") or payload.get("lines") or []
+    if not isinstance(raw_lines, list):
+        raise HTTPException(status_code=400, detail="proxy_list must be a list of strings")
+    default_type = str(payload.get("proxy_type") or "http").strip().lower() or "http"
+    do_live = bool(payload.get("live", True))
+    lines = [str(x).strip() for x in raw_lines if str(x).strip()][:30]
+    results = []
+    for line in lines:
+        cleaned = re.sub(r"\{[^}]*\}\s*$", "", line).strip()
+        cleaned = re.sub(r"\[[^\]]*\]\s*$", "", cleaned).strip()
+        host = ""
+        port = ""
+        username = ""
+        try:
+            url = _build_proxy_url(cleaned, default_type)
+            # crude host/port extract
+            rest = url.split("://", 1)[-1]
+            if "@" in rest:
+                auth, hp = rest.rsplit("@", 1)
+                username = auth.split(":", 1)[0]
+            else:
+                hp = rest
+            if hp.startswith("["):
+                # ipv6
+                host = hp
+                port = ""
+            else:
+                host = hp.rsplit(":", 1)[0]
+                port = hp.rsplit(":", 1)[-1] if ":" in hp else ""
+            row = {
+                "raw": line,
+                "ok": True,
+                "proxy_type": default_type,
+                "host": host,
+                "port": port,
+                "username": username,
+                "exit_ip": "",
+                "error": "",
+            }
+        except Exception as exc:
+            results.append({
+                "raw": line, "ok": False, "proxy_type": default_type,
+                "host": "", "port": "", "username": "", "exit_ip": "",
+                "error": f"parse_failed: {exc}",
+            })
+            continue
+        if do_live:
+            try:
+                import httpx as _httpx
+                async with _httpx.AsyncClient(
+                    proxy=url, timeout=_httpx.Timeout(10.0, connect=6.0),
+                    verify=False, trust_env=False,
+                ) as cli:
+                    r = await cli.get("http://api.ipify.org/?format=text")
+                    ip = (r.text or "").strip().split()[0] if r.status_code == 200 else ""
+                    if ip and 7 <= len(ip) <= 45:
+                        row["exit_ip"] = ip
+                    else:
+                        row["ok"] = False
+                        row["error"] = f"no_exit_ip status={r.status_code}"
+            except Exception as exc:
+                row["ok"] = False
+                row["error"] = str(exc)[:160]
+        results.append(row)
+    return {
+        "total": len(results),
+        "ok": sum(1 for r in results if r.get("ok")),
+        "failed": sum(1 for r in results if not r.get("ok")),
+        "results": results,
+    }
+
 
 @api_router.post("/proxies/check-ip")
 async def check_proxy_ip_quality(data: dict, user: dict = Depends(get_current_user_with_fresh_data)):
