@@ -317,6 +317,7 @@ export default function ProxyBulkAddPanel({ existingProxies = [], onAdded }) {
           proxy_type: proxyType,
           skip_duplicates: checkDuplicate,
           skip_used_exit_ips: true,
+          require_verified_exit: true,
           exit_ips: exitIps,
           tags: tags.trim() || undefined,
         },

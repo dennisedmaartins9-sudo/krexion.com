@@ -5972,29 +5972,45 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             if want_ids:
                 by_id = {str(d.get("id")): d for d in candidates}
                 ordered: List[Dict[str, Any]] = []
+                used_sel = set(used_ips)
                 for pid in want_ids:
                     d = by_id.get(pid)
-                    if d and d not in ordered:
-                        ordered.append(d)
-                picked = (ordered[:count] if ordered else picked)[:count]
+                    if not d or d in ordered:
+                        continue
+                    dip = str(d.get("detected_ip") or "").strip()
+                    if not dip:
+                        continue  # only verified outbound IPs for saved pool
+                    if dip in used_sel:
+                        continue
+                    if d.get("bound_profile_id"):
+                        continue
+                    ordered.append(d)
+                    used_sel.add(dip)
+                picked = ordered[:count]
             saved_meta = picked
             saved_lines = [
                 str(d.get("proxy_string") or "").strip() for d in picked if d.get("proxy_string")
             ]
+            # v2.7.120 — Hard-fail: never create proxy-less profiles when pool is short
             if len(saved_lines) < count:
-                proxy_warnings.append(
-                    f"Only {len(saved_lines)} free saved prox{'y' if len(saved_lines) == 1 else 'ies'} "
-                    f"for {count} profiles — extras skipped. "
-                    "Add more via Proxies → Check proxy → Add (unique outbound IPs)."
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Need {count} free saved proxies with verified outbound IP, "
+                        f"but only {len(saved_lines)} available. "
+                        f"Set profile count to {max(len(saved_lines), 1)} (or less), "
+                        "or add more via Proxies → Check proxy → Add. "
+                        "No profiles were created."
+                    ),
                 )
-            if not saved_lines:
-                proxy_warnings.append(
-                    "No free saved proxies with verified outbound IP. "
-                    "Open Proxies → paste lines → Check proxy → Add to list."
-                )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"advanced_create: saved proxy pool failed: {e}")
-            proxy_warnings.append(f"Saved proxy pool failed: {str(e)[:120]}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Saved proxy pool failed: {str(e)[:160]}. No profiles were created.",
+            )
 
     for i, plat in enumerate(platform_slots):
         is_mobile = plat in ("ios", "android")
@@ -6134,11 +6150,17 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
             doc.setdefault("proxy", {})["raw_line"] = _pline
 
         # v2.7.106/114 — RUT-quality unique exit IP before save (no soft-defer).
-        # v2.7.118 — Saved pool: trust Check-proxy verified outbound IP when still unique
-        # (avoids rotating-gateway re-roll that caused create IP errors).
+        # v2.7.118 — Static saved: trust Check-proxy exit when still unique.
+        # v2.7.120 — Rotating saved gateways: live RUT probe (never trust stale Check IP).
         if proxy_is_active(doc.get("proxy") or {}):
             bind: Dict[str, Any] = {"ok": False}
-            if proxy_mode == "saved" and _saved_exit_hint:
+            _saved_rotating = False
+            if proxy_mode == "saved":
+                _px_rot = dict(doc.get("proxy") or {})
+                if _pline:
+                    _px_rot["raw_line"] = _pline
+                _saved_rotating = _is_rotating_gateway_proxy(_px_rot)
+            if proxy_mode == "saved" and _saved_exit_hint and not _saved_rotating:
                 try:
                     _prepare_proxy_for_profile_create(doc)
                     canonical = await _assert_unique_team_profile_ip(
@@ -6163,10 +6185,11 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     }
                 except Exception as exc:
                     bind = {"ok": False, "reason": str(exc)[:200]}
-            if not bind.get("ok") and not (proxy_mode == "saved" and bind.get("reason")):
-                # Normal RUT bind (provider / manual / proxyjet, or saved without hint)
-                if proxy_mode == "saved" and not _saved_exit_hint:
-                    pass  # fall through to probe bind
+            if not bind.get("ok") and not (
+                proxy_mode == "saved" and bind.get("reason") and not _saved_rotating
+            ):
+                # Live RUT bind: provider / manual / proxyjet / rotating saved /
+                # saved without hint / rotating gateway that must re-probe
                 bind = await _bind_unique_exit_ip_at_create(
                     uid,
                     user,
@@ -6176,8 +6199,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     targeting=_targeting,
                     max_retries=24,
                 )
-            elif proxy_mode == "saved" and not bind.get("ok") and _saved_exit_hint:
-                # Hint was already used — do not soft-save; skip profile
+            elif proxy_mode == "saved" and not bind.get("ok") and _saved_exit_hint and not _saved_rotating:
+                # Static hint already used — do not soft-save; skip profile
                 pass
             if not bind.get("ok"):
                 skipped_profiles.append({
@@ -6202,6 +6225,15 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                         "verified on first launch"
                     )
         else:
+            # v2.7.120 — Saved mode never creates proxy-less profiles (hard-fail above).
+            # Other modes may still leave a slot proxy-less with a warning.
+            if proxy_mode == "saved":
+                skipped_profiles.append({
+                    "name": str(name),
+                    "reason": "saved proxy missing for this profile slot",
+                })
+                proxy_warnings.append(f"Skipped {name}: saved proxy missing for slot")
+                continue
             _prepare_proxy_for_profile_create(doc)
 
         docs.append(doc)

@@ -291,11 +291,19 @@ export default function ProxiesPage() {
       return;
     }
 
+    // v2.7.120 — Classic Upload without Check proxy cannot enter profile pool
+    toast.error(
+      "Classic Upload is blocked without verified outbound IPs. " +
+      "Close this dialog and use List → Check proxy → Add (unique exit IPs only).",
+      { duration: 10000 },
+    );
+    return;
+
     try {
       const token = localStorage.getItem("token");
       const response = await axios.post(
         `${API}/proxies/upload`,
-        { proxy_list: proxyList, proxy_type: proxyType, skip_duplicates: true },
+        { proxy_list: proxyList, proxy_type: proxyType, skip_duplicates: true, require_verified_exit: true },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       
@@ -1182,10 +1190,11 @@ export default function ProxiesPage() {
             </DialogTrigger>
             <DialogContent className="bg-[var(--brand-card)] border-[var(--brand-border)] max-w-2xl">
               <DialogHeader>
-                <DialogTitle>Add Proxies — Any Provider</DialogTitle>
+                <DialogTitle>Add Proxies — Use Check proxy (List)</DialogTitle>
                 <DialogDescription className="space-y-1">
-                  <span className="block">Works with <span className="text-cyan-300">any proxy provider</span> — BrightData, SmartProxy, Oxylabs, IPRoyal, Nimble, Rayobyte, GeoNode, BestGo, DataImpulse, ProxyEmpire, and many more.</span>
-                  <span className="block text-[11px] text-zinc-500">Paste one proxy per line. Any of these 5 formats auto-detected:</span>
+                  <span className="block text-amber-200">Classic Upload without Check proxy is blocked for profile safety (v2.7.120).</span>
+                  <span className="block">Use <span className="text-cyan-300">List → Check proxy → Add</span> so only unique verified outbound IPs enter the saved pool.</span>
+                  <span className="block text-[11px] text-zinc-500">Supported formats (for the List panel):</span>
                 </DialogDescription>
               </DialogHeader>
               <form onSubmit={handleUpload} className="space-y-4">

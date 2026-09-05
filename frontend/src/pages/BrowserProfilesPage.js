@@ -863,7 +863,23 @@ export default function BrowserProfilesPage() {
       toast.error("Exact resolution needs width and height");
       return;
     }
+    // v2.7.120 — Hard-fail client-side when saved proxies < profile count
+    if (advProxy.mode === "saved") {
+      const selected = Array.isArray(advProxy.saved_proxy_ids)
+        ? advProxy.saved_proxy_ids.filter(Boolean)
+        : [];
+      const free = selected.length > 0 ? selected.length : savedProxyPool.length;
+      if (free < count) {
+        toast.error(
+          `Need ${count} free saved proxies, but only ${free} available. ` +
+          `Set profile count to ${Math.max(free, 1)} (or less), or add more via Proxies → Check proxy → Add. Profiles were NOT created.`,
+          { duration: 12000 },
+        );
+        return;
+      }
+    }
     setAdvCreating(true);
+
     try {
       const payload = {
         count,
@@ -3554,6 +3570,15 @@ export default function BrowserProfilesPage() {
                             Auto-pick {advCount} free
                           </button>
                         </div>
+                                                {!savedProxyPoolLoading && savedProxyPool.length > 0 && Number(advCount) > (
+                          (advProxy.saved_proxy_ids || []).filter(Boolean).length || savedProxyPool.length
+                        ) && (
+                          <p className="text-[11px] text-red-300 bg-red-950/40 border border-red-800/50 rounded px-2 py-1.5" data-testid="bp-saved-proxy-count-mismatch">
+                            Profile count ({advCount}) is higher than free saved proxies ({(advProxy.saved_proxy_ids || []).filter(Boolean).length || savedProxyPool.length}).
+                            {" "}Lower the count or add more proxies — create is blocked until they match.
+                          </p>
+                        )}
+
                         {!savedProxyPoolLoading && savedProxyPool.length === 0 && (
                           <p className="text-[11px] text-amber-200">
                             No free saved proxies. Open <span className="font-semibold">Proxies</span> → paste lines →

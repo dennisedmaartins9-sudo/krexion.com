@@ -1,3 +1,11 @@
+# v2.7.120 — 2026-09 — Saved-proxy hard gates (no proxy-less / no unverified)
+# - Use saved proxy: if free verified proxies < profile count → HTTP 400, ZERO
+#   profiles created. UI blocks submit + shows count mismatch banner.
+# - Rotating saved gateways: live RUT probe at create (never trust stale Check IP).
+# - Static saved: still trusts unique Check-proxy exit IP.
+# - Classic Upload without Check-proxy exit IP blocked (require_verified_exit).
+# - available-for-profiles excludes click-used exit IPs; probe-lines limit 100.
+#
 # v2.7.119 — 2026-09 — Used saved proxies removed from Proxies list
 # - Profile create with "Use saved proxy": after assign, that proxy row is
 #   deleted from the Proxies list (consumed — not left as "bound" clutter).

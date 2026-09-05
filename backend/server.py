@@ -2757,6 +2757,9 @@ class ProxyUpload(BaseModel):
     skip_used_exit_ips: bool = True
     # Map of raw paste line → verified outbound exit IP from Check proxy.
     exit_ips: Optional[Dict[str, str]] = None
+    # v2.7.120 — Profile-pool safety: refuse lines without Check-proxy exit IP
+    # (Classic Upload without verification cannot enter the saved-proxy pool).
+    require_verified_exit: bool = True
     tags: Optional[str] = None
     remark: Optional[str] = None
 
@@ -17998,6 +18001,8 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
     skipped_duplicates = 0
     skipped_used_exit = 0
     skipped_invalid = 0
+    skipped_unverified = 0
+    require_verified = bool(getattr(proxy_upload, "require_verified_exit", True))
     batch_tags = (getattr(proxy_upload, "tags", None) or "").strip() or None
     batch_remark = (getattr(proxy_upload, "remark", None) or "").strip() or None
 
@@ -18029,6 +18034,10 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
             or exit_ip_map.get(cleaned_proxy)
             or ""
         ).strip()
+        # v2.7.120 — Classic Upload without Check-proxy exit IP cannot enter pool
+        if require_verified and not verified_exit:
+            skipped_unverified += 1
+            continue
         if skip_used_exit and verified_exit:
             if verified_exit in used_exit_ips or verified_exit in batch_exit_ips:
                 skipped_used_exit += 1
@@ -18077,13 +18086,33 @@ async def upload_proxies(proxy_upload: ProxyUpload, user: dict = Depends(get_cur
         if batch_remark:
             proxy_doc["remark"] = batch_remark
     
+    if not proxy_docs and skipped_unverified > 0 and skipped_duplicates == 0 and skipped_used_exit == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No proxies added — {skipped_unverified} line(s) have no verified outbound IP. "
+                "Use Proxies List → Check proxy → Add (required for profile pool). "
+                "Classic Upload without Check proxy is blocked."
+            ),
+        )
+    if not proxy_docs and skipped_unverified > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No proxies added ({skipped_unverified} unverified"
+                f"{f', {skipped_duplicates} duplicate' if skipped_duplicates else ''}"
+                f"{f', {skipped_used_exit} used exit IP' if skipped_used_exit else ''}). "
+                "Use Proxies List → Check proxy → Add so only unique verified outbound IPs are saved."
+            ),
+        )
+
     if proxy_docs:
         # Save to user's database
         await user_db.proxies.insert_many(proxy_docs)
     
     logger.info(
         f"Uploaded {len(proxy_docs)} proxies for user {main_user_id} "
-        f"(skipped_duplicates={skipped_duplicates}, skipped_used_exit={skipped_used_exit}, skipped_invalid={skipped_invalid}, "
+        f"(skipped_duplicates={skipped_duplicates}, skipped_used_exit={skipped_used_exit}, skipped_invalid={skipped_invalid}, skipped_unverified={skipped_unverified}, "
         f"skip_duplicates={skip_dupes}; VPN check during testing)"
     )
     
@@ -18847,7 +18876,8 @@ async def proxies_available_for_profiles(
     check_user_feature(user, "proxies")
     user_db = get_db_for_user(user)
     main_uid = user.get("parent_user_id") or user["id"]
-    used = await _collect_used_exit_ips(user_db, main_uid, set())
+    click_ips = await get_all_click_ips_from_entire_database(user_id=main_uid)
+    used = await _collect_used_exit_ips(user_db, main_uid, set(click_ips or set()))
     # Profiles already claim exit IPs — also exclude proxies bound to a profile
     q = {"user_id": user["id"]}
     if user.get("is_sub_user"):
@@ -18890,7 +18920,7 @@ async def probe_proxy_lines(payload: dict, user: dict = Depends(get_current_user
         raise HTTPException(status_code=400, detail="proxy_list must be a list of strings")
     default_type = str(payload.get("proxy_type") or "http").strip().lower() or "http"
     do_live = bool(payload.get("live", True))
-    lines = [str(x).strip() for x in raw_lines if str(x).strip()][:30]
+    lines = [str(x).strip() for x in raw_lines if str(x).strip()][:100]
     results = []
     for line in lines:
         cleaned = re.sub(r"\{[^}]*\}\s*$", "", line).strip()
