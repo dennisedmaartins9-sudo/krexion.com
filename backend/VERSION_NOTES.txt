@@ -1,3 +1,11 @@
+# v2.7.124 — 2026-09 — Ship-gate verified green (anti-detect + saved-proxy locked)
+# - Official ship gate: tests/test_v2_*.py + test_browser_profile* → all green
+#   (987 passed / 5 skipped).
+# - Locks v2.7.123 anti-detect honesty path:
+#   TLS prewarm honesty, Cloak/Patchright RUT kernel, Chrome/136 UA sync,
+#   WebRTC exit-IP rewrite, ad-chain permanent off, Strict/soft real-IP warns.
+# - Prior saved-proxy AdsPower path (v2.7.118–122) remains locked.
+#
 # v2.7.123 — 2026-09 — Anti-detect holes closed (TLS honesty + kernel + WebRTC)
 # - RUT: CloakBrowser/Patchright kernel launch when available (Profiles parity);
 #   honest preflight kernel label; Playwright fallback logged clearly.
