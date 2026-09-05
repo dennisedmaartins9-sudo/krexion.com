@@ -2674,9 +2674,25 @@ async def _launch_profile_session_inner(
                                     _launch_ui_meta["mobile_shell_embedded"] = True
                                     stop_session_icon_keeper(str(session_id))
                                     return
+                                # v2.7.126 — Strict ON: never leave plain Chromium/WebKit
+                                # as a "running" Krexion design. Soft path only when
+                                # Strict is OFF.
+                                if strict_mobile_shell:
+                                    try:
+                                        from krexion_mobile_browser_shell import (
+                                            stop_mobile_shell as _stop_ms,
+                                        )
+                                        _stop_ms(str(session_id))
+                                    except Exception:
+                                        pass
+                                    raise RuntimeError(
+                                        "Strict mobile shell: Krexion phone chrome started "
+                                        "but could not frame the browser. Launch aborted — "
+                                        "plain Chromium/WebKit will not be shown as Krexion design."
+                                    )
                                 _launch_warnings.append(
                                     "Krexion phone chrome started but the browser window "
-                                    "was not framed inside it — session kept open."
+                                    "was not framed inside it — session kept open (Strict shell OFF)."
                                 )
                                 if _profile_engine == "webkit":
                                     try:
@@ -2819,10 +2835,8 @@ async def _launch_profile_session_inner(
                                     "Krexion mobile device shell did not start — "
                                     "you are seeing the plain browser window, not the branded iOS/Android shell."
                                 )
-                            # Soft-continue when engine is up — aborting wastes the
-                            # profile; honesty warning beats endless Strict fail.
-                            # v2.7.110 — still polish bare WebKit (strip menus +
-                            # phone size) so operator does not see zoomed MiniBrowser.
+                            # v2.7.126 — Strict + require_embed: abort. Soft-continue
+                            # only when Strict is OFF (or early pass without embed).
                             try:
                                 from krexion_window_icon import profile_engine_window_exists
                                 _engine_up = profile_engine_window_exists(
@@ -2831,6 +2845,19 @@ async def _launch_profile_session_inner(
                                 )
                             except Exception:
                                 _engine_up = bool(_driver_pid)
+                            if strict_mobile_shell and require_embed:
+                                try:
+                                    from krexion_mobile_browser_shell import (
+                                        stop_mobile_shell as _stop_ms2,
+                                    )
+                                    _stop_ms2(str(session_id))
+                                except Exception:
+                                    pass
+                                raise RuntimeError(
+                                    "Strict mobile shell: Krexion phone chrome did not "
+                                    "frame the browser. Launch aborted so plain Chromium/"
+                                    "WebKit is not shown as Krexion design."
+                                )
                             if _profile_engine == "webkit":
                                 try:
                                     from krexion_mobile_browser_shell import (
@@ -2849,20 +2876,15 @@ async def _launch_profile_session_inner(
                                     logger.debug(
                                         f"[profile-launch] webkit polish fallback skipped: {_pol_err}"
                                     )
-                            if strict_mobile_shell and not _engine_up:
-                                raise RuntimeError(
-                                    "Strict mobile shell: Krexion phone chrome did not "
-                                    "frame the browser. Launch aborted so plain Chromium/"
-                                    "WebKit is not shown as a real device."
-                                )
                             _launch_ui_meta["mobile_shell"] = bool(_shell_active)
                             _launch_ui_meta["mobile_shell_embedded"] = False
                             if _shell_active or _engine_up:
                                 _launch_warnings.append(
                                     "Krexion phone chrome could not fully frame the "
-                                    "browser — session kept open. Retry Launch or check "
-                                    "Windows display scaling / pywebview."
+                                    "browser — session kept open (Strict shell OFF). "
+                                    "Retry Launch or check Windows display scaling / pywebview."
                                 )
+                                # marker for tests: soft path only when Strict OFF
                             stop_session_icon_keeper(str(session_id))
                             return
                     except RuntimeError:
@@ -2872,7 +2894,6 @@ async def _launch_profile_session_inner(
                         _launch_warnings.append(
                             "Mobile device shell could not be applied — not a real device shell UI."
                         )
-                        # Soft-continue: keep headed engine rather than aborting the profile
                         try:
                             from krexion_window_icon import profile_engine_window_exists
                             _engine_up = profile_engine_window_exists(
@@ -2881,6 +2902,17 @@ async def _launch_profile_session_inner(
                             )
                         except Exception:
                             _engine_up = bool(_driver_pid)
+                        if strict_mobile_shell and require_embed:
+                            try:
+                                from krexion_mobile_browser_shell import (
+                                    stop_mobile_shell as _stop_ms3,
+                                )
+                                _stop_ms3(str(session_id))
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                f"Strict mobile shell: {str(_ms_err)[:200]}"
+                            ) from _ms_err
                         if _profile_engine == "webkit":
                             try:
                                 from krexion_mobile_browser_shell import (
@@ -2897,12 +2929,8 @@ async def _launch_profile_session_inner(
                                 )
                             except Exception:
                                 pass
-                        if strict_mobile_shell and not _engine_up:
-                            raise RuntimeError(
-                                f"Strict mobile shell: {str(_ms_err)[:200]}"
-                            ) from _ms_err
                         _launch_warnings.append(
-                            f"Phone chrome error (session kept): {str(_ms_err)[:120]}"
+                            f"Phone chrome error (session kept, Strict OFF): {str(_ms_err)[:120]}"
                         )
 
                 # Non-Windows / shell not attempted: honesty warning for mobile profiles
@@ -3815,13 +3843,14 @@ async def _launch_profile_session_inner(
                     logger.warning(f"[profile-launch] post-goto diagnostic page render failed: {_de}")
 
         # Finalize branding — verify HWND embed after navigation (early pass may
-        # have started the phone chrome already; do not tear it down).
+        # have started the phone chrome already). Restart shell when early pass
+        # left chrome un-framed so Krexion design can still apply.
         try:
             await asyncio.sleep(0.35)
             _brand_krexion_taskbar(
                 mobile_shell=True,
                 require_embed=True,
-                allow_restart=not bool(_launch_ui_meta.get("mobile_shell")),
+                allow_restart=not bool(_launch_ui_meta.get("mobile_shell_embedded")),
             )
             if session_id in _RUNNING_SESSIONS:
                 _launch_ui_meta["ui_watch_started_mono"] = time.monotonic()

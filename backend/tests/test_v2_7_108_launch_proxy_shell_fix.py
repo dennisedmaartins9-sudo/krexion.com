@@ -40,13 +40,20 @@ def test_title_pid_scan_uses_iswindow():
 def test_shell_loop_unions_chromium_cmdline_pids():
     src = (ROOT / "krexion_mobile_browser_shell.py").read_text(encoding="utf-8")
     assert "find_chromium_pids_by_cmdline_substrings" in src
-    assert '--window-name=Krexion' in src
+    assert "--window-name=Krexion" in src
 
 
-def test_launcher_soft_continues_when_engine_up():
+def test_launcher_strict_aborts_when_shell_not_embedded():
+    """v2.7.126 — Strict ON must not soft-continue with plain Chromium/WebKit."""
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "profile_engine_window_exists" in src
-    assert "session kept open" in src
+    assert "plain Chromium/WebKit will not be shown as Krexion design." in src
+    assert "strict_mobile_shell and require_embed" in src
+    assert (
+        'allow_restart=not bool(_launch_ui_meta.get("mobile_shell_embedded"))' in src
+    )
+    # Soft-continue wording only when Strict OFF
+    assert "session kept open (Strict shell OFF)" in src
     assert "_USER_SESSION_PICKUP_TIMEOUT_SEC = 120.0" in src
 
 
@@ -61,14 +68,16 @@ def test_mirror_persists_last_proxy_check():
 def test_health_penalizes_unverified_create_exit_ip():
     from browser_profile_health import compute_profile_health
 
-    h = compute_profile_health({
-        "status": "error",
-        "proxy": {"enabled": True},
-        "exit_ip": "1.2.3.4",
-        "last_proxy_check": {},
-        "cookie_count": 0,
-        "fingerprint_hash": "",
-    })
+    h = compute_profile_health(
+        {
+            "status": "error",
+            "proxy": {"enabled": True},
+            "exit_ip": "1.2.3.4",
+            "last_proxy_check": {},
+            "cookie_count": 0,
+            "fingerprint_hash": "",
+        }
+    )
     assert h["score"] <= 30
     assert any("not re-verified" in i for i in h.get("issues") or [])
 

@@ -835,17 +835,26 @@ def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
         if tlow == "playwright":
             return False
         if webkit:
+            # v2.7.126 — Match MiniBrowser even with empty/about:blank titles
+            # (common before first paint) so shell can frame before navigation.
+            if (
+                "webkit" in cname
+                or "minibrowser" in cname
+                or "wkwebview" in cname
+            ):
+                return True
             return (
                 "[webkit]" in tlow
                 or "safari" in tlow
                 or "krexion orbit" in tlow
                 or "krexion" in tlow
-                or "webkit" in cname
-                or "minibrowser" in cname
+                or "about:blank" in tlow
             )
+        # Chromium / Cloak / Patchright headed HWND
+        if "chrome_widgetwin" in cname or "chromium" in cname or "cefclient" in cname:
+            return True
         return (
             "chrome" in cname
-            or "chromium" in cname
             or title.startswith("Krexion")
             or "krexion orbit" in tlow
         )

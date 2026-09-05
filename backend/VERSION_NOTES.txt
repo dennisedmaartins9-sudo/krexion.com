@@ -1,3 +1,13 @@
+# v2.7.126 — 2026-09 — Krexion browser design must launch (no plain Chromium/WebKit)
+# - Root cause: Strict mobile shell was soft-continuing whenever the engine HWND
+#   existed — so plain Chromium/WebKit stayed open with "phone chrome off".
+# - Strict ON + post-nav embed required: abort launch if Krexion phone chrome
+#   cannot frame the engine (stop shell, close browser). Soft-continue only when
+#   Strict is explicitly OFF.
+# - Post-nav restarts shell when early pass started chrome but never embedded.
+# - HWND match widened for MiniBrowser (empty/about:blank) + Chrome_WidgetWin.
+# - Keeps v2.7.125 proxy Sign-in + ghost-running + dpi shell fixes.
+#
 # v2.7.125 — 2026-09 — Permanent proxy Sign-in + phone-chrome ghost fixes
 # - Manual proxy: create/launch REQUIRE username+password (never host-only).
 # - Parse host:port:user:pass correctly when password contains "@".
