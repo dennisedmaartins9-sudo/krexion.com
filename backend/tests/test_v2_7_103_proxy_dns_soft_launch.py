@@ -20,9 +20,9 @@ def test_launcher_soft_disables_dead_dns():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "proxy DNS soft-disable" in src
     assert 'proxy_diag["soft_disabled"] = True' in src
-    assert "Launched WITHOUT proxy so the profile still opens" in src
+    assert "REAL MACHINE IP may be exposed" in src
     assert "soft_disabled" in src
-    assert "retrying WITHOUT proxy so iOS/Android still open" in src
+    assert "retrying WITHOUT proxy (REAL IP may leak) so iOS/Android still open" in src
 
 
 def test_frontend_clears_sticky_opening_message():

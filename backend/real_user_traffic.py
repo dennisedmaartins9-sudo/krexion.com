@@ -1441,6 +1441,44 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
         except Exception as _v_err:  # noqa: BLE001
             logger.debug(f"browser_variants import/use failed: {_v_err}")
 
+    # ── v2.7.123 — CloakBrowser / Patchright kernel (same as Profiles) ──
+    # Prefer C++ stealth Chromium when available; honest log on fallback.
+    try:
+        from krexion_browser_kernel import (
+            resolve_launch_plan as _resolve_kernel_plan,
+            launch_chromium_with_plan as _launch_with_plan,
+        )
+        _plan = _resolve_kernel_plan({"browser_kernel": "auto"})
+        _drv = str(_plan.get("driver") or "playwright")
+        if _drv in ("cloak", "patchright") or (_plan.get("executable_path") or "").strip():
+            _args = list(_BROWSER_LAUNCH_ARGS_BASE)
+            for _sa in (_plan.get("stealth_args") or []):
+                if _sa and _sa not in _args:
+                    _args.append(_sa)
+            _kwargs = {
+                "headless": False,
+                "args": ["--headless=new", *_args],
+            }
+            if (_plan.get("executable_path") or "").strip():
+                _kwargs["executable_path"] = str(_plan["executable_path"]).strip()
+            browser = await _launch_with_plan(pw, _kwargs, _plan)
+            logger.info(
+                "RUT browser engine: kernel=%s driver=%s exe=%s",
+                _plan.get("kernel_label"),
+                _drv,
+                bool(_kwargs.get("executable_path")),
+            )
+            return browser
+        logger.info(
+            "RUT browser engine: kernel=%s (no Cloak/Patchright) — Playwright Chromium",
+            _plan.get("kernel_label") or "playwright-chromium",
+        )
+    except Exception as _kern_err:
+        logger.info(
+            "RUT browser kernel unavailable (%s) — Playwright Chromium fallback",
+            _kern_err,
+        )
+
     fc_exe = _full_chromium_binary_path() if _use_full_chromium() else None
     if fc_exe is not None:
         # Prefer the pinned full-chromium binary path over Playwright's
@@ -5944,6 +5982,10 @@ def _build_stealth_script(
                 ),
             ),
         ),
+        # v2.7.123 — WebRTC ICE rewrite target (proxy exit IP when known)
+        "exitIp": str(
+            (geo.get("exit_ip") or geo.get("ip") or fp.get("exit_ip") or "")
+        ).strip(),
     }
     config_js = "const __KX = " + _json.dumps(kx) + ";"
 
@@ -6286,7 +6328,7 @@ safe(() => {
       pc.addIceCandidate = function (cand) {
         try {
           if (cand && cand.candidate) {
-            // Filter host/local IPs — only allow srflx (server reflexive, =proxy IP)
+            // Drop host/local — never leak LAN/real IP. Exit rewrite is SDP-side.
             if (/typ host/.test(cand.candidate) || /\.local /.test(cand.candidate)) {
               return Promise.resolve();
             }
@@ -6294,12 +6336,21 @@ safe(() => {
         } catch (e) {}
         return origAdd(cand);
       };
-      // Also strip local candidates from generated ICE
+      // Strip host/local ICE — or rewrite host IP → proxy exitIp when known
+      // (AdsPower-style). Ceiling: UDP/host block remains; no full TURN.
       const scrubSdp = (sdp) => {
         try {
-          return String(sdp || '')
-            .replace(/^a=candidate.+typ host.+\r?\n/gm, '')
-            .replace(/^a=candidate.+\.local .+\r?\n/gm, '');
+          const exitIp = String((__KX && __KX.exitIp) || '');
+          let out = String(sdp || '');
+          if (exitIp && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(exitIp)) {
+            out = out.replace(/^(a=candidate:\S+ \d+ UDP \d+ )(\d{1,3}(?:\.\d{1,3}){3})( .+ typ host.*)$/gmi,
+              function (_m, a, _ip, b) { return a + exitIp + b.replace('typ host', 'typ srflx'); });
+          } else {
+            out = out
+              .replace(/^a=candidate.+typ host.+\r?\n/gm, '')
+              .replace(/^a=candidate.+\.local .+\r?\n/gm, '');
+          }
+          return out;
         } catch (e) { return sdp; }
       };
       const origCreateOffer = pc.createOffer.bind(pc);
@@ -9622,6 +9673,14 @@ async def run_real_user_traffic_job(
     # targets when duplicate-IP guard or pass-to-offer referer mode is on.
     if skip_duplicate_ip or referer_pass_to_offer:
         tls_prewarm = False
+        try:
+            push_live_step(
+                job_id, 0, "tls", "info",
+                "TLS prewarm OFF for this job (skip_duplicate_ip and/or pass_referer_to_offer) — "
+                "cookie/origin seed only; live browser JA3 is Playwright/kernel Chromium, not curl_cffi.",
+            )
+        except Exception:
+            pass
 
     # v2.6.94 — skip_duplicate_ip must keep a shared set + lock for the
     # whole job. Python treats empty set as falsy, so `if dup_set and ip
@@ -15648,7 +15707,28 @@ async def run_real_user_traffic_job(
     # NOTE: Browsers + Playwright handle are stashed in `_browser_holder`
     # so `_get_live_browser(engine=…)` can transparently relaunch if
     # either engine crashes mid-job (prevents the TargetClosedError death-spiral).
-    pw_cm = async_playwright()
+    # v2.7.123 — Patchright driver when kernel plan says so (Profiles parity)
+    _rut_kernel_plan = {
+        "engine": "chromium",
+        "driver": "playwright",
+        "executable_path": "",
+        "stealth_args": [],
+        "kernel_label": "playwright-chromium",
+        "reduce_js_fingerprint_noise": False,
+        "preference": "auto",
+    }
+    _async_pw_factory = async_playwright
+    try:
+        from krexion_browser_kernel import (
+            resolve_launch_plan as _rkp,
+            get_async_playwright_factory as _gaf,
+        )
+        _rut_kernel_plan = _rkp({"browser_kernel": "auto"})
+        _async_pw_factory = _gaf(_rut_kernel_plan)
+    except Exception as _kp_err:
+        logger.debug(f"RUT kernel plan/factory fallback: {_kp_err}")
+    _browser_holder["kernel_plan"] = _rut_kernel_plan
+    pw_cm = _async_pw_factory()
     pw = await pw_cm.__aenter__()
     _browser_holder["pw"] = pw
     _browser_holder["pw_cm"] = pw_cm
@@ -15662,9 +15742,10 @@ async def run_real_user_traffic_job(
         asyncio.create_task(_install_full_chromium_background())
     else:
         _fc = _full_chromium_binary_path()
+        _kl = str((_browser_holder.get("kernel_plan") or {}).get("kernel_label") or "playwright-chromium")
         push_live_step(
             job_id, 0, "preflight", "ok",
-            f"Full Chromium ready · --headless=new · exe={_fc}",
+            f"Full Chromium ready · --headless=new · exe={_fc} · kernel={_kl}",
         )
     # WebKit preflight — iOS visits need Playwright WebKit
     try:

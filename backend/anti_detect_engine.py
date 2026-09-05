@@ -117,13 +117,13 @@ def _resolve_rut():
 # natural across cohorts.
 # ─────────────────────────────────────────────────────────────────────
 _DEFAULT_UA_POOL = [
-    # Desktop Chrome (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Desktop Chrome (Windows) — keep in sync with RUT Chrome/136 pool
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     # Desktop Chrome (macOS)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     # Mobile Chrome (Android)
-    "Mozilla/5.0 (Linux; Android 14; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
     # Mobile Safari (iOS)
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 ]
@@ -408,6 +408,15 @@ async def apply_stealth_to_context(context, fp: Optional[Dict[str, Any]] = None,
                     "vendor": fp["webgl_vendor"],
                     "renderer": fp["webgl_renderer"],
                 }))
+        except Exception:
+            pass
+        # v2.7.123 — Fingerprint WIN parity (iframe/Worker/chrome.runtime)
+        try:
+            from fingerprint_win import build_fingerprint_win_js
+            _fh = int(fp.get("fp_hash") or fp.get("canvas_seed") or 0) & 0xFFFFFFFF
+            await context.add_init_script(
+                build_fingerprint_win_js(fp, cloak_mode=False, fp_hash=_fh)
+            )
         except Exception:
             pass
         await context.set_extra_http_headers(build_client_hint_headers(fp, actual_ua))

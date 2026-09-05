@@ -3328,6 +3328,11 @@ export default function BrowserProfilesPage() {
                                 If proxy DNS/check fails, abort launch — do NOT open on your real IP.
                                 Recommended ON for agency / offer accounts.
                               </span>
+                              {!form.anti_detect.proxy_check_block_on_fail && (
+                                <span className="block text-[10px] text-amber-400 mt-1" data-testid="bp-strict-proxy-off-warn">
+                                  WARNING: Strict OFF — if proxy DNS/check fails, browser may open on your real machine IP.
+                                </span>
+                              )}
                             </span>
                           </label>
                           <label className="flex items-start gap-2" data-testid="bp-strict-mobile-shell">

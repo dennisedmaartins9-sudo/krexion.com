@@ -2223,7 +2223,7 @@ async def _launch_profile_session_inner(
             proxy_diag["server"] = str(proxy_arg.get("server") or "")
             _launch_warnings.append(
                 f"Proxy host could not be resolved ({_dns_err}). "
-                "Launched WITHOUT proxy so the profile still opens. "
+                "Launched WITHOUT proxy — REAL MACHINE IP may be exposed. "
                 "Fix Settings → Proxy Providers (use a working host like "
                 "gw.dataimpulse.com) or paste a fresh manual line, then relaunch."
             )
@@ -3018,7 +3018,7 @@ async def _launch_profile_session_inner(
                         ) from _ctx_err
                     logger.warning(
                         f"[profile-launch] context+proxy failed ({_ctx_msg[:120]}) "
-                        "— retrying WITHOUT proxy so iOS/Android still open"
+                        "— retrying WITHOUT proxy (REAL IP may leak) so iOS/Android still open"
                     )
                     context_kwargs.pop("proxy", None)
                     proxy_arg = None
@@ -3027,7 +3027,7 @@ async def _launch_profile_session_inner(
                     proxy_diag["error"] = _ctx_msg[:240]
                     proxy_diag["requested"] = True
                     _launch_warnings.append(
-                        "Proxy failed at browser start — opened WITHOUT proxy. "
+                        "Proxy failed at browser start — opened WITHOUT proxy (REAL MACHINE IP may be exposed). "
                         "Fix Proxy Providers host/password, then relaunch."
                     )
                     context = await browser.new_context(**context_kwargs)

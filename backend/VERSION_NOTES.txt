@@ -1,3 +1,14 @@
+# v2.7.123 — 2026-09 — Anti-detect holes closed (TLS honesty + kernel + WebRTC)
+# - RUT: CloakBrowser/Patchright kernel launch when available (Profiles parity);
+#   honest preflight kernel label; Playwright fallback logged clearly.
+# - RUT TLS: skip_duplicate_ip / pass_to_offer / in-app preset force tls_prewarm
+#   OFF — UI + live step no longer claim full JA3 when cookie-seed only.
+# - anti_detect_engine UA pool synced to Chrome/136 (match RUT).
+# - apply_stealth_to_context: Fingerprint WIN parity with RUT/Profiles.
+# - WebRTC: rewrite host ICE → exit IP when known (else strip host/local).
+# - Ad-chain / network-click-chain: FE honesty — permanently disabled.
+# - Strict proxy OFF + soft DNS: stronger REAL IP leak warnings.
+#
 # v2.7.122 — 2026-09 — Ship-gate verified green (saved-proxy path locked)
 # - Full ship gate: tests/test_v2_*.py + test_browser_profile* → all green.
 # - Saved-proxy AdsPower path verified end-to-end:

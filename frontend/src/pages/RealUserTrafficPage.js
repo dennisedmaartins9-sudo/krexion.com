@@ -657,6 +657,7 @@ export default function RealUserTrafficPage() {
   // (privacy by design — we don't tell end users what's running).
   const [antiDetectMaster, setAntiDetectMaster] = useState(false);
 
+
   // ── 2026-07 v2.2.1 — In-App Browser Preset (one-click "Traffic Source") ──
   // When set to a platform name (facebook / messenger / instagram / tiktok /
   // snapchat / linkedin / twitter), the backend engine automatically:
@@ -729,6 +730,15 @@ export default function RealUserTrafficPage() {
   // offer sees the EXACT chosen Referer instead of Krexion origin).
   // Default OFF — preserves legacy behavior for existing users.
   const [refererPassToOffer, setRefererPassToOffer] = useState(false);
+
+  // v2.7.123 — backend forces tls_prewarm OFF when skip-duplicate-IP,
+  // pass-referer-to-offer, or in-app preset is active. Surface that honestly.
+  const tlsPrewarmEffective = !!(
+    tlsPrewarm
+    && !skipDuplicateIp
+    && !refererPassToOffer
+    && (!inappBrowserPreset || inappBrowserPreset === "none")
+  );
   // 2026-06-14 — UA ↔ Referer coercion (anti-fraud). When ON and the
   // resolved Referer is an in-app platform (FB/TikTok/IG/Snapchat/…)
   // the engine appends realistic in-app webview markers to the
@@ -3720,7 +3730,12 @@ export default function RealUserTrafficPage() {
                       // production-grade defaults. Customer doesn't see
                       // what got enabled — privacy by design.
                       if (!pacingPerHour) setPacingPerHour(30);
-                      setTlsPrewarm(true);
+                      // TLS prewarm only when skip-dup / pass-to-offer / in-app won't force it OFF
+                      setTlsPrewarm(
+                        !skipDuplicateIp
+                        && !refererPassToOffer
+                        && (!inappBrowserPreset || inappBrowserPreset === "none")
+                      );
                       setBehavioralBioEnabled(true);
                       // IP warm-up stays independent (default OFF) — slow
                       // (~10–15s/visit) and least often needed; customer
@@ -3746,8 +3761,13 @@ export default function RealUserTrafficPage() {
             </div>
             <p className="text-xs text-zinc-400 mt-2">
               {antiDetectMaster
-                ? "✓ Full anti-detect stack active — your traffic is configured with all professional-grade evasion layers."
+                ? (tlsPrewarmEffective
+                    ? "✓ Anti-detect stack ON — fingerprint, behavioral bio, and TLS prewarm (JA3 seed) active."
+                    : "✓ Anti-detect stack ON — fingerprint + behavioral bio. TLS prewarm is OFF here (skip-duplicate IP / pass-referer / in-app preset) — cookie seed only, not live JA3.")
                 : "Turn ON for professional-grade traffic. Recommended for all paid campaigns and CPL / SOI offers."}
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-1" data-testid="rut-ad-chain-honesty">
+              Ad-chain / network-click-chain simulation is permanently disabled (tracker integrity) — not a user toggle.
             </p>
           </div>
 
@@ -5074,7 +5094,12 @@ export default function RealUserTrafficPage() {
           {/* Toggle filters - inline row */}
           <div className="flex flex-wrap gap-x-6 gap-y-3 pt-2 border-t border-zinc-800">
             <CheckRow testId="rut-skip-duplicate-ip" checked={skipDuplicateIp} onChange={setSkipDuplicateIp}>
-              <span className="text-zinc-300">🚫 Skip duplicate exit IP</span>
+              <span className="text-zinc-300">
+                🚫 Skip duplicate exit IP
+                <span className="block text-[10px] text-zinc-500">
+                  When ON, TLS prewarm is forced OFF (single-click integrity) — cookie/origin seed only.
+                </span>
+              </span>
             </CheckRow>
             {/* 2026-06-26 — quick action to wipe the per-user burnt-IP
                 cache. After many test runs the persistent blocklist
@@ -5841,7 +5866,7 @@ export default function RealUserTrafficPage() {
                       </label>
                     </div>
                     <p className="text-[11px] text-violet-300/70">
-                      Tip: <b>Reward</b> — LinkThem / reward4spot. Min deals = 3. Anti-detect (TLS, fingerprint, behavioral bio) + Referrer Pro run on every visit before Smart Funnel. Reward pattern auto-enables <b>Mixed Realistic</b> referer if none selected.
+                      Tip: <b>Reward</b> — LinkThem / reward4spot. Min deals = 3. Anti-detect (fingerprint, behavioral bio; TLS prewarm only when skip-dup/pass-to-offer/in-app allow it) + Referrer Pro run on every visit before Smart Funnel. Reward pattern auto-enables <b>Mixed Realistic</b> referer if none selected.
                     </p>
                   </div>
                 )}
