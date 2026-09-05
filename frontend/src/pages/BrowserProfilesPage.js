@@ -934,7 +934,7 @@ export default function BrowserProfilesPage() {
           ? ` ${String(d.proxy_warnings[0]).slice(0, 160)}`
           : "";
         toast.error(
-          `No profiles saved — ${skipped} skipped (need unique clean residential IP for selected state).${why} Fix proxy balance / geo / password, then retry.`,
+          `No profiles saved — ${skipped} skipped (need unique clean residential IP for selected state).${why} Fix proxy balance / geo / password (if gateway is BestGo but provider says DataImpulse, fix Gateway host or credentials), then retry.`,
           { duration: 12000 },
         );
       } else if (n > 0 && deferred > 0 && ips === 0) {

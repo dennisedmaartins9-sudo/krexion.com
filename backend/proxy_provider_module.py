@@ -803,6 +803,26 @@ _PROVIDER_PROFILES: List[Dict[str, Any]] = [
         "ttl_key": "sessionduration",
         "ttl_unit": "min",
     },
+    {
+        # BestGo / RRP residential (ca.rrp.bestgo.work, us.rrp.bestgo.work).
+        # Dash DSL: USER-country-us-state-alabama-session-12345678
+        # v2.7.116 — MUST be host-detected BEFORE name fallback. A provider
+        # labeled "dataimpulse …" with a BestGo gateway was getting
+        # DataImpulse `__cr.us;state…` DSL → TCP ok, exit IP endpoints empty.
+        "name": "BestGo",
+        "hosts": ["bestgo.work", "bestgo.com", "bestproxy.com"],
+        "prefix": "-",
+        "delim": "-",
+        "kv": "-",
+        "keys": {
+            "country": "country", "state": "state", "city": "city",
+            "zip": "zip", "asn": "asn",
+        },
+        "state_fmt": "{slug}",
+        "sid_key": "session",
+        "ttl_key": None,
+        "ttl_unit": None,
+    },
 ]
 
 # v2.7.33 — One-click famous provider presets (Settings › Proxy Providers).
@@ -931,6 +951,17 @@ PROVIDER_CATALOG: List[Dict[str, Any]] = [
         "proxy_type": "http",
     },
     {
+        "id": "bestgo",
+        "name": "BestGo",
+        "tagline": "Residential RRP · ca.rrp.bestgo.work",
+        "gateway_host": "ca.rrp.bestgo.work",
+        "gateway_port": "10000",
+        "alt_ports": ["10001"],
+        "username_hint": "BestGo dashboard user (country-us / session dash DSL auto-applied)",
+        "docs_url": "https://bestgo.work/",
+        "proxy_type": "http",
+    },
+    {
         "id": "webshare",
         "name": "Webshare",
         "tagline": "Static/rotating — paste or API",
@@ -970,6 +1001,8 @@ def _detect_profile(
             if needle in h:
                 return prof
     # Fallback: match common provider names when gateway host is custom/CDN.
+    # Never apply name fallback when the host already looks like a *different*
+    # known vendor domain (e.g. label "dataimpulse" + host ca.rrp.bestgo.work).
     _name_needles = {
         "dataimpulse": "DataImpulse",
         "bright data": "Bright Data",
@@ -984,9 +1017,21 @@ def _detect_profile(
         "webshare": "IPRoyal",
         "netnut": "NetNut",
         "thordata": "Thordata",
+        "bestgo": "BestGo",
+        "bestproxy": "BestGo",
     }
+    _host_owned_by: Optional[str] = None
+    for prof in _PROVIDER_PROFILES:
+        for needle in prof["hosts"]:
+            if needle and needle in h:
+                _host_owned_by = prof["name"]
+                break
+        if _host_owned_by:
+            break
     for needle, pname in _name_needles.items():
         if needle in n:
+            if _host_owned_by and _host_owned_by != pname:
+                return None
             for prof in _PROVIDER_PROFILES:
                 if prof["name"] == pname:
                     return prof

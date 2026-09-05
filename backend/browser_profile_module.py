@@ -2325,7 +2325,11 @@ def _friendly_proxy_probe_error(raw: str, gateway_host: str = "") -> str:
         hint = f" via '{host}'" if host else ""
         bestgo = "bestgo" in host.lower() or "rrp." in host.lower()
         tip = (
-            "BestGo gateways need a live balance + correct country/session in the username. "
+            "BestGo gateways need a live balance + correct country/session username "
+            "(dash DSL: user-country-us-session-…). If this provider is labeled "
+            "DataImpulse but the gateway is *.bestgo.work, open Proxies → set Gateway "
+            "to gw.dataimpulse.com OR keep BestGo host and use BestGo credentials — "
+            "DataImpulse __cr DSL does not work on BestGo. "
             if bestgo
             else "Check provider balance / country targeting / password. "
         )

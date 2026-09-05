@@ -1,3 +1,13 @@
+# v2.7.116 — 2026-09 — BestGo host DSL (fix DataImpulse label → empty exit IP)
+# - Symptom: Create with provider labeled "dataimpulse …" but gateway
+#   ca.rrp.bestgo.work → "Exit IP check failed… IP endpoints returned nothing"
+#   → all profiles skipped.
+# - Root cause: name-fallback treated provider as DataImpulse and rewrote
+#   username to `__cr.us;state…` which BestGo ignores (TCP up, no exit IP).
+# - Fix: Add BestGo provider profile (dash country/state/session DSL) with
+#   hosts bestgo.work / bestgo.com; host detection wins over label; catalog
+#   preset + clearer Proxies mismatch tip in create toast / probe error.
+#
 # v2.7.115 — 2026-09 — Ship-gate verified green (create/launch proxy quality locked)
 # - Official gate: tests/test_v2_*.py + test_browser_profile* → 950 passed / 5 skipped.
 # - Fixed test_dependency_health poisoning sys.modules["real_user_traffic"] (broke suite).
