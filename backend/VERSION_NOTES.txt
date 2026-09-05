@@ -1,3 +1,12 @@
+# v2.7.122 — 2026-09 — Ship-gate verified green (saved-proxy path locked)
+# - Full ship gate: tests/test_v2_*.py + test_browser_profile* → all green.
+# - Saved-proxy AdsPower path verified end-to-end:
+#   Check proxy → unique exit Add → Use saved proxy create → used removed.
+# - Hard-fail when free verified proxies < profile count (zero profiles).
+# - Rotating saved: live RUT probe; static: unique Check-proxy exit.
+# - Classic Upload without verified exit blocked; available-for-profiles
+#   no longer self-excludes free pool (v2.7.121).
+#
 # v2.7.121 — 2026-09 — Fix available-for-profiles self-exclude (empty pool)
 # - available-for-profiles no longer treats free pool detected_ips as "used"
 #   (that made the Use saved proxy picker always show 0). Used = profiles + clicks.
