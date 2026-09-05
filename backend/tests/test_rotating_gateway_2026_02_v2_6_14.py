@@ -20,19 +20,33 @@ import pathlib
 import pytest
 import requests
 
-BACKEND_DIR = "/app/backend"
-if BACKEND_DIR not in sys.path:
-    sys.path.insert(0, BACKEND_DIR)
+_HERE = pathlib.Path(__file__).resolve()
+_BACKEND_DIR = str(_HERE.parents[1])
+_REPO_ROOT = _HERE.parents[2]
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+# Cloud layout fallback
+if "/app/backend" not in sys.path and pathlib.Path("/app/backend").is_dir():
+    sys.path.insert(0, "/app/backend")
 
 import real_user_traffic as rut
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL") or ""
+BASE_URL = (os.environ.get("REACT_APP_BACKEND_URL") or "").rstrip("/")
 if not BASE_URL:
-    # fall back to reading frontend/.env
-    fe_env = pathlib.Path("/app/frontend/.env").read_text()
-    m = re.search(r"REACT_APP_BACKEND_URL\s*=\s*(\S+)", fe_env)
-    BASE_URL = m.group(1).strip() if m else ""
-BASE_URL = BASE_URL.rstrip("/")
+    # fall back to frontend/.env when present (local or /app layout)
+    for _cand in (
+        _REPO_ROOT / "frontend" / ".env",
+        pathlib.Path("/app/frontend/.env"),
+    ):
+        try:
+            if _cand.is_file():
+                _fe = _cand.read_text(encoding="utf-8", errors="ignore")
+                _m = re.search(r"REACT_APP_BACKEND_URL\s*=\s*(\S+)", _fe)
+                if _m:
+                    BASE_URL = _m.group(1).strip().rstrip("/")
+                    break
+        except OSError:
+            pass
 
 
 # ── 1. _parse_proxy_line — rotating gateway detection ────────────────
@@ -82,7 +96,10 @@ def _build_pick_next_proxy(parsed_proxies, no_repeated=True):
     ACTUAL implementation inside run_real_user_traffic without needing
     to run the full 200-arg engine.
     """
-    src = pathlib.Path("/app/backend/real_user_traffic.py").read_text()
+    _rut = pathlib.Path(_BACKEND_DIR) / "real_user_traffic.py"
+    if not _rut.is_file():
+        _rut = pathlib.Path("/app/backend/real_user_traffic.py")
+    src = _rut.read_text(encoding="utf-8")
     # Extract the pick_next_proxy function body
     m = re.search(
         r"^    def pick_next_proxy\(\).*?(?=^    def pick_next_ua)",
@@ -131,10 +148,15 @@ def test_pick_next_proxy_static_burnt_after_first():
 
 
 # ── 4. STATIC AST checks — variable + usages ─────────────────────────
-SRC_TEXT = pathlib.Path("/app/backend/real_user_traffic.py").read_text()
+_rut_src = pathlib.Path(_BACKEND_DIR) / "real_user_traffic.py"
+if not _rut_src.is_file():
+    _rut_src = pathlib.Path("/app/backend/real_user_traffic.py")
+SRC_TEXT = _rut_src.read_text(encoding="utf-8") if _rut_src.is_file() else ""
 
 def test_static_can_retry_offer_block_defined():
     """_can_retry_offer_block is a local variable inside run_real_user_traffic."""
+    if not SRC_TEXT:
+        pytest.skip("real_user_traffic.py not found")
     # Find the run_real_user_traffic function body only
     m = re.search(r"def run_real_user_traffic\w*\b", SRC_TEXT)
     assert m, "run_real_user_traffic function missing"

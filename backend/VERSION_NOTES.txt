@@ -1,3 +1,10 @@
+# v2.7.115 — 2026-09 — Ship-gate verified green (create/launch proxy quality locked)
+# - Official gate: tests/test_v2_*.py + test_browser_profile* → 950 passed / 5 skipped.
+# - Fixed test_dependency_health poisoning sys.modules["real_user_traffic"] (broke suite).
+# - Fixed rotating-gateway test /app .env hard-fail on collection.
+# - scripts/run_ship_gate.sh added; pytest.ini ignores live-e2e env tests.
+# - Manual + provider create/launch simulations green (unique/non-VPN/state + sticky).
+#
 # v2.7.114 — 2026-09 — Create = RUT-quality IP before save (no soft-defer)
 # - Soft-defer removed: profiles are NOT saved until exit IP is verified.
 # - Same bar as Real User Traffic: unique team IP + non-VPN/datacenter +

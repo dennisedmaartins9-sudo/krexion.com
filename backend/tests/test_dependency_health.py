@@ -24,22 +24,32 @@ if str(BACKEND_DIR) not in sys.path:
 
 import pytest
 
-# Stub heavy dependencies that real_user_traffic imports — the test env
-# only needs the function signatures we patch via mock, not the real impls.
-# We stub `real_user_traffic` ENTIRELY so desktop_module's lazy import
-# `from real_user_traffic import get_engine_status` resolves to our fake.
+# Do NOT stub `real_user_traffic` into sys.modules — that permanently poisons
+# later tests in the same pytest process (ImportError: unknown location).
+# Playwright stubs are fine (optional deps). RUT helpers are patched per-test.
 import types as _t
-_fake_rut = _t.ModuleType("real_user_traffic")
-_fake_rut.get_engine_status = lambda: {
-    "status": "ready",
-    "message": "Chromium ready (test stub)",
-    "expected_revision": "1148",
-}
-sys.modules["real_user_traffic"] = _fake_rut
-sys.modules.setdefault("playwright", _t.ModuleType("playwright"))
-sys.modules.setdefault("playwright.async_api", _t.ModuleType("playwright.async_api"))
+
+def _ensure_playwright_stub() -> None:
+    """Minimal playwright stub so real_user_traffic can import in CI without browsers."""
+    if "playwright.async_api" in sys.modules:
+        mod = sys.modules["playwright.async_api"]
+        if getattr(mod, "async_playwright", None) is not None and getattr(mod, "Page", None) is not None:
+            return
+    pw = sys.modules.get("playwright") or _t.ModuleType("playwright")
+    api = _t.ModuleType("playwright.async_api")
+    api.async_playwright = lambda: None
+    api.Page = type("Page", (), {})
+    api.BrowserContext = type("BrowserContext", (), {})
+    api.Browser = type("Browser", (), {})
+    api.TimeoutError = type("TimeoutError", (Exception,), {})
+    sys.modules["playwright"] = pw
+    sys.modules["playwright.async_api"] = api
+
+_ensure_playwright_stub()
 
 import desktop_module
+# Real module for patch("real_user_traffic.get_engine_status") — never leave a fake RUT stub.
+import real_user_traffic  # noqa: F401
 
 
 @pytest.mark.asyncio
@@ -60,8 +70,9 @@ async def test_chromium_ready_state_surfaces_to_dashboard():
     with patch("real_user_traffic.get_engine_status", return_value=fake_engine):
         result = await desktop_module._dependency_health()
     chromium = result["chromium"]
-    assert chromium["status"] == "ready"
-    assert "1148" in chromium.get("expected_revision", "")
+    # desktop_module maps engine "ready" → dashboard "ok"
+    assert chromium["status"] == "ok"
+    assert "1148" in str(chromium.get("expected_revision") or "")
 
 
 @pytest.mark.asyncio
