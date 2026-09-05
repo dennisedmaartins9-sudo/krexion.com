@@ -2026,41 +2026,51 @@ def _is_rotating_gateway_proxy(proxy_cfg: Dict[str, Any]) -> bool:
 
 
 def _rotate_manual_proxy_session(proxy_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Inject a fresh gateway session so the next probe gets a new exit IP."""
+    """Inject a fresh gateway session so the next probe gets a new exit IP.
+
+    v2.7.113 — Never force_replace geo DSL. DataImpulse usernames like
+    `login__cr.us;state.alabama` must keep country/state; only sessid rotates.
+    Older force_replace path stripped geo → `__sessid.N` and broke targeting.
+    """
     out = hydrate_proxy_credentials(dict(proxy_cfg or {}))
     username = str(out.get("username") or "").strip()
     if not username:
         return out
     host = _proxy_host_from_server(str(out.get("server") or ""))
     try:
+        import re as _re
+
         from proxy_provider_module import (
-            _apply_targeting_to_username,
-            _detect_profile,
             _make_session_id,
             _rotate_session_in_username,
         )
 
         new_user = _rotate_session_in_username(username)
         if new_user == username and _is_rotating_gateway_proxy(out):
-            targeting: Dict[str, Any] = {"_want_sid": True, "force_replace": True}
-            cc = str(
-                out.get("proxyjet_country") or out.get("country") or ""
-            ).strip().upper()
-            st = str(out.get("proxyjet_state") or out.get("state") or "").strip()
-            if cc and cc != "ANY":
-                targeting["country"] = cc
-            if st:
-                targeting["state"] = st
-            new_user = _apply_targeting_to_username(username, host, targeting)
-            new_user = _rotate_session_in_username(new_user)
-            if new_user == username:
-                sid = _make_session_id()
-                if ";" in username or "__cr." in username.lower():
-                    new_user = f"{username};sessid.{sid}"
-                elif "-session-" in username.lower() or "_session-" in username.lower():
-                    new_user = _rotate_session_in_username(f"{username}-session-{sid}")
-                else:
-                    new_user = f"{username};sessid.{sid}"
+            sid = _make_session_id()
+            # Drop prior sessid tokens only — keep __cr / state / city DSL intact.
+            stripped = _re.sub(
+                r"(?:;|__)(?:sessid|sessionid)\.[A-Za-z0-9_{}]+",
+                "",
+                username,
+                flags=_re.I,
+            )
+            stripped = _re.sub(
+                r"-(?:session(?:id)?|sessid|sess)-[A-Za-z0-9]+",
+                "",
+                stripped,
+                flags=_re.I,
+            ).rstrip(";-_")
+            if (
+                ";" in stripped
+                or "__cr." in stripped.lower()
+                or "__" in stripped
+            ):
+                new_user = f"{stripped};sessid.{sid}"
+            elif "-session-" in username.lower() or "_session-" in username.lower():
+                new_user = _rotate_session_in_username(f"{stripped}-session-{sid}")
+            else:
+                new_user = f"{stripped};sessid.{sid}"
         if new_user != username:
             out["username"] = new_user
             raw = _canonical_proxy_raw_line(out)
@@ -3014,23 +3024,42 @@ async def _ensure_profile_launch_proxy(
     profile_id = str(doc.get("id") or "")
     cred_uid = str(doc.get("user_id") or uid).strip() or uid
     provider_id = str(proxy_cfg.get("provider_id") or "").strip()
+    use_proxyjet = bool(proxy_cfg.get("use_proxyjet"))
 
-    # Rotating providers / smart_session / ProxyJet: ALWAYS fresh sessid at launch.
-    # v2.7.108 — must clear raw_line too; hydrate_proxy_credentials restores server
-    # from create-bound sticky sessid and blocks new IP allocation.
-    _fresh_rotating = bool(
-        provider_id
-        or proxy_cfg.get("smart_session")
-        or proxy_cfg.get("use_proxyjet")
-        or _is_rotating_gateway_proxy(proxy_cfg)
+    # v2.7.113 — Manual rotating gateways (DataImpulse paste, etc.) keep host:port
+    # and only rotate sessid. v2.7.108 wiped server+raw_line for ALL rotating
+    # hosts, then resolve_profile_proxy_for_launch could not rebuild without a
+    # provider_id → "proxy enabled but no server URL could be resolved".
+    _manual_rotating = (
+        not provider_id
+        and not use_proxyjet
+        and _is_rotating_gateway_proxy(proxy_cfg)
     )
-    if _fresh_rotating:
+    # Provider / ProxyJet / smart_session (provider-backed): fresh allocated line.
+    _fresh_rotating = bool(provider_id or use_proxyjet or proxy_cfg.get("smart_session"))
+    if _manual_rotating:
+        proxy_cfg.pop("exit_ip", None)
+        proxy_cfg = hydrate_proxy_credentials(proxy_cfg)
+        if not str(proxy_cfg.get("server") or "").strip():
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Profile '{doc.get('name') or profile_id[:8]}': proxy enabled but no server "
+                    "URL could be resolved. Re-paste the manual proxy line "
+                    "(user:pass@host:port) on the profile, then launch again."
+                ),
+            )
+        proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+        proxy_cfg = await resolve_profile_proxy_for_launch(
+            cred_uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
+        )
+    elif _fresh_rotating:
         proxy_cfg.pop("exit_ip", None)
         proxy_cfg.pop("raw_line", None)
         proxy_cfg.pop("raw", None)
         proxy_cfg["server"] = ""
         # Keep provider_id / password; username comes from newly allocated line
-        if provider_id or proxy_cfg.get("use_proxyjet"):
+        if provider_id or use_proxyjet:
             proxy_cfg["username"] = ""
         proxy_cfg = await resolve_profile_proxy_for_launch(
             cred_uid, user, proxy_cfg, team_dedupe=True, profile_country=profile_country,
@@ -4379,18 +4408,22 @@ async def refresh_profile_proxy(request: Request, profile_id: str):
     proxy.pop("exit_ip", None)
     patch_doc["exit_ip"] = ""
     provider_id = str(proxy.get("provider_id") or "").strip()
-    # v2.7.108 — clear sticky create sessid so Retry actually rotates IP
-    proxy.pop("raw_line", None)
-    proxy.pop("raw", None)
-    if provider_id or proxy.get("use_proxyjet") or _is_rotating_gateway_proxy(proxy):
+    use_proxyjet = bool(proxy.get("use_proxyjet"))
+    # v2.7.113 — Manual rotating: rotate sessid in-place (keep host:port).
+    # Provider/ProxyJet: clear sticky create sessid and re-allocate.
+    if provider_id or use_proxyjet:
+        proxy.pop("raw_line", None)
+        proxy.pop("raw", None)
         proxy["server"] = ""
-        if provider_id or proxy.get("use_proxyjet"):
-            proxy["username"] = ""
-        elif _is_rotating_gateway_proxy(proxy):
-            proxy = _rotate_manual_proxy_session(proxy)
-        patch_doc["proxy"] = proxy
+        proxy["username"] = ""
         patch_doc["proxy"] = await resolve_profile_proxy_for_launch(
-            uid, user, patch_doc["proxy"], profile_country=patch_doc.get("country"),
+            uid, user, proxy, profile_country=patch_doc.get("country"),
+        )
+    elif _is_rotating_gateway_proxy(proxy):
+        proxy = hydrate_proxy_credentials(proxy)
+        proxy = _rotate_manual_proxy_session(proxy)
+        patch_doc["proxy"] = await resolve_profile_proxy_for_launch(
+            uid, user, proxy, profile_country=patch_doc.get("country"),
         )
     else:
         patch_doc["proxy"] = proxy

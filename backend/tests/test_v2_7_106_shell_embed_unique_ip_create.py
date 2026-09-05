@@ -36,8 +36,9 @@ def test_advanced_create_binds_unique_ip_helper():
     assert "_bind_unique_exit_ip_at_create" in block
     assert "unique_ips_bound" in block
     assert "skipped_profiles" in block
-    assert "proxy_bind_deferred\": False" in block or "proxy_bind_deferred\":False" in block.replace(" ", "")
-
+    # v2.7.112+ — deferred flag is dynamic (soft-defer when IP endpoints flake)
+    assert "proxy_bind_deferred" in block
+    assert "deferred_count" in block or "deferred_exit_ip_count" in block
 
 def test_create_profile_requires_unique_ip_when_proxy_on():
     src = (ROOT / "browser_profile_module.py").read_text(encoding="utf-8")

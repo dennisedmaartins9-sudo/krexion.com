@@ -1,3 +1,13 @@
+# v2.7.113 — 2026-09 — Manual DataImpulse launch: keep server URL + geo sessid
+# - Symptom: Create with pasted DataImpulse lines succeeded, Launch failed with
+#   "proxy enabled but no server URL could be resolved".
+# - Cause: v2.7.108 treated ALL rotating gateways like providers — wiped
+#   server + raw_line at launch. Manual lines have no provider_id, so resolve
+#   could not rebuild the URL.
+# - Fix: Manual rotating (DataImpulse/etc.) hydrate + rotate sessid in-place
+#   (keep host:port). Provider/ProxyJet still clear sticky create sessid.
+# - Also: sessid rotate no longer force_replace-strips `__cr.us;state.*` geo.
+#
 # v2.7.112 — 2026-09 — Create with BestGo / rotating provider: exit-IP harden + soft-defer
 # - Symptom: Create 5 with provider labeled DataImpulse but gateway
 #   ca.rrp.bestgo.work → "Exit IP check failed… IP endpoints returned nothing"

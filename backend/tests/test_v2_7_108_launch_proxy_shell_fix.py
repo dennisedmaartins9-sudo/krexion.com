@@ -11,9 +11,12 @@ def test_ensure_launch_clears_raw_line_for_fresh_session():
     start = src.index("async def _ensure_profile_launch_proxy")
     end = src.index("\nasync def ", start + 10)
     block = src[start:end]
+    # Provider / ProxyJet path still clears sticky create sessid.
     assert 'proxy_cfg.pop("raw_line"' in block
     assert "_fresh_rotating" in block
     assert 'proxy_cfg["username"] = ""' in block
+    # v2.7.113 — manual rotating keeps host:port (does not wipe server).
+    assert "_manual_rotating" in block
 
 
 def test_refresh_proxy_clears_raw_line():
