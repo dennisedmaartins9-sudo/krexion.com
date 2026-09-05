@@ -32,7 +32,8 @@ def test_minimal_ip_urls_are_http_first():
 
 def test_probe_skips_tls_for_http_first_hosts():
     src = (ROOT / "real_user_traffic.py").read_text(encoding="utf-8")
-    assert "_http_first = _prefer_http_first_geo_probe(_probe_host)" in src
+    # v2.7.112 passes username so rrp./session markers also get HTTP-first
+    assert "_prefer_http_first_geo_probe(_probe_host" in src
     assert "not _http_first" in src
     assert "ok = await _try_minimal_ip(cli)" in src
 

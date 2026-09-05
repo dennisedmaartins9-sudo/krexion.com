@@ -4547,11 +4547,16 @@ _ROTATING_GATEWAY_HOSTS = (
     "9proxy.com",
     "coronium.io",
     "pyproxy.com",
+    # BestGo / RRP residential rotating (ca.rrp.bestgo.work, us.rrp.bestgo.work)
+    "bestgo.work",
+    "bestgo.com",
+    "bestproxy.com",
 )
 
 _ROTATING_GATEWAY_HOST_PREFIXES = (
     "gw.", "gate.", "pr.", "residential.", "rotating.", "rotate.",
     "isp.", "sticky.", "proxy.", "gateway.",
+    "rrp.", "res.", "resi.",
 )
 
 _ROTATING_GATEWAY_USER_MARKERS = (
@@ -4610,20 +4615,20 @@ def _is_smartproxy_gateway_host(host: str) -> bool:
     )
 
 
-def _prefer_http_first_geo_probe(host: str) -> bool:
+def _prefer_http_first_geo_probe(host: str, username: str = "") -> bool:
     """Residential rotating gateways need plain-HTTP IP probes first.
 
-    curl_cffi TLS + HTTPS CONNECT through DataImpulse / Oxylabs / etc. often
-    hangs or returns empty bodies, which made create-time unique-IP binding
-    skip every profile with "geo endpoints returned no IP". Match the launch
-    path: HTTP api.ipify.org first, skip TLS fingerprint probe.
+    curl_cffi TLS + HTTPS CONNECT through DataImpulse / BestGo / Oxylabs / etc.
+    often hangs or returns empty bodies, which made create-time unique-IP
+    binding skip every profile with "geo endpoints returned no IP". Match the
+    launch path: HTTP api.ipify.org first, skip TLS fingerprint probe.
     """
     h = (host or "").strip().lower()
     if not h:
         return False
     if _is_smartproxy_gateway_host(h):
         return True
-    return any(
+    if any(
         h == dom or h.endswith("." + dom)
         for dom in (
             "dataimpulse.com",
@@ -4646,8 +4651,17 @@ def _prefer_http_first_geo_probe(host: str) -> bool:
             "infatica.io",
             "ip2world.com",
             "spaceproxy.net",
+            "bestgo.work",
+            "bestgo.com",
+            "bestproxy.com",
         )
-    )
+    ):
+        return True
+    # Any other host that already looks like a rotating residential gateway
+    try:
+        return bool(_detect_rotating_gateway(h, username or ""))
+    except Exception:
+        return False
 
 
 async def _enrich_geo_from_exit_ip(result: Dict[str, Any]) -> None:
@@ -5137,9 +5151,14 @@ async def _probe_proxy_geo(
 
     _probe_host = _host_from_proxy_server(server).lower()
     _is_decodo = _is_smartproxy_gateway_host(_probe_host)
-    # v2.7.109 — DataImpulse + other residential: same fast HTTP-first path
-    # as Decodo (create unique-IP gate was failing with geo endpoints / no IP).
-    _http_first = _prefer_http_first_geo_probe(_probe_host)
+    # v2.7.109/112 — DataImpulse / BestGo / other residential: HTTP-first path
+    # (create unique-IP gate was failing with geo endpoints / no IP).
+    _proxy_user = str(
+        (proxy or {}).get("username")
+        or (proxy or {}).get("user")
+        or ""
+    )
+    _http_first = _prefer_http_first_geo_probe(_probe_host, _proxy_user)
     _probe_ua = (ua or "").strip() or (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -5227,19 +5246,42 @@ async def _probe_proxy_geo(
 
     def _extract_plain_ip(body: str) -> str:
         text = (body or "").strip()
-        if not text or text.startswith("<") or len(text) > 64:
+        if not text or len(text) > 8000:
             return ""
-        if text.startswith("{"):
-            try:
-                import json as _json
+        # Prefer clean plain / JSON bodies first
+        if not text.startswith("<"):
+            candidate = text
+            if candidate.startswith("{"):
+                try:
+                    import json as _json
 
-                data = _json.loads(text)
-                text = str((data or {}).get("ip") or (data or {}).get("query") or "").strip()
-            except Exception:
-                return ""
-        text = text.split()[0].strip().strip('"').strip("'")
-        if 7 <= len(text) <= 45:
-            return text
+                    data = _json.loads(candidate)
+                    candidate = str(
+                        (data or {}).get("ip")
+                        or (data or {}).get("query")
+                        or (data or {}).get("origin")
+                        or ""
+                    ).strip()
+                except Exception:
+                    candidate = ""
+            if candidate:
+                candidate = candidate.split()[0].strip().strip('"').strip("'")
+                if 7 <= len(candidate) <= 45:
+                    return candidate
+        # v2.7.112 — BestGo / residential gateways sometimes wrap the IP in
+        # HTML or noisy JSON. Pull the first public IPv4 / IPv6 from the body.
+        import re as _re
+
+        m4 = _re.search(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}"
+            r"(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b",
+            text,
+        )
+        if m4:
+            return m4.group(0)
+        m6 = _re.search(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b", text)
+        if m6:
+            return m6.group(0)
         return ""
 
     async def _try_minimal_ip(cli: httpx.AsyncClient) -> bool:
@@ -5247,20 +5289,33 @@ async def _probe_proxy_geo(
         for url in (
             "http://api.ipify.org/?format=text",
             "http://checkip.amazonaws.com/",
-            "http://ifconfig.me/ip",
             "http://icanhazip.com",
+            "http://ifconfig.me/ip",
+            "http://ipinfo.io/ip",
+            "http://ipecho.net/plain",
             "http://ip-api.com/json/?fields=status,query",
             "https://api.ipify.org/?format=text",
+            "https://ifconfig.me/ip",
         ):
             try:
                 r = await cli.get(url)
-                if r.status_code != 200:
+                # Some residential gateways return 200 with an HTML error that
+                # still embeds the exit IP — extract either way.
+                if r.status_code not in (200, 201) and r.status_code not in (403, 407):
+                    # Keep reading 200-class and common auth/block codes for IP scrape
+                    if not (r.text or "").strip():
+                        continue
+                if r.status_code == 407:
+                    result["probe_error"] = "proxy authentication failed (407) — check username/password"
                     continue
                 ip = ""
-                if "ip-api.com" in url:
-                    data = r.json() or {}
-                    if data.get("status") == "success":
-                        ip = str(data.get("query") or "").strip()
+                if "ip-api.com" in url and r.status_code == 200:
+                    try:
+                        data = r.json() or {}
+                        if data.get("status") == "success":
+                            ip = str(data.get("query") or "").strip()
+                    except Exception:
+                        ip = _extract_plain_ip(r.text or "")
                 else:
                     ip = _extract_plain_ip(r.text or "")
                 if ip:

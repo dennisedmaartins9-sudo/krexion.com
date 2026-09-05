@@ -1,3 +1,14 @@
+# v2.7.112 — 2026-09 — Create with BestGo / rotating provider: exit-IP harden + soft-defer
+# - Symptom: Create 5 with provider labeled DataImpulse but gateway
+#   ca.rrp.bestgo.work → "Exit IP check failed… IP endpoints returned nothing"
+#   → all profiles skipped ("No profiles saved — 5 skipped").
+# - Fix A: Treat bestgo.work / rrp.* as rotating + HTTP-first geo probe (same
+#   DataImpulse path); scrape IPv4 from noisy/HTML bodies; more IP endpoints;
+#   clearer 407 / BestGo balance tips.
+# - Fix B: Soft-defer create when rotating line is allocated but IP endpoints
+#   flake — save profiles with exit_ip_deferred; unique IP verified on launch.
+#   UI toasts deferred saves instead of hard "0 saved".
+#
 # v2.7.111 — 2026-09 — Suite green: stale asserts + Linux chromium path tests
 # - Semver-fix VERSION string compares (`2.7.110` < `2.7.20` as text).
 # - Chromium bundle tests use platform dirs (chrome-linux on CI, win64 on native).

@@ -925,6 +925,7 @@ export default function BrowserProfilesPage() {
       const n = d.created || 0;
       const skipped = Array.isArray(d.skipped) ? d.skipped.length : 0;
       const ips = Number(d.unique_ips_bound || 0);
+      const deferred = Number(d.deferred_exit_ip_count || 0) || (d.proxy_bind_deferred ? n : 0);
       const mixLabel = d.mix
         ? ` (iOS ${d.mix.ios || 0} · Android ${d.mix.android || 0} · Desktop ${d.mix.desktop || 0})`
         : "";
@@ -933,11 +934,16 @@ export default function BrowserProfilesPage() {
           `No profiles saved — ${skipped} skipped (unique exit IP unavailable). Fix proxy / pool and retry.`,
           { duration: 10000 },
         );
+      } else if (n > 0 && deferred > 0 && ips === 0) {
+        toast.success(
+          `${n} profiles saved · exit IP check deferred (verified on first launch)${skipped ? ` · ${skipped} skipped` : ""}`,
+          { duration: 9000 },
+        );
       } else {
         toast.success(
           n === 1
             ? `Profile "${d.profiles?.[0]?.name || ""}" created${ips ? ` · IP ${d.profiles?.[0]?.exit_ip || "bound"}` : ""}`
-            : `${n} unique profiles created${mixLabel}${ips ? ` · ${ips} unique IPs bound` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+            : `${n} unique profiles created${mixLabel}${ips ? ` · ${ips} unique IPs bound` : ""}${deferred ? ` · ${deferred} IP deferred` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
         );
       }
       if (Array.isArray(d.proxy_warnings) && d.proxy_warnings.length) {

@@ -2298,18 +2298,31 @@ def _friendly_proxy_probe_error(raw: str, gateway_host: str = "") -> str:
             return (
                 f"DNS could not resolve proxy gateway '{host}'. "
                 "Open Proxies → edit provider → Gateway host must be real "
-                "(e.g. gw.dataimpulse.com) with port 823 or 10000."
+                "(e.g. gw.dataimpulse.com or ca.rrp.bestgo.work) with the correct port."
             )
         return (
             "DNS could not resolve the proxy gateway host. "
             "Open Proxies → edit provider → check Gateway host + port."
         )
-    if "geo endpoints returned no ip" in low or "ip endpoints returned no ip" in low:
+    if "407" in low or "authentication failed" in low or "proxy auth" in low:
         hint = f" via '{host}'" if host else ""
         return (
+            f"Proxy authentication failed{hint}. "
+            "Open Proxies → edit provider → re-save username/password "
+            "(and country targeting if set), then retry Create."
+        )
+    if "geo endpoints returned no ip" in low or "ip endpoints returned no ip" in low:
+        hint = f" via '{host}'" if host else ""
+        bestgo = "bestgo" in host.lower() or "rrp." in host.lower()
+        tip = (
+            "BestGo gateways need a live balance + correct country/session in the username. "
+            if bestgo
+            else "Check provider balance / country targeting / password. "
+        )
+        return (
             f"Exit IP check failed{hint} — gateway reachable but IP endpoints "
-            "returned nothing. Check provider balance / country targeting / "
-            "password, then retry Create."
+            f"returned nothing. {tip}"
+            "Then retry Create."
         )
     return msg[:240]
 
@@ -2319,6 +2332,7 @@ async def _quick_http_exit_ip_via_proxy(proxy: Dict[str, Any], ua: str = "") -> 
     try:
         from real_user_traffic import _proxy_url_for_http  # type: ignore
         import httpx
+        import re
     except Exception:
         return ""
     server = _proxy_url_for_http(proxy)
@@ -2333,11 +2347,28 @@ async def _quick_http_exit_ip_via_proxy(proxy: Dict[str, Any], ua: str = "") -> 
         "http://checkip.amazonaws.com/",
         "http://icanhazip.com",
         "http://ifconfig.me/ip",
+        "http://ipinfo.io/ip",
+        "http://ipecho.net/plain",
     )
+
+    def _pull_ip(text: str) -> str:
+        body = (text or "").strip()
+        if not body:
+            return ""
+        first = body.split()[0].strip().strip('"').strip("'")
+        if first and _is_valid_exit_ip(first):
+            return first
+        m = re.search(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}"
+            r"(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b",
+            body,
+        )
+        return m.group(0) if m else ""
+
     try:
         async with httpx.AsyncClient(
             proxy=server,
-            timeout=httpx.Timeout(12.0, connect=8.0),
+            timeout=httpx.Timeout(18.0, connect=10.0),
             headers={"User-Agent": probe_ua},
             verify=False,
             http2=False,
@@ -2346,9 +2377,9 @@ async def _quick_http_exit_ip_via_proxy(proxy: Dict[str, Any], ua: str = "") -> 
             for url in urls:
                 try:
                     r = await cli.get(url)
-                    if r.status_code != 200:
+                    if r.status_code == 407:
                         continue
-                    body = (r.text or "").strip().split()[0].strip().strip('"')
+                    body = _pull_ip(r.text or "")
                     if body and _is_valid_exit_ip(body):
                         return body
                 except Exception:
@@ -2663,11 +2694,16 @@ async def _bind_unique_exit_ip_at_create(
     targeting: Optional[Dict[str, Any]] = None,
     max_retries: int = 8,
 ) -> Dict[str, Any]:
-    """Probe exit IP before insert — only unique IPs become saved profiles.
+    """Probe exit IP before insert — prefer unique IPs; soft-defer when gateway flakes.
 
     Rotates provider/manual gateway sessions until team+batch unique.
     Returns {"ok": True, "exit_ip": "..."} or {"ok": False, "reason": "..."}.
     Profiles without proxy are ok (no IP to bind).
+
+    v2.7.112 — When a rotating provider/manual gateway is allocated but every
+    IP endpoint returns empty (BestGo / DataImpulse flaky balance windows),
+    soft-save with exit_ip_deferred instead of skipping the whole batch.
+    Unique IP is enforced again at first launch.
     """
     _prepare_proxy_for_profile_create(doc)
     proxy_cfg = dict(doc.get("proxy") or {})
@@ -2680,6 +2716,8 @@ async def _bind_unique_exit_ip_at_create(
     profile_id = str(doc.get("id") or "").strip()
     attempts = max(1, int(max_retries or 8))
     last_err = "exit IP probe failed"
+    had_allocated_line = False
+    last_empty_ip_err = False
 
     for attempt in range(attempts):
         # Provider: allocate a fresh unique line each attempt
@@ -2692,12 +2730,15 @@ async def _bind_unique_exit_ip_at_create(
                     proxy_cfg, lines[0], provider_id=provider_id,
                 )
                 proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+                had_allocated_line = True
             except HTTPException as he:
                 last_err = str(he.detail or he)[:200]
                 break
             except Exception as exc:
                 last_err = str(exc)[:200]
                 break
+        elif str(proxy_cfg.get("server") or "").strip():
+            had_allocated_line = True
 
         doc["proxy"] = dict(proxy_cfg)
         probe = await _probe_profile_proxy(
@@ -2707,11 +2748,22 @@ async def _bind_unique_exit_ip_at_create(
         exit_ip = str(probe.get("exit_ip") or "").strip()
         if not exit_ip:
             last_err = str(probe.get("error") or "exit IP probe failed")[:200]
+            err_l = last_err.lower()
+            last_empty_ip_err = (
+                "geo endpoints returned no ip" in err_l
+                or "ip endpoints returned no ip" in err_l
+                or "exit ip check failed" in err_l
+                or "returned nothing" in err_l
+            )
             if (provider_id or rotating_manual) and attempt < attempts - 1:
-                if rotating_manual:
-                    proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
-                    proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
-                    await asyncio.sleep(0.2)
+                # Rotate session on the current line before next allocate
+                if rotating_manual or provider_id:
+                    try:
+                        proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                        proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.25)
                 continue
             break
 
@@ -2727,6 +2779,8 @@ async def _bind_unique_exit_ip_at_create(
             doc["proxy"] = dict(proxy_cfg)
             doc["proxy"]["exit_ip"] = canonical
             doc["proxy"]["sticky_session"] = True
+            doc.pop("exit_ip_deferred", None)
+            doc.get("proxy", {}).pop("exit_ip_deferred", None)
             raw = _canonical_proxy_raw_line(doc["proxy"])
             if raw:
                 doc["proxy"]["raw_line"] = raw
@@ -2740,14 +2794,42 @@ async def _bind_unique_exit_ip_at_create(
             if exc.status_code != 409 or attempt >= attempts - 1:
                 break
             # Duplicate — rotate for next attempt
-            if rotating_manual:
-                proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
-                proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+            if rotating_manual or provider_id:
+                try:
+                    proxy_cfg = _rotate_manual_proxy_session(proxy_cfg)
+                    proxy_cfg = await _finalize_proxy_cfg_for_launch(uid, user, proxy_cfg)
+                except Exception:
+                    pass
                 await asyncio.sleep(0.2)
             elif not provider_id:
                 # Static manual: cannot rotate to a new IP
                 break
             # provider: next loop allocates a new line
+
+    # Soft-defer: rotating gateway line exists but IP endpoints flaked —
+    # still save so Create is not a total waste; launch re-binds unique IP.
+    if had_allocated_line and last_empty_ip_err and (provider_id or rotating_manual):
+        doc["proxy"] = dict(proxy_cfg)
+        doc.pop("exit_ip", None)
+        doc["exit_ip_deferred"] = True
+        doc["proxy"]["exit_ip_deferred"] = True
+        doc["proxy"].pop("exit_ip", None)
+        raw = _canonical_proxy_raw_line(doc["proxy"])
+        if raw:
+            doc["proxy"]["raw_line"] = raw
+        logger.warning(
+            f"[browser-profile create] exit IP deferred profile={profile_id[:8]} "
+            f"reason={last_err[:120]}"
+        )
+        return {
+            "ok": True,
+            "exit_ip": "",
+            "deferred": True,
+            "warning": (
+                "Exit IP check flaked — profile saved; unique IP will be "
+                f"verified on first launch. ({last_err[:120]})"
+            ),
+        }
 
     return {
         "ok": False,
@@ -3227,10 +3309,16 @@ async def create_profile(request: Request, body: ProfileBody):
                     "Profile was NOT saved (no wasted profile)."
                 ),
             )
+        deferred = bool(bind.get("deferred"))
     else:
         _prepare_proxy_for_profile_create(doc)
+        deferred = False
     await _DB.browser_profiles.insert_one(doc)
-    return {"profile": _public_view(doc), "id": doc["id"]}
+    out = {"profile": _public_view(doc), "id": doc["id"]}
+    if deferred:
+        out["exit_ip_deferred"] = True
+        out["warning"] = str(bind.get("warning") or "")[:240]
+    return out
 
 
 @router.get("/device-catalog")
@@ -5523,6 +5611,7 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
     used_ips: Set[str] = await _load_team_profile_used_ips(uid)
     batch_assigned: Set[str] = set()
     unique_ips_bound = 0
+    deferred_count = 0
     _targeting = {
         "country": (body.proxy.country or body.country or "US").upper()[:2],
         "state": (body.proxy.state or "").upper(),
@@ -5655,8 +5744,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         if _pline:
             doc.setdefault("proxy", {})["raw_line"] = _pline
 
-        # v2.7.106 — Only save profiles with a verified unique exit IP
-        # (or no proxy). Failed probes / duplicates are skipped, not inserted.
+        # v2.7.106/112 — Prefer verified unique exit IP before save.
+        # Soft-defer when rotating gateway flakes (BestGo empty IP endpoints).
         if proxy_is_active(doc.get("proxy") or {}):
             bind = await _bind_unique_exit_ip_at_create(
                 uid,
@@ -5679,6 +5768,16 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                 continue
             if bind.get("exit_ip"):
                 unique_ips_bound += 1
+            if bind.get("deferred"):
+                deferred_count += 1
+                warn = str(bind.get("warning") or "").strip()
+                if warn:
+                    proxy_warnings.append(f"{doc.get('name') or name}: {warn[:180]}")
+                else:
+                    proxy_warnings.append(
+                        f"{doc.get('name') or name}: exit IP deferred — "
+                        "verified on first launch"
+                    )
         else:
             _prepare_proxy_for_profile_create(doc)
 
@@ -5694,7 +5793,8 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
         "proxy_mode": proxy_mode,
         "proxies_allocated": unique_ips_bound if proxy_mode in ("proxyjet", "provider", "manual") else 0,
         "smart_session": bool(proxy_mode == "provider" and body.proxy.provider_id),
-        "proxy_bind_deferred": False,
+        "proxy_bind_deferred": deferred_count > 0,
+        "deferred_exit_ip_count": deferred_count,
         "proxy_warnings": proxy_warnings,
         "unique_ips_bound": unique_ips_bound,
         "mix": {plat: n for plat, n in (mix_plan or [])},
