@@ -1,3 +1,8 @@
+# v2.7.136 — 2026-09 — Ship-gate verified green (Strict shell frame locked)
+# - Official ship-gate: 1044 passed / 5 skipped after v2.7.135 Strict frame fix.
+# - Stale test updated (early require_embed=False + post-nav Strict gate).
+# - No product change vs 2.7.135 — verified green ship for Deploy/Electron/Native.
+#
 # v2.7.135 — 2026-09 — Strict mobile shell permanent frame fix
 # - Root: Strict ON aborted Open when early pass required HWND embed ~0.45s
 #   after new_page — iPhone WebKit + Android Chromium both failed with

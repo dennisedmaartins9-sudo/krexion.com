@@ -53,7 +53,11 @@ def test_launcher_rehydrates_and_blocks_signin():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "hydrate_proxy_credentials" in src
     assert "username/password is missing" in src
-    assert "require_embed=bool(strict_mobile_shell)" in src
+    # v2.7.135 — early phone-chrome soft-start (no Strict abort before nav);
+    # final Strict gate still requires embed post-navigation.
+    assert "require_embed=False" in src
+    assert "Last-chance multi-pass discover" in src
+    assert "Launch aborted so plain Chromium/" in src
 
 
 def test_shell_host_sets_krexion_appid():
