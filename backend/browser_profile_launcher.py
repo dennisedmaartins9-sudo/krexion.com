@@ -193,6 +193,20 @@ def _profile_user_closed_ui(
     return False
 
 
+
+
+def _start_title_keeper_for_session(session_id: str, hwnds: list) -> None:
+    """Best-effort AdsPower-style durable window title."""
+    try:
+        sess = (_RUNNING_SESSIONS.get(session_id) or {})
+        title = str(sess.get("window_title") or "")
+        if not title or not hwnds:
+            return
+        from krexion_window_icon import keep_krexion_window_title
+        keep_krexion_window_title(hwnds, title, session_key=f"title:{session_id}")
+    except Exception:
+        pass
+
 async def _apply_shell_commands(
     session_id: str,
     context: Any,
@@ -443,7 +457,7 @@ async def _enqueue_for_user_session(
                 "profile_id": profile_id,
                 "session_id": session_id,
                 "status": "queued",
-                "message": "Waiting for Krexion tray (user session) to open Chromium…",
+                "message": "Waiting for Krexion tray (user session) to open Krexion Browser…",
             })
         except Exception as _cb_err:  # noqa: BLE001
             logger.debug(f"queued-callback failed: {_cb_err}")
@@ -1664,7 +1678,7 @@ async def _launch_session_inline(
             from playwright.async_api import async_playwright
         except ImportError as _ie:
             await _notify_error(
-                "Playwright is not installed on this host. The Krexion "
+                "Krexion Browser engine is not installed on this host. The Krexion "
                 "desktop install should auto-bundle it; please reinstall "
                 "or run `python -m playwright install chromium` manually."
             )
@@ -1688,7 +1702,7 @@ async def _launch_session_inline(
                 pass
             elif estatus == "installing":
                 await _notify_error(
-                    "Chromium browser engine is still downloading "
+                    "Krexion Browser engine is still downloading "
                     "(~150 MB). Please wait ~60 seconds and click "
                     "Launch again."
                 )
@@ -1698,7 +1712,7 @@ async def _launch_session_inline(
                 ok = await _ensure_full_chromium_available()
                 if not ok or _full_chromium_binary_path() is None:
                     await _notify_error(
-                        "Chromium browser engine is missing — downloading "
+                        "Krexion Browser engine is missing — downloading "
                         "it now (~150 MB, takes ~60-90 seconds). Click "
                         "Launch again once this banner clears."
                     )
@@ -1902,6 +1916,12 @@ async def _launch_profile_session_inner(
             pass
     _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
     _launch_warnings: List[str] = []
+    def _brand_warn(msg: str) -> None:
+        try:
+            from krexion_profile_branding import sanitize_user_facing as _suf
+            _launch_warnings.append(_suf(msg))
+        except Exception:
+            _launch_warnings.append(msg)
     if paranoia_mode:
         _launch_warnings.append(
             "Paranoia mode: CDP off, WebRTC proxy, IPv6 disabled, Strict proxy ON."
@@ -2199,8 +2219,8 @@ async def _launch_profile_session_inner(
         )
     if _profile_engine == "webkit":
         _launch_warnings.append(
-            "WebKit engine: Safari-shaped stealth (no window.chrome / Sec-CH-UA). "
-            "Still desktop MiniBrowser — not a physical iPhone."
+            "Krexion Safari: Safari-shaped stealth (no window.chrome / Sec-CH-UA). "
+            "Still desktop Krexion Safari — not a physical iPhone."
         )
 
     # Persist Strict proxy flag for old profiles that never saved it (one-shot migrate)
@@ -2300,6 +2320,42 @@ async def _launch_profile_session_inner(
         _taskbar_slot = int(
             ((_RUNNING_SESSIONS.get(session_id) or {}).get("taskbar_slot")) or 1
         )
+        # v2.7.129 — AdsPower-parity window title + Custom Icon identity
+        try:
+            from krexion_profile_branding import (
+                app_user_model_id as _aumid,
+                build_window_title as _bwt,
+                chromium_app_user_model_arg as _aum_arg,
+                resolve_icon_mode as _rim,
+            )
+
+            _icon_mode = _rim(anti, profile_config)
+            _is_webkit = str(_profile_engine or "").lower() in ("webkit", "safari", "ios")
+            _is_phone = bool(is_mobile)
+            _window_title = _bwt(
+                slot=_taskbar_slot,
+                name=str(_profile_label),
+                notes=str(profile_config.get("notes") or ""),
+                custom_no=str(
+                    profile_config.get("custom_no")
+                    or profile_config.get("serial_number")
+                    or ""
+                ),
+                icon_mode=_icon_mode,
+                webkit=_is_webkit,
+                phone=_is_phone,
+            )
+            _pre_appid = _aumid(_taskbar_slot, phone=_is_phone)
+            _aum_cli = _aum_arg(_taskbar_slot)
+            try:
+                (_RUNNING_SESSIONS.get(session_id) or {}).update({"window_title": _window_title})
+            except Exception:
+                pass
+            # Title keeper starts once HWNDs are known (icon apply paths call it too).
+        except Exception:
+            _window_title = f"Krexion Browser \u2014 {_taskbar_slot} \u00b7 {str(_profile_label)[:32]}"
+            _pre_appid = f"Krexion.BrowserProfile.{_taskbar_slot}"
+            _aum_cli = f"--app-user-model-id={_pre_appid}"
         # v2.7.15 — WebRTC launch flags from webrtc_mode (default proxy = current)
         _WEBRTC_FORCE = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
         _launch_args = [a for a in _headed_launch_args(anti) if a != _WEBRTC_FORCE]
@@ -2311,12 +2367,10 @@ async def _launch_profile_session_inner(
         else:
             # proxy (default): keep non-proxied UDP disabled
             _launch_args.append(_WEBRTC_FORCE)
-        # v2.7.13 — AppUserModelID per slot so each open profile gets its
-        # own numbered Krexion taskbar button (not one shared Chrome icon).
+        # v2.7.13 / v2.7.129 — AppUserModelID per slot (AdsPower-style taskbar group)
         try:
             if sys.platform.startswith("win"):
                 import ctypes as _ctypes_pre
-                _pre_appid = f"Krexion.BrowserProfile.{_taskbar_slot}"
                 _ctypes_pre.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_pre_appid)
         except Exception:
             pass
@@ -2324,8 +2378,9 @@ async def _launch_profile_session_inner(
             "headless": False,
             "args": [
                 *_launch_args,
-                # Window title until first page paint; site title takes over after.
-                f"--window-name=Krexion \u2014 {_profile_label} ({_taskbar_slot})",
+                # Durable branded title (title-keeper re-applies after navigation)
+                f"--window-name={_window_title}",
+                _aum_cli,
             ],
         }
         # Merge CloakBrowser default stealth CLI args (dedupe)
@@ -2430,11 +2485,18 @@ async def _launch_profile_session_inner(
         browser = None  # type: ignore
 
         if _profile_engine == "webkit":
-            # Playwright WebKit — no channel=chrome, no Chromium CLI flags.
+            # Krexion Safari (WebKit) — AdsPower FlowerBrowser-class white-label.
             # Force Safari stealth profile unless user set minimal.
             if stealth_profile == "full":
                 stealth_profile = "safari"
             wk_kwargs: Dict[str, Any] = {"headless": False}
+            try:
+                from krexion_branded_browser import ensure_krexion_safari_binary as _eks
+                _safari = _eks()
+                if _safari:
+                    wk_kwargs["executable_path"] = _safari
+            except Exception:
+                pass
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
             except Exception as _wk_err:
@@ -2443,7 +2505,7 @@ async def _launch_profile_session_inner(
                     _wk_err,
                 )
                 _launch_warnings.append(
-                    "Safari/WebKit engine unavailable — running Chromium instead. "
+                    "Krexion Safari unavailable — running Krexion Browser instead. "
                     "This is NOT a real iPhone/iOS Safari. It is a desktop browser "
                     "with a mobile shell (viewport + UA). Advanced trackers can still "
                     "tell it is not a physical iPhone."
@@ -2591,6 +2653,7 @@ async def _launch_profile_session_inner(
             try:
                 from krexion_window_icon import (
                     apply_krexion_icon_to_pids,
+                    keep_krexion_window_title,
                     collect_profile_process_tree,
                     resolve_playwright_driver_pid,
                     stop_session_icon_keeper,
@@ -2617,7 +2680,7 @@ async def _launch_profile_session_inner(
                     _include_webkit = True
                     _title_markers = ["[WebKit]", "Safari", "Krexion"]
                 else:
-                    _cmd_markers = ["--window-name=Krexion"]
+                    _cmd_markers = ["--window-name=Krexion", "--window-name=Krexion Browser", "--window-name=Krexion Safari", "--window-name=Krexion Phone"]
                 _family_pids = sorted(
                     collect_profile_process_tree(int(_driver_pid) if _driver_pid else None)
                     or set(_target_pids)
@@ -2817,6 +2880,18 @@ async def _launch_profile_session_inner(
                                     skip_toolwindow=True,
                                     session_lifetime=False,
                                 )
+                                try:
+                                    # AdsPower-style durable title (site navigations overwrite --window-name)
+                                    if _window_title:
+                                        keep_krexion_window_title(
+                                            [],
+                                            str(_window_title),
+                                            session_key=f"title:{session_id}",
+                                            pids=list(_family_pids or []),
+                                        )
+                                    _start_title_keeper_for_session(session_id, [])
+                                except Exception:
+                                    pass
                                 return
 
                             # Process up but HWND never framed — last force discover
@@ -2977,6 +3052,17 @@ async def _launch_profile_session_inner(
                     skip_toolwindow=True,
                     session_lifetime=True,
                 )
+                try:
+                    if _window_title:
+                        keep_krexion_window_title(
+                            [],
+                            str(_window_title),
+                            session_key=f"title:{session_id}",
+                            pids=list(_family_pids or []),
+                        )
+                    _start_title_keeper_for_session(session_id, [])
+                except Exception:
+                    pass
             except RuntimeError:
                 raise
             except Exception as _icon_err:

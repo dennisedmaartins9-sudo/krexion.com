@@ -5321,7 +5321,7 @@ async def launch_profile(
             desktop_available = True
             bridge_job_id = f"local:{session_id}"
             launch_message = (
-                "Opening Chromium on this PC — if nothing appears in ~1 minute, "
+                "Opening Krexion Browser on this PC — if nothing appears in ~1 minute, "
                 "open the Krexion tray icon and click Launch again."
             )
         except Exception as e:

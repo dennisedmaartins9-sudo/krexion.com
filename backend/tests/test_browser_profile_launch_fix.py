@@ -100,14 +100,14 @@ async def test_playwright_import_failure_notifies_error():
         sys.modules["playwright"] = _pw_stub
         sys.modules["playwright.async_api"] = _pw_async_stub
     assert result["ok"] is False
-    assert "Playwright" in result["error"]
+    assert ("Playwright" in result["error"] or "Krexion Browser engine" in result["error"])
     # Critical assertion — cloud was notified, profile card will un-stick
     assert len(collector.calls) == 1
     notice = collector.calls[0]
     assert notice["status"] == "error"
     assert notice["session_id"] == "s1"
     assert notice["profile_id"] == "p1"
-    assert "Playwright" in notice["error_message"]
+    assert ("Playwright" in notice["error_message"] or "Krexion Browser engine" in notice["error_message"])
 
 
 @pytest.mark.asyncio

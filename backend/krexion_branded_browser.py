@@ -296,3 +296,149 @@ def parent_engine_hwnd_into_shell(engine_hwnd: int, shell_hwnd: int) -> bool:
     except Exception as exc:
         logger.debug(f"[branded-browser] SetParent failed: {exc}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# v2.7.129 — Krexion Safari (WebKit) white-label — AdsPower FlowerBrowser parity
+# ---------------------------------------------------------------------------
+
+_SAFARI_NAME = "krexion-safari.exe" if sys.platform.startswith("win") else "krexion-safari"
+_SAFARI_CACHE_ENV = "KREXION_BRANDED_SAFARI_PATH"
+
+
+def _playwright_webkit_path() -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            path = p.webkit.executable_path
+            if path and os.path.isfile(path):
+                return str(path)
+    except Exception as exc:
+        logger.debug(f"[branded-safari] playwright webkit probe skipped: {exc}")
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        browsers = Path(local) / "ms-playwright"
+        if browsers.is_dir():
+            for exe in sorted(browsers.glob("webkit-*/Playwright.exe"), reverse=True):
+                if exe.is_file():
+                    return str(exe)
+            for exe in sorted(browsers.glob("webkit-*/MiniBrowser.exe"), reverse=True):
+                if exe.is_file():
+                    return str(exe)
+            for exe in sorted(browsers.glob("webkit-*/pw_run.sh"), reverse=True):
+                # Linux/mac helper — prefer sibling MiniBrowser when present
+                mb = exe.parent / "MiniBrowser"
+                if mb.is_file():
+                    return str(mb)
+    return ""
+
+
+def ensure_krexion_safari_binary(*, force_refresh: bool = False) -> str:
+    """Copy WebKit MiniBrowser → krexion-safari.exe (AdsPower FlowerBrowser-class)."""
+    cached = (os.environ.get(_SAFARI_CACHE_ENV) or "").strip()
+    if cached and os.path.isfile(cached) and not force_refresh:
+        return cached
+
+    src = _playwright_webkit_path()
+    if not src or not os.path.isfile(src):
+        logger.debug("[branded-safari] no WebKit binary to brand")
+        return ""
+
+    if Path(src).name.lower() in ("krexion-safari.exe", "krexion-safari"):
+        os.environ[_SAFARI_CACHE_ENV] = src
+        return src
+
+    dest_dir = _brand_dir()
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning(f"[branded-safari] brand dir create failed: {exc}")
+        return src
+
+    dst = dest_dir / _SAFARI_NAME
+    try:
+        src_mtime = os.path.getmtime(src)
+        needs = force_refresh or (not dst.is_file()) or (os.path.getmtime(dst) < src_mtime)
+        if needs:
+            src_path = Path(src)
+            wk_dir = src_path.parent
+            # Copy adjacent WebKit deps (DLLs / .so) so rename still runs
+            for item in wk_dir.iterdir():
+                target = dest_dir / item.name
+                try:
+                    if item.is_file():
+                        if item.name.lower() in (
+                            "minibrowser.exe",
+                            "playwright.exe",
+                            "minibrowser",
+                        ):
+                            continue
+                        if (not target.exists()) or item.stat().st_mtime > target.stat().st_mtime:
+                            shutil.copy2(item, target)
+                    elif item.is_dir() and item.name.lower() not in ("installer",):
+                        if not target.exists():
+                            shutil.copytree(item, target, dirs_exist_ok=True)
+                except Exception:
+                    pass
+            shutil.copy2(src, dst)
+            # Stamp as Krexion Safari when PE tools exist
+            if sys.platform.startswith("win"):
+                try:
+                    _try_stamp_pe_product(dst, "Krexion Safari", "krexion-safari")
+                except Exception:
+                    _try_stamp_pe(dst)
+            logger.info(f"[branded-safari] ready src={src} → dst={dst}")
+    except Exception as exc:
+        logger.warning(f"[branded-safari] copy failed ({exc}) — using source path")
+        return src
+
+    if dst.is_file():
+        os.environ[_SAFARI_CACHE_ENV] = str(dst)
+        return str(dst)
+    return src
+
+
+def _try_stamp_pe_product(dst: Path, product: str, internal: str) -> None:
+    """Stamp PE with a specific product name (Browser vs Safari)."""
+    if not sys.platform.startswith("win"):
+        return
+    icons = _icon_candidates()
+    ico = next((p for p in icons if p.suffix.lower() == ".ico"), None)
+    for tool in (
+        shutil.which("rcedit-x64.exe"),
+        shutil.which("rcedit.exe"),
+        str(Path(__file__).resolve().parents[1] / "tools" / "rcedit-x64.exe"),
+        str(Path(__file__).resolve().parents[1] / "build" / "tools" / "rcedit-x64.exe"),
+    ):
+        if not tool or not os.path.isfile(tool):
+            continue
+        try:
+            import subprocess
+
+            cmd = [
+                tool,
+                str(dst),
+                "--set-version-string",
+                "ProductName",
+                product,
+                "--set-version-string",
+                "FileDescription",
+                product,
+                "--set-version-string",
+                "CompanyName",
+                "Krexion",
+                "--set-version-string",
+                "InternalName",
+                internal,
+                "--set-version-string",
+                "OriginalFilename",
+                dst.name,
+            ]
+            if ico:
+                cmd.extend(["--set-icon", str(ico)])
+            subprocess.run(cmd, check=False, capture_output=True, timeout=60)
+            logger.info(f"[branded-browser] PE stamped {product} via {tool}")
+            return
+        except Exception as exc:
+            logger.debug(f"[branded-browser] rcedit product stamp skipped: {exc}")

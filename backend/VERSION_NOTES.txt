@@ -1,3 +1,12 @@
+# v2.7.129 — 2026-09 — AdsPower-parity profile branding (deep match)
+# - Product engines: Krexion Browser (SunBrowser-class) + Krexion Safari (FlowerBrowser-class).
+# - Window title: Krexion Browser — {Profile No / name / notes / custom NO}.
+# - Taskbar Custom Icon mode (FE + anti_detect.taskbar_icon_mode) like AdsPower Global Settings.
+# - AppUserModelID + --app-user-model-id per profile slot; durable title keeper after navigations.
+# - White-label krexion-safari.exe from WebKit MiniBrowser; PID finder includes it.
+# - User-facing copy purge: no Chromium / Playwright / MiniBrowser in toasts & cards.
+# - Keeps v2.7.128 branded krexion-browser.exe + phone chrome SetParent path.
+#
 # v2.7.128 — 2026-09 — Krexion branded browser kernel (AdsPower-style)
 # - White-label binary: Cloak/Playwright chrome copied to krexion-browser.exe so
 #   Task Manager / process list show Krexion, not chrome.exe.

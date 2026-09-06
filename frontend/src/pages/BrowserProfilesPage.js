@@ -150,6 +150,7 @@ const DEFAULT_NEW = {
     // Abort if phone chrome (mobile shell) cannot frame the browser
     strict_mobile_shell: true,
     browser_kernel: "auto",
+    taskbar_icon_mode: "profile_no",
     fingerprint_win: true,
     fingerprint_win_prefer_real: true,
     allow_extensions: false,
@@ -1730,7 +1731,7 @@ export default function BrowserProfilesPage() {
             ? "Launch + JSON automation queued on this PC"
             : "Launch queued — desktop app will open the browser",
         );
-        // Clear sticky "Opening Chromium…" after browser is claimed (poll).
+        // Clear sticky "Opening Krexion Browser…" after browser is claimed (poll).
         setTimeout(() => {
           setStatusMap((m) => {
             if (!m[id]) return m;
@@ -2088,7 +2089,7 @@ export default function BrowserProfilesPage() {
           <Shield className="w-4 h-4 mt-0.5 text-amber-300" />
           <div>
             <span className="font-semibold">How it works:</span> Create a profile, then click{" "}
-            <span className="text-amber-300">Launch</span>. On Local Engine / Native, Chromium opens on this PC
+            <span className="text-amber-300">Launch</span>. On Local Engine / Native, Krexion Browser opens on this PC
             (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
             app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
             Select multiple cards for bulk Launch / Stop / Delete.
@@ -2103,7 +2104,7 @@ export default function BrowserProfilesPage() {
         {cloudModeHint === "cloud" && (
           <div className="mb-4 p-3 rounded-lg bg-violet-950/25 border border-violet-700/40 text-xs text-violet-200">
             <span className="font-semibold">Cloud mode:</span> Launch requires your Krexion desktop app online on this account.
-            Profiles queue here; Chromium opens on your PC — not in the browser tab.
+            Profiles queue here; Krexion Browser opens on your PC — not in the browser tab.
           </div>
         )}
 
@@ -3002,7 +3003,7 @@ export default function BrowserProfilesPage() {
                         </div>
                       )}
                       <p className="text-[11px] text-amber-200/90" data-testid="bp-ios-honesty">
-                        iOS uses Playwright WebKit + Krexion phone shell on your PC —{" "}
+                        iOS uses Krexion Safari + Krexion phone shell on your PC —{" "}
                         <span className="font-semibold">not a real iPhone</span>.
                         Android/Desktop use Chromium. Good for UX / manual checks; advanced trackers can still see it is a desktop browser.
                       </p>
@@ -3256,8 +3257,24 @@ export default function BrowserProfilesPage() {
                                 <option value="patchright">Krexion Browser Hardened</option>
                                 <option value="playwright">Krexion Browser Standard</option>
                                 <option value="firefox">Krexion Firefox</option>
-                                <option value="chrome">System Chrome (not recommended)</option>
+                                <option value="chrome">System browser (not recommended)</option>
                               </select>
+                            <Label className="text-zinc-400 text-[10px] mt-2">Taskbar icon</Label>
+                            <select
+                              data-testid="bp-taskbar-icon-mode"
+                              className="w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-100"
+                              value={form.anti_detect?.taskbar_icon_mode || "profile_no"}
+                              onChange={(e) => setForm({
+                                ...form,
+                                anti_detect: { ...form.anti_detect, taskbar_icon_mode: e.target.value },
+                              })}
+                            >
+                              <option value="profile_no">Profile No.</option>
+                              <option value="name">Profile name</option>
+                              <option value="notes">Notes</option>
+                              <option value="custom_no">Custom No. (last 4)</option>
+                              <option value="default">Krexion Browser only</option>
+                            </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
                                 Auto selects the strongest Krexion stealth kernel available on this PC
                               </p>
@@ -3316,7 +3333,7 @@ export default function BrowserProfilesPage() {
                               </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
                                 Keep <span className="text-zinc-300">proxy</span> when a proxy is on.
-                                &quot;proxy&quot; = Chromium UDP block (not exit-IP ICE rewrite).
+                                &quot;proxy&quot; = UDP block (not exit-IP ICE rewrite).
                                 &quot;real&quot; can leak your real IP — launcher auto-forces proxy if needed.
                               </p>
                             </div>
@@ -3373,7 +3390,7 @@ export default function BrowserProfilesPage() {
                               Strict mobile shell (abort if phone chrome fails)
                               <span className="block text-[9px] text-zinc-500">
                                 Windows phone frame must embed the browser — otherwise launch aborts
-                                (no plain Chromium/WebKit fake). Default ON for mobile profiles.
+                                (no plain unframed browser). Default ON for mobile profiles.
                               </span>
                             </span>
                           </label>
@@ -3405,7 +3422,7 @@ export default function BrowserProfilesPage() {
                               onChange={(e) => setForm({ ...form, anti_detect: { ...form.anti_detect, stealth_profile: e.target.value } })}
                               data-testid="bp-stealth-profile"
                             >
-                              <option value="full">Full (Chromium stack)</option>
+                              <option value="full">Full (Krexion Browser stack)</option>
                               <option value="minimal">Minimal (fewer JS patches)</option>
                               <option value="safari">Safari-shaped (WebKit / no chrome.*)</option>
                             </select>
@@ -4278,8 +4295,8 @@ export default function BrowserProfilesPage() {
                       {launchChecklist.data.mobile_shell_embedded
                         ? "Last session: Krexion phone chrome framed the browser (desktop frame — not a real phone)"
                         : launchChecklist.data.strict_mobile_shell !== false
-                          ? "Mobile + Strict shell ON — launch aborts if Krexion phone chrome cannot frame the browser (no plain Chromium/WebKit)."
-                          : "Mobile profile: without Strict shell, plain Chromium/WebKit may show if phone chrome fails. Shell is Windows-only."}
+                          ? "Mobile + Strict shell ON — launch aborts if Krexion phone chrome cannot frame the browser (no plain Chromium/WebKit unframed window)."
+                          : "Mobile profile: without Strict shell, a plain browser window may show if phone chrome fails. Shell is Windows-only."}
                     </span>
                   </li>
                 )}

@@ -812,6 +812,86 @@ def resolve_playwright_driver_pid(browser: Any = None, context: Any = None) -> O
     return None
 
 
+
+def keep_krexion_window_title(
+    hwnds: list,
+    title: str,
+    *,
+    poll_seconds: float = 120.0,
+    poll_interval: float = 2.0,
+    session_key: str = "",
+    pids: Optional[list] = None,
+) -> Optional[threading.Thread]:
+    """AdsPower-style: re-assert branded window title after navigations overwrite it."""
+    if not _IS_WINDOWS or not title:
+        return None
+    stop_event = threading.Event()
+    key = str(session_key or f"title:{id(hwnds) if hwnds else id(title)}").strip()
+    pid_set = {int(p) for p in (pids or []) if p}
+
+    def _discover_hwnds() -> list:
+        found = [int(h) for h in (hwnds or []) if h]
+        if found and not pid_set:
+            return found
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            out: list = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            def _cb(hwnd, _lp):
+                try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid_set and int(pid.value) not in pid_set:
+                        return True
+                    if not pid_set:
+                        # Fallback: only windows already titled Krexion*
+                        buf = ctypes.create_unicode_buffer(512)
+                        user32.GetWindowTextW(hwnd, buf, 512)
+                        if "krexion" not in (buf.value or "").lower():
+                            return True
+                    out.append(int(hwnd))
+                except Exception:
+                    pass
+                return True
+
+            user32.EnumWindows(_cb, 0)
+            return out or found
+        except Exception:
+            return found
+
+    def _loop() -> None:
+        import time
+        import ctypes
+
+        deadline = time.time() + max(5.0, float(poll_seconds or 120.0))
+        user32 = ctypes.windll.user32
+        while time.time() < deadline and not stop_event.is_set():
+            for hwnd in _discover_hwnds():
+                try:
+                    if hwnd and user32.IsWindow(int(hwnd)):
+                        user32.SetWindowTextW(int(hwnd), str(title)[:240])
+                except Exception:
+                    pass
+            stop_event.wait(max(0.5, float(poll_interval or 2.0)))
+        with _LOCK:
+            _SESSION_ICON_STOP.pop(key, None)
+
+    with _LOCK:
+        old = _SESSION_ICON_STOP.pop(key, None)
+        if old is not None:
+            old.set()
+        _SESSION_ICON_STOP[key] = stop_event
+    th = threading.Thread(target=_loop, name=f"krexion-title-{key[:40]}", daemon=True)
+    th.start()
+    return th
+
+
 def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
     """Locate Playwright WebKit MiniBrowser PIDs (Windows headed iOS profiles).
 
@@ -825,6 +905,9 @@ def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
         "webkitwebprocess.exe",
         "webkitnetworkprocess.exe",
         "webkit.exe",
+        # v2.7.129 — white-label AdsPower FlowerBrowser-class binary
+        "krexion-safari.exe",
+        "krexion-safari",
     }
     try:
         import psutil as _psu
@@ -1163,6 +1246,7 @@ def _is_profile_engine_hwnd(hwnd: int, *, webkit: bool) -> bool:
                 or "safari" in title.lower()
                 or "webkit" in cname
                 or "minibrowser" in cname
+                or "krexion-safari" in cname
             )
         return (
             "chrome" in cname
