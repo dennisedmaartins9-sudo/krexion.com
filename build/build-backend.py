@@ -716,6 +716,21 @@ def write_build_manifest() -> None:
     log("Wrote build/krexion-manifest.json")
 
 
+def _full_rebuild(req: Path) -> None:
+    """Cold embed build — downloads Python, pip-installs, copies sources."""
+    ensure_clean_dist()
+    extract_embed_python()
+    enable_site_packages()
+    install_pip()
+    pip_install_requirements(req)
+    copy_backend_source()
+    compile_strip_backend_source()
+    copy_desktop_package()
+    rebrand_python_exe()
+    write_build_manifest()
+    write_deps_fingerprint(req)
+
+
 def main() -> int:
     log(f"Krexion native backend build starting (host: {platform.system()})")
     log(f"  REPO_ROOT = {REPO_ROOT}")
@@ -727,20 +742,27 @@ def main() -> int:
 
     try:
         req = filtered_requirements()
+        used_fast = False
         if deps_cache_valid(req):
-            fast_rebuild_from_cached_deps(req)
+            try:
+                fast_rebuild_from_cached_deps(req)
+                used_fast = True
+            except Exception as fast_err:  # noqa: BLE001
+                # v2.7.134 — disk-full can leave a fingerprint-matched but
+                # corrupt site-packages (e.g. missing stripe._version). Fall
+                # back to a cold rebuild instead of failing the release.
+                log(
+                    f"FAST BUILD failed ({type(fast_err).__name__}: {fast_err}) "
+                    "— wiping cache and doing full rebuild",
+                    prefix="!!!",
+                )
+                if FINGERPRINT_FILE.exists():
+                    FINGERPRINT_FILE.unlink(missing_ok=True)
+                _full_rebuild(req)
         else:
-            ensure_clean_dist()
-            extract_embed_python()
-            enable_site_packages()
-            install_pip()
-            pip_install_requirements(req)
-            copy_backend_source()
-            compile_strip_backend_source()
-            copy_desktop_package()
-            rebrand_python_exe()
-            write_build_manifest()
-            write_deps_fingerprint(req)
+            _full_rebuild(req)
+        if used_fast:
+            log("Completed via FAST BUILD (cached site-packages)")
     except subprocess.CalledProcessError as e:
         log(f"ERROR: subprocess failed: {e}", prefix="!!!")
         return 2

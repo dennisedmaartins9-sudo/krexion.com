@@ -1,4 +1,4 @@
-"""v2.7.132 — Native Windows disk self-heal before embed build."""
+"""v2.7.132+ — Native Windows disk self-heal (superseded by v2.7.133 nuclear)."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +16,10 @@ def test_windows_release_has_disk_selfheal():
     wf = (REPO / ".github/workflows/build-windows-release.yml").read_text(
         encoding="utf-8"
     )
-    assert "Windows disk self-heal (before embed build)" in wf
-    assert "krexion-ci-cache\\runs" in wf or "krexion-ci-cache/runs" in wf or "krexion-ci-cache" in wf
+    # v2.7.133 renamed/moved step ahead of checkout (nuclear wipe)
+    assert "Windows disk self-heal (before checkout)" in wf or (
+        "Windows disk self-heal (before embed build)" in wf
+    )
+    assert "krexion-ci-cache" in wf
     assert "_diag" in wf
-    assert "2 GB" in wf or "2.0" in wf
+    assert "5 GB" in wf or "5.0" in wf or "2 GB" in wf or "2.0" in wf

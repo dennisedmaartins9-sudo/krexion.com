@@ -288,7 +288,7 @@ jobs:
             $ms.Write($bytes, 0, $bytes.Length)
           }
           $hash = ([BitConverter]::ToString($sha.ComputeHash($ms.ToArray()))).Replace('-','').ToLower().Substring(0,16)
-          $cache = "C:\krexion-ci-cache\deps-v1-$hash"
+          $cache = "C:\krexion-ci-cache\deps-v2-$hash"
           Add-Content -Path $env:GITHUB_ENV -Value ('KREXION_DEPS_CACHE=' + $cache)
           $core = Join-Path $cache 'krexion-backend.dist\krexion-core.exe'
           if (Test-Path $core) {

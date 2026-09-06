@@ -1,3 +1,9 @@
+# v2.7.134 — 2026-09 — Native FAST BUILD corrupt-cache fallback (perfect green)
+# - After nuclear disk clean, fingerprint-matched site-packages can still be
+#   corrupt (missing stripe._version) → embed build exit 3.
+# - FAST BUILD now falls back to a full cold rebuild on verify failure.
+# - Keeps v2.7.133 nuclear self-heal before checkout + emergency clean.
+#
 # v2.7.133 — 2026-09 — Native Windows nuclear disk self-heal (perfect green)
 # - Root: v2.7.132 self-heal never ran — disk full killed the job before steps
 #   (IOException writing C:\krexion-runner\_diag\pages\*.log).
