@@ -1,3 +1,10 @@
+# v2.7.132 — 2026-09 — Native Windows disk self-heal (perfect green)
+# - Root cause: self-hosted Windows runner C: full → embed build crashed
+#   ("There is not enough space on the disk" writing runner Worker_*.log).
+# - Pre-build disk self-heal: prune _diag logs, old ci-cache runs, pip/temp;
+#   fail early if still <2 GB free.
+# - Keeps v2.7.131 checkout retries + 130 AdsPower list + 128/129 branding.
+#
 # v2.7.131 — 2026-09 — Native Windows checkout harden (perfect green ship)
 # - Self-hosted Windows Native build: git checkout retries (5x) + lock cleanup
 #   + workspace re-init — fixes recurring Checkout code via git flakes.

@@ -113,6 +113,73 @@ jobs:
           echo "Checked out $SHA"
           test "$(git rev-parse HEAD)" = "$SHA"
 
+
+      - name: Windows disk self-heal (before embed build)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Show-Free([string]$label) {
+            $d = Get-PSDrive -Name C -ErrorAction SilentlyContinue
+            if ($d) {
+              $gb = [math]::Round(($d.Free / 1GB), 2)
+              Write-Host ("{0}: C: free {1} GB" -f $label, $gb)
+              return $gb
+            }
+            return 0
+          }
+          $before = Show-Free 'BEFORE'
+          # Runner diag logs (this run died writing Worker_*.log — disk full)
+          @(
+            'C:\krexion-runner\_diag',
+            'C:\actions-runner\_diag',
+            "$env:USERPROFILE\actions-runner\_diag",
+            'C:\Windows\Temp',
+            "$env:TEMP"
+          ) | ForEach-Object {
+            if (Test-Path $_) {
+              Get-ChildItem $_ -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) -or $_.Extension -in '.log','.tmp' } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+              Write-Host "Cleaned $_"
+            }
+          }
+          # Old Native handoff caches (keep last 2 runs only)
+          $runs = 'C:\krexion-ci-cache\runs'
+          if (Test-Path $runs) {
+            Get-ChildItem $runs -Directory -ErrorAction SilentlyContinue |
+              Sort-Object CreationTime -Descending |
+              Select-Object -Skip 2 |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Pruned old $runs (kept newest 2)"
+          }
+          # Stale deps caches older than 14 days
+          $depsRoot = 'C:\krexion-ci-cache'
+          if (Test-Path $depsRoot) {
+            Get-ChildItem $depsRoot -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'deps-v1-*' -and $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          # Pip / Playwright / npm residue
+          @(
+            "$env:LOCALAPPDATA\pip\Cache",
+            "$env:LOCALAPPDATA\Temp",
+            "$env:USERPROFILE\.cache\pip"
+          ) | ForEach-Object {
+            if (Test-Path $_) {
+              try { Remove-Item "$_\*" -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+              Write-Host "Cleared $_"
+            }
+          }
+          # Empty recycle bin best-effort
+          try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue } catch {}
+          $after = Show-Free 'AFTER'
+          if ($after -lt 2.0) {
+            Write-Host "::error::C: free space still under 2 GB after self-heal ($after GB). Free disk on the Windows runner, then re-run."
+            exit 1
+          }
+          Write-Host "Disk self-heal OK ($after GB free)"
+
+
       - name: Compute version
         id: version
         shell: bash
