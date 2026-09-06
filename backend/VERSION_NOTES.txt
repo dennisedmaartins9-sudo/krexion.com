@@ -1,3 +1,11 @@
+# v2.7.133 — 2026-09 — Native Windows nuclear disk self-heal (perfect green)
+# - Root: v2.7.132 self-heal never ran — disk full killed the job before steps
+#   (IOException writing C:\krexion-runner\_diag\pages\*.log).
+# - Self-heal moved BEFORE checkout; nuclear wipe of _diag, prior _work,
+#   full krexion-ci-cache, pip/temp; require >=5 GB free.
+# - New workflow: Windows Disk Emergency Clean (dispatch, no checkout).
+# - Keeps v2.7.131 checkout retries + 130 list UX + 128/129 branding.
+#
 # v2.7.132 — 2026-09 — Native Windows disk self-heal (perfect green)
 # - Root cause: self-hosted Windows runner C: full → embed build crashed
 #   ("There is not enough space on the disk" writing runner Worker_*.log).

@@ -69,6 +69,75 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
     steps:
+      # v2.7.133 — MUST run before checkout. v2.7.132 self-heal never ran
+      # because disk-full killed the job during setup/logging before any step.
+      - name: Windows disk self-heal (before checkout)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Show-Free([string]$label) {
+            $d = Get-PSDrive -Name C -ErrorAction SilentlyContinue
+            if ($d) {
+              $gb = [math]::Round(($d.Free / 1GB), 2)
+              Write-Host ("{0}: C free {1} GB" -f $label, $gb)
+              return $gb
+            }
+            return 0
+          }
+          Show-Free 'BEFORE' | Out-Null
+          # Nuclear wipe of runner diag (pages/*.log filled the disk)
+          @(
+            'C:\krexion-runner\_diag',
+            'C:\actions-runner\_diag',
+            "$env:USERPROFILE\actions-runner\_diag"
+          ) | ForEach-Object {
+            if (Test-Path $_) {
+              Remove-Item "$_\*" -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Wiped $_"
+            }
+          }
+          # Prior workspaces (keep tools/actions + this job tree)
+          $wsRoot = $null
+          if ($env:GITHUB_WORKSPACE) { $wsRoot = Split-Path -Parent $env:GITHUB_WORKSPACE }
+          foreach ($work in @('C:\krexion-runner\_work', 'C:\actions-runner\_work')) {
+            if (-not (Test-Path $work)) { continue }
+            Get-ChildItem $work -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              if ($_.Name -in @('_tool', '_update', '_actions', '_temp')) { return }
+              if ($wsRoot -and ($_.FullName -eq $wsRoot)) { return }
+              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path "$work\_temp") {
+              Remove-Item "$work\_temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "Pruned $work"
+          }
+          # Wipe CI cache entirely — cheaper than disk-full abort
+          if (Test-Path 'C:\krexion-ci-cache') {
+            Remove-Item 'C:\krexion-ci-cache\*' -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host 'Wiped C:\krexion-ci-cache'
+          }
+          @(
+            'C:\Windows\Temp',
+            "$env:TEMP",
+            "$env:LOCALAPPDATA\Temp",
+            "$env:LOCALAPPDATA\pip\Cache",
+            "$env:USERPROFILE\.cache\pip",
+            "$env:LOCALAPPDATA\npm-cache",
+            "$env:LOCALAPPDATA\Yarn\Cache"
+          ) | ForEach-Object {
+            if (Test-Path $_) {
+              try { Remove-Item "$_\*" -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+              Write-Host "Cleared $_"
+            }
+          }
+          try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue } catch {}
+          $after = Show-Free 'AFTER'
+          if ($after -lt 5.0) {
+            Write-Host "::error::C free space still under 5 GB after self-heal ($after GB). Run Windows Disk Emergency Clean, or free disk on the runner PC."
+            exit 1
+          }
+          Write-Host "Disk self-heal OK ($after GB free)"
+
       - name: Checkout code via git
         shell: bash
         env:
@@ -112,72 +181,6 @@ jobs:
           fi
           echo "Checked out $SHA"
           test "$(git rev-parse HEAD)" = "$SHA"
-
-
-      - name: Windows disk self-heal (before embed build)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Continue'
-          function Show-Free([string]$label) {
-            $d = Get-PSDrive -Name C -ErrorAction SilentlyContinue
-            if ($d) {
-              $gb = [math]::Round(($d.Free / 1GB), 2)
-              Write-Host ("{0}: C: free {1} GB" -f $label, $gb)
-              return $gb
-            }
-            return 0
-          }
-          $before = Show-Free 'BEFORE'
-          # Runner diag logs (this run died writing Worker_*.log — disk full)
-          @(
-            'C:\krexion-runner\_diag',
-            'C:\actions-runner\_diag',
-            "$env:USERPROFILE\actions-runner\_diag",
-            'C:\Windows\Temp',
-            "$env:TEMP"
-          ) | ForEach-Object {
-            if (Test-Path $_) {
-              Get-ChildItem $_ -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) -or $_.Extension -in '.log','.tmp' } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-              Write-Host "Cleaned $_"
-            }
-          }
-          # Old Native handoff caches (keep last 2 runs only)
-          $runs = 'C:\krexion-ci-cache\runs'
-          if (Test-Path $runs) {
-            Get-ChildItem $runs -Directory -ErrorAction SilentlyContinue |
-              Sort-Object CreationTime -Descending |
-              Select-Object -Skip 2 |
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "Pruned old $runs (kept newest 2)"
-          }
-          # Stale deps caches older than 14 days
-          $depsRoot = 'C:\krexion-ci-cache'
-          if (Test-Path $depsRoot) {
-            Get-ChildItem $depsRoot -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -like 'deps-v1-*' -and $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          # Pip / Playwright / npm residue
-          @(
-            "$env:LOCALAPPDATA\pip\Cache",
-            "$env:LOCALAPPDATA\Temp",
-            "$env:USERPROFILE\.cache\pip"
-          ) | ForEach-Object {
-            if (Test-Path $_) {
-              try { Remove-Item "$_\*" -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-              Write-Host "Cleared $_"
-            }
-          }
-          # Empty recycle bin best-effort
-          try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue } catch {}
-          $after = Show-Free 'AFTER'
-          if ($after -lt 2.0) {
-            Write-Host "::error::C: free space still under 2 GB after self-heal ($after GB). Free disk on the Windows runner, then re-run."
-            exit 1
-          }
-          Write-Host "Disk self-heal OK ($after GB free)"
 
 
       - name: Compute version
