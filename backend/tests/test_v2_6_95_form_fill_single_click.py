@@ -147,5 +147,6 @@ def test_automation_continue_js_has_href_filter():
 
 
 def test_version_is_current():
+    from releases_module import _parse
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert int(version.replace(".", "")) >= 2695
+    assert _parse(version) >= _parse("2.6.95")

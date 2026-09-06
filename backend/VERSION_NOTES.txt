@@ -1,3 +1,14 @@
+# v2.8.0 — 2026-09 — ONE lasting AdsPower-class Profile Engine lock
+# User ask: "aik he bar behtar update" — stop 2.7.13x patch churn for Open Profile.
+# This release LOCKS the durable profile runtime (not another soft hotfix):
+#   1) Cloak C++ / krexion-browser.exe preferred kernel (branded; never chrome.exe UI)
+#   2) Persistent user-data-dir ALWAYS ON for Chromium profiles (AdsPower disk save)
+#   3) Keeps v2.7.137 proxy auth relay (no Chromium Sign-in popup)
+#   4) Keeps v2.7.138 truthful phone-chrome embed (no fake SetParent success)
+# Honest ceiling: full from-source SunBrowser Chromium fork is a separate mega
+# project (months). 2.8.0 is the maximum AdsPower-class profile runtime we can
+# ship as ONE installer so customers are not forced through repeated micro-patches.
+#
 # v2.7.138 — 2026-09 — Phone chrome embed TRUTH (no more fake framed)
 # - Root cause of recurring brand/phone failures: SetParent returned
 #   `bool(prev) or True` (always True) and overlay position alone marked

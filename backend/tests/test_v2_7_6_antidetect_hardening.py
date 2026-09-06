@@ -28,9 +28,10 @@ def _read(name: str) -> str:
 
 
 def test_version_is_2_7_6_or_newer():
-    # Superseded by v2.7.7; keep hardening assertions, allow VERSION bump.
+    # Superseded by later 2.7.x / 2.8.x; keep hardening assertions, allow VERSION bump.
+    from releases_module import _parse
     ver = _read("VERSION").strip()
-    assert ver in ("2.7.6", "2.7.7") or ver.startswith("2.7.")
+    assert _parse(ver) >= _parse("2.7.6")
 
 
 def test_identity_store_has_pin_ua():

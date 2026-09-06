@@ -1,5 +1,5 @@
 """
-Krexion Browser Kernel Resolver (v2.7.16)
+Krexion Browser Kernel Resolver (v2.8.0 — AdsPower-class profile lock)
 =========================================
 Closes the Octo/AdsPower "custom Chromium kernel" gap by optionally
 launching profiles on CloakBrowser (source-level C++ stealth Chromium)
@@ -24,6 +24,8 @@ logger = logging.getLogger("krexion.browser_kernel")
 
 
 def resolve_kernel_preference(anti: Optional[Dict[str, Any]] = None) -> str:
+    # v2.8.0 — Profile default is AdsPower-class stealth kernel (Cloak C++),
+    # not stock Playwright. Operators may still force playwright via env/anti.
     env = (os.environ.get("KREXION_BROWSER_KERNEL") or "").strip().lower()
     if env in ("auto", "cloak", "patchright", "playwright", "firefox", "chrome"):
         return env
@@ -138,7 +140,13 @@ def resolve_launch_plan(anti: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         plan["kernel_label"] = "patchright-cdp"
         return _apply_krexion_brand_binary(plan)
 
+    # Last resort stock Chromium — still white-label as krexion-browser.exe
+    # so users never see chrome.exe / Playwright branding on headed profiles.
     plan["kernel_label"] = "playwright-chromium"
+    logger.warning(
+        "[kernel] CloakBrowser C++ kernel unavailable — using branded Chromium fallback. "
+        "Install CloakBrowser for AdsPower-class source-level stealth."
+    )
     return _apply_krexion_brand_binary(plan)
 
 

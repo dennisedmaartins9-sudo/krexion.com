@@ -80,5 +80,6 @@ def test_dataimpulse_uses_slug_format():
 
 
 def test_version_is_2_6_96():
+    from releases_module import _parse
     version = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
-    assert int(version.replace(".", "")) >= 2696
+    assert _parse(version) >= _parse("2.6.96")

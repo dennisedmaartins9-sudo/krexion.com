@@ -1897,7 +1897,16 @@ async def _launch_profile_session_inner(
         proxy_check_block_on_fail = False
     strict_mobile_shell = bool(anti.get("strict_mobile_shell"))
     # Default ON — matches AntiDetectConfig; old code used False and broke persistence
-    use_persistent_context = bool(anti.get("use_persistent_context", True))
+    # v2.8.0 — AdsPower-class profiles ALWAYS persist to disk (cookies/localStorage/
+    # cache survive Close→Open). Escape hatch only for tests/CI:
+    # KREXION_ALLOW_EPHEMERAL_PROFILES=1
+    _ephemeral_ok = (os.environ.get("KREXION_ALLOW_EPHEMERAL_PROFILES") or "").strip() in (
+        "1", "true", "yes",
+    )
+    if _ephemeral_ok:
+        use_persistent_context = bool(anti.get("use_persistent_context", True))
+    else:
+        use_persistent_context = True
     local_api_cdp = bool(
         anti.get("local_api_cdp")
         or profile_config.get("local_api_cdp")
@@ -2633,11 +2642,14 @@ async def _launch_profile_session_inner(
             # v2.7.15 / v2.7.105e — Persistent context works WITH Cloak executable_path
             # (previously Cloak blocked user-data-dir — AdsPower-class save never ran).
             _krx_mode = (os.environ.get("KREXION_MODE") or "").lower()
+            # v2.8.0 — Persist on any headed Windows/Linux profile host.
+            # Pre-2.8 required KREXION_MODE in (native|local|desktop) which
+            # silently skipped AdsPower-class disk save on some Electron builds.
             _want_persist = (
                 use_persistent_context
                 and _profile_engine not in ("webkit", "firefox")
                 and (sys.platform.startswith("win") or sys.platform.startswith("linux"))
-                and _krx_mode in ("native", "local", "desktop")
+                and _krx_mode not in ("cloud", "headless", "server")
             )
             _persistent_mode = False
             browser = None  # type: ignore
