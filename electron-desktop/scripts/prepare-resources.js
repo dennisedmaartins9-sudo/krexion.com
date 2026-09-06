@@ -443,15 +443,29 @@ function prepareFrontend() {
 // runtime picks one based on the job kind. Yes this adds ~300 MB to the
 // installer, but the alternative is a feature that silently does nothing.
 function prepareChromium() {
+  // v2.9.6 — Also install Playwright WebKit so Krexion Safari / iOS profiles
+  // can Open honestly on Electron (no silent Cloak Chromium swap).
   const dest = path.join(RES, 'chromium');
-  if (fs.existsSync(dest)) {
-    const existing = fs.readdirSync(dest).filter((n) => n.startsWith('chromium'));
-    if (existing.length > 0) {
-      log(`chromium: cached (${existing.length} build(s) under ${dest}) — skipping`);
-      return;
-    }
-  }
   fs.mkdirSync(dest, { recursive: true });
+  const existingChromium = fs
+    .readdirSync(dest)
+    .filter((n) => n.startsWith('chromium'));
+  const existingWebkit = fs
+    .readdirSync(dest)
+    .filter((n) => n.startsWith('webkit'));
+  const need = [];
+  if (existingChromium.length === 0) {
+    need.push('chromium', 'chromium-headless-shell');
+  }
+  if (existingWebkit.length === 0) {
+    need.push('webkit');
+  }
+  if (need.length === 0) {
+    log(
+      `browsers: cached (${existingChromium.length} chromium, ${existingWebkit.length} webkit under ${dest}) — skipping`
+    );
+    return;
+  }
 
   const pythonExe = path.join(RES, 'python', 'python.exe');
   if (!fs.existsSync(pythonExe)) {
@@ -465,24 +479,36 @@ function prepareChromium() {
     PYTHONIOENCODING: 'utf-8',
     PYTHONUTF8: '1',
   };
-  log('chromium: downloading via playwright install (this can take 5-10 min)');
+  log(`browsers: downloading via playwright install [${need.join(', ')}] (can take 5-10 min)`);
   // Don't throw on non-zero — Playwright sometimes reports rc=1 even when
   // browsers are fully extracted. We verify by checking the dest folder.
   const r = spawnSync(
     pythonExe,
-    ['-m', 'playwright', 'install', 'chromium', 'chromium-headless-shell'],
+    ['-m', 'playwright', 'install', ...need],
     { stdio: 'inherit', shell: false, env }
   );
   if (r.status !== 0) {
-    log(`chromium: playwright install exited rc=${r.status} — verifying folder before failing`);
+    log(`browsers: playwright install exited rc=${r.status} — verifying folder before failing`);
   }
-  const installed = fs.existsSync(dest)
+  const installedChromium = fs.existsSync(dest)
     ? fs.readdirSync(dest).filter((n) => n.startsWith('chromium'))
     : [];
-  if (installed.length === 0) {
+  if (installedChromium.length === 0) {
     throw new Error('chromium: playwright install produced no browser folder under ' + dest);
   }
-  log(`chromium: ready (${installed.join(', ')}) under ${dest}`);
+  const installedWebkit = fs
+    .readdirSync(dest)
+    .filter((n) => n.startsWith('webkit'));
+  if (installedWebkit.length === 0) {
+    throw new Error(
+      'webkit: playwright install produced no webkit folder under ' +
+        dest +
+        ' (required for Krexion Safari / iOS profiles — AdsPower honesty)'
+    );
+  }
+  log(
+    `browsers: ready (chromium=${installedChromium.join(',')}; webkit=${installedWebkit.join(',')}) under ${dest}`
+  );
 }
 
 // ── 5. Icon ──────────────────────────────────────────────────────────────────

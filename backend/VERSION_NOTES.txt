@@ -1,3 +1,13 @@
+# v2.9.6 — 2026-09 — Safari/iOS Open honesty + Electron WebKit + Sync engine infer
+# Residual after v2.9.5 deep audit:
+#   1) Open no longer silently rewrites iOS/Safari → Android Cloak Chromium when
+#      WebKit is missing — aborts before launch (AdsPower honesty)
+#   2) Create persists browser_engine (+ anti_detect.browser_engine); requested
+#      os=ios stays ios (no coerce-to-android)
+#   3) Sync engine gate also infers WebKit from os / UA when field missing
+#   4) Electron prepare-resources installs Playwright WebKit alongside Chromium
+# Bundles v2.9.3–2.9.5 shell/proxy/UI/tray/CDP honesty locks.
+#
 # v2.9.5 — 2026-09 — AdsPower Open parity residuals (tray parallel + honesty)
 # Follow-up to v2.9.4 after deep residual audit:
 #   1) Tray drain claims up to KREXION_TRAY_MAX_PARALLEL (default 5) so bulk

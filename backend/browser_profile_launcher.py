@@ -1971,17 +1971,64 @@ async def _launch_profile_session_inner(
     anti["local_api_cdp"] = local_api_cdp
     anti["stealth_profile"] = stealth_profile
 
+    # v2.9.6 — Safari/iOS intent must NEVER be silently rewritten to Android
+    # Cloak Chromium before the WebKit launch abort can fire (AdsPower honesty).
+    # Pre-2.9.6: `_normalize_mobile_ua_for_visit` swapped iOS→Android when WebKit
+    # was missing, so Open "succeeded" on Chromium and the v2.9.5 abort never ran.
+    _safari_intent = bool(_webkit_profile)
     try:
-        from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
-        ua, _ua_meta = _norm_ua(ua)
+        from real_user_traffic import _ua_prefers_webkit as _ua_wk
+
+        if _ua_wk(ua):
+            _safari_intent = True
     except Exception:
-        _ua_meta = {}
+        pass
+    if str(profile_config.get("os") or "").lower() in ("ios", "iphone", "ipad"):
+        _safari_intent = True
+
+    _ua_meta: Dict[str, Any] = {}
+    if _safari_intent:
         try:
-            from real_user_traffic import _coerce_ua_off_webkit_on_chromium as _coerce_ios
-            ua = _coerce_ios(ua)
+            from real_user_traffic import _webkit_runtime_available as _wk_ok
+
+            _wk_ready = bool(_wk_ok())
         except Exception:
-            pass
-    _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
+            _wk_ready = False
+        if not _wk_ready:
+            raise RuntimeError(
+                "Krexion Safari (WebKit) is required for this iOS/Safari profile "
+                "but is not installed. Install/repair Krexion Safari engine, then "
+                "Open again. Open will NOT silently switch to Cloak Chromium."
+            )
+        # Keep original UA; force WebKit (do not Android-swap).
+        _ua_meta = {
+            "swapped_ios": False,
+            "os": "ios",
+            "is_mobile": True,
+            "engine": "webkit",
+            "note": (
+                "iOS/Safari profile — WebKit required "
+                "(no Chromium fallback / no Chromium lie)"
+            ),
+        }
+        _profile_engine = "webkit"
+    else:
+        try:
+            from real_user_traffic import _normalize_mobile_ua_for_visit as _norm_ua
+
+            ua, _ua_meta = _norm_ua(ua)
+        except Exception:
+            _ua_meta = {}
+            try:
+                from real_user_traffic import (
+                    _coerce_ua_off_webkit_on_chromium as _coerce_ios,
+                )
+
+                ua = _coerce_ios(ua)
+            except Exception:
+                pass
+        _profile_engine = str((_ua_meta or {}).get("engine") or "chromium").lower()
+
     _launch_warnings: List[str] = []
     def _brand_warn(msg: str) -> None:
         try:

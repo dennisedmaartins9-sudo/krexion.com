@@ -1782,8 +1782,8 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     is_mobile = bool(body.is_mobile or body.device_type == "mobile")
     has_touch = bool(body.has_touch or is_mobile)
     ua = body.user_agent.strip() or _gen_random_ua(is_mobile)
-    # v2.7.9 — Dual-engine honesty: keep iOS UAs as requested (launch picks
-    # WebKit or Android fallback); Chromium path for non-iOS.
+    # v2.7.9 / v2.9.6 — Dual-engine honesty: keep iOS UAs as requested; Open
+    # requires WebKit and aborts if missing (no Android Chromium lie).
     ua, _meta = _normalize_profile_ua_honesty(ua)
     requested_os = (body.os or "").strip().lower()
     os_val = _infer_os_from_ua(
@@ -1793,13 +1793,31 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     )
     if _meta.get("os") in ("android", "ios"):
         os_val = _meta["os"]
-    if os_val == "android" and requested_os == "ios":
-        os_val = "android"
+    if requested_os in ("ios", "iphone", "ipad"):
+        # v2.9.6 — Prefer iOS when UA agrees. Do NOT force ios over an explicit
+        # Android UA (v2.7.8 coherence: operator said ios but UA is Android).
+        _ua_l = (ua or "").lower()
+        _ua_is_ios = ("iphone" in _ua_l or "ipad" in _ua_l) and "like mac os x" in _ua_l
+        _ua_is_android = "android" in _ua_l
+        if _ua_is_ios or not _ua_is_android:
+            os_val = "ios"
+        else:
+            os_val = "android"
         is_mobile = True
         has_touch = True
     if os_val in ("android", "ios"):
         is_mobile = True
         has_touch = True
+    # Persist engine so Sync / Local API gates work without UA re-parse.
+    _browser_engine = str(
+        getattr(body, "browser_engine", None)
+        or (_meta.get("engine") if isinstance(_meta, dict) else None)
+        or ("webkit" if os_val == "ios" else "chromium")
+    ).strip().lower()
+    if _browser_engine in ("safari", "ios"):
+        _browser_engine = "webkit"
+    if os_val == "android" and _browser_engine == "webkit":
+        _browser_engine = "chromium"
     viewport = body.viewport if body.viewport.get("width") else _gen_random_viewport(is_mobile)
     pid = str(uuid.uuid4())
     # 2026-01 — auto-generate unique name if blank
@@ -1814,6 +1832,7 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "timezone": body.timezone,
         "device_type": body.device_type if not is_mobile else (body.device_type or "mobile"),
         "os": os_val,
+        "browser_engine": _browser_engine,
         "user_agent": ua,
         "viewport": viewport,
         "is_mobile": is_mobile,
@@ -1853,10 +1872,11 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
     }
     # Mobile: Strict phone chrome ON unless user explicitly turned it off
     _anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
+    _anti = dict(_anti)
+    _anti.setdefault("browser_engine", _browser_engine)
     if is_mobile and "strict_mobile_shell" not in _anti:
-        _anti = dict(_anti)
         _anti["strict_mobile_shell"] = True
-        doc["anti_detect"] = _anti
+    doc["anti_detect"] = _anti
     # v2.7.130 — serial_number may be 0 here; async create path backfills via
     # `_ensure_profile_serial(doc)` (Motor is async — cannot query here).
     return doc
@@ -4090,14 +4110,28 @@ async def sync_start(request: Request, body: SyncStartBody):
     from browser_profile_sync import resolve_cdp_for_profile, start_sync
 
     def _engine_of(doc: dict) -> str:
+        """Resolve engine for Sync gates (v2.9.6 — also infer from os/UA)."""
         anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
-        return str(
+        eng = str(
             doc.get("browser_engine")
             or doc.get("engine")
             or (anti or {}).get("browser_engine")
             or (anti or {}).get("browser_kernel")
+            or doc.get("engine_used")
             or ""
         ).strip().lower()
+        if eng in ("webkit", "safari", "ios", "firefox", "chromium", "cloak", "chrome"):
+            return eng
+        if str(doc.get("os") or "").lower() in ("ios", "iphone", "ipad"):
+            return "webkit"
+        try:
+            from real_user_traffic import _ua_prefers_webkit
+
+            if _ua_prefers_webkit(str(doc.get("user_agent") or "")):
+                return "webkit"
+        except Exception:
+            pass
+        return eng
 
     # v2.9.4 — WebKit / Krexion Safari has no CDP attach surface for Synchronizer
     if _engine_of(master) in ("webkit", "safari", "ios"):
