@@ -1,3 +1,14 @@
+# v2.7.138 — 2026-09 — Phone chrome embed TRUTH (no more fake framed)
+# - Root cause of recurring brand/phone failures: SetParent returned
+#   `bool(prev) or True` (always True) and overlay position alone marked
+#   embedded → Strict green while Playwright/Chromium stayed naked.
+# - SetParent now verifies GetParent(engine)==shell; mark_embedded only
+#   after verified parent; overlay is NOT embed success.
+# - Wait for shell content HWND before SetParent; Playwright title in all
+#   WebKit PID discoveries; early driver PID resolve; continuous hide until
+#   embed; proxy relay never forwards 407/Sign-in to Chromium; Strict proxy
+#   never falls back to Playwright user:pass auth.
+#
 # v2.7.137 — 2026-09 — Proxy Sign-in gone + WebKit Playwright brand fixed
 # - Chromium: local CONNECT auth relay injects Proxy-Authorization so DataImpulse
 #   / residential gateways never pop Chromium's native "Sign in" proxy dialog.

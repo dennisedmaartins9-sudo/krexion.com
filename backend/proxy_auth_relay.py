@@ -218,12 +218,25 @@ class ProxyAuthRelay:
             await up_writer.drain()
             # Read upstream response headers
             resp = await asyncio.wait_for(up_reader.readuntil(b"\r\n\r\n"), timeout=25.0)
-            client_writer.write(resp)
-            await client_writer.drain()
             # Tunnel bytes both ways after 200
             status_line = resp.split(b"\r\n", 1)[0]
             if b" 200 " not in status_line and not status_line.endswith(b" 200"):
-                # Auth failure / reject — close after forwarding status
+                # v2.7.138 — NEVER forward 407 + Proxy-Authenticate to Chromium.
+                # That is exactly what pops the native "Sign in" proxy dialog
+                # even when the browser talks only to 127.0.0.1.
+                deny = (
+                    b"HTTP/1.1 502 Bad Gateway\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 48\r\n"
+                    b"\r\n"
+                    b"Upstream proxy rejected CONNECT (auth or network)"
+                )
+                try:
+                    client_writer.write(deny)
+                    await client_writer.drain()
+                except Exception:
+                    pass
                 try:
                     up_writer.close()
                 except Exception:
@@ -233,6 +246,8 @@ class ProxyAuthRelay:
                 except Exception:
                     pass
                 return
+            client_writer.write(resp)
+            await client_writer.drain()
             await asyncio.gather(
                 _pipe(client_reader, up_writer),
                 _pipe(up_reader, client_writer),

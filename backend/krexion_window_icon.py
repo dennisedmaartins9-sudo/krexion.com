@@ -843,7 +843,11 @@ def keep_krexion_window_title(
             @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
             def _cb(hwnd, _lp):
                 try:
-                    if not user32.IsWindowVisible(hwnd):
+                    # v2.7.138 — Brand even while Strict hides the naked engine
+                    # (IsWindowVisible was skipping Playwright HWNDs → title stuck).
+                    if not user32.IsWindow(hwnd):
+                        return True
+                    if not pid_set and not user32.IsWindowVisible(hwnd):
                         return True
                     pid = wintypes.DWORD()
                     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -1265,7 +1269,11 @@ def _is_profile_engine_hwnd(hwnd: int, *, webkit: bool) -> bool:
 
 
 def profile_engine_window_exists(driver_pid: Optional[int], *, webkit: bool = False) -> bool:
-    """True while the headed profile engine window still exists (minimize OK)."""
+    """True while the headed profile engine window still exists (minimize OK).
+
+    Unknown/missing driver_pid returns True (ghost-detection safe). Callers
+    that WAIT for an HWND must check driver_pid is known first (v2.7.138).
+    """
     if not driver_pid:
         return True
     pid_set = collect_profile_process_tree(int(driver_pid))

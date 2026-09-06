@@ -292,7 +292,16 @@ def parent_engine_hwnd_into_shell(engine_hwnd: int, shell_hwnd: int) -> bool:
             0,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | 0x0001 | 0x0002,
         )
-        return bool(prev) or True
+        # v2.7.138 — NEVER lie. Pre-138 `bool(prev) or True` always returned True,
+        # so Strict thought the engine was framed while Playwright stayed naked.
+        parent_now = int(user32.GetParent(int(engine_hwnd)) or 0)
+        if parent_now != int(shell_hwnd):
+            logger.warning(
+                "[branded-browser] SetParent did not stick engine=%s shell=%s parent_now=%s prev=%s",
+                engine_hwnd, shell_hwnd, parent_now, int(prev or 0),
+            )
+            return False
+        return True
     except Exception as exc:
         logger.debug(f"[branded-browser] SetParent failed: {exc}")
         return False

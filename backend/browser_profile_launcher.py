@@ -2333,13 +2333,24 @@ async def _launch_profile_session_inner(
             )
         except Exception as _relay_err:
             logger.warning(
-                "[profile-launch] proxy auth relay failed (%s) — "
-                "falling back to Playwright proxy auth (Sign-in dialog may appear)",
+                "[profile-launch] proxy auth relay failed (%s)",
                 _relay_err,
             )
             _proxy_auth_relay = None
             proxy_diag["auth_relay"] = False
             proxy_diag["auth_relay_error"] = str(_relay_err)[:200]
+            # v2.7.138 — Strict proxy: never fall back to Playwright user:pass
+            # (that is what opens Chromium's native Sign-in dialog).
+            if proxy_check_block_on_fail:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Strict proxy: local auth relay failed to start "
+                        f"({str(_relay_err)[:160]}). Browser was NOT opened with "
+                        "Playwright proxy auth, so Chromium cannot show a "
+                        "proxy Sign-in popup. Fix proxy host/credentials and relaunch."
+                    ),
+                ) from _relay_err
 
     # v2.7.16 — Patchright driver when plan says so
     try:
@@ -3574,15 +3585,34 @@ async def _launch_profile_session_inner(
         # Final Strict gate remains AFTER navigation (require_embed=True).
         if is_mobile:
             try:
+                # v2.7.138 — Resolve driver PID BEFORE the HWND wait (pre-138
+                # waited with driver_pid=None → exists() always True → no wait).
+                try:
+                    from krexion_window_icon import resolve_playwright_driver_pid as _rpd_early
+                    _early_pid = _rpd_early(browser, context)
+                    if _early_pid:
+                        _launch_ui_meta["driver_pid"] = int(_early_pid)
+                except Exception:
+                    pass
                 # Give headed engine a moment to create its HWND
-                for _hwnd_wait in range(12):
+                for _hwnd_wait in range(20):
                     try:
                         from krexion_window_icon import profile_engine_window_exists
-                        if profile_engine_window_exists(
-                            int(_launch_ui_meta.get("driver_pid") or 0) or None,
+                        _wait_pid = int(_launch_ui_meta.get("driver_pid") or 0) or None
+                        # v2.7.138 — must have a real PID; exists(None) is True by design
+                        if _wait_pid and profile_engine_window_exists(
+                            _wait_pid,
                             webkit=_profile_engine == "webkit",
                         ):
                             break
+                    except Exception:
+                        pass
+                    # Re-resolve PID each tick — iOS engine process can spawn late
+                    try:
+                        from krexion_window_icon import resolve_playwright_driver_pid as _rpd_tick
+                        _tick_pid = _rpd_tick(browser, context)
+                        if _tick_pid:
+                            _launch_ui_meta["driver_pid"] = int(_tick_pid)
                     except Exception:
                         pass
                     await asyncio.sleep(0.25)
@@ -3612,14 +3642,27 @@ async def _launch_profile_session_inner(
                     except Exception:
                         pass
                 if strict_mobile_shell and not _launch_ui_meta.get("mobile_shell_embedded"):
-                    # Honesty: hide/minimize naked engine so user never sees
-                    # plain Chromium/WebKit as "Krexion" before post-nav frame.
+                    # Honesty: hide naked engine so user never sees plain
+                    # Chromium/WebKit as "Krexion" before post-nav frame.
+                    # v2.7.138 — keep hiding until embed OR ~8s (windows that
+                    # appear mid-nav were slipping past the one-shot hide).
                     try:
                         from krexion_window_icon import hide_profile_engine_windows
-                        hide_profile_engine_windows(
-                            int(_launch_ui_meta.get("driver_pid") or 0) or None,
-                            webkit=_profile_engine == "webkit",
-                        )
+
+                        async def _keep_hiding_naked_engine() -> None:
+                            for _ in range(16):
+                                if _launch_ui_meta.get("mobile_shell_embedded"):
+                                    return
+                                try:
+                                    hide_profile_engine_windows(
+                                        int(_launch_ui_meta.get("driver_pid") or 0) or None,
+                                        webkit=_profile_engine == "webkit",
+                                    )
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(0.5)
+
+                        asyncio.create_task(_keep_hiding_naked_engine())
                     except Exception:
                         pass
                     _launch_warnings.append(

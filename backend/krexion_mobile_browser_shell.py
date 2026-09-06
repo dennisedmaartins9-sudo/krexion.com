@@ -541,6 +541,29 @@ def mark_mobile_shell_embedded(session_key: str, *, hwnd: int = 0) -> None:
         rec["embedded_at"] = time.time()
 
 
+
+def wait_for_shell_content_hwnd(session_key: str, *, timeout_sec: float = 8.0) -> int:
+    """v2.7.138 — Block until pywebview writes handles.content (SetParent host).
+
+    Pre-138 SetParent ran while content=0, fell back to overlay, then falsely
+    marked embedded → Strict green with naked Playwright/Chromium.
+    """
+    import time as _t
+
+    deadline = _t.time() + max(0.5, float(timeout_sec or 8.0))
+    key = str(session_key or "")
+    while _t.time() < deadline:
+        try:
+            handles = _load_shell_handles(key)
+            content = int((handles or {}).get("content") or 0)
+            if content:
+                return content
+        except Exception:
+            pass
+        _t.sleep(0.15)
+    return 0
+
+
 def wait_for_mobile_shell(session_key: str, *, timeout_sec: float = 30.0) -> bool:
     """Wait until pywebview chrome subprocess is registered and alive."""
     deadline = time.time() + max(2.0, float(timeout_sec or 30.0))
@@ -707,7 +730,7 @@ def polish_webkit_phone_fallback(
         pid_set |= find_webkit_browser_pids(parent_pid)
         pid_set |= find_pids_by_window_title_substrings(
             "[WebKit]", "Safari", "Krexion Orbit", "Krexion"
-        )
+        , "Playwright")
         if not pid_set:
             return False
 
@@ -974,7 +997,7 @@ def _shell_apply_loop(
             pid_set |= find_webkit_browser_pids(parent_pid)
             pid_set |= find_pids_by_window_title_substrings(
                 "[WebKit]", "Safari", "Krexion Orbit"
-            )
+            , "Playwright")
         else:
             pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
 
@@ -995,7 +1018,7 @@ def _shell_apply_loop(
                 # Refresh every tick — MiniBrowser often appears after first paint
                 pid_set |= find_pids_by_window_title_substrings(
                     "[WebKit]", "Safari", "Krexion Orbit"
-                )
+                , "Playwright")
             else:
                 pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
 
@@ -1021,14 +1044,23 @@ def _shell_apply_loop(
                 if int(hwnd) not in _positioned:
                     # v2.7.128 — Prefer SetParent into Krexion content host HWND
                     # (AdsPower-style). Overlay positioning remains the fallback.
+                    # v2.7.138 — Only mark embedded after VERIFIED SetParent.
+                    # Pre-138 marked on overlay position alone → Strict green while
+                    # naked Playwright/Chromium still floated outside the phone.
+                    _parented = False
                     try:
                         handles = _load_shell_handles(session_key)
                         content_hwnd = int(handles.get("content") or 0)
+                        if not content_hwnd:
+                            content_hwnd = int(
+                                wait_for_shell_content_hwnd(session_key, timeout_sec=3.0)
+                                or 0
+                            )
                         if content_hwnd:
                             from krexion_branded_browser import parent_engine_hwnd_into_shell
 
                             if parent_engine_hwnd_into_shell(int(hwnd), content_hwnd):
-                                # Fill the content host client area
+                                _parented = True
                                 try:
                                     import ctypes
 
@@ -1053,10 +1085,11 @@ def _shell_apply_loop(
                     user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
                     user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
                     _positioned.add(int(hwnd))
-                    try:
-                        mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
-                    except Exception:
-                        pass
+                    if _parented:
+                        try:
+                            mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
+                        except Exception:
+                            pass
                     # Engine off taskbar — shell chrome owns the Krexion button
                     try:
                         hide_hwnd_from_taskbar(int(hwnd))
@@ -1301,6 +1334,10 @@ def force_discover_and_mark_embedded(
         return False
     if is_mobile_shell_embedded(key):
         return True
+    # v2.7.138 — content host must exist before SetParent can succeed
+    if not wait_for_shell_content_hwnd(key, timeout_sec=6.0):
+        logger.warning("[mobile-shell] content HWND not ready — cannot SetParent yet")
+        return False
     try:
         import ctypes
         from ctypes import wintypes
@@ -1332,13 +1369,13 @@ def force_discover_and_mark_embedded(
             pid_set |= find_webkit_browser_pids(parent_pid)
             pid_set |= find_pids_by_window_title_substrings(
                 "[WebKit]", "Safari", "Krexion Orbit"
-            )
+            , "Playwright")
         else:
             pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
             # Broader: branded titles after AdsPower-style white-label
             pid_set |= find_pids_by_window_title_substrings(
                 "Krexion Browser", "Krexion Orbit", "Krexion Phone", "Krexion"
-            )
+            , "Playwright")
         if not pid_set:
             return False
 
@@ -1397,7 +1434,18 @@ def force_discover_and_mark_embedded(
         except Exception:
             parented = False
         if not parented:
+            # Overlay-only is NOT embed success for Strict / AdsPower parity.
             _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+            user32.ShowWindow(int(hwnd), 8)
+            try:
+                user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
+            except Exception:
+                pass
+            try:
+                hide_hwnd_from_taskbar(int(hwnd))
+            except Exception:
+                pass
+            return False
         user32.ShowWindow(int(hwnd), 8)
         try:
             user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
