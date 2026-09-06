@@ -1,3 +1,12 @@
+# v2.9.1 — 2026-09 — Residual AdsPower-kernel UX lock
+# Deep audit after 2.9.0 found leftover soft paths in the product surface:
+#   1) FE still offered Playwright / Patchright / system Chrome kernel options
+#      (Open would hard-fail) — removed; only auto|cloak|firefox remain
+#   2) API AntiDetectConfig now rejects browser_kernel=playwright|patchright|chrome
+#      unless KREXION_ALLOW_STOCK_CHROMIUM=1
+#   3) Local API docs wording: prefers → REQUIRES Cloak C++
+# Kernel mandate / installer bundling from 2.9.0 unchanged.
+#
 # v2.9.0 — 2026-09 — AdsPower-class Cloak C++ KERNEL COMPLETE (mandatory)
 # User ask: "100% AdsPower kernel (from-source Chromium) chahiye" — complete it.
 # Honest scope: CloakBrowser IS source-level C++ patched Chromium (AdsPower

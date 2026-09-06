@@ -60,7 +60,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, validator, Field
 
 logger = logging.getLogger("browser_profile_module")
 
@@ -1250,6 +1250,25 @@ class ProxyConfig(BaseModel):
     smart_session: bool = False
 
 
+
+def _normalize_browser_kernel(value: str) -> str:
+    """v2.9.1 — headed Chromium kernels: only auto|cloak (and firefox). Stock banned."""
+    v = str(value or "auto").strip().lower()
+    if v not in ("auto", "cloak", "patchright", "playwright", "firefox", "chrome"):
+        return "auto"
+    if v in ("playwright", "patchright", "chrome"):
+        import os
+        allowed = (os.environ.get("KREXION_ALLOW_STOCK_CHROMIUM") or "").strip().lower() in (
+            "1", "true", "yes",
+        )
+        if not allowed:
+            raise ValueError(
+                f"browser_kernel={v} is blocked. Krexion 2.9+ requires Cloak C++ "
+                "(browser_kernel=auto|cloak). Set KREXION_ALLOW_STOCK_CHROMIUM=1 only for emergency."
+            )
+    return v
+
+
 class AntiDetectConfig(BaseModel):
     """Single master switch + same flags as RUT (auto-tuned)."""
     master: bool = True             # ⭐ master toggle (default ON for new profiles)
@@ -1283,8 +1302,13 @@ class AntiDetectConfig(BaseModel):
     disable_ipv6: bool = True
     # full | minimal | safari — safari auto for WebKit; minimal skips FP WIN layer
     stealth_profile: str = "full"
-    # v2.7.16 — Octo-class: auto prefers CloakBrowser C++ Chromium
-    browser_kernel: str = "auto"  # auto|cloak|patchright|playwright|firefox|chrome
+    # v2.9.0+ — AdsPower-class: auto|cloak require Cloak C++ (stock PW banned)
+    browser_kernel: str = "auto"  # auto|cloak|firefox  (playwright/patchright/chrome blocked unless escape)
+
+    @validator("browser_kernel", pre=True, always=True)
+    def _v_browser_kernel(cls, v):  # noqa: N805
+        return _normalize_browser_kernel(v)
+
     # v2.7.20 — CreepJS-class Fingerprint WIN pack (default ON)
     fingerprint_win: bool = True
     # When True + Stealth kernel: prefer real modes (less JS noise)
@@ -3953,8 +3977,8 @@ async def local_api_docs(request: Request, format: str = Query(default="json")):
             "Auth: JWT (Bearer) always. If `KREXION_LOCAL_API_KEY` is set, also send",
             "`X-Krexion-Local-Key` or `Authorization: Bearer <key>`.",
             "",
-            "Kernel: `anti_detect.browser_kernel=auto` prefers CloakBrowser C++ Chromium",
-            "(AdsPower-class C++). Stock Playwright banned unless KREXION_ALLOW_STOCK_CHROMIUM=1.",
+            "Kernel: `anti_detect.browser_kernel=auto|cloak` REQUIRES CloakBrowser C++ Chromium",
+            "(AdsPower-class). Stock Playwright banned unless KREXION_ALLOW_STOCK_CHROMIUM=1.",
             "",
         ])
         return {"ok": True, "format": "markdown", "markdown": "\n".join(lines), "map": mapping}

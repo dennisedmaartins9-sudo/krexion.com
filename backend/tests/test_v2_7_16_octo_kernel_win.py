@@ -40,10 +40,16 @@ def test_frontend_kernel_select():
     text = fe.read_text(encoding="utf-8")
     assert 'browser_kernel: "auto"' in text
     assert 'data-testid="bp-browser-kernel"' in text
-    # White-label: customer UI shows Krexion Browser Stealth (no Cloak vendor names)
+    # White-label: customer UI shows Krexion Browser Stealth (no CloakBrowser vendor string)
     assert "Krexion Browser Stealth" in text or "Krexion Stealth" in text
     assert "CloakBrowser" not in text
     assert 'value="cloak"' in text  # internal kernel value
+    # v2.9.1 — stock Playwright / Patchright / system Chrome removed from UI
+    assert 'value="playwright"' not in text
+    assert 'value="patchright"' not in text
+    assert 'value="chrome"' not in text
+    assert "bundled Krexion C++ stealth kernel" in text
+    assert "Stock Playwright Chromium is not used" in text
 
 
 def test_resolve_plan_smoke(monkeypatch):

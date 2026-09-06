@@ -3314,10 +3314,7 @@ export default function BrowserProfilesPage() {
                               >
                                 <option value="auto">Krexion Browser (auto)</option>
                                 <option value="cloak">Krexion Browser Stealth</option>
-                                <option value="patchright">Krexion Browser Hardened</option>
-                                <option value="playwright">Krexion Browser Standard</option>
                                 <option value="firefox">Krexion Firefox</option>
-                                <option value="chrome">System browser (not recommended)</option>
                               </select>
                             <Label className="text-zinc-400 text-[10px] mt-2">Taskbar icon</Label>
                             <select
@@ -3336,7 +3333,7 @@ export default function BrowserProfilesPage() {
                               <option value="default">Krexion Browser only</option>
                             </select>
                               <p className="text-[9px] text-zinc-500 mt-0.5">
-                                Auto selects the strongest Krexion stealth kernel available on this PC
+                                Headed Chromium profiles require the bundled Krexion C++ stealth kernel. Stock Playwright Chromium is not used.
                               </p>
                             </div>
                             <label className="col-span-2 flex items-start gap-2">
