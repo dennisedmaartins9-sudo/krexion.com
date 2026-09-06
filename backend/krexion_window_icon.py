@@ -1303,3 +1303,65 @@ def profile_engine_window_exists(driver_pid: Optional[int], *, webkit: bool = Fa
         return True
     return found
 
+
+def hide_profile_engine_windows(driver_pid: Optional[int], *, webkit: bool = False) -> int:
+    """Best-effort hide/minimize naked engine HWNDs until Krexion phone chrome frames them.
+
+    v2.7.135 — Used when Strict shell is ON but early embed has not completed yet,
+    so the operator never sees plain Chromium/WebKit as "Krexion".
+    """
+    if not driver_pid:
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return 0
+    try:
+        pids = collect_profile_process_tree(int(driver_pid))
+    except Exception:
+        pids = {int(driver_pid)}
+    if webkit:
+        try:
+            pids |= find_webkit_browser_pids(int(driver_pid))
+        except Exception:
+            pass
+    else:
+        try:
+            pids |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
+        except Exception:
+            pass
+    if not pids:
+        return 0
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+    hidden = 0
+
+    def _cb(hwnd, _lp):
+        nonlocal hidden
+        try:
+            pid = wintypes.DWORD(0)
+            GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value) not in pids:
+                return True
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            # SW_HIDE — shell apply loop will ShowWindow again after frame
+            user32.ShowWindow(hwnd, 0)
+            try:
+                hide_hwnd_from_taskbar(int(hwnd))
+            except Exception:
+                pass
+            hidden += 1
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    except Exception:
+        return hidden
+    return hidden
+
+

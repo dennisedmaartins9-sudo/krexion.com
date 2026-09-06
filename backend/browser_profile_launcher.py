@@ -2935,6 +2935,27 @@ async def _launch_profile_session_inner(
                             except Exception:
                                 _engine_up = bool(_driver_pid)
                             if strict_mobile_shell and require_embed:
+                                # v2.7.135 — Last-chance multi-pass discover before abort
+                                _final_ok = False
+                                for _fd_try in range(6):
+                                    try:
+                                        if force_discover_and_mark_embedded(
+                                            str(session_id),
+                                            parent_pid=int(_driver_pid) if _driver_pid else None,
+                                            seed_pids=_family_pids,
+                                            webkit=_profile_engine == "webkit",
+                                            profile_slot=int(_taskbar_slot),
+                                        ):
+                                            _final_ok = True
+                                            break
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.55)
+                                if _final_ok or is_mobile_shell_embedded(session_id):
+                                    _launch_ui_meta["mobile_shell"] = True
+                                    _launch_ui_meta["mobile_shell_embedded"] = True
+                                    stop_session_icon_keeper(str(session_id))
+                                    return
                                 try:
                                     from krexion_mobile_browser_shell import (
                                         stop_mobile_shell as _stop_ms2,
@@ -3466,22 +3487,64 @@ async def _launch_profile_session_inner(
             except Exception as _dpr_err:
                 logger.debug(f"[profile-launch] WebKit DPR spoof skipped: {_dpr_err}")
 
-        # v2.7.127 — Early Krexion phone chrome. Strict ON: require HWND embed
-        # before first navigation so plain Chromium/WebKit is never shown as
-        # "Krexion" (AdsPower-style). Soft Strict OFF: start shell, embed later.
+        # v2.7.135 — Early Krexion phone chrome: ALWAYS start shell without
+        # requiring HWND embed yet. Pre-135 Strict ON aborted here when the
+        # engine HWND was not ready ~0.45s after new_page (iOS WebKit + Android
+        # Chromium both failed open). Hide naked engine until post-nav embed.
+        # Final Strict gate remains AFTER navigation (require_embed=True).
         if is_mobile:
             try:
-                await asyncio.sleep(0.45)
+                # Give headed engine a moment to create its HWND
+                for _hwnd_wait in range(12):
+                    try:
+                        from krexion_window_icon import profile_engine_window_exists
+                        if profile_engine_window_exists(
+                            int(_launch_ui_meta.get("driver_pid") or 0) or None,
+                            webkit=_profile_engine == "webkit",
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.25)
+                else:
+                    await asyncio.sleep(0.35)
+                # Soft start — never abort on missing embed in early pass
                 _brand_krexion_taskbar(
                     mobile_shell=True,
-                    require_embed=bool(strict_mobile_shell),
+                    require_embed=False,
                     allow_restart=True,
                 )
+                # Soft force-discover (best effort); Strict still enforced post-nav
+                if not _launch_ui_meta.get("mobile_shell_embedded"):
+                    try:
+                        from krexion_mobile_browser_shell import (
+                            force_discover_and_mark_embedded as _fd_early,
+                        )
+                        if _fd_early(
+                            str(session_id),
+                            parent_pid=int(_launch_ui_meta.get("driver_pid") or 0) or None,
+                            seed_pids=None,
+                            webkit=_profile_engine == "webkit",
+                            profile_slot=int(_taskbar_slot),
+                        ):
+                            _launch_ui_meta["mobile_shell"] = True
+                            _launch_ui_meta["mobile_shell_embedded"] = True
+                    except Exception:
+                        pass
                 if strict_mobile_shell and not _launch_ui_meta.get("mobile_shell_embedded"):
-                    raise RuntimeError(
-                        "Strict mobile shell: Krexion phone chrome did not frame the "
-                        "browser before navigation. Launch aborted — plain Chromium/"
-                        "WebKit will not be shown as Krexion design."
+                    # Honesty: hide/minimize naked engine so user never sees
+                    # plain Chromium/WebKit as "Krexion" before post-nav frame.
+                    try:
+                        from krexion_window_icon import hide_profile_engine_windows
+                        hide_profile_engine_windows(
+                            int(_launch_ui_meta.get("driver_pid") or 0) or None,
+                            webkit=_profile_engine == "webkit",
+                        )
+                    except Exception:
+                        pass
+                    _launch_warnings.append(
+                        "Krexion phone chrome started — framing browser after navigation "
+                        "(Strict shell will abort only if final embed fails)."
                     )
             except RuntimeError as _early_shell_err:
                 # Strict abort — close browser before user mistakes it for Krexion design

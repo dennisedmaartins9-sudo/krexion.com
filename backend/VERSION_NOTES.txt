@@ -1,3 +1,13 @@
+# v2.7.135 — 2026-09 — Strict mobile shell permanent frame fix
+# - Root: Strict ON aborted Open when early pass required HWND embed ~0.45s
+#   after new_page — iPhone WebKit + Android Chromium both failed with
+#   "Krexion phone chrome did not frame the browser".
+# - Early pass: always start phone chrome with require_embed=False; hide naked
+#   engine until framed; Soft force-discover. Final Strict gate stays post-nav.
+# - _load_shell_handles now returns content HWND; force_discover SetParents
+#   into content host + broader title PID match; 6x last-chance discover.
+# - Keeps AdsPower list/branding + Native disk self-heal (v2.7.128–134).
+#
 # v2.7.134 — 2026-09 — Native FAST BUILD corrupt-cache fallback (perfect green)
 # - After nuclear disk clean, fingerprint-matched site-packages can still be
 #   corrupt (missing stripe._version) → embed build exit 3.

@@ -876,6 +876,12 @@ def _set_window_pos(hwnd: int, x: int, y: int, w: int, h: int) -> None:
 
 
 def _load_shell_handles(session_key: str) -> Dict[str, int]:
+    """Read shell HWND map written by krexion_mobile_shell_host.
+
+    v2.7.135 — Must include ``content`` (AdsPower-style SetParent host).
+    Pre-135 only returned top/bottom, so SetParent never ran and Strict
+    embed often failed even when the phone chrome was visible.
+    """
     with _LOCK:
         rec = _ACTIVE.get(str(session_key or ""))
     if not rec:
@@ -887,7 +893,11 @@ def _load_shell_handles(session_key: str) -> Dict[str, int]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         h = data.get("handles") or {}
-        return {"top": int(h.get("top") or 0), "bottom": int(h.get("bottom") or 0)}
+        return {
+            "top": int(h.get("top") or 0),
+            "bottom": int(h.get("bottom") or 0),
+            "content": int(h.get("content") or 0),
+        }
     except Exception:
         return {}
 
@@ -1318,6 +1328,10 @@ def force_discover_and_mark_embedded(
             )
         else:
             pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
+            # Broader: branded titles after AdsPower-style white-label
+            pid_set |= find_pids_by_window_title_substrings(
+                "Krexion Browser", "Krexion Orbit", "Krexion Phone", "Krexion"
+            )
         if not pid_set:
             return False
 
@@ -1351,7 +1365,32 @@ def force_discover_and_mark_embedded(
         hwnd = found[0]
         _remove_menu_bar(hwnd)
         _strip_native_caption(hwnd)
-        _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+        # v2.7.135 — Prefer SetParent into content host (same as apply loop).
+        # Overlay-only discovery left Strict launches flaky when chrome was up
+        # but engine HWND was never re-parented.
+        parented = False
+        try:
+            handles = _load_shell_handles(key)
+            content_hwnd = int(handles.get("content") or 0)
+            if content_hwnd:
+                from krexion_branded_browser import parent_engine_hwnd_into_shell
+
+                parented = bool(
+                    parent_engine_hwnd_into_shell(int(hwnd), content_hwnd)
+                )
+                if parented:
+                    try:
+                        rect = wintypes.RECT()
+                        user32.GetClientRect(content_hwnd, ctypes.byref(rect))
+                        cw = max(eng_w, int(rect.right - rect.left))
+                        ch = max(eng_h, int(rect.bottom - rect.top))
+                        _set_window_pos(hwnd, 0, 0, cw, ch)
+                    except Exception:
+                        _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
+        except Exception:
+            parented = False
+        if not parented:
+            _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
         user32.ShowWindow(int(hwnd), 8)
         try:
             user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
