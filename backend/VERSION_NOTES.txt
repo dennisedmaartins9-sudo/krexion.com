@@ -1,3 +1,9 @@
+# v2.9.9 — 2026-09 — Native WebKit hard-gate PowerShell ASCII fix
+# v2.9.8 threw on missing webkit but em-dash (—) in throw strings broke the
+# Windows PowerShell parser (Unexpected token). ASCII hyphens only in throw /
+# Write-Host strings so Native Build can compile.
+# Bundles v2.9.8 Native WebKit hard-gate + v2.9.3–2.9.7 honesty locks.
+#
 # v2.9.8 — 2026-09 — Native WebKit packaging hard-gate (AdsPower parity)
 # Residual after v2.9.7 CI-green audit:
 #   Native Build Windows Release still Write-Warning'd when webkit-* missing
