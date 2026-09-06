@@ -3536,7 +3536,7 @@ async def _launch_profile_session_inner(
                     "lat": geo["lat"],
                     "lon": geo["lon"],
                 }
-                await _rut_apply_context_stealth(
+                _stealth_ok = await _rut_apply_context_stealth(
                     context,
                     fp=_stealth_fp,
                     geo=geo_stealth,
@@ -3552,15 +3552,34 @@ async def _launch_profile_session_inner(
                     engine=str(_profile_engine or "chromium"),
                     stealth_profile=stealth_profile,
                 )
-                logger.info(
-                    f"[profile-launch] RUT-parity stealth ON — "
-                    f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
-                    f"engine={_profile_engine} stealth_profile={stealth_profile} "
-                    f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]} "
-                    f"canvas={canvas_mode} webrtc={webrtc_mode} "
-                    f"fp_win={bool(anti.get('fingerprint_win', True))} "
-                    f"cloak_quiet={_cloak_quiet}"
+                # v2.9.7 — Soft RUT degrade (return False / _krx_stealth_degraded)
+                # must surface like hard inject failure — AdsPower honesty.
+                _soft_degraded = (not _stealth_ok) or bool(
+                    getattr(context, "_krx_stealth_degraded", False)
                 )
+                if _soft_degraded:
+                    try:
+                        context._krx_stealth_degraded = True
+                    except Exception:
+                        pass
+                    _launch_warnings.append(
+                        "Stealth degraded — RUT anti-detect inject partially failed; "
+                        "fingerprint may be weaker than AdsPower-class baseline."
+                    )
+                    logger.warning(
+                        "[profile-launch] RUT stealth SOFT-DEGRADED — "
+                        f"ok={_stealth_ok} flag={getattr(context, '_krx_stealth_degraded', None)}"
+                    )
+                else:
+                    logger.info(
+                        f"[profile-launch] RUT-parity stealth ON — "
+                        f"os={_stealth_fp.get('os')} platform={_stealth_fp.get('platform')} "
+                        f"engine={_profile_engine} stealth_profile={stealth_profile} "
+                        f"webgl={str(_stealth_fp.get('webgl_renderer') or '')[:48]} "
+                        f"canvas={canvas_mode} webrtc={webrtc_mode} "
+                        f"fp_win={bool(anti.get('fingerprint_win', True))} "
+                        f"cloak_quiet={_cloak_quiet}"
+                    )
 
                 if paranoia_mode:
                     # Never invent window.chrome on WebKit/Safari path

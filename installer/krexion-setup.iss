@@ -101,7 +101,9 @@ Source: "..\build\mongo-portable\*"; DestDir: "{app}\database"; Flags: ignorever
 
 ; Browser engine (Playwright Chromium + WebKit → `browser-engine`)
 ; WebKit enables iOS Safari-honest dual-engine without manual `playwright install`.
-Source: "..\build\chromium-bundle\*"; DestDir: "{app}\browser-engine"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; v2.9.7 — MANDATORY (no skipifsourcedoesntexist). Build pipeline must stage
+; build\chromium-bundle (incl. webkit-*) before compiling the installer.
+Source: "..\build\chromium-bundle\*"; DestDir: "{app}\browser-engine"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; v2.9.0 — AdsPower-class Cloak C++ Krexion Kernel (mandatory headed Chromium)
 ; v2.9.5 — Cloak C++ kernel is MANDATORY (no skipifsourcedoesntexist).

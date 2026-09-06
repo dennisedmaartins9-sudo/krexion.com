@@ -1,3 +1,11 @@
+# v2.9.7 — 2026-09 — Fingerprint soft-degrade honesty + Inno WebKit gate
+# Residual after v2.9.6 AdsPower audit:
+#   1) Soft RUT stealth degrade (return False / _krx_stealth_degraded) now
+#      appends launch_warnings like hard inject failure — health scores it
+#   2) Inno browser-engine (Chromium+WebKit) no longer skipifsourcedoesntexist
+#      — Safari packaging parity with Electron / Cloak kernel gate
+# Bundles v2.9.3–2.9.6 shell/proxy/UI/tray/CDP/Safari honesty locks.
+#
 # v2.9.6 — 2026-09 — Safari/iOS Open honesty + Electron WebKit + Sync engine infer
 # Residual after v2.9.5 deep audit:
 #   1) Open no longer silently rewrites iOS/Safari → Android Cloak Chromium when
