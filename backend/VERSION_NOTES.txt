@@ -1,3 +1,14 @@
+# v2.9.2 — 2026-09 — Legacy kernel-pref coerce (residual lock)
+# Deep post-ship audit found one real residual:
+#   Old profiles saved with browser_kernel=playwright|patchright|chrome
+#   hard-failed on Open after the 2.9 mandate.
+# Fix:
+#   1) launcher coerces those legacy prefs → auto (Cloak C++) before resolve
+#   2) persists anti_detect_patch browser_kernel=auto on Open (one-shot migrate)
+#   3) _public_view surfaces auto so Edit/list never shows banned stock kernels
+# Existing customer profiles Open solid on AdsPower-class kernel without
+# manual Edit/Save. Kernel mandate / bundling unchanged.
+#
 # v2.9.1 — 2026-09 — Residual AdsPower-kernel UX lock
 # Deep audit after 2.9.0 found leftover soft paths in the product surface:
 #   1) FE still offered Playwright / Patchright / system Chrome kernel options

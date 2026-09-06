@@ -1922,6 +1922,18 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     # Hint: strict when proxy enabled (default ON for unset / old profiles)
     d["strict_proxy"] = _strict_proxy_mode(doc if isinstance(doc, dict) else d)
     _anti = d.get("anti_detect") if isinstance(d.get("anti_detect"), dict) else {}
+    # v2.9.2 — never surface banned stock kernels to Edit/list UI (coerce → auto)
+    try:
+        _bk_pub = str((_anti or {}).get("browser_kernel") or "auto").strip().lower()
+        _stock_escape = (os.environ.get("KREXION_ALLOW_STOCK_CHROMIUM") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if not _stock_escape and _bk_pub in ("playwright", "patchright", "chrome"):
+            _anti = dict(_anti or {})
+            _anti["browser_kernel"] = "auto"
+            d["anti_detect"] = _anti
+    except Exception:
+        pass
     d["strict_mobile_shell"] = bool((_anti or {}).get("strict_mobile_shell", True)) if bool(d.get("is_mobile")) else bool((_anti or {}).get("strict_mobile_shell"))
     # Effective: mobile + unset → strict ON
     if bool(d.get("is_mobile")) and "strict_mobile_shell" not in (_anti or {}):

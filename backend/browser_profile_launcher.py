@@ -1840,7 +1840,7 @@ async def _launch_profile_session_inner(
     )
     has_touch = bool(profile_config.get("has_touch") or is_mobile)
     dsf = float(profile_config.get("device_scale_factor") or (3.0 if is_mobile else 1.0))
-    anti = profile_config.get("anti_detect") or {}
+    anti = dict(profile_config.get("anti_detect") or {})
     master = bool(anti.get("master", True))
     identity_persist = bool(anti.get("identity_persist", True))
     tls_prewarm = bool(anti.get("tls_prewarm", True)) and master
@@ -1861,6 +1861,23 @@ async def _launch_profile_session_inner(
         or ""
     ).lower()
     _webkit_profile = _profile_engine_hint in ("webkit", "safari", "ios")
+    # v2.9.2 — coerce legacy stock-kernel prefs so old profiles still Open
+    # on Cloak C++ after the 2.9 mandate (without a manual Edit/Save).
+    _coerced_legacy_kernel = False
+    _legacy_kernel = str(anti.get("browser_kernel") or "auto").strip().lower()
+    if (
+        not _webkit_profile
+        and not _stock_chromium_ok()
+        and _legacy_kernel in ("playwright", "patchright", "chrome")
+    ):
+        logger.info(
+            "[profile-launch] coercing legacy browser_kernel=%s → auto "
+            "(AdsPower-class Cloak C++)",
+            _legacy_kernel,
+        )
+        anti["browser_kernel"] = "auto"
+        profile_config["anti_detect"] = anti
+        _coerced_legacy_kernel = True
     try:
         _kernel_plan = _resolve_kernel_plan(
             anti,
@@ -2273,19 +2290,23 @@ async def _launch_profile_session_inner(
             "Still desktop Krexion Safari — not a physical iPhone."
         )
 
-    # Persist Strict proxy flag for old profiles that never saved it (one-shot migrate)
+    # Persist one-shot anti_detect migrations for old profiles
+    _ad_patch: Dict[str, Any] = {}
     if (
         _proxy_on
         and proxy_check_block_on_fail
         and "proxy_check_block_on_fail" not in (profile_config.get("anti_detect") or {})
-        and on_session_update
     ):
+        _ad_patch["proxy_check_block_on_fail"] = True
+    if _coerced_legacy_kernel:
+        _ad_patch["browser_kernel"] = "auto"
+    if _ad_patch and on_session_update:
         try:
             await on_session_update({
                 "profile_id": profile_id,
                 "session_id": session_id,
                 "status": "launching",
-                "anti_detect_patch": {"proxy_check_block_on_fail": True},
+                "anti_detect_patch": _ad_patch,
             })
         except Exception:
             pass
