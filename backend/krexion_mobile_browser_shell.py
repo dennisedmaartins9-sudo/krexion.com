@@ -832,8 +832,9 @@ def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
         user32.GetClassNameW(hwnd, cls, 256)
         cname = (cls.value or "").lower()
         tlow = title.strip().lower()
+        # v2.7.137 — Windows WebKit main HWND title is often exactly "Playwright".
         if tlow == "playwright":
-            return False
+            return bool(webkit)
         if webkit:
             # v2.7.126 — Match MiniBrowser even with empty/about:blank titles
             # (common before first paint) so shell can frame before navigation.
@@ -841,11 +842,13 @@ def _is_engine_content_hwnd(hwnd: int, *, webkit: bool) -> bool:
                 "webkit" in cname
                 or "minibrowser" in cname
                 or "wkwebview" in cname
+                or "playwright" in cname
             ):
                 return True
             return (
                 "[webkit]" in tlow
                 or "safari" in tlow
+                or "playwright" in tlow
                 or "krexion orbit" in tlow
                 or "krexion" in tlow
                 or "about:blank" in tlow
@@ -1094,10 +1097,14 @@ def _shell_apply_loop(
                     title_buf = ctypes.create_unicode_buffer(512)
                     user32.GetWindowTextW(hwnd, title_buf, 512)
                     title = (title_buf.value or "").strip()
-                    if title.lower() == "playwright":
+                    # v2.7.137 — Do not hide the WebKit engine titled "Playwright"
+                    # before/while it is the content HWND; only hide true strays.
+                    if title.lower() == "playwright" and not webkit:
                         user32.ShowWindow(int(hwnd), 0)
                         return True
                     if _is_engine_content_hwnd(int(hwnd), webkit=webkit):
+                        # Already embedded engines are skipped above; extra
+                        # matching HWNDs are duplicates — hide them.
                         user32.ShowWindow(int(hwnd), 0)
                 except Exception:
                     pass

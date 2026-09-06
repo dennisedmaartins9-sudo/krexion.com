@@ -1772,6 +1772,25 @@ async def _launch_session_inline(
         # ALWAYS reclaim the session slot so a hard-crashing launch
         # doesn't leak _RUNNING_SESSIONS entries forever (used by the
         # /stop endpoint to find the right session).
+        try:
+            _relay = (_RUNNING_SESSIONS.get(session_id) or {}).get("proxy_auth_relay")
+            if _relay is not None:
+                try:
+                    stop = getattr(_relay, "stop", None)
+                    if stop is not None:
+                        res = stop()
+                        if hasattr(res, "__await__"):
+                            # best-effort: schedule if loop running
+                            import asyncio as _aio
+                            try:
+                                loop = _aio.get_running_loop()
+                                loop.create_task(res)
+                            except RuntimeError:
+                                _aio.run(res)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         _RUNNING_SESSIONS.pop(session_id, None)
 
 
@@ -2281,6 +2300,47 @@ async def _launch_profile_session_inner(
     timezone_id = geo["timezone"]
     accept_lang = geo["accept_language"]
 
+    # v2.7.137 — Local auth relay so Chromium never shows proxy Sign-in dialog.
+    # Geo/probe above still used upstream user:pass; browser sees only 127.0.0.1.
+    _proxy_auth_relay = None
+    if (
+        proxy_arg
+        and str(proxy_arg.get("server") or "").strip()
+        and str(proxy_arg.get("username") or "").strip()
+        and str(proxy_arg.get("password") or "").strip()
+    ):
+        try:
+            from proxy_auth_relay import start_proxy_auth_relay as _spar
+
+            _proxy_auth_relay = await _spar(
+                server=str(proxy_arg.get("server") or ""),
+                username=str(proxy_arg.get("username") or ""),
+                password=str(proxy_arg.get("password") or ""),
+            )
+            proxy_arg = dict(_proxy_auth_relay.browser_proxy)
+            proxy_diag["auth_relay"] = True
+            proxy_diag["auth_relay_server"] = str(proxy_arg.get("server") or "")
+            try:
+                _sess = _RUNNING_SESSIONS.get(session_id)
+                if isinstance(_sess, dict):
+                    _sess["proxy_auth_relay"] = _proxy_auth_relay
+            except Exception:
+                pass
+            logger.info(
+                "[profile-launch] proxy auth relay ON %s session=%s",
+                proxy_arg.get("server"),
+                (session_id or "")[:8],
+            )
+        except Exception as _relay_err:
+            logger.warning(
+                "[profile-launch] proxy auth relay failed (%s) — "
+                "falling back to Playwright proxy auth (Sign-in dialog may appear)",
+                _relay_err,
+            )
+            _proxy_auth_relay = None
+            proxy_diag["auth_relay"] = False
+            proxy_diag["auth_relay_error"] = str(_relay_err)[:200]
+
     # v2.7.16 — Patchright driver when plan says so
     try:
         from krexion_browser_kernel import get_async_playwright_factory as _gaf
@@ -2678,7 +2738,7 @@ async def _launch_profile_session_inner(
                 _include_webkit = False
                 if _profile_engine == "webkit":
                     _include_webkit = True
-                    _title_markers = ["[WebKit]", "Safari", "Krexion"]
+                    _title_markers = ["[WebKit]", "Safari", "Krexion", "Playwright"]
                 else:
                     _cmd_markers = ["--window-name=Krexion", "--window-name=Krexion Browser", "--window-name=Krexion Safari", "--window-name=Krexion Phone"]
                 _family_pids = sorted(
@@ -3463,6 +3523,26 @@ async def _launch_profile_session_inner(
             logger.debug(f"[profile-launch] CDP UA all-pages skipped: {_cdp_ua_err}")
 
         page = await context.new_page()
+        # v2.7.137 — stamp WebKit "Playwright" window to Krexion title immediately
+        if _profile_engine == "webkit" and _window_title:
+            try:
+                from krexion_window_icon import (
+                    resolve_playwright_driver_pid as _rpd,
+                    keep_krexion_window_title as _kkt,
+                    collect_profile_process_tree as _cpt,
+                )
+                _stamp_pid = _rpd(browser, context)
+                _stamp_pids = sorted(_cpt(int(_stamp_pid) if _stamp_pid else None) or [])
+                if _stamp_pid and int(_stamp_pid) not in _stamp_pids:
+                    _stamp_pids.append(int(_stamp_pid))
+                _kkt(
+                    [],
+                    str(_window_title),
+                    session_key=f"title:{session_id}",
+                    pids=list(_stamp_pids or []),
+                )
+            except Exception as _stamp_err:
+                logger.debug(f"[profile-launch] early WebKit title stamp skipped: {_stamp_err}")
 
         # v2.7.110 — Re-assert CSS viewport (WebKit can ignore first paint size)
         # and spoof devicePixelRatio when context DSF was forced to 1.0.
@@ -4233,6 +4313,15 @@ async def _launch_profile_session_inner(
             stop_session_icon_keeper(session_id)
         except Exception:
             pass
+        # v2.7.137 — tear down local proxy auth relay
+        try:
+            _relay = (_RUNNING_SESSIONS.get(session_id) or {}).get("proxy_auth_relay")
+            if _relay is None:
+                _relay = locals().get("_proxy_auth_relay")
+            if _relay is not None:
+                await _relay.stop()
+        except Exception as _relay_stop_err:
+            logger.debug(f"[profile-launch] proxy auth relay stop skipped: {_relay_stop_err}")
         new_storage: Dict[str, Any] = {}
         try:
             _still = True

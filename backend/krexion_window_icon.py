@@ -905,6 +905,9 @@ def find_webkit_browser_pids(parent_pid: Optional[int] = None) -> Set[int]:
         "webkitwebprocess.exe",
         "webkitnetworkprocess.exe",
         "webkit.exe",
+        # v2.7.137 — stock Playwright WebKit binary title/process on Windows
+        "playwright.exe",
+        "playwright",
         # v2.7.129 — white-label AdsPower FlowerBrowser-class binary
         "krexion-safari.exe",
         "krexion-safari",
@@ -1137,14 +1140,13 @@ def _icon_apply_loop_multi(
                     )
                     if not pid_match and not title_match:
                         return True
-                    # Playwright / stock Chromium helpers — hide so only Krexion-
-                    # branded phone chrome / Orbit window stays on the taskbar
-                    # (AdsPower-style: user should not see Playwright icons).
+                    # AdsPower-style: hide stock Chromium helpers. For WebKit,
+                    # the main engine window is often titled "Playwright" —
+                    # brand it (do NOT hide) so phone chrome can frame it.
                     _tlow = title.strip().lower()
-                    if (
-                        _tlow == "playwright"
-                        or _tlow.startswith("playwright ")
-                        or _tlow == "chromium"
+                    if _tlow == "chromium" or (
+                        not include_webkit
+                        and (_tlow == "playwright" or _tlow.startswith("playwright "))
                     ):
                         user32.ShowWindow(hwnd, 0)  # SW_HIDE
                         return True
@@ -1238,15 +1240,19 @@ def _is_profile_engine_hwnd(hwnd: int, *, webkit: bool) -> bool:
         cls = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(hwnd, cls, 256)
         cname = (cls.value or "").lower()
+        # v2.7.137 — On Windows, stock WebKit's main window IS titled "Playwright".
+        # Treat it as the engine when webkit=True; still reject for Chromium profiles.
         if title.strip().lower() == "playwright":
-            return False
+            return bool(webkit)
         if webkit:
             return (
                 "[webkit]" in title.lower()
                 or "safari" in title.lower()
+                or "playwright" in title.lower()
                 or "webkit" in cname
                 or "minibrowser" in cname
                 or "krexion-safari" in cname
+                or "playwright" in cname
             )
         return (
             "chrome" in cname
