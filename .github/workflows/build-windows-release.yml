@@ -78,16 +78,40 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
           REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           SHA="${{ github.sha }}"
+          # v2.7.131 — retry checkout; self-hosted Windows flakes on index.lock / fetch races
+          rm -f .git/index.lock 2>/dev/null || true
           if [ ! -d .git ]; then
             git init
-            git remote add origin "$REPO"
+            git remote add origin "$REPO" || git remote set-url origin "$REPO"
           else
-            git remote set-url origin "$REPO"
+            git remote set-url origin "$REPO" || true
           fi
-          git fetch --force origin "$SHA"
-          git checkout --force --detach "$SHA"
-          git reset --hard "$SHA"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            echo "Checkout attempt $attempt for $SHA"
+            rm -f .git/index.lock 2>/dev/null || true
+            if git fetch --force --depth=1 origin "$SHA" \
+              && git checkout --force --detach "$SHA" \
+              && git reset --hard "$SHA"; then
+              ok=1
+              break
+            fi
+            echo "Checkout attempt $attempt failed — waiting $((attempt * 10))s"
+            sleep $((attempt * 10))
+            if [ "$attempt" -ge 3 ]; then
+              echo "Re-init workspace after repeated checkout failure"
+              find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} + 2>/dev/null || true
+              rm -rf .git
+              git init
+              git remote add origin "$REPO"
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            echo "FATAL: git checkout failed after retries"
+            exit 1
+          fi
           echo "Checked out $SHA"
+          test "$(git rev-parse HEAD)" = "$SHA"
 
       - name: Compute version
         id: version
@@ -336,16 +360,40 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
           REPO="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           SHA="${{ github.sha }}"
+          # v2.7.131 — retry checkout; self-hosted Windows flakes on index.lock / fetch races
+          rm -f .git/index.lock 2>/dev/null || true
           if [ ! -d .git ]; then
             git init
-            git remote add origin "$REPO"
+            git remote add origin "$REPO" || git remote set-url origin "$REPO"
           else
-            git remote set-url origin "$REPO"
+            git remote set-url origin "$REPO" || true
           fi
-          git fetch --force origin "$SHA"
-          git checkout --force --detach "$SHA"
-          git reset --hard "$SHA"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            echo "Checkout attempt $attempt for $SHA"
+            rm -f .git/index.lock 2>/dev/null || true
+            if git fetch --force --depth=1 origin "$SHA" \
+              && git checkout --force --detach "$SHA" \
+              && git reset --hard "$SHA"; then
+              ok=1
+              break
+            fi
+            echo "Checkout attempt $attempt failed — waiting $((attempt * 10))s"
+            sleep $((attempt * 10))
+            if [ "$attempt" -ge 3 ]; then
+              echo "Re-init workspace after repeated checkout failure"
+              find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} + 2>/dev/null || true
+              rm -rf .git
+              git init
+              git remote add origin "$REPO"
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            echo "FATAL: git checkout failed after retries"
+            exit 1
+          fi
           echo "Checked out $SHA"
+          test "$(git rev-parse HEAD)" = "$SHA"
 
       # Same 429 rule as build-backend: ZERO marketplace `uses:` on
       # this self-hosted Windows job. Backend handoff is a local copy

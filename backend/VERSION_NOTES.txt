@@ -1,3 +1,8 @@
+# v2.7.131 — 2026-09 — Native Windows checkout harden (perfect green ship)
+# - Self-hosted Windows Native build: git checkout retries (5x) + lock cleanup
+#   + workspace re-init — fixes recurring Checkout code via git flakes.
+# - Keeps v2.7.130 AdsPower-parity profile list + 128/129 branded browser.
+#
 # v2.7.130 — 2026-09 — AdsPower-parity profile LIST design (Krexion branded)
 # - Default view = dense table (No. | Name | Proxy | Group | Notes | Last open | Status | Open/Close)
 # - Admin chrome: New Profile / Quick Create toolbar; marketing hero removed
