@@ -1,3 +1,19 @@
+# v2.9.5 — 2026-09 — AdsPower Open parity residuals (tray parallel + honesty)
+# Follow-up to v2.9.4 after deep residual audit:
+#   1) Tray drain claims up to KREXION_TRAY_MAX_PARALLEL (default 5) so bulk
+#      Open starts together like AdsPower — no fake single-file wait
+#   2) Explicit Krexion Safari / WebKit Open ABORTS if WebKit missing
+#      (no silent Cloak Chromium "success" lie for iOS profiles)
+#   3) CDP: never invent http://debugger as websocket — Sync gets honest empty
+#   4) Tray Mongo mirrors cdp_ws/debugger_address/launch_warnings so NSSM
+#      Local API / Sync (separate process) can attach
+#   5) Firefox Open aborts on engine miss (same honesty as WebKit)
+#   6) resolve_cdp_for_profile probes /json/version before http:// fallback
+#   7) Local API docs: Start queues — poll status for cdp_ws
+#   8) Inno Setup requires krexion-kernel (no skipifsourcedoesntexist)
+#   9) FE polls Sync status for mid-session slave_errors
+# Bundles v2.9.3–2.9.4 shell/proxy/UI/sync honesty locks.
+#
 # v2.9.4 — 2026-09 — AdsPower-class Browser Profiles parity lock (complete Open UX)
 # Goal: Krexion profiles Open like AdsPower — no surprise real-IP, no silent
 # stealth fail, table retries, Sync honesty, Strict mobile shell frame retry.

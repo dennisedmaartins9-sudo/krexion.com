@@ -2636,39 +2636,18 @@ async def _launch_profile_session_inner(
             try:
                 browser = await p.webkit.launch(**wk_kwargs)
             except Exception as _wk_err:
-                logger.warning(
-                    "WebKit launch failed (%s) — falling back to Chromium",
+                # v2.9.5 — AdsPower honesty: never silently open Cloak Chromium
+                # for an explicit Krexion Safari / iOS profile (would look "running"
+                # while fingerprint/engine no longer match).
+                logger.error(
+                    "WebKit launch failed (%s) — aborting Safari/iOS Open (no Chromium lie)",
                     _wk_err,
                 )
-                _launch_warnings.append(
-                    "Krexion Safari unavailable — running Krexion Browser instead. "
-                    "This is NOT a real iPhone/iOS Safari. It is a desktop browser "
-                    "with a mobile shell (viewport + UA). Advanced trackers can still "
-                    "tell it is not a physical iPhone."
-                )
-                _profile_engine = "chromium"
-                try:
-                    from real_user_traffic import (
-                        _normalize_mobile_ua_for_chromium as _norm_chr,
-                    )
-                    ua, _fb_meta = _norm_chr(ua)
-                    if _fb_meta.get("os"):
-                        profile_os = str(_fb_meta["os"])
-                    if _fb_meta.get("is_mobile"):
-                        is_mobile = True
-                        has_touch = True
-                    try:
-                        from anti_detect_v230 import align_ua_to_chromium as _align_chrome
-                        _aligned = _align_chrome(ua)
-                        if _aligned:
-                            ua = _aligned
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                if proxy_arg:
-                    launch_kwargs["proxy"] = proxy_arg
-                browser = await _krx_launch_chromium()
+                raise RuntimeError(
+                    "Krexion Safari (WebKit) failed to start. "
+                    "Install/repair Krexion Safari engine, then Open again. "
+                    f"Detail: {type(_wk_err).__name__}: {str(_wk_err)[:160]}"
+                ) from _wk_err
         elif _profile_engine == "firefox":
             ff_kwargs: Dict[str, Any] = {"headless": False}
             if proxy_arg:
@@ -2677,14 +2656,17 @@ async def _launch_profile_session_inner(
                 browser = await p.firefox.launch(**ff_kwargs)
                 logger.info("[profile-launch] Firefox engine ON")
             except Exception as _ff_err:
-                logger.warning(f"Firefox launch failed ({_ff_err}) — Chromium fallback")
-                _launch_warnings.append(
-                    "Firefox engine unavailable — running Chromium instead."
+                # v2.9.5 — same honesty as WebKit: never silently swap to Cloak
+                # Chromium for an explicit Firefox profile.
+                logger.error(
+                    "Firefox launch failed (%s) — aborting (no Chromium lie)",
+                    _ff_err,
                 )
-                _profile_engine = "chromium"
-                if proxy_arg:
-                    launch_kwargs["proxy"] = proxy_arg
-                browser = await _krx_launch_chromium()
+                raise RuntimeError(
+                    "Krexion Firefox engine failed to start. "
+                    "Install/repair Firefox engine, then Open again. "
+                    f"Detail: {type(_ff_err).__name__}: {str(_ff_err)[:160]}"
+                ) from _ff_err
         else:
             # Prefer CloakBrowser C++ kernel (Octo-class) when available.
             channel: Optional[str] = None
@@ -3260,7 +3242,12 @@ async def _launch_profile_session_inner(
             except Exception as _cdp_err:
                 logger.debug(f"[profile-launch] CDP discover skipped: {_cdp_err}")
             if not _cdp_ws:
-                _cdp_ws = f"http://{_debugger_addr}"
+                # v2.9.5 — do NOT invent http:// as a websocket; Sync/Local API
+                # need a real webSocketDebuggerUrl or an honest empty value.
+                _launch_warnings.append(
+                    f"CDP websocket not ready at {_debugger_addr} — "
+                    "Synchronizer / Local API attach may fail until re-Open."
+                )
             if session_id in _RUNNING_SESSIONS:
                 _RUNNING_SESSIONS[session_id]["cdp_ws"] = _cdp_ws
                 _RUNNING_SESSIONS[session_id]["debugger_address"] = _debugger_addr
@@ -4742,10 +4729,13 @@ async def process_pending_user_session_launches(
     cloud_session_update_url: str = "",
     license_key: str = "",
 ) -> int:
-    """Pick up to ONE queued launch and run it inline. Returns the
-    number of launches started (0 or 1). The tray app calls this in a
-    loop with ~2s pause between calls — we deliberately process one
-    at a time so a single misconfigured profile can't block the queue.
+    """Claim up to N queued launches and start them as background tasks.
+
+    Returns the number of launches started (0..N). Default N=5
+    (KREXION_TRAY_MAX_PARALLEL), capped by free slots vs currently
+    running sessions — AdsPower-class multi-Open without fake waiting.
+    A single bad profile still cannot block the queue (each runs in
+    its own task).
 
     Also drains stop_requested flags on already-claimed entries so a
     customer's "Stop" click on the cloud / desktop UI propagates from
@@ -4819,142 +4809,187 @@ async def process_pending_user_session_launches(
     except Exception as _drain_err:  # noqa: BLE001
         logger.debug(f"[user-session] stop drain query failed: {_drain_err}")
 
-    # 3. Atomically claim one queued launch (skip stop-requested rows)
+    # 3. Claim up to N queued launches (skip stop-requested), start each
+    #    as a background task. Cap by free slots vs running sessions.
     try:
-        doc = await motor_db[_LAUNCH_QUEUE_COLLECTION].find_one_and_update(
-            {"status": "queued", "stop_requested": {"$ne": True}},
-            {"$set": {"status": "claimed", "claimed_at": _now_iso()}},
-            sort=[("queued_at", 1)],
+        _max_par = int(os.environ.get("KREXION_TRAY_MAX_PARALLEL", "5") or 5)
+    except Exception:
+        _max_par = 5
+    _max_par = max(1, min(_max_par, 20))
+    try:
+        # Any live session entry occupies a parallel slot (AdsPower-class cap).
+        _running_n = len(_RUNNING_SESSIONS)
+    except Exception:
+        _running_n = 0
+    _slots = max(0, _max_par - int(_running_n))
+    if _slots <= 0:
+        logger.debug(
+            f"[user-session] tray parallel full running={_running_n} max={_max_par}"
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[user-session] queue poll failed: {exc}")
-        return 0
-    if not doc:
         return 0
 
-    session_id = str(doc.get("id") or "")
-    profile_config = doc.get("profile_config") or {}
-    profile_id = str(profile_config.get("id") or doc.get("profile_id") or "")
-    start_url = str(doc.get("start_url") or "https://www.google.com/")
-    logger.info(
-        f"[user-session] claimed launch session_id={session_id[:8]} "
-        f"profile={profile_id[:8]}"
-    )
-
-    async def _on_update(body: Dict[str, Any]) -> None:
-        """Mirror status into the local Mongo collections that the
-        normal flow writes, AND optionally push to the cloud."""
+    started = 0
+    for _slot_i in range(_slots):
         try:
-            sid = str(body.get("session_id") or session_id)
-            status = str(body.get("status") or "")
-            now = _now_iso()
-            if status:
-                await motor_db.browser_profile_sessions.update_one(
-                    {"id": sid},
-                    {"$set": {
+            doc = await motor_db[_LAUNCH_QUEUE_COLLECTION].find_one_and_update(
+                {"status": "queued", "stop_requested": {"$ne": True}},
+                {"$set": {"status": "claimed", "claimed_at": _now_iso()}},
+                sort=[("queued_at", 1)],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[user-session] queue poll failed: {exc}")
+            break
+        if not doc:
+            break
+
+        session_id = str(doc.get("id") or "")
+        profile_config = doc.get("profile_config") or {}
+        profile_id = str(profile_config.get("id") or doc.get("profile_id") or "")
+        start_url = str(doc.get("start_url") or "https://www.google.com/")
+        logger.info(
+            f"[user-session] claimed launch session_id={session_id[:8]} "
+            f"profile={profile_id[:8]} parallel={started + 1}/{_slots}"
+        )
+
+        async def _on_update(body: Dict[str, Any], _sid=session_id, _pid=profile_id) -> None:
+            """Mirror status into local Mongo + optional cloud push.
+
+            v2.9.5 — Persist CDP + launch metadata so NSSM Local API / Sync
+            (different process from tray) can attach via Mongo — not only
+            tray in-memory _RUNNING_SESSIONS.
+            """
+            try:
+                sid = str(body.get("session_id") or _sid)
+                status = str(body.get("status") or "")
+                now = _now_iso()
+                if status:
+                    _sess_set: Dict[str, Any] = {
                         "status": status,
                         "fingerprint_hash": body.get("fingerprint_hash", ""),
                         "error_message": body.get("error_message", "")[:500],
                         "updated_at": now,
-                    }},
-                )
-                if status == "running":
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": {
+                    }
+                    if body.get("cdp_ws"):
+                        _sess_set["cdp_ws"] = str(body.get("cdp_ws"))[:512]
+                    if body.get("debugger_address"):
+                        _sess_set["debugger_address"] = str(
+                            body.get("debugger_address")
+                        )[:128]
+                    await motor_db.browser_profile_sessions.update_one(
+                        {"id": sid},
+                        {"$set": _sess_set},
+                    )
+                    _prof_set: Dict[str, Any] = {}
+                    if status == "running":
+                        _prof_set = {
                             "status": "running",
                             "session_id": sid,
                             "last_error": "",
-                        }},
-                    )
-                elif status == "queued":
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": {"status": "launching", "session_id": sid}},
-                    )
-                elif status == "stopping":
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": {"status": "stopping", "session_id": sid}},
-                    )
-                elif status in ("stopped", "closed", "error"):
-                    _prof_set: Dict[str, Any] = {
-                        "status": "idle" if status in ("stopped", "closed") else "error",
-                        "session_id": "",
-                    }
-                    if status == "error" and body.get("error_message"):
-                        _prof_set["last_error"] = str(body.get("error_message"))[:512]
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": _prof_set},
-                    )
-                if body.get("storage_state") and isinstance(body["storage_state"], dict):
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": {"storage_state": body["storage_state"]}},
-                    )
-                if body.get("fingerprint_hash"):
-                    await motor_db.browser_profiles.update_one(
-                        {"id": profile_id},
-                        {"$set": {"fingerprint_hash": str(body["fingerprint_hash"])[:128]}},
-                    )
-        except Exception as _local_err:  # noqa: BLE001
-            logger.debug(f"[user-session] local mirror failed: {_local_err}")
+                        }
+                    elif status == "queued":
+                        _prof_set = {"status": "launching", "session_id": sid}
+                    elif status == "stopping":
+                        _prof_set = {"status": "stopping", "session_id": sid}
+                    elif status in ("stopped", "closed", "error"):
+                        _prof_set = {
+                            "status": "idle" if status in ("stopped", "closed") else "error",
+                            "session_id": "",
+                            "cdp_ws": "",
+                            "debugger_address": "",
+                        }
+                        if status == "error" and body.get("error_message"):
+                            _prof_set["last_error"] = str(body.get("error_message"))[:512]
+                    # Always merge CDP / warnings when present (running + mid-launch)
+                    if body.get("cdp_ws"):
+                        _prof_set["cdp_ws"] = str(body.get("cdp_ws"))[:512]
+                    if body.get("debugger_address"):
+                        _prof_set["debugger_address"] = str(
+                            body.get("debugger_address")
+                        )[:128]
+                    if body.get("browser_kernel"):
+                        _prof_set["browser_kernel"] = str(body.get("browser_kernel"))[:64]
+                    for _ak in (
+                        "launch_warnings",
+                        "mobile_shell_active",
+                        "mobile_shell_embedded",
+                        "engine_used",
+                        "last_proxy_check",
+                        "exit_ip",
+                        "automation_status",
+                        "automation_step",
+                        "automation_total_steps",
+                        "automation_action",
+                        "automation_error",
+                    ):
+                        if _ak in body:
+                            _prof_set[_ak] = body[_ak]
+                    if body.get("fingerprint_hash"):
+                        _prof_set["fingerprint_hash"] = str(
+                            body.get("fingerprint_hash")
+                        )[:128]
+                    if body.get("storage_state") and isinstance(
+                        body["storage_state"], dict
+                    ):
+                        _prof_set["storage_state"] = body["storage_state"]
+                    if _prof_set:
+                        await motor_db.browser_profiles.update_one(
+                            {"id": _pid},
+                            {"$set": _prof_set},
+                        )
+            except Exception as _local_err:  # noqa: BLE001
+                logger.debug(f"[user-session] local mirror failed: {_local_err}")
 
-        # Optional: forward to cloud session-update endpoint
-        if cloud_session_update_url:
-            try:
-                import httpx as _httpx
-                async with _httpx.AsyncClient(timeout=15) as client:
-                    headers = {"Content-Type": "application/json"}
-                    if license_key:
-                        headers["X-Krexion-License"] = license_key
-                    await client.post(
-                        cloud_session_update_url, json=body, headers=headers,
-                    )
-            except Exception as _cloud_err:  # noqa: BLE001
-                logger.debug(f"[user-session] cloud push failed: {_cloud_err}")
+            if cloud_session_update_url:
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=15) as client:
+                        headers = {"Content-Type": "application/json"}
+                        if license_key:
+                            headers["X-Krexion-License"] = license_key
+                        await client.post(
+                            cloud_session_update_url, json=body, headers=headers,
+                        )
+                except Exception as _cloud_err:  # noqa: BLE001
+                    logger.debug(f"[user-session] cloud push failed: {_cloud_err}")
 
-    # Run the actual inline launch in THIS user-session process.
-    # The launch blocks until the customer closes the browser, so we
-    # fire it as a background task and return — the queue polling
-    # loop can then start the next claim immediately if needed.
-    async def _run_and_finalize() -> None:
-        try:
-            await _launch_session_inline(
-                profile_config,
-                session_id=session_id,
-                start_url=start_url,
-                on_session_update=_on_update,
-            )
-            await motor_db[_LAUNCH_QUEUE_COLLECTION].update_one(
-                {"id": session_id},
-                {"$set": {"status": "completed",
-                          "completed_at": _now_iso()}},
-            )
-        except Exception as exc:  # noqa: BLE001
-            err_msg = f"{type(exc).__name__}: {str(exc)[:240]}"
-            logger.warning(
-                f"[user-session] launch crashed session_id={session_id[:8]}: {err_msg}"
-            )
+        async def _run_and_finalize(_sid=session_id, _pc=profile_config, _url=start_url, _pid=profile_id, _upd=_on_update) -> None:
             try:
+                await _launch_session_inline(
+                    _pc,
+                    session_id=_sid,
+                    start_url=_url,
+                    on_session_update=_upd,
+                )
                 await motor_db[_LAUNCH_QUEUE_COLLECTION].update_one(
-                    {"id": session_id},
-                    {"$set": {"status": "error",
-                              "error_message": err_msg,
+                    {"id": _sid},
+                    {"$set": {"status": "completed",
                               "completed_at": _now_iso()}},
                 )
-            except Exception:  # noqa: BLE001
-                pass
-            await _on_update({
-                "session_id": session_id,
-                "profile_id": profile_id,
-                "status": "error",
-                "error_message": err_msg,
-            })
+            except Exception as exc:  # noqa: BLE001
+                err_msg = f"{type(exc).__name__}: {str(exc)[:240]}"
+                logger.warning(
+                    f"[user-session] launch crashed session_id={_sid[:8]}: {err_msg}"
+                )
+                try:
+                    await motor_db[_LAUNCH_QUEUE_COLLECTION].update_one(
+                        {"id": _sid},
+                        {"$set": {"status": "error",
+                                  "error_message": err_msg,
+                                  "completed_at": _now_iso()}},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                await _upd({
+                    "session_id": _sid,
+                    "profile_id": _pid,
+                    "status": "error",
+                    "error_message": err_msg,
+                })
 
-    asyncio.create_task(_run_and_finalize())
-    return 1
+        asyncio.create_task(_run_and_finalize())
+        started += 1
+
+    return started
 
 
 async def warm_profile_cookies(

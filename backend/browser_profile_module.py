@@ -412,11 +412,11 @@ def _allow_ios_safari_ua() -> bool:
 
 
 def _normalize_profile_ua_honesty(ua: str) -> Tuple[str, Dict[str, Any]]:
-    """Profile create/update UA honesty (v2.7.9 dual-engine).
+    """Profile create/update UA honesty (v2.7.9 dual-engine / v2.9.5 abort).
 
-    Prefer storing iOS UAs as the user requested — launch path picks
-    Playwright WebKit or Android Chrome fallback. Non-iOS UAs go through
-    ``_normalize_mobile_ua_for_visit`` (Chromium path).
+    Prefer storing iOS UAs as the user requested — Open uses Krexion Safari
+    (WebKit) and ABORTS if WebKit is missing (no silent Chromium lie).
+    Non-iOS UAs go through ``_normalize_mobile_ua_for_visit`` (Chromium path).
     """
     try:
         from real_user_traffic import (
@@ -426,13 +426,16 @@ def _normalize_profile_ua_honesty(ua: str) -> Tuple[str, Dict[str, Any]]:
         )
         raw = ua or ""
         if _ua_prefers_webkit(raw):
-            # Store as requested; launch decides WebKit vs Chromium fallback.
+            # Store as requested; Open requires WebKit (v2.9.5).
             return raw.strip(), {
                 "swapped_ios": False,
                 "os": _os_from_mobile_ua(raw) or "ios",
                 "is_mobile": True,
                 "engine": "webkit",
-                "note": "iOS UA stored as requested; launch picks WebKit or Chromium fallback",
+                "note": (
+                    "iOS UA stored as requested; Open requires Krexion Safari "
+                    "(WebKit) — aborts if Safari engine missing"
+                ),
             }
         return _normalize_mobile_ua_for_visit(raw)
     except Exception:
@@ -3894,8 +3897,10 @@ async def local_api_info(request: Request):
             "kernel": "GET /api/browser-profiles/local/kernel",
         },
         "notes": (
-            "Start returns cdp_ws when enable_cdp=true and Chromium launches on this machine. "
-            "Connect Playwright via chromium.connect_over_cdp(cdp_ws). "
+            "Start queues Open and returns session_id immediately — poll "
+            "GET /api/browser-profiles/local/status/{profile_id} until status=running "
+            "and cdp_ws is set (enable_cdp=true). Then connect Playwright via "
+            "chromium.connect_over_cdp(cdp_ws). "
             "Kernel auto = CloakBrowser C++ Chromium MANDATORY for headed profiles (AdsPower-class). Stock Playwright is banned unless KREXION_ALLOW_STOCK_CHROMIUM=1. "
             "When KREXION_LOCAL_API_KEY is set, also send X-Krexion-Local-Key or Authorization Bearer."
         ),

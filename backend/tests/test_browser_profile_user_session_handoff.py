@@ -173,8 +173,8 @@ def test_enqueue_inserts_record_and_notifies():
 # ── process_pending_user_session_launches() ─────────────────────────
 
 def test_process_pending_claims_queued_entry_and_runs_launch():
-    """Tray-app helper picks one queued entry, marks it claimed, spawns
-    a background task that runs the inline launch."""
+    """Tray-app helper claims queued entries (up to KREXION_TRAY_MAX_PARALLEL),
+    marks each claimed, and spawns background inline launches."""
     queued_record = {
         "id": "session-001",
         "profile_id": "profile-001",
@@ -184,7 +184,10 @@ def test_process_pending_claims_queued_entry_and_runs_launch():
     }
 
     queue_collection = AsyncMock()
-    queue_collection.find_one_and_update = AsyncMock(return_value=queued_record)
+    # First claim returns the doc; subsequent polls see empty queue.
+    queue_collection.find_one_and_update = AsyncMock(
+        side_effect=[queued_record, None]
+    )
     queue_collection.update_one = AsyncMock()
     queue_collection.find = MagicMock(return_value=_async_iter([]))
 

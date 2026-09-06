@@ -104,7 +104,9 @@ Source: "..\build\mongo-portable\*"; DestDir: "{app}\database"; Flags: ignorever
 Source: "..\build\chromium-bundle\*"; DestDir: "{app}\browser-engine"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; v2.9.0 — AdsPower-class Cloak C++ Krexion Kernel (mandatory headed Chromium)
-Source: "..\build\krexion-kernel\*"; DestDir: "{app}\krexion-kernel"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; v2.9.5 — Cloak C++ kernel is MANDATORY (no skipifsourcedoesntexist).
+; Build pipeline must stage build\krexion-kernel before compiling the installer.
+Source: "..\build\krexion-kernel\*"; DestDir: "{app}\krexion-kernel"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Frontend production build — required
 Source: "..\build\frontend-build\*"; DestDir: "{app}\frontend"; Flags: ignoreversion recursesubdirs createallsubdirs

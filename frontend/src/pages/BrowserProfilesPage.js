@@ -762,6 +762,40 @@ export default function BrowserProfilesPage() {
     fetchProfiles();
   }, [filterQ, filterTag, filterFolder, sortBy, showTrash]);
 
+  // v2.9.5 — Poll Sync status while active so mid-session slave_errors surface
+  useEffect(() => {
+    if (!activeSyncId) return undefined;
+    let cancelled = false;
+    let lastCount = 0;
+    const tick = async () => {
+      try {
+        const r = await fetch(`${API}/sync/${activeSyncId}`, { headers: authHeaders });
+        if (!r.ok || cancelled) return;
+        const d = await r.json();
+        if (!d?.active) {
+          if (!cancelled) {
+            setActiveSyncId("");
+            toast.info("Synchronizer ended");
+          }
+          return;
+        }
+        const n = Number(d.slave_error_count || 0);
+        if (n > lastCount) {
+          const latest = (d.slave_errors || [])[0];
+          const detail = latest?.error ? String(latest.error).slice(0, 120) : `${n} slave error(s)`;
+          toast.warning(`Sync slave issue: ${detail}`);
+          lastCount = n;
+        }
+      } catch (_) { /* ignore transient */ }
+    };
+    tick();
+    const iv = setInterval(tick, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+    };
+  }, [activeSyncId]);
+
   useEffect(() => {
     if (!cardMenuId) return undefined;
     const close = () => setCardMenuId(null);

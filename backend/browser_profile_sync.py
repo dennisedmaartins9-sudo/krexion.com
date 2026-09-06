@@ -227,28 +227,58 @@ async def _broadcast_event(sync_id: str, payload: Dict[str, Any]) -> None:
 
 
 def resolve_cdp_for_profile(profile_id: str, doc: Optional[Dict[str, Any]] = None) -> str:
-    """Prefer in-memory session CDP, then Mongo fields."""
+    """Prefer real websocket CDP, then http://debugger when port is live.
+
+    v2.9.5 — Do not invent http:// from a stale address without a live
+    /json/version probe. Playwright accepts http://host:port only when
+    the debugger is actually listening.
+    """
+
+    def _http_cdp_if_live(addr: str) -> str:
+        addr = (addr or "").strip()
+        if not addr or "://" in addr:
+            return ""
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"http://{addr}/json/version", timeout=1.5
+            ) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+            import json as _json
+
+            ws = str((_json.loads(data) or {}).get("webSocketDebuggerUrl") or "").strip()
+            if ws:
+                return ws
+            # Port alive but no ws field — Playwright can still use HTTP endpoint.
+            return f"http://{addr}"
+        except Exception:
+            return ""
+
     try:
         from browser_profile_launcher import list_running
 
         for sess in list_running().values():
             if str(sess.get("profile_id") or "") == str(profile_id):
                 ws = str(sess.get("cdp_ws") or "").strip()
-                if ws:
+                if ws.startswith("ws://") or ws.startswith("wss://"):
+                    return ws
+                if ws.startswith("http://") or ws.startswith("https://"):
                     return ws
                 addr = str(sess.get("debugger_address") or "").strip()
-                if addr:
-                    return f"http://{addr}"
+                live = _http_cdp_if_live(addr)
+                if live:
+                    return live
     except Exception:
         pass
     doc = doc or {}
     ws = str(doc.get("cdp_ws") or "").strip()
-    if ws:
+    if ws.startswith("ws://") or ws.startswith("wss://"):
+        return ws
+    if ws.startswith("http://") or ws.startswith("https://"):
         return ws
     addr = str(doc.get("debugger_address") or "").strip()
-    if addr:
-        return f"http://{addr}"
-    return ""
+    return _http_cdp_if_live(addr)
 
 
 async def start_sync(
