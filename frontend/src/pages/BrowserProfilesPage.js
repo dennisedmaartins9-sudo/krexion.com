@@ -98,6 +98,7 @@ const US_STATE_OPTIONS = [
 
 const DEFAULT_NEW = {
   name: "",
+  custom_no: "",
   notes: "",
   country: "us",
   language: "en-US",
@@ -336,7 +337,14 @@ export default function BrowserProfilesPage() {
   const [profileTemplates, setProfileTemplates] = useState([]);
   const [templateBusy, setTemplateBusy] = useState(false);
   // v2.7.76 — Agency UX: sort, view modes, trash, launch checklist, clone opts
-  const [viewMode, setViewMode] = useState("cards");
+  const [viewMode, setViewMode] = useState(() => {
+    try {
+      const v = localStorage.getItem("krexion_bp_view");
+      return v === "cards" || v === "table" ? v : "table";
+    } catch (_) {
+      return "table";
+    }
+  });
   const [sortBy, setSortBy] = useState("updated_at");
   const [maxConcurrent, setMaxConcurrent] = useState(5);
   const [showTrash, setShowTrash] = useState(false);
@@ -768,6 +776,10 @@ export default function BrowserProfilesPage() {
 
   // v2.6.32 — Poll while any profile is mid-launch so cloud-bridged cards update.
   useEffect(() => {
+    try { localStorage.setItem("krexion_bp_view", viewMode); } catch (_) {}
+  }, [viewMode]);
+
+  useEffect(() => {
     const active = profiles.some((p) =>
       ["launching", "running", "stopping", "queued"].includes(p.status)
     );
@@ -798,6 +810,40 @@ export default function BrowserProfilesPage() {
     const s = String(notes).trim();
     return s.length > max ? `${s.slice(0, max)}…` : s;
   };
+
+  const formatProxyCompact = (p) => {
+    const px = p?.proxy || {};
+    if (!px || px.enabled === false) return "—";
+    const named = px.provider_name || px.name || px.label || "";
+    if (named) return String(named).slice(0, 28);
+    const server = String(px.server || px.host || px.raw_line || "").trim();
+    if (!server) return "Direct";
+    try {
+      const u = server.includes("://") ? new URL(server) : null;
+      if (u?.hostname) return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+    } catch (_) {}
+    const parts = server.replace(/^https?:\/\//i, "").split(":");
+    if (parts.length >= 2 && parts[1]) return `${parts[0]}:${parts[1]}`.slice(0, 32);
+    return server.slice(0, 32);
+  };
+
+  const profileNoLabel = (p, idx = 0) => {
+    const custom = String(p?.custom_no || "").trim();
+    if (custom) return custom;
+    if (p?.serial_number) return String(p.serial_number);
+    if (p?.profile_no) return String(p.profile_no);
+    return String(idx + 1);
+  };
+
+  const statusListLabel = (status) => {
+    const s = status || "idle";
+    if (s === "running") return "Running";
+    if (s === "launching" || s === "queued") return "Opening…";
+    if (s === "stopping") return "Closing…";
+    if (s === "error") return "Error";
+    return "Idle";
+  };
+
 
   const renderHealthBadge = (p) => {
     const h = p.health || {};
@@ -1880,7 +1926,7 @@ export default function BrowserProfilesPage() {
         className="bg-red-600 hover:bg-red-700 text-white h-7 text-xs"
         data-testid={`bp-stop-${p.id}`}
       >
-        <StopCircle className="w-3 h-3 mr-1" /> Stop
+        <StopCircle className="w-3 h-3 mr-1" /> Close
       </Button>
     </>
   );
@@ -1973,39 +2019,38 @@ export default function BrowserProfilesPage() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950 p-6">
-      <div className="max-w-7xl mx-auto">
-        <div className="flex items-center justify-between mb-6">
+    <div className="min-h-screen bg-zinc-950 p-4 md:p-6" data-testid="bp-dense-layout">
+      <div className="max-w-[1400px] mx-auto">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <div>
-            <h1 className="text-3xl font-bold bg-gradient-to-r from-fuchsia-400 via-purple-400 to-cyan-400 bg-clip-text text-transparent">
-              🌐 Browser Profiles
+            <h1 className="text-xl font-semibold text-zinc-100 tracking-tight" data-testid="bp-page-title">
+              Krexion Browser Profiles
             </h1>
-            <p className="text-zinc-400 text-sm mt-1">
-              Krexion Browser Profiles — each profile uses the full Krexion anti-detect stack
-              (same engine that powers Real User Traffic).
+            <p className="text-zinc-500 text-xs mt-0.5">
+              Open · proxy · fingerprint — dense profile list · Krexion branded
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              data-testid="bp-open-create"
+              onClick={openCustomProfileModal}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white h-8 text-xs"
+            >
+              <Plus className="w-3.5 h-3.5 mr-1" /> New Profile
+            </Button>
             <Button
               data-testid="bp-quick-desktop"
               onClick={() => handleQuickGenerate("desktop")}
-              className="bg-fuchsia-600 hover:bg-fuchsia-700 text-white"
+              variant="outline" className="border-zinc-700 text-zinc-200 h-8 text-xs"
             >
-              <Plus className="w-4 h-4 mr-1" /> Quick Desktop
+              <Plus className="w-3.5 h-3.5 mr-1" /> Quick Create
             </Button>
             <Button
               data-testid="bp-quick-mobile"
               onClick={() => handleQuickGenerate("mobile")}
-              className="bg-cyan-600 hover:bg-cyan-700 text-white"
+              variant="outline" className="border-zinc-700 text-zinc-200 h-8 text-xs"
             >
-              <Smartphone className="w-4 h-4 mr-1" /> Quick Mobile
-            </Button>
-            <Button
-              data-testid="bp-open-create"
-              onClick={openCustomProfileModal}
-              variant="outline" className="border-zinc-700 text-zinc-300"
-            >
-              <Plus className="w-4 h-4 mr-1" /> Custom Profile
+              <Smartphone className="w-3.5 h-3.5 mr-1" /> Quick Mobile
             </Button>
             <label data-testid="bp-import" className="inline-flex items-center gap-1 px-3 py-2 rounded-md border border-zinc-700 text-zinc-300 text-sm cursor-pointer hover:bg-zinc-900">
               <Upload className="w-4 h-4" /> Import
@@ -2084,21 +2129,13 @@ export default function BrowserProfilesPage() {
 
           <div className="flex-1 min-w-0">
 
-        {/* Info banner */}
-        <div className="mb-6 p-3 rounded-lg bg-amber-950/20 border border-amber-700/40 text-xs text-amber-200 flex items-start gap-2">
-          <Shield className="w-4 h-4 mt-0.5 text-amber-300" />
-          <div>
-            <span className="font-semibold">How it works:</span> Create a profile, then click{" "}
-            <span className="text-amber-300">Launch</span>. On Local Engine / Native, Krexion Browser opens on this PC
-            (tray helper may open it if the backend runs as a Windows service). On cloud, your Krexion desktop
-            app picks up the job. Anti-detect + cookies/localStorage from previous sessions apply automatically.
-            Select multiple cards for bulk Launch / Stop / Delete.
-            <div className="mt-2 text-amber-100/90">
-              <span className="font-semibold">New defaults:</span> Strict proxy ON (dead proxy = no browser / no real-IP leak)
-              · Full profile save ON · iPhone/Android = desktop shell, not a real phone.
-              · Use <span className="text-amber-50">any</span> proxy provider from Settings (not locked to one vendor).
-            </div>
-          </div>
+        {/* Compact tip — admin chrome (no marketing banner) */}
+        <div className="mb-3 px-3 py-2 rounded-md bg-zinc-900/80 border border-zinc-800 text-[11px] text-zinc-400 flex items-center gap-2" data-testid="bp-admin-tip">
+          <Shield className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
+          <span>
+            <span className="text-zinc-300 font-medium">Open</span> runs Krexion Browser on this PC (Local Engine / Native).
+            Strict proxy stays ON by default — dead proxy never leaks your real IP.
+          </span>
         </div>
 
         {cloudModeHint === "cloud" && (
@@ -2161,7 +2198,7 @@ export default function BrowserProfilesPage() {
               type="button"
               data-testid="bp-view-cards"
               onClick={() => setViewMode("cards")}
-              className={`px-2 py-1 text-xs flex items-center gap-1 ${viewMode === "cards" ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-400 hover:bg-zinc-900"}`}
+              className={`px-2 py-1 text-xs flex items-center gap-1 ${viewMode === "cards" ? "bg-zinc-800 text-zinc-100" : "text-zinc-400 hover:bg-zinc-900"}`}
             >
               <LayoutGrid className="w-3.5 h-3.5" /> Cards
             </button>
@@ -2169,7 +2206,7 @@ export default function BrowserProfilesPage() {
               type="button"
               data-testid="bp-view-table"
               onClick={() => setViewMode("table")}
-              className={`px-2 py-1 text-xs flex items-center gap-1 border-l border-zinc-700 ${viewMode === "table" ? "bg-fuchsia-950/50 text-fuchsia-300" : "text-zinc-400 hover:bg-zinc-900"}`}
+              className={`px-2 py-1 text-xs flex items-center gap-1 border-l border-zinc-700 ${viewMode === "table" ? "bg-emerald-950/50 text-emerald-300" : "text-zinc-400 hover:bg-zinc-900"}`}
             >
               <Table2 className="w-3.5 h-3.5" /> Table
             </button>
@@ -2339,7 +2376,7 @@ export default function BrowserProfilesPage() {
             </div>
             <Button size="sm" disabled={!selectedCount || bulkBusy || (bulkLaunchAuto.enabled && !bulkLaunchAuto.automation_upload_id)} onClick={handleBulkLaunch}
               className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid="bp-bulk-launch">
-              <Play className="w-3 h-3 mr-1" /> Launch
+              <Play className="w-3 h-3 mr-1" /> Open
             </Button>
             <div className="relative" data-testid="bp-bulk-json-wrap">
               <Button
@@ -2400,7 +2437,7 @@ export default function BrowserProfilesPage() {
             ) : null}
             <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkStop}
               className="bg-amber-700 hover:bg-amber-800 text-white h-7 text-xs" data-testid="bp-bulk-stop">
-              <StopCircle className="w-3 h-3 mr-1" /> Stop
+              <StopCircle className="w-3 h-3 mr-1" /> Close
             </Button>
             <Button size="sm" disabled={!selectedCount || bulkBusy} onClick={handleBulkDelete}
               variant="outline" className="border-red-900/60 text-red-400 h-7 text-xs" data-testid="bp-bulk-delete">
@@ -2417,43 +2454,59 @@ export default function BrowserProfilesPage() {
               {showTrash ? (
                 <p>Recycle bin is empty.</p>
               ) : (
-                <p>No profiles yet. Click <span className="text-fuchsia-400 font-semibold">Quick Desktop</span> or <span className="text-cyan-400 font-semibold">Quick Mobile</span> for a one-click profile.</p>
+                <p>No profiles yet. Click <span className="text-emerald-400 font-semibold">New Profile</span> or <span className="text-zinc-200 font-semibold">Quick Create</span>.</p>
               )}
             </CardContent>
           </Card>
         ) : viewMode === "table" ? (
-          <div className="rounded-lg border border-zinc-800 overflow-hidden">
-            <table className="w-full text-xs text-zinc-300" data-testid="bp-table">
-              <thead className="bg-zinc-900/80 text-zinc-500 uppercase tracking-wide">
+          <div className="rounded-lg border border-zinc-800 overflow-x-auto bg-zinc-950/40" data-testid="bp-dense-table-wrap">
+            <table className="w-full text-xs text-zinc-300 min-w-[960px]" data-testid="bp-table">
+              <thead className="bg-zinc-900 text-zinc-500 uppercase tracking-wide text-[10px]">
                 <tr>
-                  <th className="px-3 py-2 text-left w-8" />
-                  <th className="px-3 py-2 text-left">Name</th>
-                  <th className="px-3 py-2 text-left">Status</th>
-                  <th className="px-3 py-2 text-left">Health</th>
-                  <th className="px-3 py-2 text-left">Country</th>
-                  <th className="px-3 py-2 text-left">Cookies</th>
-                  <th className="px-3 py-2 text-left">Last used</th>
-                  <th className="px-3 py-2 text-right">Action</th>
+                  <th className="px-2 py-2 text-left w-8">
+                    <input
+                      type="checkbox"
+                      className="accent-emerald-500"
+                      data-testid="bp-select-all"
+                      checked={profiles.length > 0 && profiles.every((p) => selectedIds.has(p.id))}
+                      onChange={(e) => {
+                        if (e.target.checked) profiles.forEach((p) => { if (!selectedIds.has(p.id)) toggleSelect(p.id); });
+                        else profiles.forEach((p) => { if (selectedIds.has(p.id)) toggleSelect(p.id); });
+                      }}
+                    />
+                  </th>
+                  <th className="px-2 py-2 text-left w-14">No.</th>
+                  <th className="px-2 py-2 text-left">Name</th>
+                  <th className="px-2 py-2 text-left">Proxy</th>
+                  <th className="px-2 py-2 text-left">Group</th>
+                  <th className="px-2 py-2 text-left">Notes</th>
+                  <th className="px-2 py-2 text-left">Last open</th>
+                  <th className="px-2 py-2 text-left">Status</th>
+                  <th className="px-2 py-2 text-right">Action</th>
                 </tr>
               </thead>
               <tbody>
-                {profiles.map((p) => (
-                  <tr key={p.id} className="border-t border-zinc-800 hover:bg-zinc-900/50" data-testid={`bp-row-${p.id}`}>
-                    <td className="px-3 py-2">
-                      <input type="checkbox" className="accent-fuchsia-500" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} />
+                {profiles.map((p, idx) => (
+                  <tr key={p.id} className="border-t border-zinc-800/80 hover:bg-zinc-900/60 h-10" data-testid={`bp-row-${p.id}`}>
+                    <td className="px-2 py-1.5">
+                      <input type="checkbox" className="accent-emerald-500" checked={selectedIds.has(p.id)} onChange={() => toggleSelect(p.id)} />
                     </td>
-                    <td className="px-3 py-2 font-medium text-zinc-100 truncate max-w-[12rem]">{p.name}</td>
-                    <td className="px-3 py-2">
-                      <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>{p.status || "idle"}</Badge>
+                    <td className="px-2 py-1.5 text-zinc-400 font-mono tabular-nums" data-testid={`bp-no-${p.id}`}>{profileNoLabel(p, idx)}</td>
+                    <td className="px-2 py-1.5 font-medium text-zinc-100 truncate max-w-[14rem]" title={p.name}>{p.name}</td>
+                    <td className="px-2 py-1.5 text-zinc-400 truncate max-w-[10rem]" title={formatProxyCompact(p)}>{formatProxyCompact(p)}</td>
+                    <td className="px-2 py-1.5 text-zinc-400 truncate max-w-[8rem]">
+                      {(p.folder || p.group || "—")}
+                      {(p.tags || []).length ? <span className="text-zinc-600"> · {(p.tags || []).slice(0, 2).join(",")}</span> : null}
                     </td>
-                    <td className="px-3 py-2">{renderHealthBadge(p)}</td>
-                    <td className="px-3 py-2">{(p.country || "?").toUpperCase()}</td>
-                    <td className="px-3 py-2">{p.storage_state_stats?.cookie_count || 0}</td>
-                    <td className="px-3 py-2 text-zinc-500">{p.last_used_label || "—"}</td>
-                    <td className="px-3 py-2 text-right">
+                    <td className="px-2 py-1.5 text-zinc-500 truncate max-w-[10rem]" title={p.notes || ""}>{truncateNotes(p.notes, 40) || "—"}</td>
+                    <td className="px-2 py-1.5 text-zinc-500 whitespace-nowrap">{p.last_used_label || "—"}</td>
+                    <td className="px-2 py-1.5">
+                      <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>{statusListLabel(p.status)}</Badge>
+                    </td>
+                    <td className="px-2 py-1.5 text-right">
                       {showTrash ? (
                         <div className="flex flex-wrap gap-1 justify-end">
-                          <Button size="sm" variant="outline" className="border-fuchsia-700 text-fuchsia-300 h-7 text-xs"
+                          <Button size="sm" variant="outline" className="border-emerald-700 text-emerald-300 h-7 text-xs"
                             onClick={() => handleRestore(p.id)} data-testid={`bp-restore-${p.id}`}>
                             <RotateCcw className="w-3 h-3 mr-1" /> Restore
                           </Button>
@@ -2468,7 +2521,7 @@ export default function BrowserProfilesPage() {
                         </div>
                       ) : (
                         <Button size="sm" onClick={() => handleLaunch(p.id)} className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid={`bp-launch-${p.id}`}>
-                          <Play className="w-3 h-3 mr-1" /> Launch
+                          <Play className="w-3 h-3 mr-1" /> Open
                         </Button>
                       )}
                     </td>
@@ -2630,7 +2683,7 @@ export default function BrowserProfilesPage() {
                       </div>
                     ) : (
                       <Button data-testid={`bp-launch-${p.id}`} onClick={() => handleLaunch(p.id)} size="sm" className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs">
-                        <Play className="w-3 h-3 mr-1" /> Launch
+                        <Play className="w-3 h-3 mr-1" /> Open
                       </Button>
                     )}
                     {!showTrash && (
@@ -2862,6 +2915,13 @@ export default function BrowserProfilesPage() {
                           className="bg-zinc-900 border-zinc-700 text-zinc-100" />
                       </div>
                     )}
+                  </div>
+                  <div>
+                    <Label className="text-zinc-300 text-xs">Custom No. <span className="text-zinc-500">(optional list No.)</span></Label>
+                    <Input data-testid="bp-form-custom-no" value={form.custom_no || ""}
+                      onChange={(e) => setForm({ ...form, custom_no: e.target.value })}
+                      className="bg-zinc-900 border-zinc-700 text-zinc-100"
+                      placeholder="e.g. 1001" />
                   </div>
                   <div>
                     <Label className="text-zinc-300 text-xs">Country</Label>

@@ -1341,6 +1341,8 @@ class ProfileBody(BaseModel):
     # callers that send a name keep working unchanged.
     name: str = Field(default="", max_length=120)
     notes: str = Field(default="", max_length=2000)
+    custom_no: str = Field(default="", max_length=32)
+    serial_number: int = Field(default=0, ge=0)
     country: str = Field(default="us", max_length=8)
     language: str = Field(default="en-US", max_length=24)
     timezone: str = Field(default="America/New_York", max_length=64)
@@ -1818,6 +1820,9 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         "cdp_ws": "",
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
+        # v2.7.130 — AdsPower-parity profile No. / custom No. for list + taskbar
+        "serial_number": int(getattr(body, "serial_number", 0) or 0),
+        "custom_no": str(getattr(body, "custom_no", "") or "").strip()[:32],
     }
     # Mobile: Strict phone chrome ON unless user explicitly turned it off
     _anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
@@ -1825,6 +1830,25 @@ def _profile_doc(user_id: str, body: ProfileBody) -> Dict[str, Any]:
         _anti = dict(_anti)
         _anti["strict_mobile_shell"] = True
         doc["anti_detect"] = _anti
+    # v2.7.130 — serial_number may be 0 here; async create path backfills via
+    # `_ensure_profile_serial(doc)` (Motor is async — cannot query here).
+    return doc
+
+
+async def _ensure_profile_serial(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Assign next AdsPower-style profile No. when unset."""
+    if int(doc.get("serial_number") or 0):
+        return doc
+    uid = str(doc.get("user_id") or "")
+    try:
+        last = await _DB.browser_profiles.find_one(
+            {"user_id": uid},
+            sort=[("serial_number", -1)],
+            projection={"serial_number": 1},
+        )
+        doc["serial_number"] = int((last or {}).get("serial_number") or 0) + 1
+    except Exception:
+        doc["serial_number"] = int(__import__("time").time()) % 100000
     return doc
 
 
@@ -1915,6 +1939,13 @@ def _public_view(doc: Dict[str, Any]) -> Dict[str, Any]:
     d["launch_warnings"] = list(_lw) if isinstance(_lw, list) else []
     d["mobile_shell_active"] = bool(d.get("mobile_shell_active"))
     d["engine_used"] = str(d.get("engine_used") or "")
+    # v2.7.130 — list No. for AdsPower-parity profile table
+    try:
+        d["serial_number"] = int(d.get("serial_number") or 0)
+    except Exception:
+        d["serial_number"] = 0
+    d["custom_no"] = str(d.get("custom_no") or "").strip()[:32]
+    d["profile_no"] = str(d.get("custom_no") or d.get("serial_number") or "")
     return d
 
 
@@ -3675,6 +3706,7 @@ async def create_profile(request: Request, body: ProfileBody):
     else:
         _prepare_proxy_for_profile_create(doc)
         deferred = False
+    await _ensure_profile_serial(doc)
     await _DB.browser_profiles.insert_one(doc)
     out = {"profile": _public_view(doc), "id": doc["id"]}
     if deferred:
@@ -3796,6 +3828,7 @@ async def import_profiles(request: Request, body: ImportProfilesBody):
             if body.include_cookies and isinstance(raw.get("storage_state"), dict):
                 doc["storage_state"] = raw["storage_state"]
                 doc["storage_synced_at"] = _now_iso()
+            await _ensure_profile_serial(doc)
             await _DB.browser_profiles.insert_one(doc)
             created.append(_public_view(doc))
         except Exception as e:
@@ -4212,6 +4245,7 @@ async def import_vendor_profiles(
             if include_cookies and isinstance(raw.get("storage_state"), dict):
                 doc["storage_state"] = raw["storage_state"]
             _prepare_proxy_for_profile_create(doc)
+            await _ensure_profile_serial(doc)
             await _DB.browser_profiles.insert_one(doc)
             created += 1
         except Exception as exc:
@@ -5773,6 +5807,7 @@ async def quick_generate(request: Request, body: Dict[str, Any] = Body(default_f
         anti_detect=AntiDetectConfig(master=True),
     )
     doc = _profile_doc(uid, pb)
+    await _ensure_profile_serial(doc)
     await _DB.browser_profiles.insert_one(doc)
     return {"profile": _public_view(doc), "id": doc["id"]}
 
