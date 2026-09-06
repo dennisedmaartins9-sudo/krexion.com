@@ -100,6 +100,27 @@ def compute_profile_health(doc: Dict[str, Any]) -> Dict[str, Any]:
         score -= 12
         issues.append("TLS prewarm failed")
 
+    # v2.9.4 — surface last Open failure + stealth degrade in health
+    last_err = str(doc.get("last_error") or doc.get("error_message") or "").strip()
+    if last_err and status in ("error", "idle", "stopped"):
+        score -= 15
+        issues.append(f"last Open error: {last_err[:80]}")
+    warns = doc.get("launch_warnings") or []
+    if isinstance(warns, list):
+        for w in warns[:3]:
+            ws = str(w or "")
+            if not ws:
+                continue
+            if "Stealth degraded" in ws or "stealth degraded" in ws.lower():
+                score -= 18
+                issues.append("stealth degraded on last Open")
+            elif "soft-disabled" in ws.lower() or "real-IP" in ws or "real IP" in ws:
+                score -= 12
+                issues.append("proxy soft-disabled (real IP risk)")
+            elif "phone chrome" in ws.lower() or "mobile shell" in ws.lower():
+                score -= 8
+                issues.append("mobile shell warning")
+
     fraud = last_proxy.get("fraud_score")
     if fraud is not None:
         try:

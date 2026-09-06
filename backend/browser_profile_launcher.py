@@ -3545,6 +3545,10 @@ async def _launch_profile_session_inner(
                     context._krx_stealth_degraded = True
                 except Exception:
                     pass
+                _launch_warnings.append(
+                    f"Stealth degraded — full anti-detect inject failed ({type(e).__name__}); "
+                    "webdriver-hide / v230 baseline only. Fingerprint may be weaker."
+                )
                 # Minimal fallback — at least hide webdriver flag + try v230
                 # (headed Profile soft-fails with warning; visit still opens)
                 try:
@@ -4043,21 +4047,50 @@ async def _launch_profile_session_inner(
             except Exception as _fe:
                 logger.warning(f"[profile-launch] fraud block page render failed: {_fe}")
         elif proxy_diag.get("soft_disabled"):
-            # DNS soft-disable already stripped proxy — open the real start URL.
+            # v2.9.4 — AdsPower-class honesty: NEVER auto-navigate on real IP
+            # after soft-disable. Show the same interstitial as a hard proxy
+            # fail so the operator must explicitly continue without proxy.
             try:
-                _target_url = start_url or "https://www.google.com/"
-                _target_url = _profile_enrich_nav_url(
-                    _target_url, _profile_referrer_state
+                _safe_server = str(proxy_diag.get("server") or "").replace("<", "&lt;").replace(">", "&gt;")
+                _safe_err = str(proxy_diag.get("error") or "proxy soft-disabled (DNS/unreachable)").replace("<", "&lt;").replace(">", "&gt;")
+                _safe_start = str(start_url or "https://www.google.com/").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                _soft_html = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<title>Krexion — Proxy disabled (real IP risk)</title>"
+                    "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+                    "background:#0b0b10;color:#e4e4e7;margin:0;padding:48px;"
+                    "min-height:100vh;box-sizing:border-box}"
+                    ".card{max-width:720px;margin:0 auto;background:#18181b;"
+                    "border:1px solid #3f3f46;border-radius:12px;padding:32px}"
+                    "h1{margin:0 0 8px;font-size:22px;color:#fb7185}"
+                    "h2{margin:24px 0 8px;font-size:14px;color:#a1a1aa;font-weight:600;"
+                    "text-transform:uppercase;letter-spacing:0.05em}"
+                    "code{background:#0a0a0f;border:1px solid #27272a;padding:2px 6px;"
+                    "border-radius:4px;font-size:13px;color:#fbbf24;word-break:break-all}"
+                    ".btn{display:inline-block;margin-top:24px;padding:10px 20px;"
+                    "background:#7c3aed;color:white;border:none;border-radius:6px;"
+                    "font-size:14px;cursor:pointer;text-decoration:none}"
+                    ".btn:hover{background:#6d28d9}"
+                    ".muted{color:#71717a;font-size:13px;line-height:1.6}"
+                    "</style></head><body><div class='card'>"
+                    "<h1>⚠ Proxy was disabled — real IP risk</h1>"
+                    "<p class='muted'>Krexion could not keep this profile on the configured proxy "
+                    "(DNS/unreachable). The browser did <b>not</b> open your start URL automatically "
+                    "so your real IP is not leaked by surprise.</p>"
+                    "<h2>Proxy server</h2><code>"+_safe_server+"</code>"
+                    "<h2>Reason</h2><code>"+_safe_err+"</code>"
+                    "<p class='muted'>Fix the proxy, or continue only if you intentionally accept "
+                    "your real IP for this window.</p>"
+                    "<a class='btn' href='"+_safe_start+"'>Continue without proxy →</a>"
+                    "</div></body></html>"
                 )
-                await page.goto(
-                    _target_url,
-                    timeout=45000,
-                    wait_until="domcontentloaded",
-                    **({"referer": _referer_url} if _referer_url else {}),
+                await page.set_content(_soft_html, timeout=5000)
+                _launch_warnings.append(
+                    "Proxy soft-disabled — interstitial shown (no auto real-IP navigation)."
                 )
             except Exception as _soft_nav_err:
                 logger.warning(
-                    f"[profile-launch] soft-disable nav failed: {_soft_nav_err}"
+                    f"[profile-launch] soft-disable interstitial failed: {_soft_nav_err}"
                 )
         elif proxy_diag["requested"] and proxy_diag["ok"] is False:
             try:

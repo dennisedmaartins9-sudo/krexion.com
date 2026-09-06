@@ -1,3 +1,21 @@
+# v2.9.4 — 2026-09 — AdsPower-class Browser Profiles parity lock (complete Open UX)
+# Goal: Krexion profiles Open like AdsPower — no surprise real-IP, no silent
+# stealth fail, table retries, Sync honesty, Strict mobile shell frame retry.
+# Bundles + extends v2.9.3 shell work:
+#   1) Engine: Cloak C++ still mandatory (v2.9.0–2.9.2); no stock Chromium regress
+#   2) Launch: soft-disabled proxy shows interstitial (NO auto real-IP goto);
+#      stealth inject fail → visible launch_warnings; longer Strict shell frame
+#      retries (v2.9.3 SetParent harden + visual glue)
+#   3) UI: dense table shows last_error + warnings; Open again + New proxy;
+#      parseApiError toasts (no raw FastAPI JSON); card Open again always
+#   4) Fingerprint: stealth degrade counted in profile health score
+#   5) Proxy: Strict abort unchanged; soft path honest interstitial
+#   6) Automation/Sync: slave_errors in status; WebKit/Safari Sync blocked with
+#      clear CDP message (Cloak-only Sync)
+#   7) Packaging: unchanged Electron/Native Cloak bundle paths
+# Honest non-goals (still not this release): private Google Chromium from-scratch
+# fork; real Android/iOS OS (phone chrome remains desktop frame on Windows).
+#
 # v2.9.3 — 2026-09 — Strict mobile shell frame retry (Android Open abort fix)
 # User report: Android profile Open shows plain Chromium for a few seconds then
 # closes with: "Strict mobile shell: Krexion phone chrome did not frame the browser".

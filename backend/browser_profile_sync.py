@@ -213,6 +213,15 @@ async def _broadcast_event(sync_id: str, payload: Dict[str, Any]) -> None:
             group["last_event_at"] = time.time()
         except Exception as e:
             logger.debug(f"[sync] slave replay error: {e}")
+            errs = list(group.get("slave_errors") or [])
+            errs.append({
+                "profile_id": str(slave.get("profile_id") or ""),
+                "error": f"{type(e).__name__}: {str(e)[:160]}",
+                "event": et,
+                "at": time.time(),
+            })
+            group["slave_errors"] = errs[-40:]
+            group["slave_error_count"] = int(group.get("slave_error_count") or 0) + 1
 
     await asyncio.gather(*[_one(s) for s in slaves], return_exceptions=True)
 
@@ -347,6 +356,8 @@ def status_sync(sync_id: str) -> Dict[str, Any]:
         "events": int(g.get("events") or 0),
         "started_at": g.get("started_at") or 0,
         "last_event_at": g.get("last_event_at") or 0,
+        "slave_error_count": int(g.get("slave_error_count") or 0),
+        "slave_errors": list(g.get("slave_errors") or [])[-10:],
     }
 
 

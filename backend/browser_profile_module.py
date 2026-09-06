@@ -4084,6 +4084,26 @@ async def sync_start(request: Request, body: SyncStartBody):
         raise HTTPException(status_code=400, detail="Master profile must be running")
     from browser_profile_sync import resolve_cdp_for_profile, start_sync
 
+    def _engine_of(doc: dict) -> str:
+        anti = doc.get("anti_detect") if isinstance(doc.get("anti_detect"), dict) else {}
+        return str(
+            doc.get("browser_engine")
+            or doc.get("engine")
+            or (anti or {}).get("browser_engine")
+            or (anti or {}).get("browser_kernel")
+            or ""
+        ).strip().lower()
+
+    # v2.9.4 — WebKit / Krexion Safari has no CDP attach surface for Synchronizer
+    if _engine_of(master) in ("webkit", "safari", "ios"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Synchronizer does not support Krexion Safari / WebKit profiles "
+                "(no CDP). Use Krexion Browser (Cloak) profiles for Sync."
+            ),
+        )
+
     master_cdp = resolve_cdp_for_profile(body.master_id, master)
     if not master_cdp:
         raise HTTPException(
@@ -4095,6 +4115,14 @@ async def sync_start(request: Request, body: SyncStartBody):
         sdoc = await _get_profile_for_user(sid, uid, min_role="editor")
         if (sdoc.get("status") or "") != "running":
             raise HTTPException(status_code=400, detail=f"Slave {sid} must be running")
+        if _engine_of(sdoc) in ("webkit", "safari", "ios"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Slave {sid} is Krexion Safari / WebKit — Synchronizer needs "
+                    "Cloak Chromium CDP. Remove it from the sync set."
+                ),
+            )
         cdp = resolve_cdp_for_profile(sid, sdoc)
         if not cdp:
             raise HTTPException(status_code=400, detail=f"Slave {sid} missing CDP — re-launch")

@@ -39,6 +39,23 @@ import {
 const API = `${process.env.REACT_APP_BACKEND_URL}/api/browser-profiles`;
 const UPLOADS_API = `${process.env.REACT_APP_BACKEND_URL}/api/uploads`;
 
+/** Toast human detail, never raw FastAPI JSON blobs. */
+function parseApiError(raw, fallback = "Request failed") {
+  const text = typeof raw === "string" ? raw : (raw?.message || String(raw || ""));
+  if (!text) return fallback;
+  try {
+    const j = JSON.parse(text);
+    if (typeof j?.detail === "string") return j.detail;
+    if (Array.isArray(j?.detail)) {
+      return j.detail.map((d) => d?.msg || d?.message || JSON.stringify(d)).join("; ");
+    }
+    if (typeof j?.message === "string") return j.message;
+    if (typeof j?.error === "string") return j.error;
+  } catch (_) {}
+  return text.length > 280 ? `${text.slice(0, 280)}…` : text;
+}
+
+
 const DEFAULT_LAUNCH_AUTO = {
   enabled: false,
   automation_upload_id: "",
@@ -1631,12 +1648,15 @@ export default function BrowserProfilesPage() {
           jitter: true,
         }),
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw new Error(parseApiError(await r.text(), "Sync failed"));
       const d = await r.json();
       setActiveSyncId(d.sync_id || "");
       toast.success(`Synchronizer ON — master ${String(ids[0]).slice(0, 8)}…`);
+      if (d.slave_error_count) {
+        toast.warning(`Sync started with prior slave errors: ${d.slave_error_count}`);
+      }
     } catch (e) {
-      toast.error(`Sync failed: ${e.message}`);
+      toast.error(`Sync failed: ${parseApiError(e.message)}`);
     } finally {
       setSyncBusy(false);
     }
@@ -1766,8 +1786,9 @@ export default function BrowserProfilesPage() {
       });
       if (!r.ok) {
         const txt = await r.text();
-        if (r.status === 409) throw new Error(txt || "Profile is already running — stop it first");
-        throw new Error(txt);
+        const msg = parseApiError(txt, "Launch failed");
+        if (r.status === 409) throw new Error(msg || "Profile is already running — stop it first");
+        throw new Error(msg);
       }
       const d = await r.json();
       setStatusMap((m) => ({ ...m, [id]: { ...d } }));
@@ -2501,7 +2522,19 @@ export default function BrowserProfilesPage() {
                     <td className="px-2 py-1.5 text-zinc-500 truncate max-w-[10rem]" title={p.notes || ""}>{truncateNotes(p.notes, 40) || "—"}</td>
                     <td className="px-2 py-1.5 text-zinc-500 whitespace-nowrap">{p.last_used_label || "—"}</td>
                     <td className="px-2 py-1.5">
-                      <Badge variant="outline" className={`text-[10px] ${statusBadgeClass(p.status)}`}>{statusListLabel(p.status)}</Badge>
+                      <div className="flex flex-col gap-0.5 max-w-[12rem]">
+                        <Badge variant="outline" className={`text-[10px] w-fit ${statusBadgeClass(p.status)}`}>{statusListLabel(p.status)}</Badge>
+                        {(p.status === "error" || p.status === "queued") && p.last_error ? (
+                          <span className="text-[9px] text-red-300/90 truncate" title={p.last_error} data-testid={`bp-row-err-${p.id}`}>
+                            {String(p.last_error).slice(0, 64)}
+                          </span>
+                        ) : null}
+                        {(p.launch_warnings || []).length > 0 ? (
+                          <span className="text-[9px] text-amber-300/90 truncate" title={(p.launch_warnings || []).join(" · ")}>
+                            ⚠ {String((p.launch_warnings || [])[0]).slice(0, 48)}
+                          </span>
+                        ) : null}
+                      </div>
                     </td>
                     <td className="px-2 py-1.5 text-right">
                       {showTrash ? (
@@ -2518,6 +2551,21 @@ export default function BrowserProfilesPage() {
                       ) : profileIsBusy(p) ? (
                         <div className="flex flex-wrap gap-1 justify-end">
                           {renderProfileRunningActions(p)}
+                        </div>
+                      ) : p.status === "error" ? (
+                        <div className="flex flex-wrap gap-1 justify-end">
+                          <Button size="sm" onClick={() => handleLaunch(p.id)} className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid={`bp-reopen-${p.id}`}>
+                            <Play className="w-3 h-3 mr-1" /> Open again
+                          </Button>
+                          {(p.proxy?.enabled || p.proxy?.provider_id || p.proxy?.server) ? (
+                            <Button size="sm" variant="outline" disabled={proxyRetryBusy === p.id}
+                              className="h-7 text-[10px] border-amber-800/60 text-amber-300"
+                              data-testid={`bp-row-retry-proxy-${p.id}`}
+                              onClick={() => handleRetryWithNewProxy(p.id)}>
+                              <RefreshCw className={`w-3 h-3 mr-1 ${proxyRetryBusy === p.id ? "animate-spin" : ""}`} />
+                              New proxy
+                            </Button>
+                          ) : null}
                         </div>
                       ) : (
                         <Button size="sm" onClick={() => handleLaunch(p.id)} className="bg-emerald-600 hover:bg-emerald-700 text-white h-7 text-xs" data-testid={`bp-launch-${p.id}`}>
@@ -2765,18 +2813,30 @@ export default function BrowserProfilesPage() {
                       <div className="text-[10px] text-red-300/90 italic break-words" data-testid={`bp-last-error-${p.id}`}>
                         ⚠ {p.last_error}
                       </div>
-                      {p.status === "error" && !showTrash && (p.proxy?.enabled || p.proxy?.provider_id || p.proxy?.server) && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={proxyRetryBusy === p.id}
-                          className="h-6 text-[10px] border-amber-800/60 text-amber-300"
-                          data-testid={`bp-retry-proxy-${p.id}`}
-                          onClick={() => handleRetryWithNewProxy(p.id)}
-                        >
-                          <RefreshCw className={`w-3 h-3 mr-1 ${proxyRetryBusy === p.id ? "animate-spin" : ""}`} />
-                          Retry with new proxy
-                        </Button>
+                      {p.status === "error" && !showTrash && (
+                        <div className="flex flex-wrap gap-1">
+                          <Button
+                            size="sm"
+                            className="h-6 text-[10px] bg-emerald-700 hover:bg-emerald-600 text-white"
+                            data-testid={`bp-card-reopen-${p.id}`}
+                            onClick={() => handleLaunch(p.id)}
+                          >
+                            <Play className="w-3 h-3 mr-1" /> Open again
+                          </Button>
+                          {(p.proxy?.enabled || p.proxy?.provider_id || p.proxy?.server) && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={proxyRetryBusy === p.id}
+                              className="h-6 text-[10px] border-amber-800/60 text-amber-300"
+                              data-testid={`bp-retry-proxy-${p.id}`}
+                              onClick={() => handleRetryWithNewProxy(p.id)}
+                            >
+                              <RefreshCw className={`w-3 h-3 mr-1 ${proxyRetryBusy === p.id ? "animate-spin" : ""}`} />
+                              Retry with new proxy
+                            </Button>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}
@@ -3457,7 +3517,9 @@ export default function BrowserProfilesPage() {
                             <span>
                               Local API CDP (remote debugging)
                               <span className="block text-[9px] text-zinc-500">
-                                Opens --remote-debugging-port on 127.0.0.1 for automation. Default OFF — detection surface if unused.
+                                Opens --remote-debugging-port on 127.0.0.1 for automation.
+                                Default OFF in the form — Open on local/native Krexion auto-enables CDP
+                                when Synchronizer / Local API needs it (local automation attach).
                               </span>
                             </span>
                           </label>
