@@ -1,3 +1,11 @@
+# v2.7.137 — 2026-09 — Proxy Sign-in gone + WebKit Playwright brand fixed
+# - Chromium: local CONNECT auth relay injects Proxy-Authorization so DataImpulse
+#   / residential gateways never pop Chromium's native "Sign in" proxy dialog.
+# - WebKit: stock window titled "Playwright" is now treated as the engine
+#   (brand + phone chrome), not hidden as a helper; title stamped to Krexion.
+# - playwright.exe added to WebKit PID discovery; early title stamp after new_page.
+# - Ship-gate: 1053 passed / 5 skipped.
+#
 # v2.7.136 — 2026-09 — Ship-gate verified green (Strict shell frame locked)
 # - Official ship-gate: 1044 passed / 5 skipped after v2.7.135 Strict frame fix.
 # - Stale test updated (early require_embed=False + post-nav Strict gate).
