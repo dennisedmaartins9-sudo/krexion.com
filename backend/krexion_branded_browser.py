@@ -190,6 +190,19 @@ def ensure_krexion_browser_binary(
     src = ""
     if prefer_cloak:
         src = _cloak_chrome_path()
+        # v2.9.0 — headed AdsPower-class path must brand Cloak only
+        if not src:
+            try:
+                from krexion_browser_kernel import stock_chromium_allowed
+
+                allow_stock = stock_chromium_allowed()
+            except Exception:
+                allow_stock = False
+            if not allow_stock:
+                logger.warning(
+                    "[branded-browser] Cloak C++ kernel missing — refusing Playwright chrome brand"
+                )
+                return ""
     if not src:
         src = _playwright_chrome_path()
     if not src and not prefer_cloak:

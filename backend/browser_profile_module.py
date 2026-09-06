@@ -3860,7 +3860,7 @@ async def local_api_info(request: Request):
         "notes": (
             "Start returns cdp_ws when enable_cdp=true and Chromium launches on this machine. "
             "Connect Playwright via chromium.connect_over_cdp(cdp_ws). "
-            "Kernel auto = CloakBrowser C++ Chromium when installed (Octo-class), else Patchright, else Playwright. "
+            "Kernel auto = CloakBrowser C++ Chromium MANDATORY for headed profiles (AdsPower-class). Stock Playwright is banned unless KREXION_ALLOW_STOCK_CHROMIUM=1. "
             "When KREXION_LOCAL_API_KEY is set, also send X-Krexion-Local-Key or Authorization Bearer."
         ),
     }
@@ -3872,14 +3872,42 @@ async def local_kernel_status(request: Request):
     await _resolve_user(request)
     _enforce_local_api_key(request)
     try:
-        from krexion_browser_kernel import cloak_info, patchright_available, resolve_launch_plan
-        plan = resolve_launch_plan({"browser_kernel": "auto"})
+        from krexion_browser_kernel import (
+            cloak_info,
+            patchright_available,
+            resolve_launch_plan,
+            KrexionKernelMissingError,
+            stock_chromium_allowed,
+        )
+        # Status probe is not a headed Open — report availability honestly.
+        try:
+            plan = resolve_launch_plan(
+                {"browser_kernel": "auto"},
+                headed_profile=False,
+            )
+        except KrexionKernelMissingError as missing:
+            plan = {
+                "engine": "chromium",
+                "driver": "missing",
+                "kernel_label": "krexion-kernel-missing",
+                "cpp_kernel": False,
+                "adspower_class": False,
+                "error": str(missing)[:240],
+            }
+        cloak = cloak_info()
         return {
             "ok": True,
-            "cloak": cloak_info(),
+            "cloak": cloak,
             "patchright": patchright_available(),
             "auto_plan": plan,
+            "adspower_class_ready": bool(cloak.get("available") or plan.get("cpp_kernel")),
+            "stock_chromium_allowed": stock_chromium_allowed(),
             "env_KREXION_BROWSER_KERNEL": (os.environ.get("KREXION_BROWSER_KERNEL") or "auto"),
+            "notes": (
+                "v2.9.0: headed Browser Profiles require Cloak C++ Krexion Kernel "
+                "(AdsPower-class). Stock Playwright Chromium is banned unless "
+                "KREXION_ALLOW_STOCK_CHROMIUM=1."
+            ),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)[:240]}
@@ -3926,7 +3954,7 @@ async def local_api_docs(request: Request, format: str = Query(default="json")):
             "`X-Krexion-Local-Key` or `Authorization: Bearer <key>`.",
             "",
             "Kernel: `anti_detect.browser_kernel=auto` prefers CloakBrowser C++ Chromium",
-            "(Octo Octium-class), then Patchright, then Playwright.",
+            "(AdsPower-class C++). Stock Playwright banned unless KREXION_ALLOW_STOCK_CHROMIUM=1.",
             "",
         ])
         return {"ok": True, "format": "markdown", "markdown": "\n".join(lines), "map": mapping}

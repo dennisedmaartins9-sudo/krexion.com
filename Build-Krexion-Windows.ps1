@@ -150,6 +150,19 @@ if (-not $SkipChromium) {
         }
     }
     Ok "Browser-engine bundle (Chromium + WebKit): $chromiumBundle"
+
+# ── Step 4b: Bundle Cloak C++ Krexion Kernel (AdsPower-class) ─────────────
+Step "4b" 9 "Bundling Cloak C++ Krexion Kernel (AdsPower-class headed profiles)"
+$kernelDest = Join-Path $BuildDir "krexion-kernel"
+New-Item -ItemType Directory -Force -Path $kernelDest | Out-Null
+$embedPython = Join-Path $TargetDir "python.exe"
+if (-not (Test-Path $embedPython)) { $embedPython = "python" }
+& $embedPython -m pip install -q "cloakbrowser>=0.5.0"
+& $embedPython (Join-Path $PSScriptRoot "backend/scripts/bundle_krexion_kernel.py") --dest $kernelDest --platform windows-x64
+if ($LASTEXITCODE -ne 0) { Die "Krexion Kernel (Cloak C++) bundle failed" }
+if (-not (Test-Path (Join-Path $kernelDest "chrome.exe"))) { Die "krexion-kernel/chrome.exe missing" }
+Ok "Krexion Kernel: $kernelDest"
+
 }
 else {
     Warn "Skipped Chromium/WebKit download (per -SkipChromium)"

@@ -227,6 +227,17 @@ function startBackend() {
     // and every Browser-Profile launch / RUT job would fail with
     // "Executable doesn't exist at ... \chromium-headless-shell-...".
     PLAYWRIGHT_BROWSERS_PATH: path.join(resourcesRoot, 'chromium'),
+    // v2.9.0 — AdsPower-class Cloak C++ kernel (mandatory for headed profiles)
+    KREXION_KERNEL_PATH: path.join(
+      resourcesRoot,
+      'krexion-kernel',
+      process.platform === 'win32' ? 'chrome.exe' : 'chrome'
+    ),
+    CLOAKBROWSER_BINARY_PATH: path.join(
+      resourcesRoot,
+      'krexion-kernel',
+      process.platform === 'win32' ? 'chrome.exe' : 'chrome'
+    ),
   };
 
   // Prefer uvicorn directly; server.py exposes `app` as a FastAPI instance.

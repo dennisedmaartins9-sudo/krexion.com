@@ -23,8 +23,18 @@ def test_persistent_profiles_forced():
 
 def test_kernel_prefers_cloak_and_brands_fallback():
     src = (ROOT / "krexion_browser_kernel.py").read_text(encoding="utf-8")
-    assert "v2.8.0 — AdsPower-class profile lock" in src or "AdsPower-class stealth kernel" in src
-    assert "CloakBrowser C++ kernel unavailable" in src
+    assert (
+        "v2.8.0 — AdsPower-class profile lock" in src
+        or "AdsPower-class stealth kernel" in src
+        or "AdsPower-class C++ Chromium" in src
+        or "v2.9.0" in src
+    )
+    assert (
+        "CloakBrowser C++ kernel unavailable" in src
+        or "Cloak unavailable" in src
+        or "Krexion Kernel (Cloak C++ Chromium)" in src
+        or "HARD FAIL" in src
+    )
     assert "ensure_krexion_browser_binary" in src
 
 

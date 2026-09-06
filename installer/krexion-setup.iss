@@ -12,6 +12,7 @@
 ;   • bin\krexion-service.exe         — Windows service wrapper (renamed NSSM)
 ;   • database\                       — Embedded local database engine
 ;   • browser-engine\                 — Bundled Chromium + WebKit (Android/iOS)
+;   • krexion-kernel\                 — Cloak C++ Chromium (AdsPower-class headed profiles)
 ;   • frontend\                       — Production React build
 ;   • krexion-tray.exe                — System tray app (optional)
 ;
@@ -101,6 +102,9 @@ Source: "..\build\mongo-portable\*"; DestDir: "{app}\database"; Flags: ignorever
 ; Browser engine (Playwright Chromium + WebKit → `browser-engine`)
 ; WebKit enables iOS Safari-honest dual-engine without manual `playwright install`.
 Source: "..\build\chromium-bundle\*"; DestDir: "{app}\browser-engine"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+
+; v2.9.0 — AdsPower-class Cloak C++ Krexion Kernel (mandatory headed Chromium)
+Source: "..\build\krexion-kernel\*"; DestDir: "{app}\krexion-kernel"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; Frontend production build — required
 Source: "..\build\frontend-build\*"; DestDir: "{app}\frontend"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -335,7 +339,7 @@ Filename: "{app}\bin\{#AppExeService}"; \
 ; these here means the very first byte written to stdout is already
 ; UTF-8, which is how the Electron build already runs the backend.
 Filename: "{app}\bin\{#AppExeService}"; \
-  Parameters: "set KrexionBackend AppEnvironmentExtra ""MONGO_URL=mongodb://127.0.0.1:27017"" ""DB_NAME=krexion"" ""KREXION_MODE=native"" ""KREXION_BUILD_TYPE=binary"" ""KREXION_CLOUD_URL={#AppURL}"" ""KREXION_SYNC_STATUS_FILE={commonappdata}\Krexion\sync-status.json"" ""PLAYWRIGHT_BROWSERS_PATH={app}\browser-engine"" ""STRICT_CLOUD_HEAVY_BLOCK=false"" ""LICENSE_KEY_FILE={commonappdata}\Krexion\license-key.txt"" ""PYTHONIOENCODING=utf-8"" ""PYTHONUTF8=1"""; \
+  Parameters: "set KrexionBackend AppEnvironmentExtra ""MONGO_URL=mongodb://127.0.0.1:27017"" ""DB_NAME=krexion"" ""KREXION_MODE=native"" ""KREXION_BUILD_TYPE=binary"" ""KREXION_CLOUD_URL={#AppURL}"" ""KREXION_SYNC_STATUS_FILE={commonappdata}\Krexion\sync-status.json"" ""PLAYWRIGHT_BROWSERS_PATH={app}\browser-engine"" ""KREXION_KERNEL_PATH={app}\krexion-kernel\chrome.exe"" ""CLOAKBROWSER_BINARY_PATH={app}\krexion-kernel\chrome.exe"" ""STRICT_CLOUD_HEAVY_BLOCK=false"" ""LICENSE_KEY_FILE={commonappdata}\Krexion\license-key.txt"" ""PYTHONIOENCODING=utf-8"" ""PYTHONUTF8=1"""; \
   Flags: runhidden
 
 Filename: "{app}\bin\{#AppExeService}"; \

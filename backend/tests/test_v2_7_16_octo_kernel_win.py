@@ -46,7 +46,9 @@ def test_frontend_kernel_select():
     assert 'value="cloak"' in text  # internal kernel value
 
 
-def test_resolve_plan_smoke():
+def test_resolve_plan_smoke(monkeypatch):
+    # v2.9.0 — playwright preference requires stock escape hatch for headed plans
+    monkeypatch.setenv("KREXION_ALLOW_STOCK_CHROMIUM", "1")
     from krexion_browser_kernel import resolve_launch_plan
 
     plan = resolve_launch_plan({"browser_kernel": "playwright"})

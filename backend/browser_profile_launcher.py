@@ -1847,18 +1847,40 @@ async def _launch_profile_session_inner(
     behavioral_bio = bool(anti.get("behavioral_bio", True)) and master
     ip_warmup = bool(anti.get("ip_warmup", False)) and master
     paranoia_mode = bool(anti.get("paranoia_mode", False))
-    # v2.7.16 — Octo-class kernel (CloakBrowser C++ / Patchright / Firefox)
+    # v2.9.0 — AdsPower-class Cloak C++ kernel is MANDATORY for headed Chromium
+    # profiles. Never swallow KrexionKernelMissingError into Playwright fallback.
+    from krexion_browser_kernel import (
+        resolve_launch_plan as _resolve_kernel_plan,
+        KrexionKernelMissingError as _KernelMissing,
+        stock_chromium_allowed as _stock_chromium_ok,
+    )
+    _profile_engine_hint = str(
+        profile_config.get("browser_engine")
+        or profile_config.get("engine")
+        or anti.get("browser_engine")
+        or ""
+    ).lower()
+    _webkit_profile = _profile_engine_hint in ("webkit", "safari", "ios")
     try:
-        from krexion_browser_kernel import resolve_launch_plan as _resolve_kernel_plan
-        _kernel_plan = _resolve_kernel_plan(anti)
+        _kernel_plan = _resolve_kernel_plan(
+            anti,
+            headed_profile=not _webkit_profile,
+        )
+    except _KernelMissing:
+        raise
     except Exception as _kp_err:
-        logger.debug(f"[profile-launch] kernel plan fallback: {_kp_err}")
+        logger.debug(f"[profile-launch] kernel plan soft-error: {_kp_err}")
+        if not _webkit_profile:
+            raise _KernelMissing(
+                f"Krexion Kernel resolve failed: {_kp_err}. "
+                "AdsPower-class Cloak C++ Chromium is required for profiles."
+            ) from _kp_err
         _kernel_plan = {
-            "engine": "chromium",
+            "engine": "webkit",
             "driver": "playwright",
             "executable_path": "",
             "stealth_args": [],
-            "kernel_label": "playwright-chromium",
+            "kernel_label": "playwright-webkit",
             "reduce_js_fingerprint_noise": False,
             "preference": "auto",
         }
@@ -2496,12 +2518,25 @@ async def _launch_profile_session_inner(
                 or variant == "chrome"
                 or _plan.get("preference") == "chrome"
             )
+            # v2.9.0 — system Chrome only when stock escape hatch is on
             if _force_sys and not _plan.get("executable_path"):
+                if not _stock_chromium_ok():
+                    raise _KernelMissing(
+                        "System Chrome is blocked for headed Krexion profiles. "
+                        "AdsPower-class Cloak C++ kernel (krexion-browser) is required."
+                    )
                 _plan["channel"] = "chrome"
                 _plan["kernel_label"] = "system-chrome"
             try:
                 return await _lcp(p, launch_kwargs, _plan)
             except Exception as _lex:
+                # v2.9.0 — never silently fall back to stock Playwright Chromium
+                # when the AdsPower-class C++ kernel was required / selected.
+                if _plan.get("cpp_kernel") or _plan.get("adspower_class") or not _stock_chromium_ok():
+                    raise _KernelMissing(
+                        f"Krexion Kernel launch failed: {_lex}. "
+                        "AdsPower-class Cloak C++ Chromium is required — stock Chromium fallback is disabled."
+                    ) from _lex
                 logger.warning(f"[profile-launch] kernel launch failed ({_lex}); stock chromium")
                 _kw = dict(launch_kwargs)
                 try:

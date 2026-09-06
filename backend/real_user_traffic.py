@@ -1448,7 +1448,7 @@ async def _launch_anti_detect_browser(pw, *, variant: str = "auto") -> Browser:
             resolve_launch_plan as _resolve_kernel_plan,
             launch_chromium_with_plan as _launch_with_plan,
         )
-        _plan = _resolve_kernel_plan({"browser_kernel": "auto"})
+        _plan = _resolve_kernel_plan({"browser_kernel": "auto"}, headed_profile=False)
         _drv = str(_plan.get("driver") or "playwright")
         if _drv in ("cloak", "patchright") or (_plan.get("executable_path") or "").strip():
             _args = list(_BROWSER_LAUNCH_ARGS_BASE)
@@ -15723,7 +15723,7 @@ async def run_real_user_traffic_job(
             resolve_launch_plan as _rkp,
             get_async_playwright_factory as _gaf,
         )
-        _rut_kernel_plan = _rkp({"browser_kernel": "auto"})
+        _rut_kernel_plan = _rkp({"browser_kernel": "auto"}, headed_profile=False)
         _async_pw_factory = _gaf(_rut_kernel_plan)
     except Exception as _kp_err:
         logger.debug(f"RUT kernel plan/factory fallback: {_kp_err}")

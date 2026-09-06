@@ -1,3 +1,15 @@
+# v2.9.0 — 2026-09 — AdsPower-class Cloak C++ KERNEL COMPLETE (mandatory)
+# User ask: "100% AdsPower kernel (from-source Chromium) chahiye" — complete it.
+# Honest scope: CloakBrowser IS source-level C++ patched Chromium (AdsPower
+# SunBrowser class). Compiling Google Chromium from scratch in-repo is a
+# separate multi-month fork team — not this release.
+# This release LOCKS headed Browser Profiles onto Cloak C++:
+#   1) Cloak C++ / krexion-browser.exe MANDATORY for headed Chromium Open
+#   2) Stock Playwright Chromium banned unless KREXION_ALLOW_STOCK_CHROMIUM=1
+#   3) Installers (Electron + Native Inno) BUNDLE Cloak as krexion-kernel/
+#   4) Missing kernel → hard fail (no silent Playwright fallback)
+#   5) Keeps v2.8.0 persistent profiles + v2.7.137 proxy relay + v2.7.138 embed truth
+#
 # v2.8.0 — 2026-09 — ONE lasting AdsPower-class Profile Engine lock
 # User ask: "aik he bar behtar update" — stop 2.7.13x patch churn for Open Profile.
 # This release LOCKS the durable profile runtime (not another soft hotfix):

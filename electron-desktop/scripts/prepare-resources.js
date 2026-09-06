@@ -486,6 +486,50 @@ function prepareChromium() {
 }
 
 // ── 5. Icon ──────────────────────────────────────────────────────────────────
+
+// ── 4.6 Krexion Kernel (Cloak C++ Chromium — AdsPower-class) ─────────────────
+// v2.9.0: headed Browser Profiles require Cloak C++ Chromium. Bundle it under
+// resources/krexion/krexion-kernel/ so Open Profile never falls back to stock
+// Playwright Chromium on customer PCs.
+function prepareKrexionKernel() {
+  const dest = path.join(RES, 'krexion-kernel');
+  const chromeExe = path.join(dest, process.platform === 'win32' ? 'chrome.exe' : 'chrome');
+  if (fs.existsSync(chromeExe)) {
+    log(`krexion-kernel: cached (${chromeExe}) — skipping`);
+    return;
+  }
+  fs.mkdirSync(dest, { recursive: true });
+  const pythonExe = path.join(RES, 'python', process.platform === 'win32' ? 'python.exe' : 'python');
+  const script = path.join(REPO, 'backend', 'scripts', 'bundle_krexion_kernel.py');
+  if (!fs.existsSync(script)) {
+    throw new Error('krexion-kernel: bundle_krexion_kernel.py missing at ' + script);
+  }
+  // Ensure cloakbrowser is present in embedded python (requirements already include it).
+  const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+  log('krexion-kernel: bundling Cloak C++ Chromium (AdsPower-class)');
+  const platformArg = process.platform === 'win32' ? 'windows-x64' : 'native';
+  let r = spawnSync(
+    pythonExe,
+    [script, '--dest', dest, '--platform', platformArg],
+    { stdio: 'inherit', shell: false, env }
+  );
+  if ((r.status !== 0 || !fs.existsSync(chromeExe)) && fs.existsSync(pythonExe)) {
+    // Fallback: pip install cloakbrowser then retry native ensure
+    spawnSync(pythonExe, ['-m', 'pip', 'install', '-q', 'cloakbrowser>=0.5.0'], {
+      stdio: 'inherit', shell: false, env,
+    });
+    r = spawnSync(
+      pythonExe,
+      [script, '--dest', dest, '--platform', platformArg],
+      { stdio: 'inherit', shell: false, env }
+    );
+  }
+  if (!fs.existsSync(chromeExe)) {
+    throw new Error('krexion-kernel: Cloak C++ chrome binary missing after bundle at ' + chromeExe);
+  }
+  log(`krexion-kernel: ready at ${chromeExe}`);
+}
+
 function prepareIcon() {
   const src = path.join(REPO, 'installer', 'krexion.ico');
   const dest = path.join(RES, 'icon.ico');
@@ -506,6 +550,7 @@ function prepareIcon() {
   prepareBackend();
   prepareFrontend();
   prepareChromium();
+  prepareKrexionKernel();
   prepareIcon();
   log('✅ resources ready at ' + RES);
 })().catch((err) => {
