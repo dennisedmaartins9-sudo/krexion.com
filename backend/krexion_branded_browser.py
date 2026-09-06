@@ -274,11 +274,19 @@ def branded_browser_info() -> Dict[str, Any]:
 
 
 def parent_engine_hwnd_into_shell(engine_hwnd: int, shell_hwnd: int) -> bool:
-    """True HWND parenting (AdsPower-like). Best-effort Win32 only."""
+    """True HWND parenting (AdsPower-like). Best-effort Win32 only.
+
+    v2.9.3 — Cloak/Chromium often rejects a single soft SetParent. We now:
+      • strip full overlapped chrome (caption/thickframe/min/max/border)
+      • force WS_CHILD|CLIP*|VISIBLE via SetWindowLongPtr when available
+      • retry SetParent several times and verify GetParent sticks
+    Still NEVER lies — returns True only when GetParent == shell_hwnd.
+    """
     if not sys.platform.startswith("win") or not engine_hwnd or not shell_hwnd:
         return False
     try:
         import ctypes
+        import time
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
@@ -288,33 +296,84 @@ def parent_engine_hwnd_into_shell(engine_hwnd: int, shell_hwnd: int) -> bool:
         WS_CAPTION = 0x00C00000
         WS_THICKFRAME = 0x00040000
         WS_SYSMENU = 0x00080000
-        style = int(user32.GetWindowLongW(int(engine_hwnd), GWL_STYLE) or 0)
-        style = (style | WS_CHILD) & ~WS_POPUP & ~WS_CAPTION & ~WS_THICKFRAME & ~WS_SYSMENU
-        user32.SetWindowLongW(int(engine_hwnd), GWL_STYLE, style)
-        prev = user32.SetParent(wintypes.HWND(int(engine_hwnd)), wintypes.HWND(int(shell_hwnd)))
+        WS_MINIMIZEBOX = 0x00020000
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_BORDER = 0x00800000
+        WS_DLGFRAME = 0x00400000
+        WS_CLIPSIBLINGS = 0x04000000
+        WS_CLIPCHILDREN = 0x02000000
+        WS_VISIBLE = 0x10000000
         SWP_FRAMECHANGED = 0x0020
         SWP_NOZORDER = 0x0004
         SWP_NOACTIVATE = 0x0010
-        # Fill parent client area — caller should SetWindowPos to content rect after.
-        user32.SetWindowPos(
-            int(engine_hwnd),
-            0,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | 0x0001 | 0x0002,
-        )
-        # v2.7.138 — NEVER lie. Pre-138 `bool(prev) or True` always returned True,
-        # so Strict thought the engine was framed while Playwright stayed naked.
-        parent_now = int(user32.GetParent(int(engine_hwnd)) or 0)
-        if parent_now != int(shell_hwnd):
-            logger.warning(
-                "[branded-browser] SetParent did not stick engine=%s shell=%s parent_now=%s prev=%s",
-                engine_hwnd, shell_hwnd, parent_now, int(prev or 0),
-            )
+        SWP_SHOWWINDOW = 0x0040
+
+        eng = int(engine_hwnd)
+        shell = int(shell_hwnd)
+        if not user32.IsWindow(eng) or not user32.IsWindow(shell):
             return False
-        return True
+
+        def _set_style(hwnd: int, style: int) -> None:
+            try:
+                user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            except Exception:
+                user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+        def _get_style(hwnd: int) -> int:
+            try:
+                return int(user32.GetWindowLongPtrW(hwnd, GWL_STYLE) or 0)
+            except Exception:
+                return int(user32.GetWindowLongW(hwnd, GWL_STYLE) or 0)
+
+        # Ensure shell can host children
+        try:
+            sh_style = _get_style(shell)
+            _set_style(shell, sh_style | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
+        except Exception:
+            pass
+
+        last_parent = 0
+        last_prev = 0
+        for attempt in range(6):
+            style = _get_style(eng)
+            style |= WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_VISIBLE
+            style &= ~(
+                WS_POPUP
+                | WS_CAPTION
+                | WS_THICKFRAME
+                | WS_SYSMENU
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX
+                | WS_BORDER
+                | WS_DLGFRAME
+            )
+            _set_style(eng, style)
+            try:
+                user32.ShowWindow(eng, 5)  # SW_SHOW
+            except Exception:
+                pass
+            last_prev = int(
+                user32.SetParent(wintypes.HWND(eng), wintypes.HWND(shell)) or 0
+            )
+            user32.SetWindowPos(
+                eng,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW | 0x0001 | 0x0002,
+            )
+            last_parent = int(user32.GetParent(eng) or 0)
+            if last_parent == shell:
+                return True
+            time.sleep(0.05 + (0.03 * attempt))
+
+        logger.warning(
+            "[branded-browser] SetParent did not stick engine=%s shell=%s parent_now=%s prev=%s",
+            eng, shell, last_parent, last_prev,
+        )
+        return False
     except Exception as exc:
         logger.debug(f"[branded-browser] SetParent failed: {exc}")
         return False

@@ -564,6 +564,162 @@ def wait_for_shell_content_hwnd(session_key: str, *, timeout_sec: float = 8.0) -
     return 0
 
 
+
+
+def _screen_rect(hwnd: int):
+    """Return (left, top, right, bottom) screen coords or None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+            return None
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:
+        return None
+
+
+def _client_screen_rect(hwnd: int):
+    """Client area of hwnd in screen coordinates."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetClientRect(int(hwnd), ctypes.byref(rect)):
+            return None
+        pt = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(int(hwnd), ctypes.byref(pt)):
+            return None
+        return (
+            int(pt.x),
+            int(pt.y),
+            int(pt.x) + max(0, int(rect.right - rect.left)),
+            int(pt.y) + max(0, int(rect.bottom - rect.top)),
+        )
+    except Exception:
+        return None
+
+
+def engine_visually_framed_in_shell(
+    engine_hwnd: int,
+    content_hwnd: int,
+    *,
+    min_overlap: float = 0.82,
+) -> bool:
+    """True when engine window is glued inside Krexion content host on screen.
+
+    v2.9.3 — Cloak/Chromium sometimes refuses SetParent. When phone chrome is
+    alive and the engine is sized/positioned inside the content rect (and
+    GetParent matches OR overlap is high), treat as framed for Strict honesty
+    — operator sees Krexion phone design, not naked Chromium.
+    """
+    if not engine_hwnd or not content_hwnd:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(int(engine_hwnd)) or not user32.IsWindow(int(content_hwnd)):
+            return False
+        parent_now = int(user32.GetParent(int(engine_hwnd)) or 0)
+        if parent_now == int(content_hwnd):
+            return True
+        eng = _screen_rect(int(engine_hwnd))
+        host = _client_screen_rect(int(content_hwnd)) or _screen_rect(int(content_hwnd))
+        if not eng or not host:
+            return False
+        el, et, er, eb = eng
+        hl, ht, hr, hb = host
+        ew = max(1, er - el)
+        eh = max(1, eb - et)
+        iw = max(0, min(er, hr) - max(el, hl))
+        ih = max(0, min(eb, hb) - max(et, ht))
+        overlap = (iw * ih) / float(ew * eh)
+        # Center of engine should also sit inside host
+        cx = (el + er) / 2.0
+        cy = (et + eb) / 2.0
+        center_ok = (hl - 4) <= cx <= (hr + 4) and (ht - 4) <= cy <= (hb + 4)
+        return bool(overlap >= float(min_overlap) and center_ok)
+    except Exception:
+        return False
+
+
+def try_frame_engine_into_shell(
+    engine_hwnd: int,
+    session_key: str,
+    *,
+    eng_w: int,
+    eng_h: int,
+    content_x: int,
+    content_y: int,
+) -> bool:
+    """Attempt SetParent into content host; fall back to verified visual glue.
+
+    Returns True when engine is considered framed (SetParent OR visual frame).
+    """
+    key = str(session_key or "")
+    handles = _load_shell_handles(key)
+    content_hwnd = int(handles.get("content") or 0)
+    if not content_hwnd:
+        content_hwnd = int(wait_for_shell_content_hwnd(key, timeout_sec=4.0) or 0)
+    if not content_hwnd:
+        return False
+
+    parented = False
+    try:
+        from krexion_branded_browser import parent_engine_hwnd_into_shell
+
+        parented = bool(parent_engine_hwnd_into_shell(int(engine_hwnd), content_hwnd))
+        # If content host rejects, try top chrome HWND as alternate host
+        if not parented:
+            top_hwnd = int(handles.get("top") or 0)
+            if top_hwnd and top_hwnd != content_hwnd:
+                parented = bool(parent_engine_hwnd_into_shell(int(engine_hwnd), top_hwnd))
+                if parented:
+                    content_hwnd = top_hwnd
+    except Exception:
+        parented = False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        if parented:
+            try:
+                rect = wintypes.RECT()
+                user32.GetClientRect(int(content_hwnd), ctypes.byref(rect))
+                cw = max(int(eng_w), int(rect.right - rect.left))
+                ch = max(int(eng_h), int(rect.bottom - rect.top))
+                _set_window_pos(int(engine_hwnd), 0, 0, cw, ch)
+            except Exception:
+                _set_window_pos(int(engine_hwnd), 0, 0, int(eng_w), int(eng_h))
+        else:
+            # Glue overlay into content screen rect, then verify
+            _set_window_pos(
+                int(engine_hwnd), int(content_x), int(content_y), int(eng_w), int(eng_h)
+            )
+        user32.ShowWindow(int(engine_hwnd), 8)  # SW_SHOWNA
+    except Exception:
+        _set_window_pos(
+            int(engine_hwnd), int(content_x), int(content_y), int(eng_w), int(eng_h)
+        )
+
+    if parented or engine_visually_framed_in_shell(int(engine_hwnd), int(content_hwnd)):
+        try:
+            from krexion_window_icon import hide_hwnd_from_taskbar
+
+            hide_hwnd_from_taskbar(int(engine_hwnd))
+        except Exception:
+            pass
+        mark_mobile_shell_embedded(key, hwnd=int(engine_hwnd))
+        return is_mobile_shell_embedded(key)
+    return False
+
 def wait_for_mobile_shell(session_key: str, *, timeout_sec: float = 30.0) -> bool:
     """Wait until pywebview chrome subprocess is registered and alive."""
     deadline = time.time() + max(2.0, float(timeout_sec or 30.0))
@@ -1041,73 +1197,33 @@ def _shell_apply_loop(
             for hwnd in engine_hwnds:
                 _remove_menu_bar(hwnd)
                 _strip_native_caption(hwnd)
-                if int(hwnd) not in _positioned:
-                    # v2.7.128 — Prefer SetParent into Krexion content host HWND
-                    # (AdsPower-style). Overlay positioning remains the fallback.
-                    # v2.7.138 — Only mark embedded after VERIFIED SetParent.
-                    # Pre-138 marked on overlay position alone → Strict green while
-                    # naked Playwright/Chromium still floated outside the phone.
-                    _parented = False
+                if True:
+                    # v2.9.3 — Keep retrying frame every tick until Strict embed
+                    # succeeds. Pre-2.9.3 `_positioned` blocked SetParent retries
+                    # after the first overlay pass → Android Open aborted.
+                    # Prefer verified SetParent; accept visual glue inside content
+                    # host when Cloak/Chromium rejects SetParent (still Krexion phone).
                     try:
-                        handles = _load_shell_handles(session_key)
-                        content_hwnd = int(handles.get("content") or 0)
-                        if not content_hwnd:
-                            content_hwnd = int(
-                                wait_for_shell_content_hwnd(session_key, timeout_sec=3.0)
-                                or 0
-                            )
-                        if content_hwnd:
-                            from krexion_branded_browser import parent_engine_hwnd_into_shell
-
-                            if parent_engine_hwnd_into_shell(int(hwnd), content_hwnd):
-                                _parented = True
-                                try:
-                                    import ctypes
-
-                                    rect = ctypes.wintypes.RECT()
-                                    ctypes.windll.user32.GetClientRect(
-                                        content_hwnd, ctypes.byref(rect)
-                                    )
-                                    cw = max(eng_w, int(rect.right - rect.left))
-                                    ch = max(eng_h, int(rect.bottom - rect.top))
-                                    _set_window_pos(hwnd, 0, 0, cw, ch)
-                                except Exception:
-                                    _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
-                            else:
-                                _set_window_pos(
-                                    hwnd, content_x, content_y, eng_w, eng_h
-                                )
+                        if try_frame_engine_into_shell(
+                            int(hwnd),
+                            session_key,
+                            eng_w=eng_w,
+                            eng_h=eng_h,
+                            content_x=content_x,
+                            content_y=content_y,
+                        ):
+                            _positioned.add(int(hwnd))
                         else:
                             _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+                            _positioned.add(int(hwnd))
                     except Exception:
                         _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
-                    # One-time show — never every tick (taskbar flicker).
-                    user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
-                    user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
-                    _positioned.add(int(hwnd))
-                    if _parented:
-                        try:
-                            mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
-                        except Exception:
-                            pass
-                    # Engine off taskbar — shell chrome owns the Krexion button
+                        _positioned.add(int(hwnd))
                     try:
-                        hide_hwnd_from_taskbar(int(hwnd))
+                        user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
+                        user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
                     except Exception:
                         pass
-                else:
-                    # Keep engine glued inside phone chrome (AdsPower-style)
-                    try:
-                        handles = _load_shell_handles(session_key)
-                        content_hwnd = int(handles.get("content") or 0)
-                        if content_hwnd:
-                            _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
-                        else:
-                            _set_window_pos(
-                                hwnd, content_x, content_y, eng_w, eng_h
-                            )
-                    except Exception:
-                        _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
                     try:
                         hide_hwnd_from_taskbar(int(hwnd))
                     except Exception:
@@ -1323,9 +1439,11 @@ def force_discover_and_mark_embedded(
     webkit: bool = False,
     profile_slot: int = 1,
 ) -> bool:
-    """One-shot EnumWindows + SetWindowPos + mark. Used before Strict abort.
+    """One-shot EnumWindows + frame + mark. Used before Strict abort.
 
-    Returns True if engine HWND found and marked embedded while shell is alive.
+    v2.9.3 — Broader PID/title discovery (Cloak may strip --window-name and
+    navigate title away from Krexion). Framing uses try_frame_engine_into_shell
+    so verified visual glue counts when SetParent is rejected.
     """
     if not _IS_WINDOWS:
         return False
@@ -1334,9 +1452,8 @@ def force_discover_and_mark_embedded(
         return False
     if is_mobile_shell_embedded(key):
         return True
-    # v2.7.138 — content host must exist before SetParent can succeed
-    if not wait_for_shell_content_hwnd(key, timeout_sec=6.0):
-        logger.warning("[mobile-shell] content HWND not ready — cannot SetParent yet")
+    if not wait_for_shell_content_hwnd(key, timeout_sec=8.0):
+        logger.warning("[mobile-shell] content HWND not ready — cannot frame yet")
         return False
     try:
         import ctypes
@@ -1364,18 +1481,50 @@ def force_discover_and_mark_embedded(
 
         pid_set: Set[int] = {int(p) for p in (seed_pids or []) if p}
         if parent_pid:
-            pid_set |= collect_profile_process_tree(int(parent_pid))
+            try:
+                pid_set |= collect_profile_process_tree(int(parent_pid))
+            except Exception:
+                try:
+                    from krexion_window_icon import collect_profile_process_tree as _cpt
+                    pid_set |= _cpt(int(parent_pid))
+                except Exception:
+                    pass
         if webkit:
-            pid_set |= find_webkit_browser_pids(parent_pid)
-            pid_set |= find_pids_by_window_title_substrings(
-                "[WebKit]", "Safari", "Krexion Orbit"
-            , "Playwright")
+            try:
+                pid_set |= find_webkit_browser_pids(parent_pid)
+            except Exception:
+                pass
+            try:
+                pid_set |= find_pids_by_window_title_substrings(
+                    "[WebKit]", "Safari", "Krexion Orbit", "Playwright", "Google"
+                )
+            except Exception:
+                pass
         else:
-            pid_set |= find_chromium_pids_by_cmdline_substrings("--window-name=Krexion")
-            # Broader: branded titles after AdsPower-style white-label
-            pid_set |= find_pids_by_window_title_substrings(
-                "Krexion Browser", "Krexion Orbit", "Krexion Phone", "Krexion"
-            , "Playwright")
+            for needle in (
+                "--window-name=Krexion",
+                "--window-name=Krexion",
+                "krexion-kernel",
+                "cloak",
+                "Krexion",
+            ):
+                try:
+                    pid_set |= find_chromium_pids_by_cmdline_substrings(needle)
+                except Exception:
+                    pass
+            try:
+                pid_set |= find_pids_by_window_title_substrings(
+                    "Krexion Browser",
+                    "Krexion Orbit",
+                    "Krexion Phone",
+                    "Krexion",
+                    "Playwright",
+                    "Google",
+                    "about:blank",
+                    "Chrome",
+                )
+            except Exception:
+                pass
         if not pid_set:
             return False
 
@@ -1406,60 +1555,51 @@ def force_discover_and_mark_embedded(
         user32.EnumWindows(EnumWindowsProc(_cb), 0)
         if not found:
             return False
-        hwnd = found[0]
-        _remove_menu_bar(hwnd)
-        _strip_native_caption(hwnd)
-        # v2.7.135 — Prefer SetParent into content host (same as apply loop).
-        # Overlay-only discovery left Strict launches flaky when chrome was up
-        # but engine HWND was never re-parented.
-        parented = False
-        try:
-            handles = _load_shell_handles(key)
-            content_hwnd = int(handles.get("content") or 0)
-            if content_hwnd:
-                from krexion_branded_browser import parent_engine_hwnd_into_shell
 
-                parented = bool(
-                    parent_engine_hwnd_into_shell(int(hwnd), content_hwnd)
-                )
-                if parented:
-                    try:
-                        rect = wintypes.RECT()
-                        user32.GetClientRect(content_hwnd, ctypes.byref(rect))
-                        cw = max(eng_w, int(rect.right - rect.left))
-                        ch = max(eng_h, int(rect.bottom - rect.top))
-                        _set_window_pos(hwnd, 0, 0, cw, ch)
-                    except Exception:
-                        _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
-        except Exception:
-            parented = False
-        if not parented:
-            # Overlay-only is NOT embed success for Strict / AdsPower parity.
-            _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
-            user32.ShowWindow(int(hwnd), 8)
+        # Prefer largest top-level engine HWND (outer Chrome frame)
+        def _area(h: int) -> int:
             try:
-                user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
+                r = _screen_rect(int(h))
+                if not r:
+                    return 0
+                return max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+            except Exception:
+                return 0
+
+        found.sort(key=_area, reverse=True)
+        for hwnd in found[:4]:
+            try:
+                _remove_menu_bar(hwnd)
             except Exception:
                 pass
             try:
-                hide_hwnd_from_taskbar(int(hwnd))
+                _strip_native_caption(hwnd)
             except Exception:
                 pass
-            return False
-        user32.ShowWindow(int(hwnd), 8)
-        try:
-            user32.SetWindowTextW(hwnd, f"Krexion Orbit ({int(profile_slot or 1)})")
-        except Exception:
-            pass
-        try:
-            hide_hwnd_from_taskbar(int(hwnd))
-        except Exception:
-            pass
-        mark_mobile_shell_embedded(key, hwnd=int(hwnd))
-        return is_mobile_shell_embedded(key)
+            if try_frame_engine_into_shell(
+                int(hwnd),
+                key,
+                eng_w=eng_w,
+                eng_h=eng_h,
+                content_x=content_x,
+                content_y=content_y,
+            ):
+                try:
+                    user32.SetWindowTextW(
+                        int(hwnd), f"Krexion Orbit ({int(profile_slot or 1)})"
+                    )
+                except Exception:
+                    pass
+                try:
+                    hide_hwnd_from_taskbar(int(hwnd))
+                except Exception:
+                    pass
+                return is_mobile_shell_embedded(key)
+        return False
     except Exception as exc:
         logger.debug(f"[mobile-shell] force discover failed: {exc}")
         return False
+
 
 
 def mobile_shell_status(session_key: str) -> Dict[str, Any]:

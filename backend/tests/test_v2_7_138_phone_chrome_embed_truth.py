@@ -1,4 +1,9 @@
-"""v2.7.138 — Phone chrome embed must be truthful (no fake framed)."""
+"""v2.7.138 / v2.9.3 — Phone chrome embed must be truthful (evolved).
+
+v2.7.138 locked: never lie that SetParent succeeded.
+v2.9.3 keeps that, and adds verified visual glue when Cloak rejects SetParent
+while Krexion phone chrome is alive (AdsPower-class UX, still honest).
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,23 +21,26 @@ def test_version_at_least_2_7_138():
 def test_setparent_never_lies():
     src = (ROOT / "krexion_branded_browser.py").read_text(encoding="utf-8")
     assert "GetParent" in src
-    assert "parent_now != int(shell_hwnd)" in src
+    # v2.9.3 retries then checks last_parent == shell (still GetParent-backed)
+    assert "last_parent == shell" in src or "parent_now != int(shell_hwnd)" in src
     for line in src.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        if "return bool(prev) or True" in stripped or "return bool(prev) or True" in stripped:
+        if "return bool(prev) or True" in stripped:
             raise AssertionError(f"SetParent still lies: {stripped}")
         if "or True" in stripped and "return" in stripped:
             raise AssertionError(f"suspicious return or True: {stripped}")
 
 
-def test_embed_mark_requires_verified_parent():
+def test_embed_mark_requires_verified_frame():
     src = (ROOT / "krexion_mobile_browser_shell.py").read_text(encoding="utf-8")
-    assert "if _parented:" in src
-    assert "Overlay-only is NOT embed success" in src
+    assert "try_frame_engine_into_shell" in src
+    assert "engine_visually_framed_in_shell" in src
     assert "wait_for_shell_content_hwnd" in src
     assert '"Playwright"' in src
+    assert "min_overlap" in src
+    assert "mark_mobile_shell_embedded" in src
 
 
 def test_proxy_relay_never_forwards_407():

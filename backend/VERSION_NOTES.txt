@@ -1,3 +1,19 @@
+# v2.9.3 — 2026-09 — Strict mobile shell frame retry (Android Open abort fix)
+# User report: Android profile Open shows plain Chromium for a few seconds then
+# closes with: "Strict mobile shell: Krexion phone chrome did not frame the browser".
+# Root causes:
+#   1) Apply-loop marked HWND "positioned" after first overlay pass and NEVER
+#      retried SetParent — Cloak/Chromium often needs multiple attempts.
+#   2) Soft single SetParent (style strip incomplete) failed on Cloak windows.
+#   3) Strict rejected honest visual glue when phone chrome was alive and the
+#      engine was sized inside the content host (AdsPower-class UX still OK).
+# Fix (NO deploy in this agent pass — code + tests only until user asks):
+#   • Harden parent_engine_hwnd_into_shell (full chrome strip + retries + verify)
+#   • try_frame_engine_into_shell every tick until embedded
+#   • Accept verified visual frame when SetParent rejected but shell is alive
+#   • Broader engine HWND discovery after Google title navigation
+#   • Longer Strict embed wait + more last-chance discover passes
+#
 # v2.9.2 — 2026-09 — Legacy kernel-pref coerce (residual lock)
 # Deep post-ship audit found one real residual:
 #   Old profiles saved with browser_kernel=playwright|patchright|chrome

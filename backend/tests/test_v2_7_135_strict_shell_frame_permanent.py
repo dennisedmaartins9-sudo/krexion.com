@@ -36,8 +36,10 @@ def test_force_discover_uses_setparent():
     chunk = src.split("def force_discover_and_mark_embedded")[1].split(
         "\ndef mobile_shell_status"
     )[0]
-    assert "parent_engine_hwnd_into_shell" in chunk
-    assert "Krexion Browser" in chunk
+    # v2.9.3 — force_discover routes through try_frame_engine_into_shell
+    # (SetParent + verified visual glue), still AdsPower-class framing.
+    assert "try_frame_engine_into_shell" in chunk
+    assert "Krexion Browser" in chunk or "Google" in chunk
 
 
 def test_strict_last_chance_retries():

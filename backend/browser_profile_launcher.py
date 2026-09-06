@@ -2851,7 +2851,7 @@ async def _launch_profile_session_inner(
                             force_discover_and_mark_embedded,
                         )
 
-                        _embed_wait = 45.0 if _profile_engine == "webkit" else 30.0
+                        _embed_wait = 50.0 if _profile_engine == "webkit" else 45.0  # v2.9.3 — Cloak SetParent needs longer glue window
 
                         # Already framed from early pass — just verify / refresh meta
                         if is_mobile_shell_embedded(session_id):
@@ -3076,7 +3076,7 @@ async def _launch_profile_session_inner(
                             if strict_mobile_shell and require_embed:
                                 # v2.7.135 — Last-chance multi-pass discover before abort
                                 _final_ok = False
-                                for _fd_try in range(6):
+                                for _fd_try in range(10):  # v2.9.3 — more last-chance frame attempts
                                     try:
                                         if force_discover_and_mark_embedded(
                                             str(session_id),

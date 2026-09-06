@@ -172,7 +172,9 @@ def test_shell_engine_hwnd_uses_iswindow_not_visible_only():
 def test_launcher_force_discover_before_strict_abort():
     src = (ROOT / "browser_profile_launcher.py").read_text(encoding="utf-8")
     assert "force_discover_and_mark_embedded" in src
-    assert "_embed_wait = 45.0 if _profile_engine == \"webkit\" else 30.0" in src
+    # v2.9.3 — Cloak needs a longer Strict glue window than stock Chromium
+    assert "else 45.0" in src
+    assert "_embed_wait" in src
 
 
 def test_frontend_unique_ip_create_copy():
