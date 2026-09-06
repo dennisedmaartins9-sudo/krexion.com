@@ -41,5 +41,5 @@ def test_frontend_honesty_still_warns_when_off():
     fe = (REPO / "frontend/src/pages/BrowserProfilesPage.js").read_text(
         encoding="utf-8"
     )
-    assert "Krexion phone chrome off / unavailable" in fe
+    assert "phone chrome off / unavailable" in fe
     assert "strict_mobile_shell" in fe

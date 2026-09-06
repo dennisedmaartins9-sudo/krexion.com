@@ -30,7 +30,7 @@ def main() -> int:
 
     import webview  # type: ignore
 
-    handles: dict = {"top": 0, "bottom": 0}
+    handles: dict = {"top": 0, "bottom": 0, "content": 0}
     bezel = int(cfg.get("bezel") or 0)
     outer_w = int(cfg.get("outer_w") or 400)
     top_h = int(cfg.get("top_h") or 56)
@@ -91,7 +91,7 @@ def main() -> int:
             api.bind_windows(top, bottom, session_key=session_key)
 
     top = webview.create_window(
-        title=f"KrexionShell-{slot}-top",
+        title=f"Krexion — Profile {slot}",
         html=str(cfg.get("top_html") or ""),
         width=outer_w,
         height=top_h,
@@ -105,6 +105,43 @@ def main() -> int:
         js_api=api,
     )
     top.events.loaded += _on_top_loaded
+
+    # v2.7.128 — Invisible content host between chrome bars so the engine can
+    # be SetParent'd into a Krexion-owned HWND (AdsPower-style single window).
+    content = None
+    content_y = vy + top_h + bezel
+    try:
+        content = webview.create_window(
+            title=f"KrexionContent-{slot}",
+            html=(
+                "<!doctype html><html><body style='margin:0;background:#000;"
+                "overflow:hidden'></body></html>"
+            ),
+            width=outer_w,
+            height=max(200, int(vh)),
+            x=vx,
+            y=content_y,
+            frameless=True,
+            on_top=False,
+            easy_drag=False,
+            resizable=False,
+            background_color="#000000",
+        )
+
+        def _on_content_loaded():
+            try:
+                handles["content"] = int(content.native.Handle.ToInt32())  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    handles["content"] = int(content.native.handle)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            _save_handles()
+
+        content.events.loaded += _on_content_loaded
+    except Exception:
+        content = None
+
     bottom = None
     if show_bottom:
         bottom = webview.create_window(

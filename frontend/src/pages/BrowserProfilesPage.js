@@ -2686,7 +2686,7 @@ export default function BrowserProfilesPage() {
                         ? "Krexion phone chrome active (desktop frame — not a real device)"
                         : p.mobile_shell_active
                           ? "Phone chrome started — waiting to frame browser…"
-                          : "Desktop Chromium/WebKit — Krexion phone chrome off / unavailable"}
+                          : "Krexion Browser — phone chrome off / unavailable"}
                     </div>
                   )}
                   {p.proxy_check_stale && (
@@ -2728,7 +2728,7 @@ export default function BrowserProfilesPage() {
                   )}
                   {p.status === "queued" && !p.last_error && (
                     <div className="mt-2 text-[10px] text-amber-300/80 italic">
-                      Waiting for Krexion tray to open Chromium… Keep the tray app running.
+                      Waiting for Krexion tray to open Krexion Browser… Keep the tray app running.
                     </div>
                   )}
                 </CardContent>
@@ -3251,10 +3251,10 @@ export default function BrowserProfilesPage() {
                                 })}
                                 className="w-full bg-zinc-900 border border-zinc-700 text-zinc-100 rounded px-2 py-1.5 text-xs"
                               >
-                                <option value="auto">Krexion Stealth (auto)</option>
-                                <option value="cloak">Krexion Stealth Chromium</option>
-                                <option value="patchright">Krexion Hardened Chromium</option>
-                                <option value="playwright">Krexion Standard Chromium</option>
+                                <option value="auto">Krexion Browser (auto)</option>
+                                <option value="cloak">Krexion Browser Stealth</option>
+                                <option value="patchright">Krexion Browser Hardened</option>
+                                <option value="playwright">Krexion Browser Standard</option>
                                 <option value="firefox">Krexion Firefox</option>
                                 <option value="chrome">System Chrome (not recommended)</option>
                               </select>

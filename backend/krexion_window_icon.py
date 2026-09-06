@@ -915,6 +915,10 @@ def find_chromium_pids_by_cmdline_substrings(*needles: str) -> Set[int]:
                     "msedge.exe",
                     "chrome",
                     "chromium",
+                    # v2.7.128 — white-label AdsPower-style binary name
+                    "krexion-browser.exe",
+                    "krexion-browser",
+                    "krexionbrowser.exe",
                 ):
                     continue
                 cmdline = proc.info.get("cmdline") or []

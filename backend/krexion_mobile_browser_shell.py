@@ -1006,30 +1006,66 @@ def _shell_apply_loop(
                 _remove_menu_bar(hwnd)
                 _strip_native_caption(hwnd)
                 if int(hwnd) not in _positioned:
-                    _set_window_pos(
-                        hwnd,
-                        content_x,
-                        content_y,
-                        eng_w,
-                        eng_h,
-                    )
+                    # v2.7.128 — Prefer SetParent into Krexion content host HWND
+                    # (AdsPower-style). Overlay positioning remains the fallback.
+                    try:
+                        handles = _load_shell_handles(session_key)
+                        content_hwnd = int(handles.get("content") or 0)
+                        if content_hwnd:
+                            from krexion_branded_browser import parent_engine_hwnd_into_shell
+
+                            if parent_engine_hwnd_into_shell(int(hwnd), content_hwnd):
+                                # Fill the content host client area
+                                try:
+                                    import ctypes
+
+                                    rect = ctypes.wintypes.RECT()
+                                    ctypes.windll.user32.GetClientRect(
+                                        content_hwnd, ctypes.byref(rect)
+                                    )
+                                    cw = max(eng_w, int(rect.right - rect.left))
+                                    ch = max(eng_h, int(rect.bottom - rect.top))
+                                    _set_window_pos(hwnd, 0, 0, cw, ch)
+                                except Exception:
+                                    _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
+                            else:
+                                _set_window_pos(
+                                    hwnd, content_x, content_y, eng_w, eng_h
+                                )
+                        else:
+                            _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+                    except Exception:
+                        _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
                     # One-time show — never every tick (taskbar flicker).
                     user32.ShowWindow(int(hwnd), 8)  # SW_SHOWNA
                     user32.SetWindowTextW(hwnd, f"Krexion Orbit ({profile_slot})")
                     _positioned.add(int(hwnd))
-                    mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
+                    try:
+                        mark_mobile_shell_embedded(session_key, hwnd=int(hwnd))
+                    except Exception:
+                        pass
+                    # Engine off taskbar — shell chrome owns the Krexion button
+                    try:
+                        hide_hwnd_from_taskbar(int(hwnd))
+                    except Exception:
+                        pass
                 else:
-                    _set_window_pos(
-                        hwnd,
-                        content_x,
-                        content_y,
-                        eng_w,
-                        eng_h,
-                    )
-                try:
-                    hide_hwnd_from_taskbar(int(hwnd))
-                except Exception:
-                    pass
+                    # Keep engine glued inside phone chrome (AdsPower-style)
+                    try:
+                        handles = _load_shell_handles(session_key)
+                        content_hwnd = int(handles.get("content") or 0)
+                        if content_hwnd:
+                            _set_window_pos(hwnd, 0, 0, eng_w, eng_h)
+                        else:
+                            _set_window_pos(
+                                hwnd, content_x, content_y, eng_w, eng_h
+                            )
+                    except Exception:
+                        _set_window_pos(hwnd, content_x, content_y, eng_w, eng_h)
+                    try:
+                        hide_hwnd_from_taskbar(int(hwnd))
+                    except Exception:
+                        pass
 
             embedded = set(engine_hwnds)
             if embedded:

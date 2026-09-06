@@ -40,8 +40,8 @@ def test_frontend_kernel_select():
     text = fe.read_text(encoding="utf-8")
     assert 'browser_kernel: "auto"' in text
     assert 'data-testid="bp-browser-kernel"' in text
-    # White-label: customer UI shows Krexion Stealth (no Cloak vendor names)
-    assert "Krexion Stealth" in text
+    # White-label: customer UI shows Krexion Browser Stealth (no Cloak vendor names)
+    assert "Krexion Browser Stealth" in text or "Krexion Stealth" in text
     assert "CloakBrowser" not in text
     assert 'value="cloak"' in text  # internal kernel value
 

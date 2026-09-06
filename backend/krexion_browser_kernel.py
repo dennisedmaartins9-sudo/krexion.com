@@ -89,6 +89,7 @@ def resolve_launch_plan(anti: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
       stealth_args: list[str],
       kernel_label: str,
       reduce_js_fingerprint_noise: bool,  # Cloak already C++-patches canvas/etc.
+      branded: bool,  # launched via krexion-browser.exe white-label binary
     }
     """
     pref = resolve_kernel_preference(anti)
@@ -100,6 +101,7 @@ def resolve_launch_plan(anti: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         "kernel_label": "playwright-chromium",
         "reduce_js_fingerprint_noise": False,
         "preference": pref,
+        "branded": False,
     }
 
     if pref == "firefox":
@@ -126,7 +128,7 @@ def resolve_launch_plan(anti: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
                 plan["stealth_args"] = list(cloakbrowser.get_default_stealth_args() or [])
             except Exception:
                 plan["stealth_args"] = []
-            return plan
+            return _apply_krexion_brand_binary(plan)
         if pref == "cloak":
             logger.warning("[kernel] CloakBrowser requested but unavailable — falling back")
 
@@ -134,9 +136,42 @@ def resolve_launch_plan(anti: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     if pref in ("auto", "patchright") and patchright_available():
         plan["driver"] = "patchright"
         plan["kernel_label"] = "patchright-cdp"
-        return plan
+        return _apply_krexion_brand_binary(plan)
 
     plan["kernel_label"] = "playwright-chromium"
+    return _apply_krexion_brand_binary(plan)
+
+
+def _apply_krexion_brand_binary(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """v2.7.128 — Prefer krexion-browser.exe so OS shows Krexion, not chrome.exe."""
+    if plan.get("engine") != "chromium":
+        return plan
+    if (os.environ.get("KREXION_DISABLE_BRANDED_BROWSER") or "").strip() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return plan
+    try:
+        from krexion_branded_browser import ensure_krexion_browser_binary
+
+        branded = ensure_krexion_browser_binary(
+            prefer_cloak=bool(plan.get("driver") == "cloak" or plan.get("executable_path")),
+        )
+        if branded and os.path.isfile(branded):
+            plan["executable_path"] = branded
+            plan["branded"] = True
+            # User-facing label — never advertise stock Chromium
+            label = str(plan.get("kernel_label") or "")
+            if "cloak" in label:
+                plan["kernel_label"] = "krexion-stealth-browser"
+            elif "patchright" in label:
+                plan["kernel_label"] = "krexion-hardened-browser"
+            else:
+                plan["kernel_label"] = "krexion-browser"
+            plan.pop("channel", None)
+    except Exception as exc:
+        logger.debug(f"[kernel] branded browser apply skipped: {exc}")
     return plan
 
 

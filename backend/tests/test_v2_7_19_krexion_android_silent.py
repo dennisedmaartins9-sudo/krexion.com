@@ -49,4 +49,4 @@ def test_customer_ui_white_label():
     assert "CloakBrowser" not in bp
     assert "AdsPower" not in bp
     assert "Octo" not in bp
-    assert "Krexion Stealth" in bp
+    assert "Krexion Browser Stealth" in bp or "Krexion Stealth" in bp

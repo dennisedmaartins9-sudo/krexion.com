@@ -1,3 +1,13 @@
+# v2.7.128 — 2026-09 — Krexion branded browser kernel (AdsPower-style)
+# - White-label binary: Cloak/Playwright chrome copied to krexion-browser.exe so
+#   Task Manager / process list show Krexion, not chrome.exe.
+# - Kernel auto-applies branded executable_path; labels = Krexion Browser *.
+# - Mobile shell host adds invisible content HWND; engine SetParent into it when
+#   possible (single Krexion-owned window). Overlay fallback kept.
+# - Taskbar: hide Playwright helpers; PID scan includes krexion-browser.exe.
+# - FE: kernel picker says Krexion Browser (not Chromium).
+# - Includes v2.7.127 saved-proxy Sign-in gates (deployed together in one ship).
+#
 # v2.7.127 — 2026-09 — Saved-proxy Sign-in + AdsPower-style Krexion branding
 # - Root: "Use saved proxy" create never required username+password after parse
 #   → host-only profiles → Chromium Sign-in (gw.dataimpulse.com). Now hard-gated.
