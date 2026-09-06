@@ -1,6 +1,6 @@
 name: Windows Disk Emergency Clean
 
-# Minimal job (no checkout) so it can still start when C: is nearly full.
+# Minimal job (no checkout) so it can still start when the disk is nearly full.
 # Run via workflow_dispatch before Native rebuilds after disk-full failures.
 
 on:
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   clean:
-    name: Nuclear clean C: on krexion-windows
+    name: Nuclear clean on krexion-windows
     runs-on: [self-hosted, windows, krexion-windows]
     timeout-minutes: 30
     steps:
@@ -24,12 +24,12 @@ jobs:
             $d = Get-PSDrive -Name C -ErrorAction SilentlyContinue
             if ($d) {
               $gb = [math]::Round(($d.Free / 1GB), 2)
-              Write-Host ("{0}: C: free {1} GB" -f $label, $gb)
+              Write-Host ("{0}: C free {1} GB" -f $label, $gb)
               return $gb
             }
             return 0
           }
-          $before = Show-Free 'BEFORE'
+          Show-Free 'BEFORE' | Out-Null
 
           # Wipe runner diag logs entirely (pages/*.log caused prior failures)
           @(
@@ -43,15 +43,23 @@ jobs:
             }
           }
 
-          # Drop all prior job workspaces except anything locked
+          # Drop prior job workspaces; keep tools/actions + this job's workspace tree
+          $wsRoot = $null
+          if ($env:GITHUB_WORKSPACE) {
+            $wsRoot = Split-Path -Parent $env:GITHUB_WORKSPACE
+          }
           foreach ($work in @('C:\krexion-runner\_work', 'C:\actions-runner\_work')) {
-            if (Test-Path $work) {
-              Get-ChildItem $work -Force -ErrorAction SilentlyContinue | ForEach-Object {
-                if ($_.Name -in @('_tool', '_update', '_actions')) { return }
-                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-              }
-              Write-Host "Pruned $work"
+            if (-not (Test-Path $work)) { continue }
+            Get-ChildItem $work -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              if ($_.Name -in @('_tool', '_update', '_actions', '_temp')) { return }
+              if ($wsRoot -and ($_.FullName -eq $wsRoot)) { return }
+              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             }
+            # Also clear _temp contents
+            if (Test-Path "$work\_temp") {
+              Remove-Item "$work\_temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "Pruned $work"
           }
 
           # Full CI cache wipe (rebuilds are cheaper than disk-full)
@@ -81,7 +89,7 @@ jobs:
 
           $after = Show-Free 'AFTER'
           if ($after -lt 5.0) {
-            Write-Host "::error::C: still under 5 GB free after nuclear clean ($after GB). Free disk on the Windows runner PC manually."
+            Write-Host "::error::C free space still under 5 GB after nuclear clean ($after GB). Free disk on the Windows runner PC manually."
             exit 1
           }
           Write-Host "Emergency disk clean OK ($after GB free)"
