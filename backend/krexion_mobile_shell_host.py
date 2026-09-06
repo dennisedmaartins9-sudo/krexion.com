@@ -16,10 +16,21 @@ def main() -> int:
     with open(cfg_path, encoding="utf-8") as fh:
         cfg = json.load(fh)
 
+    # v2.7.127 — AdsPower-style: own AppUserModelID + title before any HWND
+    # so taskbar shows Krexion, not EdgeWebView / python.
+    slot = int(cfg.get("slot") or 1)
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            f"Krexion.PhoneChrome.{slot}"
+        )
+    except Exception:
+        pass
+
     import webview  # type: ignore
 
     handles: dict = {"top": 0, "bottom": 0}
-    slot = int(cfg.get("slot") or 1)
     bezel = int(cfg.get("bezel") or 0)
     outer_w = int(cfg.get("outer_w") or 400)
     top_h = int(cfg.get("top_h") or 56)

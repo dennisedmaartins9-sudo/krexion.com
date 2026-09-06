@@ -1,3 +1,14 @@
+# v2.7.127 — 2026-09 — Saved-proxy Sign-in + AdsPower-style Krexion branding
+# - Root: "Use saved proxy" create never required username+password after parse
+#   → host-only profiles → Chromium Sign-in (gw.dataimpulse.com). Now hard-gated.
+# - Soft-launch ready no longer treats rotating host alone as ready without auth.
+# - Launch re-hydrates creds from raw_line before Playwright; still blocks if empty.
+# - FE rejects host-only saved lines before create.
+# - Strict mobile: require phone-chrome HWND embed BEFORE first navigation (abort
+#   if plain Chromium/WebKit would show). Shell host sets Krexion AppUserModelID.
+# - Taskbar: hide Playwright/Chromium helper windows; brand Krexion phone chrome.
+# - Keeps v2.7.125–126 proxy auth + shell dpi + ghost-running + Strict abort fixes.
+#
 # v2.7.126 — 2026-09 — Krexion browser design must launch (no plain Chromium/WebKit)
 # - Root cause: Strict mobile shell was soft-continuing whenever the engine HWND
 #   existed — so plain Chromium/WebKit stayed open with "phone chrome off".

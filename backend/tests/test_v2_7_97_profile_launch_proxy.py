@@ -39,7 +39,11 @@ def test_format_profile_proxy_probe_failure_password_hint():
 def test_proxy_ready_for_soft_launch():
     from browser_profile_module import _proxy_ready_for_soft_launch
 
-    assert _proxy_ready_for_soft_launch({"server": "http://gw:823", "password": "x"})
+    # v2.7.127 — need BOTH username and password (password alone is not enough)
+    assert _proxy_ready_for_soft_launch(
+        {"server": "http://gw:823", "username": "u", "password": "x"}
+    )
+    assert not _proxy_ready_for_soft_launch({"server": "http://gw:823", "password": "x"})
     assert not _proxy_ready_for_soft_launch({"server": "http://gw:823"})
     assert not _proxy_ready_for_soft_launch({"password": "x"})
 

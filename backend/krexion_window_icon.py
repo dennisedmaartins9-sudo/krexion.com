@@ -1050,9 +1050,15 @@ def _icon_apply_loop_multi(
                     )
                     if not pid_match and not title_match:
                         return True
-                    # Playwright driver helper — hide so only Krexion-branded
-                    # browser window stays on the taskbar.
-                    if title.strip().lower() == "playwright":
+                    # Playwright / stock Chromium helpers — hide so only Krexion-
+                    # branded phone chrome / Orbit window stays on the taskbar
+                    # (AdsPower-style: user should not see Playwright icons).
+                    _tlow = title.strip().lower()
+                    if (
+                        _tlow == "playwright"
+                        or _tlow.startswith("playwright ")
+                        or _tlow == "chromium"
+                    ):
                         user32.ShowWindow(hwnd, 0)  # SW_HIDE
                         return True
                     found_hwnds.append(int(hwnd))

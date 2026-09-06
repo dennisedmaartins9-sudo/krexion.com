@@ -2122,7 +2122,20 @@ async def _launch_profile_session_inner(
 
         username = (username or "").strip()
         password = (password or "").strip()
-        # v2.7.125 — NEVER launch with a proxy server but missing auth.
+        # v2.7.127 — Re-hydrate from raw_line right before Playwright so
+        # saved-from-list / geo-rewrite never leaves host-only auth.
+        if (not username or not password) and proxy_cfg:
+            try:
+                from browser_profile_module import hydrate_proxy_credentials as _hpc
+
+                _hyd = _hpc(dict(proxy_cfg))
+                username = username or str(_hyd.get("username") or "").strip()
+                password = password or str(_hyd.get("password") or "").strip()
+                if _hyd.get("server"):
+                    raw_server = str(_hyd.get("server") or raw_server).strip() or raw_server
+            except Exception:
+                pass
+        # v2.7.125/127 — NEVER launch with a proxy server but missing auth.
         # That is exactly what opens Chromium's "Sign in" dialog for
         # gw.dataimpulse.com / residential gateways.
         if not username or not password:
@@ -2131,7 +2144,8 @@ async def _launch_profile_session_inner(
                 detail=(
                     "Proxy server is set but username/password is missing. "
                     "Edit the profile → Proxy → paste a full line "
-                    "(user:pass@host:port or host:port:user:pass), then launch again. "
+                    "(user:pass@host:port or host:port:user:pass), or re-add the "
+                    "saved proxy with full auth, then launch again. "
                     "Launch is blocked so Chromium cannot show a proxy Sign-in popup "
                     "or leak your real IP."
                 ),
@@ -3366,18 +3380,23 @@ async def _launch_profile_session_inner(
             except Exception as _dpr_err:
                 logger.debug(f"[profile-launch] WebKit DPR spoof skipped: {_dpr_err}")
 
-        # v2.7.105d — Early Krexion phone chrome (mobile): start shell as soon as
-        # the engine window exists so plain Chromium/WebKit is not left visible
-        # through the whole first navigation. require_embed=False here so we
-        # don't block forever before goto; post-nav pass verifies HWND embed.
+        # v2.7.127 — Early Krexion phone chrome. Strict ON: require HWND embed
+        # before first navigation so plain Chromium/WebKit is never shown as
+        # "Krexion" (AdsPower-style). Soft Strict OFF: start shell, embed later.
         if is_mobile:
             try:
                 await asyncio.sleep(0.45)
                 _brand_krexion_taskbar(
                     mobile_shell=True,
-                    require_embed=False,
+                    require_embed=bool(strict_mobile_shell),
                     allow_restart=True,
                 )
+                if strict_mobile_shell and not _launch_ui_meta.get("mobile_shell_embedded"):
+                    raise RuntimeError(
+                        "Strict mobile shell: Krexion phone chrome did not frame the "
+                        "browser before navigation. Launch aborted — plain Chromium/"
+                        "WebKit will not be shown as Krexion design."
+                    )
             except RuntimeError as _early_shell_err:
                 # Strict abort — close browser before user mistakes it for Krexion design
                 logger.error(f"[profile-launch] strict mobile shell abort: {_early_shell_err}")
@@ -3393,6 +3412,19 @@ async def _launch_profile_session_inner(
                 raise
             except Exception as _early_brand_err:
                 logger.debug(f"[profile-launch] early shell skipped: {_early_brand_err}")
+                if strict_mobile_shell:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        if browser is not None and not _persistent_mode:
+                            await browser.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Strict mobile shell: {str(_early_brand_err)[:200]}"
+                    ) from _early_brand_err
 
         # WebKit MiniBrowser: rename window ASAP so taskbar/title is Krexion, not [WebKit]
         if _profile_engine == "webkit":

@@ -962,6 +962,24 @@ export default function BrowserProfilesPage() {
             const ids = Array.isArray(advProxy.saved_proxy_ids)
               ? advProxy.saved_proxy_ids.filter(Boolean)
               : [];
+            // v2.7.127 — Reject host-only saved lines client-side (no @ and
+            // fewer than 4 colon parts → no user/pass → Chromium Sign-in).
+            const pool = Array.isArray(savedProxyPool) ? savedProxyPool : [];
+            const selected = ids.length
+              ? pool.filter((p) => ids.includes(p.id || p._id))
+              : pool;
+            const bad = selected.find((p) => {
+              const s = String(p.proxy_string || p.raw || "").trim();
+              if (!s) return true;
+              if (s.includes("@")) return false;
+              return s.split(":").length < 4;
+            });
+            if (bad) {
+              throw new Error(
+                "Saved proxy needs full auth (user:pass@host:port or host:port:user:pass). "
+                + "Re-add the proxy with username+password — host-only lines cause Chromium Sign-in."
+              );
+            }
             return {
               mode: "saved",
               ...(ids.length ? { saved_proxy_ids: ids } : {}),

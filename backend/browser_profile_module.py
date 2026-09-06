@@ -2194,18 +2194,22 @@ def _proxy_ready_for_soft_launch(proxy_cfg: Dict[str, Any]) -> bool:
 
     Note: this still keeps the proxy on the browser — it only skips the
     pre-bound unique exit-IP gate. It does NOT mean "open on real IP".
+
+    v2.7.127 — Rotating gateway host alone is NOT enough. Missing password
+    must never look "ready" (that path caused Chromium proxy Sign-in).
+    Provider / ProxyJet may still resolve creds at launch time.
     """
     if not str(proxy_cfg.get("server") or "").strip():
         return False
-    if str(proxy_cfg.get("password") or "").strip():
+    if str(proxy_cfg.get("password") or "").strip() and str(
+        proxy_cfg.get("username") or ""
+    ).strip():
         return True
     if str(proxy_cfg.get("provider_id") or "").strip():
         return True
     if proxy_cfg.get("use_proxyjet"):
         return True
-    if _is_rotating_gateway_proxy(proxy_cfg):
-        return True
-    return bool(str(proxy_cfg.get("username") or "").strip())
+    return False
 
 
 def _defer_launch_proxy_probe(proxy_cfg: Dict[str, Any]) -> bool:
@@ -6127,8 +6131,24 @@ async def advanced_create(request: Request, body: AdvancedCreateBody):
                     password=_pwd,
                 )
         elif proxy_mode == "saved":
+            # v2.7.127 — Saved-from-list MUST carry username+password after parse.
+            # Host-only proxy_string → Chromium Sign-in (gw.dataimpulse.com etc.).
             if i < len(saved_lines):
                 proxy_cfg = _parse_proxy_line_to_cfg(saved_lines[i])
+                _su = str(getattr(proxy_cfg, "username", None) or "").strip()
+                _sp = str(getattr(proxy_cfg, "password", None) or "").strip()
+                if isinstance(proxy_cfg, dict):
+                    _su = str(proxy_cfg.get("username") or "").strip()
+                    _sp = str(proxy_cfg.get("password") or "").strip()
+                if not _su or not _sp:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Saved proxy is missing username AND password after parse. "
+                            "Re-add the proxy as user:pass@host:port or host:port:user:pass "
+                            "(full auth line). Without auth Chromium shows a Sign-in dialog."
+                        ),
+                    )
             # else: leave proxy-less (warning already emitted)
         elif proxy_mode == "proxyjet":
             if i < len(proxy_lines):
