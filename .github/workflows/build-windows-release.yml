@@ -759,17 +759,24 @@ jobs:
           # Ship all three: full chromium, headless-shell, and webkit.
           & $py -m playwright install chromium chromium-headless-shell webkit
           if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Playwright install returned exit $LASTEXITCODE - continuing build (chromium-bundle may be partial)"
+            # v2.9.8 — AdsPower packaging honesty: do NOT ship a half-bundle.
+            throw "Playwright install failed (exit $LASTEXITCODE) — chromium/webkit bundle incomplete"
           }
           Write-Host "=== browser-engine bundle contents (top level) ==="
           Get-ChildItem build/chromium-bundle -Directory -ErrorAction SilentlyContinue |
             Select-Object Name, FullName | Format-Table -AutoSize | Out-String -Width 200
+          $hasChromium = @(Get-ChildItem build/chromium-bundle -Directory -Filter 'chromium-*' -ErrorAction SilentlyContinue).Count -gt 0
           $hasWebkit = @(Get-ChildItem build/chromium-bundle -Directory -Filter 'webkit-*' -ErrorAction SilentlyContinue).Count -gt 0
-          if (-not $hasWebkit) {
-            Write-Warning "webkit-* folder missing from bundle — iOS dual-engine will fall back to Android Chrome until install webkit succeeds"
-          } else {
-            Write-Host "WebKit present in bundle — iOS engine ready for EXE installs"
+          if (-not $hasChromium) {
+            throw "chromium-* folder missing from bundle — Native EXE cannot Open headed profiles"
           }
+          # v2.9.8 — Hard-gate WebKit (parity with Electron prepare-resources).
+          # Runtime already aborts iOS/Safari Open if WebKit missing; packaging
+          # must not claim AdsPower-class while omitting the engine.
+          if (-not $hasWebkit) {
+            throw "webkit-* folder missing from bundle — iOS/Safari Open requires WebKit (no Android Chrome fallback)"
+          }
+          Write-Host "Chromium + WebKit present in bundle — Android/iOS engines ready for EXE installs"
           $totalSize = (Get-ChildItem build/chromium-bundle -Recurse -File -ErrorAction SilentlyContinue |
                         Measure-Object -Property Length -Sum).Sum
           Write-Host "Total chromium-bundle size: $([math]::Round($totalSize / 1MB, 1)) MB"

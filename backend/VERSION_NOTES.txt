@@ -1,3 +1,11 @@
+# v2.9.8 — 2026-09 — Native WebKit packaging hard-gate (AdsPower parity)
+# Residual after v2.9.7 CI-green audit:
+#   Native Build Windows Release still Write-Warning'd when webkit-* missing
+#   and claimed Android Chrome fallback — contradicted by v2.9.6 runtime abort.
+# Fix: throw if Playwright install fails or chromium-*/webkit-* missing
+# (parity with Electron prepare-resources hard throw).
+# Bundles v2.9.3–2.9.7 shell/proxy/UI/tray/CDP/Safari/stealth honesty locks.
+#
 # v2.9.7 — 2026-09 — Fingerprint soft-degrade honesty + Inno WebKit gate
 # Residual after v2.9.6 AdsPower audit:
 #   1) Soft RUT stealth degrade (return False / _krx_stealth_degraded) now
